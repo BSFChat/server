@@ -151,7 +151,8 @@ protected:
     void SetUp() override {
         store = std::make_unique<SqliteStore>(":memory:");
         store->initialize();
-        sync_engine = std::make_unique<SyncEngine>(*store);
+        config.server_name = "test";
+        sync_engine = std::make_unique<SyncEngine>(*store, config);
 
         store->create_user("@alice:test", hash_password("pass", 10));
         store->create_user("@bob:test", hash_password("pass", 10));
@@ -183,6 +184,7 @@ protected:
     }
 
     std::unique_ptr<SqliteStore> store;
+    Config config;
     std::unique_ptr<SyncEngine> sync_engine;
 };
 

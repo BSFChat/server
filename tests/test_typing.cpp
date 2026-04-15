@@ -23,7 +23,7 @@ protected:
 
         store = std::make_unique<SqliteStore>(":memory:");
         store->initialize();
-        sync_engine = std::make_unique<SyncEngine>(*store);
+        sync_engine = std::make_unique<SyncEngine>(*store, config);
         handler = std::make_unique<TypingHandler>(*store, *sync_engine, config);
 
         // Create test users
