@@ -2,11 +2,12 @@ include(FetchContent)
 find_package(OpenSSL REQUIRED)
 find_package(SQLite3 REQUIRED)
 
-# Protocol library (local path for development)
-FetchContent_Declare(
-    bsfchat_protocol
-    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../protocol
-)
+# Protocol library (local path for development, GitHub for CI/Docker)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/../protocol/CMakeLists.txt)
+    FetchContent_Declare(bsfchat_protocol SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../protocol)
+else()
+    FetchContent_Declare(bsfchat_protocol GIT_REPOSITORY https://github.com/BSFChat/protocol.git GIT_TAG main GIT_SHALLOW TRUE)
+endif()
 
 FetchContent_Declare(
     spdlog
