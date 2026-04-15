@@ -111,9 +111,24 @@ void bootstrap_roles(SqliteStore& store, SyncEngine& sync_engine, const Config& 
         return;
     }
 
-    // 1. Seed default server roles if missing.
+    // 1. Seed default server roles if missing OR if the existing event is
+    // legacy-shape (pre-permissions, i.e. name/level/color only). Detect the
+    // legacy shape by "no role has any permission bits set" — a legacy event
+    // deserializes with permissions=0 for every role, which would lock every
+    // user out of VIEW_CHANNEL.
     auto existing = store.get_server_roles();
-    if (existing.empty()) {
+    bool needs_seed = existing.empty();
+    if (!needs_seed) {
+        bool any_perms = false;
+        for (const auto& r : existing) {
+            if (r.permissions != 0) { any_perms = true; break; }
+        }
+        if (!any_perms) {
+            get_logger()->info("bootstrap_roles: existing server.roles event is legacy-shape, upgrading");
+            needs_seed = true;
+        }
+    }
+    if (needs_seed) {
         write_server_roles(store, sync_engine, config, canonical);
     }
 
