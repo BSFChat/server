@@ -1,3 +1,7 @@
+LABEL org.opencontainers.image.source=https://github.com/BSFChat/server
+LABEL org.opencontainers.image.description="BSFChat chat server"
+LABEL org.opencontainers.image.licenses=MIT
+
 # Stage 1: Build
 FROM ubuntu:24.04 AS builder
 
