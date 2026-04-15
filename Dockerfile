@@ -1,7 +1,3 @@
-LABEL org.opencontainers.image.source=https://github.com/BSFChat/server
-LABEL org.opencontainers.image.description="BSFChat chat server"
-LABEL org.opencontainers.image.licenses=MIT
-
 # Stage 1: Build
 FROM ubuntu:24.04 AS builder
 
@@ -19,6 +15,10 @@ RUN cmake -B /build \
 
 # Stage 2: Runtime
 FROM ubuntu:24.04
+
+LABEL org.opencontainers.image.source=https://github.com/BSFChat/server
+LABEL org.opencontainers.image.description="BSFChat chat server"
+LABEL org.opencontainers.image.licenses=MIT
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3t64 libsqlite3-0 ca-certificates \
