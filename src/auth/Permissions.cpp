@@ -52,6 +52,14 @@ permission::Flags PermissionsEngine::compute(const std::string& user_id, const s
 
     auto all_roles = store_.get_server_roles();
     auto user_role_ids = store_.get_member_role_ids(user_id);
+
+    // Fallback: if the server hasn't been bootstrapped yet (no roles at all
+    // and no member.roles events), grant the default @everyone permissions
+    // so a fresh deployment still lets users see and send messages.
+    if (all_roles.empty() && user_role_ids.empty()) {
+        return permission::kEveryoneDefault;
+    }
+
     auto user_roles = resolve_user_roles(all_roles, user_role_ids);
 
     // Base = OR of all role permission bitfields.
