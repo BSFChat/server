@@ -71,6 +71,11 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
         response.rooms.join[room_id] = std::move(joined);
     }
 
+    // Populate unread counts
+    for (auto& [room_id, joined] : response.rooms.join) {
+        joined.unread_count = store_.count_unread(user_id, room_id);
+    }
+
     response.next_batch = "s" + std::to_string(store_.get_current_stream_position());
     return response;
 }
@@ -111,6 +116,11 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
         auto& joined = response.rooms.join[room_id];
         // Replace state events (they're a superset of what we already collected)
         joined.state.events = std::move(state);
+    }
+
+    // Populate unread counts for every room that appears in this response.
+    for (auto& [room_id, joined] : response.rooms.join) {
+        joined.unread_count = store_.count_unread(user_id, room_id);
     }
 
     int64_t max_pos = since_pos;

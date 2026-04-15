@@ -20,11 +20,17 @@ int64_t now_ms() {
 }
 
 // Add a user to a single room: update membership + emit m.room.member state event.
+// Also marks all pre-existing content as read (so auto-joined users don't see a
+// wall of "unread" history they were never around for).
 void join_user_to_room(SqliteStore& store, SyncEngine& sync_engine,
                         const Config& config, const std::string& room_id,
                         const std::string& user_id) {
     // Skip if already joined
     if (store.is_room_member(room_id, user_id)) return;
+
+    // Snapshot current max position BEFORE writing the join event — this is the
+    // point up to which we consider everything "already read" for this user.
+    int64_t mark_pos = store.get_room_max_stream_position(room_id);
 
     store.set_membership(room_id, user_id, std::string(membership::kJoin));
 
@@ -33,6 +39,8 @@ void join_user_to_room(SqliteStore& store, SyncEngine& sync_engine,
     store.insert_event(event_id, room_id, user_id,
                         std::string(event_type::kRoomMember),
                         user_id, content.dump(), now_ms());
+
+    store.set_read_marker(user_id, room_id, mark_pos);
 }
 
 } // namespace

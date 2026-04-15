@@ -65,6 +65,14 @@ public:
     // Sync
     std::vector<RoomEvent> get_events_since(const std::string& user_id, int64_t since_position, int limit = 1000);
     int64_t get_current_stream_position();
+    int64_t get_room_max_stream_position(const std::string& room_id);
+
+    // Read markers
+    // Upserts (user_id, room_id) marker. Only moves forward (monotonic).
+    void set_read_marker(const std::string& user_id, const std::string& room_id, int64_t stream_pos);
+    int64_t get_read_marker(const std::string& user_id, const std::string& room_id);
+    // Counts m.room.message events in room where stream_position > marker AND sender != user_id.
+    int count_unread(const std::string& user_id, const std::string& room_id);
 
     // Profile
     void set_display_name(const std::string& user_id, const std::string& display_name);

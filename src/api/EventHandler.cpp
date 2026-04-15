@@ -131,4 +131,55 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
     res.set_content(resp.dump(), "application/json");
 }
 
+void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Response& res) {
+    auto user_id = authenticate(store_, req.get_header_value("Authorization"));
+    if (!user_id) {
+        res.status = 401;
+        res.set_content(MatrixError::missing_token().to_json().dump(), "application/json");
+        return;
+    }
+
+    auto match = match_route("/_matrix/client/v3/rooms/{roomId}/read_marker", req.path);
+    if (!match.matched) {
+        res.status = 404;
+        res.set_content(MatrixError::not_found().to_json().dump(), "application/json");
+        return;
+    }
+
+    auto& room_id = match.params["roomId"];
+    if (!store_.is_room_member(room_id, *user_id)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(), "application/json");
+        return;
+    }
+
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (...) {
+        res.status = 400;
+        res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
+        return;
+    }
+
+    // Accept either explicit last_read_pos, or an event_id we look up.
+    int64_t pos = 0;
+    if (body.contains("last_read_pos") && body["last_read_pos"].is_number_integer()) {
+        pos = body["last_read_pos"].get<int64_t>();
+    } else if (body.contains("m.fully_read") && body["m.fully_read"].is_string()) {
+        // Matrix spec shape: { "m.fully_read": "$event_id", "m.read": "$event_id" }
+        // We don't currently look these up; default to the current max for the room.
+        pos = store_.get_room_max_stream_position(room_id);
+    } else {
+        // No usable body — treat as "mark all read now".
+        pos = store_.get_room_max_stream_position(room_id);
+    }
+
+    store_.set_read_marker(*user_id, room_id, pos);
+    // Wake long-poll syncs so the count updates without waiting.
+    sync_engine_.notify_new_event();
+
+    res.set_content("{}", "application/json");
+}
+
 } // namespace bsfchat

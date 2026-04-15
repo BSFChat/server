@@ -146,6 +146,8 @@ void Server::register_routes() {
             [h = event_handler](const httplib::Request& req, httplib::Response& res) { h->handle_send_event(req, res); });
     svr.Get(R"(/_matrix/client/v3/rooms/([^/]+)/messages)",
             [h = event_handler](const httplib::Request& req, httplib::Response& res) { h->handle_room_messages(req, res); });
+    svr.Post(R"(/_matrix/client/v3/rooms/([^/]+)/read_marker)",
+            [h = event_handler](const httplib::Request& req, httplib::Response& res) { h->handle_read_marker(req, res); });
 
     // Typing route (must be before generic room PUT patterns)
     auto typing_handler = std::make_shared<TypingHandler>(*store_, *sync_engine_, config_);

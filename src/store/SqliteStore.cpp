@@ -105,6 +105,15 @@ void SqliteStore::initialize() {
     exec("CREATE INDEX IF NOT EXISTS idx_room_members_user ON room_members(user_id, membership)");
 
     exec(R"(
+        CREATE TABLE IF NOT EXISTS read_markers (
+            user_id         TEXT NOT NULL,
+            room_id         TEXT NOT NULL,
+            last_read_pos   INTEGER NOT NULL,
+            PRIMARY KEY (user_id, room_id)
+        )
+    )");
+
+    exec(R"(
         CREATE TABLE IF NOT EXISTS media (
             media_id        TEXT PRIMARY KEY,
             uploader        TEXT NOT NULL,
@@ -522,6 +531,61 @@ int64_t SqliteStore::get_current_stream_position() {
     auto stmt = prepare(db_, "SELECT COALESCE(MAX(stream_position), 0) FROM events");
     sqlite3_step(stmt.get());
     return sqlite3_column_int64(stmt.get(), 0);
+}
+
+int64_t SqliteStore::get_room_max_stream_position(const std::string& room_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT COALESCE(MAX(stream_position), 0) FROM events WHERE room_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+    return sqlite3_column_int64(stmt.get(), 0);
+}
+
+// Read markers
+
+void SqliteStore::set_read_marker(const std::string& user_id, const std::string& room_id, int64_t stream_pos) {
+    std::lock_guard lock(mutex_);
+    // Upsert, but only move forward. ON CONFLICT uses MAX(existing, new).
+    auto stmt = prepare(db_,
+        "INSERT INTO read_markers (user_id, room_id, last_read_pos) VALUES (?, ?, ?) "
+        "ON CONFLICT(user_id, room_id) DO UPDATE SET last_read_pos = "
+        "CASE WHEN excluded.last_read_pos > read_markers.last_read_pos "
+        "THEN excluded.last_read_pos ELSE read_markers.last_read_pos END");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 3, stream_pos);
+    sqlite3_step(stmt.get());
+}
+
+int64_t SqliteStore::get_read_marker(const std::string& user_id, const std::string& room_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT last_read_pos FROM read_markers WHERE user_id = ? AND room_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        return sqlite3_column_int64(stmt.get(), 0);
+    }
+    return 0;
+}
+
+int SqliteStore::count_unread(const std::string& user_id, const std::string& room_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT COUNT(*) FROM events "
+        "WHERE room_id = ? AND event_type = 'm.room.message' "
+        "AND sender != ? "
+        "AND stream_position > COALESCE("
+        "  (SELECT last_read_pos FROM read_markers WHERE user_id = ? AND room_id = ?), 0)");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        return sqlite3_column_int(stmt.get(), 0);
+    }
+    return 0;
 }
 
 // Profile
