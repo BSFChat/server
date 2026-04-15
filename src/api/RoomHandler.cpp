@@ -1,6 +1,6 @@
 #include "api/RoomHandler.h"
 #include "auth/AutoJoin.h"
-#include "auth/PowerLevels.h"
+#include "auth/Permissions.h"
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
@@ -12,6 +12,7 @@
 #include <bsfchat/ErrorCodes.h>
 #include <bsfchat/Identifiers.h>
 #include <bsfchat/MatrixTypes.h>
+#include <bsfchat/Permissions.h>
 
 #include <nlohmann/json.hpp>
 #include <chrono>
@@ -95,12 +96,11 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
                          json{{"topic", *room_req.topic}});
     }
 
-    // Set power levels — creator gets level 100
-    PowerLevelsContent power_levels;
-    power_levels.users[*user_id] = 100;
-    json pl_json;
-    to_json(pl_json, power_levels);
-    emit_state_event(room_id, *user_id, std::string(event_type::kRoomPowerLevels), "", pl_json);
+    // Note: we no longer emit m.room.power_levels. Permissions now flow from
+    // server-wide roles (bsfchat.server.roles) and per-channel overrides
+    // (bsfchat.channel.permissions). The creator is expected to already hold
+    // an admin role via RoleBootstrap; if not, they'll be granted one at the
+    // first server-settings interaction.
 
     // Set voice channel state if requested
     if (body.value("voice", false)) {
@@ -139,15 +139,8 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
                          json{{"parent_id", parent_id}, {"order", order}});
     }
 
-    // Emit default server roles on category rooms
-    if (body.value("is_category", false)) {
-        json roles_content = {{"roles", json::array({
-            {{"name", "Owner"}, {"level", 100}, {"color", "#e91e63"}},
-            {{"name", "Moderator"}, {"level", 50}, {"color", "#2196f3"}},
-            {{"name", "Member"}, {"level", 0}, {"color", "#9e9e9e"}}
-        })}};
-        emit_state_event(room_id, *user_id, std::string(event_type::kServerRoles), "", roles_content);
-    }
+    // Default server roles are seeded once per server by RoleBootstrap —
+    // we don't emit them on every category creation anymore.
 
     // Auto-join all existing users if this is a public, non-category room
     // so everyone on the server sees the new channel by default.
@@ -397,25 +390,16 @@ void RoomHandler::handle_kick(const httplib::Request& req, httplib::Response& re
     auto target_user = body["user_id"].get<std::string>();
     auto reason = body.value("reason", "");
 
-    // Check power levels
-    auto pl_event = store_.get_state_event(room_id, std::string(event_type::kRoomPowerLevels), "");
-    if (pl_event) {
-        PowerLevelsContent pl;
-        from_json(pl_event->content.data, pl);
-        PowerLevelChecker checker(pl);
-
-        if (!checker.canKick(*user_id)) {
-            res.status = 403;
-            res.set_content(MatrixError::forbidden("Insufficient power level to kick").to_json().dump(), "application/json");
-            return;
-        }
-
-        // Cannot kick someone with equal or higher power level
-        if (checker.getUserPowerLevel(target_user) >= checker.getUserPowerLevel(*user_id)) {
-            res.status = 403;
-            res.set_content(MatrixError::forbidden("Cannot kick a user with equal or higher power level").to_json().dump(), "application/json");
-            return;
-        }
+    PermissionsEngine perms(store_, config_);
+    if (!perms.can(*user_id, room_id, permission::kKickMembers)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Insufficient permissions to kick").to_json().dump(), "application/json");
+        return;
+    }
+    if (!perms.outranks(*user_id, target_user)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Cannot kick a user with equal or higher role").to_json().dump(), "application/json");
+        return;
     }
 
     if (!store_.is_room_member(room_id, target_user)) {
@@ -473,25 +457,16 @@ void RoomHandler::handle_ban(const httplib::Request& req, httplib::Response& res
     auto target_user = body["user_id"].get<std::string>();
     auto reason = body.value("reason", "");
 
-    // Check power levels
-    auto pl_event = store_.get_state_event(room_id, std::string(event_type::kRoomPowerLevels), "");
-    if (pl_event) {
-        PowerLevelsContent pl;
-        from_json(pl_event->content.data, pl);
-        PowerLevelChecker checker(pl);
-
-        if (!checker.canBan(*user_id)) {
-            res.status = 403;
-            res.set_content(MatrixError::forbidden("Insufficient power level to ban").to_json().dump(), "application/json");
-            return;
-        }
-
-        // Cannot ban someone with equal or higher power level
-        if (checker.getUserPowerLevel(target_user) >= checker.getUserPowerLevel(*user_id)) {
-            res.status = 403;
-            res.set_content(MatrixError::forbidden("Cannot ban a user with equal or higher power level").to_json().dump(), "application/json");
-            return;
-        }
+    PermissionsEngine perms(store_, config_);
+    if (!perms.can(*user_id, room_id, permission::kBanMembers)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Insufficient permissions to ban").to_json().dump(), "application/json");
+        return;
+    }
+    if (!perms.outranks(*user_id, target_user)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Cannot ban a user with equal or higher role").to_json().dump(), "application/json");
+        return;
     }
 
     store_.set_membership(room_id, target_user, std::string(membership::kBan));
@@ -542,18 +517,12 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
 
     auto target_user = body["user_id"].get<std::string>();
 
-    // Check power levels
-    auto pl_event = store_.get_state_event(room_id, std::string(event_type::kRoomPowerLevels), "");
-    if (pl_event) {
-        PowerLevelsContent pl;
-        from_json(pl_event->content.data, pl);
-        PowerLevelChecker checker(pl);
-
-        if (!checker.canInvite(*user_id)) {
-            res.status = 403;
-            res.set_content(MatrixError::forbidden("Insufficient power level to invite").to_json().dump(), "application/json");
-            return;
-        }
+    PermissionsEngine perms(store_, config_);
+    // Inviting piggybacks on MANAGE_CHANNELS for now — we don't have a separate flag.
+    if (!perms.can(*user_id, room_id, permission::kManageChannels)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Insufficient permissions to invite").to_json().dump(), "application/json");
+        return;
     }
 
     // Check target user is not already banned
@@ -601,18 +570,23 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         return;
     }
 
-    // Check power levels for state events
-    auto pl_event = store_.get_state_event(room_id, std::string(event_type::kRoomPowerLevels), "");
-    if (pl_event) {
-        PowerLevelsContent pl;
-        from_json(pl_event->content.data, pl);
-        PowerLevelChecker checker(pl);
+    // Map the state event type to the permission flag that gates it.
+    permission::Flags required = permission::kManageChannels;
+    if (evt_type == std::string(event_type::kServerRoles) ||
+        evt_type == std::string(event_type::kMemberRoles) ||
+        evt_type == std::string(event_type::kChannelPermissions)) {
+        required = permission::kManageRoles;
+    } else if (evt_type == std::string(event_type::kRoomMember)) {
+        // Self-leave is always allowed; otherwise gate through kick/ban paths.
+        required = permission::kKickMembers;
+        if (state_key == *user_id) required = permission::kViewChannel; // effectively always allowed for joined members
+    }
 
-        if (!checker.canSendEvent(*user_id, evt_type, /*is_state=*/true)) {
-            res.status = 403;
-            res.set_content(MatrixError::forbidden("Insufficient power level to set state").to_json().dump(), "application/json");
-            return;
-        }
+    PermissionsEngine perms(store_, config_);
+    if (!perms.can(*user_id, room_id, required)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Insufficient permissions for this state event").to_json().dump(), "application/json");
+        return;
     }
 
     json content;
@@ -652,17 +626,11 @@ void RoomHandler::handle_move_channel(const httplib::Request& req, httplib::Resp
         return;
     }
 
-    // Check power levels — require level >= 50 (moderator)
-    auto pl_event = store_.get_state_event(room_id, std::string(event_type::kRoomPowerLevels), "");
-    if (pl_event) {
-        PowerLevelsContent pl;
-        from_json(pl_event->content.data, pl);
-        PowerLevelChecker checker(pl);
-        if (checker.getUserPowerLevel(*user_id) < 50) {
-            res.status = 403;
-            res.set_content(MatrixError::forbidden("Insufficient power level").to_json().dump(), "application/json");
-            return;
-        }
+    PermissionsEngine perms(store_, config_);
+    if (!perms.can(*user_id, room_id, permission::kManageChannels)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Insufficient permissions to move channels").to_json().dump(), "application/json");
+        return;
     }
 
     json body;
@@ -741,17 +709,11 @@ void RoomHandler::handle_set_order(const httplib::Request& req, httplib::Respons
         return;
     }
 
-    // Check power levels — require level >= 50 (moderator)
-    auto pl_event = store_.get_state_event(room_id, std::string(event_type::kRoomPowerLevels), "");
-    if (pl_event) {
-        PowerLevelsContent pl;
-        from_json(pl_event->content.data, pl);
-        PowerLevelChecker checker(pl);
-        if (checker.getUserPowerLevel(*user_id) < 50) {
-            res.status = 403;
-            res.set_content(MatrixError::forbidden("Insufficient power level").to_json().dump(), "application/json");
-            return;
-        }
+    PermissionsEngine perms(store_, config_);
+    if (!perms.can(*user_id, room_id, permission::kManageChannels)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Insufficient permissions to reorder channels").to_json().dump(), "application/json");
+        return;
     }
 
     json body;

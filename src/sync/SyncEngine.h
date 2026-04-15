@@ -10,10 +10,11 @@
 namespace bsfchat {
 
 class SqliteStore;
+struct Config;
 
 class SyncEngine {
 public:
-    explicit SyncEngine(SqliteStore& store);
+    SyncEngine(SqliteStore& store, const Config& config);
 
     // Notify that a new event was inserted. Wakes all waiting sync requests.
     void notify_new_event();
@@ -29,6 +30,7 @@ private:
     SyncResponse build_incremental_sync(const std::string& user_id, int64_t since_pos);
 
     SqliteStore& store_;
+    const Config& config_;
     std::mutex wait_mutex_;
     std::condition_variable new_event_cv_;
     std::atomic<int64_t> current_position_{0};

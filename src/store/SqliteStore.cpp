@@ -1,6 +1,8 @@
 #include "store/SqliteStore.h"
 #include "core/Logger.h"
 
+#include <bsfchat/Constants.h>
+
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
@@ -463,6 +465,28 @@ std::vector<RoomEvent> SqliteStore::get_state_events(const std::string& room_id)
     return events;
 }
 
+std::optional<RoomEvent> SqliteStore::get_event_by_id(const std::string& event_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT event_id, room_id, sender, event_type, state_key, content, origin_server_ts "
+        "FROM events WHERE event_id = ? LIMIT 1");
+    sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+
+    RoomEvent ev;
+    ev.event_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+    ev.room_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
+    ev.sender = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 2));
+    ev.type = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 3));
+    if (sqlite3_column_type(stmt.get(), 4) != SQLITE_NULL) {
+        ev.state_key = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 4));
+    }
+    ev.content.data = nlohmann::json::parse(
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 5)));
+    ev.origin_server_ts = sqlite3_column_int64(stmt.get(), 6);
+    return ev;
+}
+
 std::optional<RoomEvent> SqliteStore::get_state_event(const std::string& room_id,
                                                        const std::string& event_type,
                                                        const std::string& state_key) {
@@ -586,6 +610,117 @@ int SqliteStore::count_unread(const std::string& user_id, const std::string& roo
         return sqlite3_column_int(stmt.get(), 0);
     }
     return 0;
+}
+
+// Permissions / roles
+
+std::vector<ServerRole> SqliteStore::get_server_roles() {
+    std::lock_guard lock(mutex_);
+    // Latest bsfchat.server.roles event globally (regardless of room).
+    std::string type(event_type::kServerRoles);
+    auto stmt = prepare(db_,
+        "SELECT content FROM events "
+        "WHERE event_type = ? AND state_key = '' "
+        "ORDER BY stream_position DESC LIMIT 1");
+    sqlite3_bind_text(stmt.get(), 1, type.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return {};
+    auto json = nlohmann::json::parse(
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)), nullptr, false);
+    if (json.is_discarded()) return {};
+    ServerRolesContent content;
+    from_json(json, content);
+    return content.roles;
+}
+
+std::vector<std::string> SqliteStore::get_member_role_ids(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    std::string type(event_type::kMemberRoles);
+    auto stmt = prepare(db_,
+        "SELECT content FROM events "
+        "WHERE event_type = ? AND state_key = ? "
+        "ORDER BY stream_position DESC LIMIT 1");
+    sqlite3_bind_text(stmt.get(), 1, type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return {};
+    auto json = nlohmann::json::parse(
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)), nullptr, false);
+    if (json.is_discarded()) return {};
+    MemberRolesContent content;
+    from_json(json, content);
+    return content.role_ids;
+}
+
+std::map<std::string, ChannelPermissionOverride>
+SqliteStore::get_channel_overrides(const std::string& room_id) {
+    std::lock_guard lock(mutex_);
+    // Latest event per state_key for this room and type.
+    std::string type(event_type::kChannelPermissions);
+    auto stmt = prepare(db_,
+        "SELECT e.state_key, e.content FROM events e "
+        "INNER JOIN (SELECT state_key, MAX(stream_position) AS mp FROM events "
+        "            WHERE room_id = ? AND event_type = ? AND state_key IS NOT NULL "
+        "            GROUP BY state_key) latest "
+        "ON e.state_key = latest.state_key AND e.stream_position = latest.mp "
+        "WHERE e.room_id = ? AND e.event_type = ?");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, type.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::map<std::string, ChannelPermissionOverride> overrides;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        std::string key = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        auto json = nlohmann::json::parse(
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1)), nullptr, false);
+        if (json.is_discarded()) continue;
+        ChannelPermissionOverride ov;
+        from_json(json, ov);
+        if (ov.allow == 0 && ov.deny == 0) continue; // skip empty
+        overrides[std::move(key)] = ov;
+    }
+    return overrides;
+}
+
+int SqliteStore::get_channel_slowmode(const std::string& room_id) {
+    std::lock_guard lock(mutex_);
+    std::string type(event_type::kChannelSettings);
+    auto stmt = prepare(db_,
+        "SELECT content FROM events "
+        "WHERE room_id = ? AND event_type = ? AND state_key = '' "
+        "ORDER BY stream_position DESC LIMIT 1");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, type.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return 0;
+    auto json = nlohmann::json::parse(
+        reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)), nullptr, false);
+    if (json.is_discarded()) return 0;
+    return json.value("slowmode_seconds", 0);
+}
+
+int64_t SqliteStore::get_last_message_ts(const std::string& user_id, const std::string& room_id) {
+    std::lock_guard lock(mutex_);
+    std::string type(event_type::kRoomMessage);
+    auto stmt = prepare(db_,
+        "SELECT MAX(origin_server_ts) FROM events "
+        "WHERE room_id = ? AND sender = ? AND event_type = ?");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, type.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return 0;
+    if (sqlite3_column_type(stmt.get(), 0) == SQLITE_NULL) return 0;
+    return sqlite3_column_int64(stmt.get(), 0);
+}
+
+std::vector<std::pair<std::string, int64_t>> SqliteStore::list_users_with_created_at() {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT user_id, created_at FROM users ORDER BY created_at ASC");
+    std::vector<std::pair<std::string, int64_t>> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        out.emplace_back(
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)),
+            sqlite3_column_int64(stmt.get(), 1));
+    }
+    return out;
 }
 
 // Profile

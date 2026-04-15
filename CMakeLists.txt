@@ -20,7 +20,9 @@ add_executable(bsfchat-server
     src/auth/AutoJoin.cpp
     src/auth/LocalAuth.cpp
     src/auth/OidcAuth.cpp
+    src/auth/Permissions.cpp
     src/auth/PowerLevels.cpp
+    src/auth/RoleBootstrap.cpp
     src/api/AuthHandler.cpp
     src/api/RoomHandler.cpp
     src/api/EventHandler.cpp

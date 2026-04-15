@@ -3,10 +3,12 @@
 #include <bsfchat/MatrixTypes.h>
 #include <sqlite3.h>
 
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 #include <cstdint>
 
@@ -61,11 +63,26 @@ public:
 
     std::vector<RoomEvent> get_state_events(const std::string& room_id);
     std::optional<RoomEvent> get_state_event(const std::string& room_id, const std::string& event_type, const std::string& state_key);
+    std::optional<RoomEvent> get_event_by_id(const std::string& event_id);
 
     // Sync
     std::vector<RoomEvent> get_events_since(const std::string& user_id, int64_t since_position, int limit = 1000);
     int64_t get_current_stream_position();
     int64_t get_room_max_stream_position(const std::string& room_id);
+
+    // Permissions / roles (reads)
+    // Returns the latest bsfchat.server.roles content across all rooms, empty if unset.
+    std::vector<ServerRole> get_server_roles();
+    // Role IDs assigned to the given user (latest bsfchat.member.roles), empty if none.
+    std::vector<std::string> get_member_role_ids(const std::string& user_id);
+    // All per-channel allow/deny overrides for the room, keyed by target ("role:..." / "user:...").
+    std::map<std::string, ChannelPermissionOverride> get_channel_overrides(const std::string& room_id);
+    // Per-channel slowmode, in seconds. 0 = disabled.
+    int get_channel_slowmode(const std::string& room_id);
+    // Timestamp (origin_server_ts, ms) of the user's most recent m.room.message in the room, 0 if none.
+    int64_t get_last_message_ts(const std::string& user_id, const std::string& room_id);
+    // For startup bootstrap: (user_id, created_at) ordered ascending by created_at.
+    std::vector<std::pair<std::string, int64_t>> list_users_with_created_at();
 
     // Read markers
     // Upserts (user_id, room_id) marker. Only moves forward (monotonic).

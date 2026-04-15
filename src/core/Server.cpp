@@ -1,6 +1,7 @@
 #include "core/Server.h"
 #include "core/Logger.h"
 #include "auth/AutoJoin.h"
+#include "auth/RoleBootstrap.h"
 #include "api/AuthHandler.h"
 #include "api/RoomHandler.h"
 #include "api/EventHandler.h"
@@ -44,7 +45,7 @@ Server::Server(Config config)
         media_storage_ = std::make_shared<LocalStorage>(config_.media_path);
     }
 
-    sync_engine_ = std::make_unique<SyncEngine>(*store_);
+    sync_engine_ = std::make_unique<SyncEngine>(*store_, config_);
 
     // Initialize OIDC auth if identity provider is configured
     if (config_.identity) {
@@ -148,6 +149,8 @@ void Server::register_routes() {
             [h = event_handler](const httplib::Request& req, httplib::Response& res) { h->handle_room_messages(req, res); });
     svr.Post(R"(/_matrix/client/v3/rooms/([^/]+)/read_marker)",
             [h = event_handler](const httplib::Request& req, httplib::Response& res) { h->handle_read_marker(req, res); });
+    svr.Put(R"(/_matrix/client/v3/rooms/([^/]+)/redact/([^/]+)/([^/]+))",
+            [h = event_handler](const httplib::Request& req, httplib::Response& res) { h->handle_redact(req, res); });
 
     // Typing route (must be before generic room PUT patterns)
     auto typing_handler = std::make_shared<TypingHandler>(*store_, *sync_engine_, config_);
@@ -214,6 +217,7 @@ void Server::start() {
     // Idempotent — skips users already joined.
     log->info("Running auto-join backfill...");
     backfill_auto_join(*store_, *sync_engine_, config_);
+    bootstrap_roles(*store_, *sync_engine_, config_);
 
     http_server_->start();
 }
