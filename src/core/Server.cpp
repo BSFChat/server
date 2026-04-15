@@ -1,5 +1,6 @@
 #include "core/Server.h"
 #include "core/Logger.h"
+#include "auth/AutoJoin.h"
 #include "api/AuthHandler.h"
 #include "api/RoomHandler.h"
 #include "api/EventHandler.h"
@@ -206,6 +207,11 @@ void Server::start() {
     if (config_.identity) {
         log->info("Identity provider: {}", config_.identity->provider_url);
     }
+
+    // Retroactively ensure all existing users are members of all public rooms.
+    // Idempotent — skips users already joined.
+    log->info("Running auto-join backfill...");
+    backfill_auto_join(*store_, *sync_engine_, config_);
 
     http_server_->start();
 }

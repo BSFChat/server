@@ -64,4 +64,22 @@ void auto_join_all_users(SqliteStore& store, SyncEngine& sync_engine,
     if (any) sync_engine.notify_new_event();
 }
 
+void backfill_auto_join(SqliteStore& store, SyncEngine& sync_engine,
+                         const Config& config) {
+    auto rooms = store.list_public_rooms();
+    auto users = store.list_all_users();
+    if (rooms.empty() || users.empty()) return;
+
+    int joins = 0;
+    for (const auto& room_id : rooms) {
+        for (const auto& user_id : users) {
+            if (!store.is_room_member(room_id, user_id)) {
+                join_user_to_room(store, sync_engine, config, room_id, user_id);
+                ++joins;
+            }
+        }
+    }
+    if (joins > 0) sync_engine.notify_new_event();
+}
+
 } // namespace bsfchat
