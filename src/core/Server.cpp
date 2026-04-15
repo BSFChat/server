@@ -83,7 +83,7 @@ void Server::register_routes() {
         res.set_content("", "text/plain");
     });
 
-    auto auth_handler = std::make_shared<AuthHandler>(*store_, config_, oidc_auth_.get());
+    auto auth_handler = std::make_shared<AuthHandler>(*store_, *sync_engine_, config_, oidc_auth_.get());
     auto room_handler = std::make_shared<RoomHandler>(*store_, *sync_engine_, config_);
     auto event_handler = std::make_shared<EventHandler>(*store_, *sync_engine_, config_);
     auto sync_handler = std::make_shared<SyncHandler>(*store_, *sync_engine_);

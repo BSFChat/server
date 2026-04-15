@@ -1,10 +1,12 @@
 #include "api/AuthHandler.h"
+#include "auth/AutoJoin.h"
 #include "auth/LocalAuth.h"
 #include "auth/OidcAuth.h"
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
 #include "store/SqliteStore.h"
+#include "sync/SyncEngine.h"
 
 #include <bsfchat/Constants.h>
 #include <bsfchat/ErrorCodes.h>
@@ -18,8 +20,9 @@ namespace bsfchat {
 
 using json = nlohmann::json;
 
-AuthHandler::AuthHandler(SqliteStore& store, const Config& config, OidcAuth* oidc_auth)
-    : store_(store), config_(config), oidc_auth_(oidc_auth) {}
+AuthHandler::AuthHandler(SqliteStore& store, SyncEngine& sync_engine,
+                         const Config& config, OidcAuth* oidc_auth)
+    : store_(store), sync_engine_(sync_engine), config_(config), oidc_auth_(oidc_auth) {}
 
 void AuthHandler::handle_versions(const httplib::Request&, httplib::Response& res) {
     json resp = {
@@ -116,7 +119,8 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
         std::string user_id = "@oidc_" + claims->sub + ":" + config_.server_name;
 
         // Create user if they don't exist (OIDC-only user with empty password hash)
-        if (!store_.user_exists(user_id)) {
+        bool newly_created = !store_.user_exists(user_id);
+        if (newly_created) {
             store_.create_user(user_id, ""); // empty hash — cannot log in with password
         }
 
@@ -128,6 +132,10 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
         auto access_token = generate_access_token();
         auto device_id = login_req.device_id.value_or(generate_device_id());
         store_.store_access_token(access_token, user_id, device_id);
+
+        if (newly_created) {
+            auto_join_public_rooms(store_, sync_engine_, config_, user_id);
+        }
 
         LoginResponse login_resp{
             .user_id = user_id,
@@ -212,6 +220,9 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
     auto access_token = generate_access_token();
     auto device_id = reg_req.device_id.value_or(generate_device_id());
     store_.store_access_token(access_token, user_id, device_id);
+
+    // Auto-join all existing public channels so new users immediately see the server's content
+    auto_join_public_rooms(store_, sync_engine_, config_, user_id);
 
     LoginResponse login_resp{
         .user_id = user_id,

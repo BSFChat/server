@@ -1,4 +1,5 @@
 #include "api/RoomHandler.h"
+#include "auth/AutoJoin.h"
 #include "auth/PowerLevels.h"
 #include "core/Config.h"
 #include "core/Logger.h"
@@ -142,6 +143,12 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
             {{"name", "Member"}, {"level", 0}, {"color", "#9e9e9e"}}
         })}};
         emit_state_event(room_id, *user_id, std::string(event_type::kServerRoles), "", roles_content);
+    }
+
+    // Auto-join all existing users if this is a public, non-category room
+    // so everyone on the server sees the new channel by default.
+    if (room_req.visibility == "public" && !body.value("is_category", false)) {
+        auto_join_all_users(store_, sync_engine_, config_, room_id, *user_id);
     }
 
     CreateRoomResponse room_resp{.room_id = room_id};

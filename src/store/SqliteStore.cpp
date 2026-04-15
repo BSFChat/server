@@ -218,6 +218,47 @@ std::vector<std::string> SqliteStore::get_joined_rooms(const std::string& user_i
     return rooms;
 }
 
+std::vector<std::string> SqliteStore::list_all_users() {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT user_id FROM users");
+    std::vector<std::string> users;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        users.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)));
+    }
+    return users;
+}
+
+std::vector<std::string> SqliteStore::list_public_rooms() {
+    std::lock_guard lock(mutex_);
+    // Return rooms where the latest m.room.join_rules state event has join_rule == "public"
+    // AND the latest bsfchat.room.type (if any) is NOT "category".
+    const char* sql = R"(
+        SELECT r.room_id FROM rooms r
+        WHERE (
+            SELECT json_extract(content, '$.join_rule')
+            FROM events
+            WHERE room_id = r.room_id
+              AND event_type = 'm.room.join_rules'
+              AND state_key = ''
+            ORDER BY stream_position DESC LIMIT 1
+        ) = 'public'
+        AND COALESCE((
+            SELECT json_extract(content, '$.type')
+            FROM events
+            WHERE room_id = r.room_id
+              AND event_type = 'bsfchat.room.type'
+              AND state_key = ''
+            ORDER BY stream_position DESC LIMIT 1
+        ), '') != 'category'
+    )";
+    auto stmt = prepare(db_, sql);
+    std::vector<std::string> rooms;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        rooms.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)));
+    }
+    return rooms;
+}
+
 bool SqliteStore::is_room_member(const std::string& room_id, const std::string& user_id) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_, "SELECT 1 FROM room_members WHERE room_id = ? AND user_id = ? AND membership = 'join'");

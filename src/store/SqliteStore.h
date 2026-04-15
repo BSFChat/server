@@ -34,11 +34,15 @@ public:
     void delete_access_token(const std::string& token);
     void delete_all_tokens_for_user(const std::string& user_id);
 
+    // Users
+    std::vector<std::string> list_all_users();
+
     // Rooms
     std::string create_room(const std::string& room_id, const std::string& creator);
     bool room_exists(const std::string& room_id);
     std::vector<std::string> get_joined_rooms(const std::string& user_id);
     bool is_room_member(const std::string& room_id, const std::string& user_id);
+    std::vector<std::string> list_public_rooms();
 
     // Room membership
     void set_membership(const std::string& room_id, const std::string& user_id, const std::string& membership);

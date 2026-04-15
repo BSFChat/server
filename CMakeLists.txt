@@ -17,6 +17,7 @@ add_executable(bsfchat-server
     src/http/HttpServer.cpp
     src/http/Router.cpp
     src/http/Middleware.cpp
+    src/auth/AutoJoin.cpp
     src/auth/LocalAuth.cpp
     src/auth/OidcAuth.cpp
     src/auth/PowerLevels.cpp
