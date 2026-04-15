@@ -4,6 +4,8 @@
 
 #include <bsfchat/Constants.h>
 
+#include <set>
+
 namespace bsfchat {
 
 SyncEngine::SyncEngine(SqliteStore& store)
@@ -78,13 +80,37 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
 
     auto events = store_.get_events_since(user_id, since_pos);
 
+    // Track rooms where this user just got joined in this batch — they need full state
+    // because earlier state events (name, topic, type, etc.) are older than since_pos.
+    std::set<std::string> newly_joined_rooms;
+
     // Group events by room
     for (auto& event : events) {
+        // Detect our own membership=join event on a room we haven't seen before
+        if (event.type == std::string(event_type::kRoomMember)
+            && event.state_key.has_value()
+            && *event.state_key == user_id) {
+            auto membership = event.content.data.value("membership", "");
+            if (membership == "join") {
+                newly_joined_rooms.insert(event.room_id);
+            }
+        }
+
         auto& joined = response.rooms.join[event.room_id];
         if (event.state_key.has_value()) {
             joined.state.events.push_back(event);
         }
         joined.timeline.events.push_back(std::move(event));
+    }
+
+    // For each newly-joined room, inject the full current state.
+    // This gives the client the room name, topic, type, power levels, etc. that
+    // existed before the user joined.
+    for (const auto& room_id : newly_joined_rooms) {
+        auto state = store_.get_state_events(room_id);
+        auto& joined = response.rooms.join[room_id];
+        // Replace state events (they're a superset of what we already collected)
+        joined.state.events = std::move(state);
     }
 
     int64_t max_pos = since_pos;
