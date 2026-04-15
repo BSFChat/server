@@ -66,6 +66,25 @@ void auto_join_all_users(SqliteStore& store, SyncEngine& sync_engine,
 
 void backfill_auto_join(SqliteStore& store, SyncEngine& sync_engine,
                          const Config& config) {
+    // First, convert all non-category rooms to public.
+    // Channels were historically created as private; this makes them accessible
+    // to everyone as the Discord-like model expects.
+    auto all_rooms = store.list_all_non_category_rooms();
+    for (const auto& room_id : all_rooms) {
+        auto jr = store.get_state_event(room_id,
+            std::string(event_type::kRoomJoinRules), "");
+        std::string current_rule = jr ? jr->content.data.value("join_rule", "") : "";
+        if (current_rule != "public") {
+            auto event_id = generate_event_id(config.server_name);
+            nlohmann::json content = {{"join_rule", "public"}};
+            store.insert_event(event_id, room_id, "@server:" + config.server_name,
+                std::string(event_type::kRoomJoinRules), "",
+                content.dump(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count());
+        }
+    }
+
     auto rooms = store.list_public_rooms();
     auto users = store.list_all_users();
     if (rooms.empty() || users.empty()) return;

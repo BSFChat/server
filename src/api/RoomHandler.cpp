@@ -72,10 +72,14 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
     emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), *user_id,
                      json{{"membership", membership::kJoin}});
 
-    // Set join rules
-    std::string join_rule_val = (room_req.visibility == "public")
-        ? std::string(join_rule::kPublic)
-        : std::string(join_rule::kInvite);
+    // Set join rules.
+    // Discord-like default: rooms are public unless explicitly marked private
+    // (or the room is a category, which doesn't get auto-join anyway).
+    // Only mark as invite-only if the client explicitly set visibility="private".
+    std::string visibility = body.value("visibility", std::string("public"));
+    std::string join_rule_val = (visibility == "private" || visibility == "invite")
+        ? std::string(join_rule::kInvite)
+        : std::string(join_rule::kPublic);
     emit_state_event(room_id, *user_id, std::string(event_type::kRoomJoinRules), "",
                      json{{"join_rule", join_rule_val}});
 
@@ -147,7 +151,7 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
 
     // Auto-join all existing users if this is a public, non-category room
     // so everyone on the server sees the new channel by default.
-    if (room_req.visibility == "public" && !body.value("is_category", false)) {
+    if (join_rule_val == join_rule::kPublic && !body.value("is_category", false)) {
         auto_join_all_users(store_, sync_engine_, config_, room_id, *user_id);
     }
 
