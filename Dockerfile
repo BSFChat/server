@@ -2,7 +2,7 @@
 FROM ubuntu:24.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake make g++ git ca-certificates libssl-dev libsqlite3-dev \
+    cmake make g++ git python3 ca-certificates libssl-dev libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY . /src
