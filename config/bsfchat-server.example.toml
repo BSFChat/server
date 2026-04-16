@@ -30,12 +30,19 @@ use_path_style = true
 
 [voice]
 enabled = true
-# Configure your own STUN/TURN servers for NAT traversal
-# stun_uri = "stun:stun.yourdomain.com:3478"
+
+# Public STUN (covers ~70% of NAT setups with no infrastructure from you).
+stun_uri = "stun:stun.l.google.com:19302"
+
+# For full coverage (symmetric NAT, strict firewalls), run your own TURN
+# relay — e.g. `apt install coturn` on the same box — and point at it:
 # turn_uri = "turn:turn.yourdomain.com:3478"
-# turn_username = ""
-# turn_password = ""
-allow_peer_to_peer = true  # Safe for LAN/local; set false in production to hide user IPs
+# turn_username = "bsfchat"
+# turn_password = "<random-secret>"
+
+# P2P is fine for a Discord-style chat. Disable only if you've deployed
+# TURN and want every call forced through the relay (privacy over cost).
+allow_peer_to_peer = true
 
 [tls]
 enabled = false
