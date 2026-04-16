@@ -115,6 +115,8 @@ void Server::register_routes() {
              [h = room_handler](const httplib::Request& req, httplib::Response& res) { h->handle_join(req, res); });
     svr.Post(R"(/_matrix/client/v3/rooms/([^/]+)/leave)",
              [h = room_handler](const httplib::Request& req, httplib::Response& res) { h->handle_leave(req, res); });
+    svr.Delete(R"(/_matrix/client/v3/rooms/([^/]+)$)",
+             [h = room_handler](const httplib::Request& req, httplib::Response& res) { h->handle_delete_room(req, res); });
     svr.Get(R"(/_matrix/client/v3/rooms/([^/]+)/state$)",
             [h = room_handler](const httplib::Request& req, httplib::Response& res) { h->handle_room_state(req, res); });
     svr.Get(R"(/_matrix/client/v3/rooms/([^/]+)/state/(.+))",

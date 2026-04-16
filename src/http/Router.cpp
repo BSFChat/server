@@ -1,7 +1,16 @@
 #include "http/Router.h"
+#include <httplib.h>
 #include <sstream>
 
 namespace bsfchat {
+
+namespace {
+// httplib exposes url decoding in its detail namespace; wrap it here so the
+// call site doesn't depend on internals.
+std::string pct_decode(const std::string& s) {
+    return httplib::detail::decode_url(s, /*convert_plus_to_space=*/false);
+}
+} // namespace
 
 RouteMatch match_route(const std::string& pattern, const std::string& path) {
     RouteMatch result;
@@ -30,9 +39,11 @@ RouteMatch match_route(const std::string& pattern, const std::string& path) {
         const auto& pathp = path_parts[i];
 
         if (pp.size() >= 3 && pp.front() == '{' && pp.back() == '}') {
-            // Parameter segment
+            // Parameter segment. Clients percent-encode user-controlled
+            // segments (state_key can be "@user:host", "role:<id>" etc.);
+            // decode here so handlers see the original characters.
             std::string name = pp.substr(1, pp.size() - 2);
-            params[name] = pathp;
+            params[name] = pct_decode(pathp);
         } else if (pp != pathp) {
             return result;
         }

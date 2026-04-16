@@ -210,6 +210,29 @@ std::string SqliteStore::create_room(const std::string& room_id, const std::stri
     return room_id;
 }
 
+void SqliteStore::delete_room(const std::string& room_id) {
+    std::lock_guard lock(mutex_);
+    // foreign_keys=ON means rooms can't be deleted while events or members
+    // reference them — delete the dependents first, wrapped in a transaction
+    // so we don't end up with a half-removed room.
+    exec("BEGIN IMMEDIATE");
+    try {
+        auto run = [&](const char* sql) {
+            auto s = prepare(db_, sql);
+            sqlite3_bind_text(s.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(s.get());
+        };
+        run("DELETE FROM read_markers WHERE room_id = ?");
+        run("DELETE FROM events WHERE room_id = ?");
+        run("DELETE FROM room_members WHERE room_id = ?");
+        run("DELETE FROM rooms WHERE room_id = ?");
+        exec("COMMIT");
+    } catch (...) {
+        exec("ROLLBACK");
+        throw;
+    }
+}
+
 bool SqliteStore::room_exists(const std::string& room_id) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_, "SELECT 1 FROM rooms WHERE room_id = ?");

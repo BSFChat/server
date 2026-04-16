@@ -12,7 +12,9 @@ endif()
 FetchContent_Declare(
     spdlog
     GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG        v1.14.1
+    # v1.14.1's bundled fmt trips a consteval check in Xcode 26's clang;
+    # v1.15.x updates fmt past the break.
+    GIT_TAG        v1.15.1
     GIT_SHALLOW    TRUE
 )
 

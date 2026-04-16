@@ -204,6 +204,44 @@ void RoomHandler::handle_join(const httplib::Request& req, httplib::Response& re
     get_logger()->info("User {} joined room {}", *user_id, room_id);
 }
 
+void RoomHandler::handle_delete_room(const httplib::Request& req, httplib::Response& res) {
+    auto user_id = authenticate(store_, req.get_header_value("Authorization"));
+    if (!user_id) {
+        res.status = 401;
+        res.set_content(MatrixError::missing_token().to_json().dump(), "application/json");
+        return;
+    }
+
+    auto match = match_route("/_matrix/client/v3/rooms/{roomId}", req.path);
+    if (!match.matched) {
+        res.status = 404;
+        res.set_content(MatrixError::not_found().to_json().dump(), "application/json");
+        return;
+    }
+    auto& room_id = match.params["roomId"];
+    if (!store_.room_exists(room_id)) {
+        res.status = 404;
+        res.set_content(MatrixError::not_found("Room not found").to_json().dump(), "application/json");
+        return;
+    }
+
+    PermissionsEngine perms(store_, config_);
+    if (!perms.can(*user_id, room_id, permission::kManageChannels)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Insufficient permissions to delete this channel").to_json().dump(), "application/json");
+        return;
+    }
+
+    store_.delete_room(room_id);
+    // Wake long-polls so clients notice and drop the room on their next
+    // sync (the server's VIEW_CHANNEL filter now trivially excludes it —
+    // they're no longer a joined member of anything by that id).
+    sync_engine_.notify_new_event();
+
+    get_logger()->info("Room {} deleted by {}", room_id, *user_id);
+    res.set_content("{}", "application/json");
+}
+
 void RoomHandler::handle_leave(const httplib::Request& req, httplib::Response& res) {
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {

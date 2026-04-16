@@ -16,6 +16,9 @@ public:
     void handle_create_room(const httplib::Request& req, httplib::Response& res);
     void handle_join(const httplib::Request& req, httplib::Response& res);
     void handle_leave(const httplib::Request& req, httplib::Response& res);
+    // DELETE /_matrix/client/v3/rooms/{id}. Requires MANAGE_CHANNELS.
+    // Destructive — removes the room and every event in it.
+    void handle_delete_room(const httplib::Request& req, httplib::Response& res);
     void handle_joined_rooms(const httplib::Request& req, httplib::Response& res);
     void handle_room_state(const httplib::Request& req, httplib::Response& res);
     void handle_room_state_event(const httplib::Request& req, httplib::Response& res);
