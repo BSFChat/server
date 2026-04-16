@@ -576,6 +576,8 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         evt_type == std::string(event_type::kMemberRoles) ||
         evt_type == std::string(event_type::kChannelPermissions)) {
         required = permission::kManageRoles;
+    } else if (evt_type == std::string(event_type::kServerInfo)) {
+        required = permission::kManageServer;
     } else if (evt_type == std::string(event_type::kRoomMember)) {
         // Self-leave is always allowed; otherwise gate through kick/ban paths.
         required = permission::kKickMembers;
