@@ -108,6 +108,38 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
             return send_error(res, 403, MatrixError::forbidden("You don't have permission to mention everyone"));
         }
 
+        // Edits: m.relates_to { rel_type: "m.replace", event_id: "$..." }.
+        // Only the original sender can edit their own message. MANAGE_MESSAGES
+        // is for deletion (redaction), not rewriting — matches Discord: mods
+        // can delete but not edit someone else's text.
+        if (content.contains("m.relates_to") && content["m.relates_to"].is_object()) {
+            const auto& rel = content["m.relates_to"];
+            if (rel.value("rel_type", "") == "m.replace") {
+                std::string target_id = rel.value("event_id", "");
+                if (target_id.empty()) {
+                    return send_error(res, 400, MatrixError::bad_json(
+                        "Edit missing target event_id"));
+                }
+                auto target = store_.get_event_by_id(target_id);
+                if (!target) {
+                    return send_error(res, 404, MatrixError::not_found(
+                        "Target message not found"));
+                }
+                if (target->room_id != room_id) {
+                    return send_error(res, 400, MatrixError::bad_json(
+                        "Edit target is in a different room"));
+                }
+                if (target->sender != *user_id) {
+                    return send_error(res, 403, MatrixError::forbidden(
+                        "You can only edit your own messages"));
+                }
+                if (target->type != std::string(event_type::kRoomMessage)) {
+                    return send_error(res, 400, MatrixError::bad_json(
+                        "Can only edit message events"));
+                }
+            }
+        }
+
         // Slowmode: users with MANAGE_MESSAGES bypass it (matches Discord).
         if (!permission::has(user_perms, permission::kManageMessages)) {
             int slow = store_.get_channel_slowmode(room_id);

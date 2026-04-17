@@ -34,7 +34,14 @@ void join_user_to_room(SqliteStore& store, SyncEngine& sync_engine,
 
     store.set_membership(room_id, user_id, std::string(membership::kJoin));
 
+    // Include the user's current display name + avatar in the member event
+    // so clients can render messages with a human-readable name from the
+    // very first sync, rather than falling back to the raw @user:host id.
     nlohmann::json content = {{"membership", membership::kJoin}};
+    auto dn = store.get_display_name(user_id);
+    if (dn) content["displayname"] = *dn;
+    auto av = store.get_avatar_url(user_id);
+    if (av) content["avatar_url"] = *av;
     auto event_id = generate_event_id(config.server_name);
     store.insert_event(event_id, room_id, user_id,
                         std::string(event_type::kRoomMember),

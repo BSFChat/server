@@ -4,18 +4,28 @@
 #include "http/Middleware.h"
 #include "http/Router.h"
 #include "store/SqliteStore.h"
+#include "sync/SyncEngine.h"
 
 #include <bsfchat/Constants.h>
 #include <bsfchat/ErrorCodes.h>
+#include <bsfchat/Identifiers.h>
 
 #include <nlohmann/json.hpp>
+#include <chrono>
 
 namespace bsfchat {
 
 using json = nlohmann::json;
 
-ProfileHandler::ProfileHandler(SqliteStore& store, const Config& config)
-    : store_(store), config_(config) {}
+namespace {
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+} // namespace
+
+ProfileHandler::ProfileHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config)
+    : store_(store), sync_engine_(sync_engine), config_(config) {}
 
 void ProfileHandler::handle_get_profile(const httplib::Request& req, httplib::Response& res) {
     auto match = match_route("/_matrix/client/v3/profile/{userId}", req.path);
@@ -107,6 +117,7 @@ void ProfileHandler::handle_put_displayname(const httplib::Request& req, httplib
     }
 
     store_.set_display_name(*user_id, body["displayname"].get<std::string>());
+    broadcastMemberUpdate(*user_id);
 
     get_logger()->info("User {} updated display name", *user_id);
     res.set_content("{}", "application/json");
@@ -176,9 +187,32 @@ void ProfileHandler::handle_put_avatar_url(const httplib::Request& req, httplib:
     }
 
     store_.set_avatar_url(*user_id, body["avatar_url"].get<std::string>());
+    broadcastMemberUpdate(*user_id);
 
     get_logger()->info("User {} updated avatar URL", *user_id);
     res.set_content("{}", "application/json");
+}
+
+void ProfileHandler::broadcastMemberUpdate(const std::string& user_id)
+{
+    // Re-emit m.room.member state event in every joined room with the
+    // current profile so all connected clients see the name/avatar change
+    // on their next sync.
+    auto rooms = store_.get_joined_rooms(user_id);
+    auto dn = store_.get_display_name(user_id);
+    auto av = store_.get_avatar_url(user_id);
+
+    for (const auto& room_id : rooms) {
+        json content = {{"membership", membership::kJoin}};
+        if (dn) content["displayname"] = *dn;
+        if (av) content["avatar_url"] = *av;
+
+        auto event_id = generate_event_id(config_.server_name);
+        store_.insert_event(event_id, room_id, user_id,
+                            std::string(event_type::kRoomMember),
+                            user_id, content.dump(), now_ms());
+    }
+    if (!rooms.empty()) sync_engine_.notify_new_event();
 }
 
 } // namespace bsfchat

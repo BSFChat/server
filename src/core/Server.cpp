@@ -176,7 +176,7 @@ void Server::register_routes() {
             [h = media_handler](const httplib::Request& req, httplib::Response& res) { h->handle_download(req, res); });
 
     // Profile routes
-    auto profile_handler = std::make_shared<ProfileHandler>(*store_, config_);
+    auto profile_handler = std::make_shared<ProfileHandler>(*store_, *sync_engine_, config_);
 
     svr.Get(R"(/_matrix/client/v3/profile/([^/]+)$)",
             [h = profile_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_profile(req, res); });

@@ -68,10 +68,18 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
     emit_state_event(room_id, *user_id, std::string(event_type::kRoomCreate), "",
                      json{{"creator", *user_id}, {"room_version", "10"}});
 
-    // Creator joins
+    // Creator joins — include their current display name + avatar so
+    // clients don't need a separate profile fetch for the first sender.
     store_.set_membership(room_id, *user_id, std::string(membership::kJoin));
-    emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), *user_id,
-                     json{{"membership", membership::kJoin}});
+    {
+        json join_content = {{"membership", membership::kJoin}};
+        auto dn = store_.get_display_name(*user_id);
+        if (dn) join_content["displayname"] = *dn;
+        auto av = store_.get_avatar_url(*user_id);
+        if (av) join_content["avatar_url"] = *av;
+        emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), *user_id,
+                         join_content);
+    }
 
     // Set join rules.
     // Discord-like default: rooms are public unless explicitly marked private
@@ -197,8 +205,14 @@ void RoomHandler::handle_join(const httplib::Request& req, httplib::Response& re
     }
 
     store_.set_membership(room_id, *user_id, std::string(membership::kJoin));
+
+    json join_content = {{"membership", membership::kJoin}};
+    auto dn = store_.get_display_name(*user_id);
+    if (dn) join_content["displayname"] = *dn;
+    auto av = store_.get_avatar_url(*user_id);
+    if (av) join_content["avatar_url"] = *av;
     emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), *user_id,
-                     json{{"membership", membership::kJoin}});
+                     join_content);
 
     res.set_content(json{{"room_id", room_id}}.dump(), "application/json");
     get_logger()->info("User {} joined room {}", *user_id, room_id);
