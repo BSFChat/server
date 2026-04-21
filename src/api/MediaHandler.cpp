@@ -155,8 +155,29 @@ void MediaHandler::handle_download(const httplib::Request& req, httplib::Respons
         res.set_header("Content-Disposition", "inline; filename=\"" + filename + "\"");
     }
 
-    res.set_content(data, content_type);
-    res.status = 200;
+    // Serve via a content provider so httplib handles HTTP Range
+    // requests natively. AVFoundation on macOS / Media Foundation on
+    // Windows / GStreamer on Linux all issue `Range:` requests for
+    // video streaming and refuse to play if the server doesn't respond
+    // with `206 Partial Content` — the previous `set_content` path
+    // returned a plain 200 every time, which manifested to users as
+    // "Failed to load media" on every video/audio attachment.
+    //
+    // The captured `data` is an std::string of bytes; we move it into
+    // the lambda's shared state and hand slices to the sink on demand.
+    auto payload = std::make_shared<std::string>(std::move(data));
+    res.set_header("Accept-Ranges", "bytes");
+    res.set_content_provider(
+        payload->size(),
+        content_type,
+        [payload](size_t offset, size_t length, httplib::DataSink& sink) {
+            if (offset < payload->size()) {
+                size_t end = std::min(offset + length, payload->size());
+                sink.write(payload->data() + offset, end - offset);
+            }
+            sink.done();
+            return true;
+        });
 }
 
 } // namespace bsfchat
