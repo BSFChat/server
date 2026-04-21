@@ -171,11 +171,16 @@ void MediaHandler::handle_download(const httplib::Request& req, httplib::Respons
         payload->size(),
         content_type,
         [payload](size_t offset, size_t length, httplib::DataSink& sink) {
+            // Known-length variant: httplib tracks completion by byte
+            // count and will stop calling us once `content_length` has
+            // been sent. Don't call sink.done() — that's for the
+            // chunked (unknown-length) overload; calling it here nukes
+            // the sink's internal write function and a subsequent
+            // invocation crashes with std::bad_function_call.
             if (offset < payload->size()) {
                 size_t end = std::min(offset + length, payload->size());
                 sink.write(payload->data() + offset, end - offset);
             }
-            sink.done();
             return true;
         });
 }
