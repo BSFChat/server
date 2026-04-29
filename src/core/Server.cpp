@@ -9,6 +9,7 @@
 #include "api/MediaHandler.h"
 #include "api/ProfileHandler.h"
 #include "api/TypingHandler.h"
+#include "api/PresenceHandler.h"
 #include "api/VoiceHandler.h"
 #include "http/Router.h"
 #include "storage/LocalStorage.h"
@@ -160,6 +161,14 @@ void Server::register_routes() {
 
     svr.Put(R"(/_matrix/client/v3/rooms/([^/]+)/typing/([^/]+))",
             [h = typing_handler](const httplib::Request& req, httplib::Response& res) { h->handle_typing(req, res); });
+
+    // Presence — same pattern as typing. PUT updates the in-memory
+    // entry; sync_handler picks the entries up at delivery time.
+    auto presence_handler = std::make_shared<PresenceHandler>(*store_, *sync_engine_, config_);
+    sync_handler->set_presence_handler(presence_handler.get());
+
+    svr.Put(R"(/_matrix/client/v3/presence/([^/]+)/status)",
+            [h = presence_handler](const httplib::Request& req, httplib::Response& res) { h->handle_put_presence(req, res); });
 
     // Sync
     svr.Get(std::string(api_path::kSync),

@@ -77,9 +77,21 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
 
         JoinedRoom joined;
         joined.state.events = store_.get_state_events(room_id);
-        joined.timeline.events = store_.get_room_events(room_id, limits::kDefaultTimelineLimit, "b");
+        // Use the paginated variant so we can set `prev_batch` to the
+        // token the client needs for back-pagination. `next_pos` here is
+        // the stream_position of the oldest row in the returned batch; the
+        // client passes it back as `from` to /rooms/{id}/messages to fetch
+        // events strictly older than this batch.
+        auto [timeline_events, next_pos] = store_.get_room_events_paginated(
+            room_id, limits::kDefaultTimelineLimit, "b");
+        joined.timeline.events = std::move(timeline_events);
         std::reverse(joined.timeline.events.begin(), joined.timeline.events.end());
-        joined.timeline.limited = true;
+        // `limited` is true when more history exists beyond this batch; the
+        // probe-row trick in get_room_events_paginated sets next_pos iff so.
+        joined.timeline.limited = next_pos.has_value();
+        if (next_pos) {
+            joined.timeline.prev_batch = "s" + std::to_string(*next_pos);
+        }
 
         response.rooms.join[room_id] = std::move(joined);
     }

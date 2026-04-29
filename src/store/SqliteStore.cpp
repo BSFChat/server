@@ -397,12 +397,19 @@ int64_t SqliteStore::insert_event(const std::string& event_id, const std::string
     return stream_pos;
 }
 
-std::vector<RoomEvent> SqliteStore::get_room_events(const std::string& room_id, int limit,
-                                                     const std::string& direction,
-                                                     const std::optional<std::string>& from) {
+std::pair<std::vector<RoomEvent>, std::optional<int64_t>>
+SqliteStore::get_room_events_paginated(const std::string& room_id, int limit,
+                                        const std::string& direction,
+                                        const std::optional<std::string>& from) {
     std::lock_guard lock(mutex_);
 
-    std::string sql = "SELECT event_id, room_id, sender, event_type, state_key, content, origin_server_ts "
+    // Same query shape as get_room_events, but we also pull stream_position
+    // so the handler can construct the `end` pagination token without a
+    // second lookup. We over-fetch by 1 row to cheaply detect whether more
+    // history exists in the scanned direction — if the fetch size equals
+    // `limit+1`, there's at least one more page; otherwise we've reached
+    // the end and return nullopt as the token.
+    std::string sql = "SELECT event_id, room_id, sender, event_type, state_key, content, origin_server_ts, stream_position "
                       "FROM events WHERE room_id = ?";
 
     if (from) {
@@ -435,9 +442,10 @@ std::vector<RoomEvent> SqliteStore::get_room_events(const std::string& room_id, 
         }
         sqlite3_bind_int64(stmt.get(), idx++, pos);
     }
-    sqlite3_bind_int(stmt.get(), idx, limit);
+    sqlite3_bind_int(stmt.get(), idx, limit + 1);
 
     std::vector<RoomEvent> events;
+    std::vector<int64_t> positions;
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         RoomEvent ev;
         ev.event_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
@@ -451,8 +459,26 @@ std::vector<RoomEvent> SqliteStore::get_room_events(const std::string& room_id, 
             reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 5)));
         ev.origin_server_ts = sqlite3_column_int64(stmt.get(), 6);
         events.push_back(std::move(ev));
+        positions.push_back(sqlite3_column_int64(stmt.get(), 7));
     }
-    return events;
+
+    // If we fetched the probe row, there's more history in this direction.
+    // Trim the probe and derive the next token from the last KEPT row.
+    std::optional<int64_t> next_token;
+    if (static_cast<int>(events.size()) > limit) {
+        events.resize(limit);
+        positions.resize(limit);
+        if (!positions.empty()) next_token = positions.back();
+    }
+    return {std::move(events), next_token};
+}
+
+std::vector<RoomEvent> SqliteStore::get_room_events(const std::string& room_id, int limit,
+                                                     const std::string& direction,
+                                                     const std::optional<std::string>& from) {
+    // Legacy non-paginated wrapper. New callers should prefer the
+    // _paginated form so they can build `end` tokens.
+    return get_room_events_paginated(room_id, limit, direction, from).first;
 }
 
 std::vector<RoomEvent> SqliteStore::get_state_events(const std::string& room_id) {

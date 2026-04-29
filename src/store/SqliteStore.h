@@ -61,6 +61,15 @@ public:
                          const std::optional<std::string>& state_key,
                          const std::string& content_json, int64_t origin_server_ts);
 
+    // Returns (events, next_from_token). next_from_token is the stream
+    // position of the oldest row in this batch for dir="b" / newest for
+    // dir="f"; encode it as "s<pos>" and pass back as `from` on the next
+    // page request. nullopt when there are no more rows in that direction.
+    std::pair<std::vector<RoomEvent>, std::optional<int64_t>>
+    get_room_events_paginated(const std::string& room_id, int limit,
+                              const std::string& direction = "b",
+                              const std::optional<std::string>& from = std::nullopt);
+
     std::vector<RoomEvent> get_room_events(const std::string& room_id, int limit, const std::string& direction = "b",
                                             const std::optional<std::string>& from = std::nullopt);
 

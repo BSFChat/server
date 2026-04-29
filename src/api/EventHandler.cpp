@@ -196,11 +196,18 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
     std::optional<std::string> from;
     if (req.has_param("from")) from = req.get_param_value("from");
 
-    auto events = store_.get_room_events(room_id, limit, dir, from);
+    auto [events, next_pos] =
+        store_.get_room_events_paginated(room_id, limit, dir, from);
 
     MessagesResponse msg_resp;
     msg_resp.chunk = std::move(events);
     if (from) msg_resp.start = *from;
+    if (next_pos) {
+        // Token format is "s<stream_position>" — same as what /sync emits
+        // for `next_batch` and what the /messages handler expects back as
+        // the `from` param.
+        msg_resp.end = "s" + std::to_string(*next_pos);
+    }
 
     json resp;
     to_json(resp, msg_resp);

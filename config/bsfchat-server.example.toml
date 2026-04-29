@@ -9,7 +9,7 @@ path = "./data/bsfchat.db"
 
 [media]
 path = "./data/media/"
-max_upload_size_mb = 50
+max_upload_size_mb = 500
 
 [auth]
 registration_enabled = true
@@ -18,7 +18,7 @@ password_hash_cost = 12
 # Storage backend for media files
 # type = "local" stores files on disk, "s3" uses S3-compatible object storage
 [storage]
-type = "s3"
+type = "local"
 
 [storage.s3]
 endpoint = "http://localhost:9002"

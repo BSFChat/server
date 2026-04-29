@@ -58,7 +58,12 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
-            type=raw,value=latest,enable={{is_default_branch}}
+            # Always add :latest on a push to main. The previous
+            # `{{is_default_branch}}` template evaluated to false on
+            # some runs, so prod was stuck on a stale image until
+            # someone manually retagged. GitHub Actions context is
+            # deterministic here.
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
