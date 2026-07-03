@@ -5,10 +5,12 @@
 namespace bsfchat {
 
 namespace {
-// httplib exposes url decoding in its detail namespace; wrap it here so the
-// call site doesn't depend on internals.
+// Percent-decode a single path segment. httplib::decode_uri_component is
+// the public replacement for the old detail::decode_url(s, false): pure
+// %XX decoding, no plus-to-space conversion (which is form-encoding, not
+// path semantics — a literal '+' in a state_key must survive).
 std::string pct_decode(const std::string& s) {
-    return httplib::detail::decode_url(s, /*convert_plus_to_space=*/false);
+    return httplib::decode_uri_component(s);
 }
 } // namespace
 
