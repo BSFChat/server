@@ -231,6 +231,8 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
                     {"user_id", *ev.state_key},
                     {"muted", ev.content.data.value("muted", false)},
                     {"deafened", ev.content.data.value("deafened", false)},
+                    {"screen_sharing", ev.content.data.value("screen_sharing", false)},
+                    {"camera_on", ev.content.data.value("camera_on", false)},
                     {"device_id", ev.content.data.value("device_id", "")},
                 });
             }
@@ -310,6 +312,8 @@ void VoiceHandler::handle_voice_members(const httplib::Request& req, httplib::Re
                     {"user_id", *ev.state_key},
                     {"muted", ev.content.data.value("muted", false)},
                     {"deafened", ev.content.data.value("deafened", false)},
+                    {"screen_sharing", ev.content.data.value("screen_sharing", false)},
+                    {"camera_on", ev.content.data.value("camera_on", false)},
                     {"device_id", ev.content.data.value("device_id", "")},
                     {"joined_at", ev.content.data.value("joined_at", int64_t(0))},
                 });
@@ -365,10 +369,13 @@ void VoiceHandler::handle_voice_state(const httplib::Request& req, httplib::Resp
             return;
         }
 
-        // Update muted/deafened from request body, keep other fields
+        // Update muted/deafened/screen_sharing/camera_on from request body,
+        // keep other fields (omitted keys leave stored values unchanged)
         auto updated = current->content.data;
         if (body.contains("muted")) updated["muted"] = body["muted"].get<bool>();
         if (body.contains("deafened")) updated["deafened"] = body["deafened"].get<bool>();
+        if (body.contains("screen_sharing")) updated["screen_sharing"] = body["screen_sharing"].get<bool>();
+        if (body.contains("camera_on")) updated["camera_on"] = body["camera_on"].get<bool>();
 
         emit_state_event(store_, sync_engine_, config_.server_name,
                          room_id, *user_id, std::string(event_type::kCallMember), *user_id, updated);

@@ -28,6 +28,8 @@ TEST(VoiceProtocol, VoiceMemberContentRoundTrip) {
     member.active = true;
     member.muted = true;
     member.deafened = false;
+    member.screen_sharing = true;
+    member.camera_on = false;
     member.device_id = "ABCDEF";
     member.joined_at = 1700000000000;
 
@@ -37,6 +39,8 @@ TEST(VoiceProtocol, VoiceMemberContentRoundTrip) {
     EXPECT_TRUE(j["active"].get<bool>());
     EXPECT_TRUE(j["muted"].get<bool>());
     EXPECT_FALSE(j["deafened"].get<bool>());
+    EXPECT_TRUE(j["screen_sharing"].get<bool>());
+    EXPECT_FALSE(j["camera_on"].get<bool>());
     EXPECT_EQ(j["device_id"], "ABCDEF");
     EXPECT_EQ(j["joined_at"], 1700000000000);
 
@@ -46,8 +50,18 @@ TEST(VoiceProtocol, VoiceMemberContentRoundTrip) {
     EXPECT_EQ(parsed.active, member.active);
     EXPECT_EQ(parsed.muted, member.muted);
     EXPECT_EQ(parsed.deafened, member.deafened);
+    EXPECT_EQ(parsed.screen_sharing, member.screen_sharing);
+    EXPECT_EQ(parsed.camera_on, member.camera_on);
     EXPECT_EQ(parsed.device_id, member.device_id);
     EXPECT_EQ(parsed.joined_at, member.joined_at);
+
+    // Legacy content without the media flags parses as false.
+    j.erase("screen_sharing");
+    j.erase("camera_on");
+    VoiceMemberContent legacy;
+    from_json(j, legacy);
+    EXPECT_FALSE(legacy.screen_sharing);
+    EXPECT_FALSE(legacy.camera_on);
 }
 
 TEST(VoiceProtocol, VoiceChannelContentRoundTrip) {
@@ -461,6 +475,92 @@ TEST_F(VoiceHandlerTest, ReaperThreadStartsAndStopsPromptly) {
     EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2));
     // Idempotent.
     handler->stop_reaper();
+}
+
+TEST_F(VoiceHandlerTest, ScreenShareStateReflectedInMembers) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    join_voice(room_id, "@alice:test");
+
+    // PUT voice/state announcing a screen share.
+    httplib::Response put_res;
+    auto put_req = make_request("PUT", "/_matrix/client/v3/rooms/" + room_id + "/voice/state",
+                                "alice-token", json{{"screen_sharing", true}}.dump());
+    handler->handle_voice_state(put_req, put_res);
+    EXPECT_EQ(status_of(put_res), 200);
+
+    // GET voice/members reflects it.
+    httplib::Response get_res;
+    auto get_req = make_request("GET", "/_matrix/client/v3/rooms/" + room_id + "/voice/members", "alice-token");
+    handler->handle_voice_members(get_req, get_res);
+    EXPECT_EQ(status_of(get_res), 200);
+
+    auto members = json::parse(get_res.body)["members"];
+    ASSERT_EQ(members.size(), 1u);
+    EXPECT_EQ(members[0]["user_id"], "@alice:test");
+    EXPECT_TRUE(members[0]["screen_sharing"].get<bool>());
+    EXPECT_FALSE(members[0]["camera_on"].get<bool>());
+}
+
+TEST_F(VoiceHandlerTest, OmittedMediaKeysLeaveFlagsUnchanged) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    join_voice(room_id, "@alice:test");
+
+    // Turn both media flags on.
+    httplib::Response res1;
+    auto req1 = make_request("PUT", "/_matrix/client/v3/rooms/" + room_id + "/voice/state",
+                             "alice-token", json{{"screen_sharing", true}, {"camera_on", true}}.dump());
+    handler->handle_voice_state(req1, res1);
+    EXPECT_EQ(status_of(res1), 200);
+
+    // A muted-toggle PUT that omits the media keys must not touch them.
+    httplib::Response res2;
+    auto req2 = make_request("PUT", "/_matrix/client/v3/rooms/" + room_id + "/voice/state",
+                             "alice-token", json{{"muted", true}}.dump());
+    handler->handle_voice_state(req2, res2);
+    EXPECT_EQ(status_of(res2), 200);
+
+    auto ev = store->get_state_event(room_id, std::string(event_type::kCallMember), "@alice:test");
+    ASSERT_TRUE(ev.has_value());
+    EXPECT_TRUE(ev->content.data.value("muted", false));
+    EXPECT_TRUE(ev->content.data.value("screen_sharing", false));
+    EXPECT_TRUE(ev->content.data.value("camera_on", false));
+
+    // Explicitly turning one flag off leaves the other on.
+    httplib::Response res3;
+    auto req3 = make_request("PUT", "/_matrix/client/v3/rooms/" + room_id + "/voice/state",
+                             "alice-token", json{{"screen_sharing", false}}.dump());
+    handler->handle_voice_state(req3, res3);
+    EXPECT_EQ(status_of(res3), 200);
+
+    ev = store->get_state_event(room_id, std::string(event_type::kCallMember), "@alice:test");
+    ASSERT_TRUE(ev.has_value());
+    EXPECT_FALSE(ev->content.data.value("screen_sharing", false));
+    EXPECT_TRUE(ev->content.data.value("camera_on", false));
+}
+
+TEST_F(VoiceHandlerTest, LeaveResetsMediaFlags) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    join_voice(room_id, "@alice:test");
+
+    httplib::Response res1;
+    auto req1 = make_request("PUT", "/_matrix/client/v3/rooms/" + room_id + "/voice/state",
+                             "alice-token", json{{"screen_sharing", true}, {"camera_on", true}}.dump());
+    handler->handle_voice_state(req1, res1);
+    EXPECT_EQ(status_of(res1), 200);
+
+    httplib::Response res2;
+    auto req2 = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/leave", "alice-token");
+    handler->handle_voice_leave(req2, res2);
+    EXPECT_EQ(status_of(res2), 200);
+
+    auto ev = store->get_state_event(room_id, std::string(event_type::kCallMember), "@alice:test");
+    ASSERT_TRUE(ev.has_value());
+    EXPECT_FALSE(ev->content.data.value("active", false));
+    EXPECT_FALSE(ev->content.data.value("screen_sharing", false));
+    EXPECT_FALSE(ev->content.data.value("camera_on", false));
 }
 
 TEST_F(VoiceHandlerTest, LeaveRequiresRoomMembership) {
