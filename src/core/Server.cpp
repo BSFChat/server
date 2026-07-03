@@ -198,19 +198,20 @@ void Server::register_routes() {
     svr.Put(R"(/_matrix/client/v3/profile/([^/]+)/avatar_url)",
             [h = profile_handler](const httplib::Request& req, httplib::Response& res) { h->handle_put_avatar_url(req, res); });
 
-    // Voice routes
-    auto voice_handler = std::make_shared<VoiceHandler>(*store_, *sync_engine_, config_);
+    // Voice routes — handler is kept as a member so start()/stop() can
+    // manage the ghost-participant reaper thread.
+    voice_handler_ = std::make_shared<VoiceHandler>(*store_, *sync_engine_, config_);
 
     svr.Post(R"(/_matrix/client/v3/rooms/([^/]+)/voice/join)",
-             [h = voice_handler](const httplib::Request& req, httplib::Response& res) { h->handle_voice_join(req, res); });
+             [h = voice_handler_](const httplib::Request& req, httplib::Response& res) { h->handle_voice_join(req, res); });
     svr.Post(R"(/_matrix/client/v3/rooms/([^/]+)/voice/leave)",
-             [h = voice_handler](const httplib::Request& req, httplib::Response& res) { h->handle_voice_leave(req, res); });
+             [h = voice_handler_](const httplib::Request& req, httplib::Response& res) { h->handle_voice_leave(req, res); });
     svr.Get(R"(/_matrix/client/v3/rooms/([^/]+)/voice/members)",
-            [h = voice_handler](const httplib::Request& req, httplib::Response& res) { h->handle_voice_members(req, res); });
+            [h = voice_handler_](const httplib::Request& req, httplib::Response& res) { h->handle_voice_members(req, res); });
     svr.Put(R"(/_matrix/client/v3/rooms/([^/]+)/voice/state)",
-            [h = voice_handler](const httplib::Request& req, httplib::Response& res) { h->handle_voice_state(req, res); });
+            [h = voice_handler_](const httplib::Request& req, httplib::Response& res) { h->handle_voice_state(req, res); });
     svr.Get("/_matrix/client/v3/voip/turnServer",
-            [h = voice_handler](const httplib::Request& req, httplib::Response& res) { h->handle_turn_server(req, res); });
+            [h = voice_handler_](const httplib::Request& req, httplib::Response& res) { h->handle_turn_server(req, res); });
 }
 
 void Server::start() {
@@ -230,10 +231,13 @@ void Server::start() {
     backfill_auto_join(*store_, *sync_engine_, config_);
     bootstrap_roles(*store_, *sync_engine_, config_);
 
+    voice_handler_->start_reaper();
+
     http_server_->start();
 }
 
 void Server::stop() {
+    if (voice_handler_) voice_handler_->stop_reaper();
     if (http_server_) http_server_->stop();
 }
 

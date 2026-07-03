@@ -1,7 +1,9 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace bsfchat {
 
@@ -27,9 +29,16 @@ struct StorageConfig {
 
 struct VoiceConfig {
     bool enabled = true;
-    std::string turn_uri;
+    // TURN server URIs. Config key `turn_uri` accepts either a single string
+    // or an array of strings (e.g. udp + tcp transport variants).
+    std::vector<std::string> turn_uris;
     std::string turn_username;
     std::string turn_password;
+    // coturn REST-API shared secret (use-auth-secret / static-auth-secret).
+    // When set, /voip/turnServer returns time-limited ephemeral credentials
+    // instead of the static turn_username/turn_password.
+    std::string turn_secret;
+    int64_t turn_ttl = 3600; // Ephemeral credential lifetime, seconds
     std::string stun_uri; // No default — admin should configure their own STUN/TURN
     bool allow_peer_to_peer = false; // Default: TURN-only for IP privacy
 };

@@ -46,6 +46,7 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/http/Router.cpp
     ${CMAKE_SOURCE_DIR}/src/http/Middleware.cpp
     ${CMAKE_SOURCE_DIR}/src/api/TypingHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/VoiceHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/storage/LocalStorage.cpp
     ${CMAKE_SOURCE_DIR}/src/storage/S3Client.cpp
     ${CMAKE_SOURCE_DIR}/src/storage/S3Storage.cpp

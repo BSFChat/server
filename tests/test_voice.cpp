@@ -1,8 +1,16 @@
 #include <gtest/gtest.h>
+#include "api/VoiceHandler.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
 #include "auth/LocalAuth.h"
 #include "core/Config.h"
+
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 
 #include <bsfchat/Constants.h>
 #include <bsfchat/Identifiers.h>
@@ -254,20 +262,22 @@ TEST(VoiceConfig, TurnServerResponseFormat) {
     Config cfg;
     cfg.voice.enabled = true;
     cfg.voice.stun_uri = "stun:stun.l.google.com:19302";
-    cfg.voice.turn_uri = "turn:turn.example.com:3478";
+    cfg.voice.turn_uris = {"turn:turn.example.com:3478"};
     cfg.voice.turn_username = "user";
     cfg.voice.turn_password = "secret";
 
     // Build the response the same way VoiceHandler does
     json uris = json::array();
     if (!cfg.voice.stun_uri.empty()) uris.push_back(cfg.voice.stun_uri);
-    if (!cfg.voice.turn_uri.empty()) uris.push_back(cfg.voice.turn_uri);
+    for (const auto& turn_uri : cfg.voice.turn_uris) {
+        if (!turn_uri.empty()) uris.push_back(turn_uri);
+    }
 
     json resp = {
         {"username", cfg.voice.turn_username},
         {"password", cfg.voice.turn_password},
         {"uris", uris},
-        {"ttl", 86400},
+        {"ttl", cfg.voice.turn_ttl},
     };
 
     EXPECT_EQ(resp["username"], "user");
@@ -275,7 +285,266 @@ TEST(VoiceConfig, TurnServerResponseFormat) {
     EXPECT_EQ(resp["uris"].size(), 2u);
     EXPECT_EQ(resp["uris"][0], "stun:stun.l.google.com:19302");
     EXPECT_EQ(resp["uris"][1], "turn:turn.example.com:3478");
-    EXPECT_EQ(resp["ttl"], 86400);
+    EXPECT_EQ(resp["ttl"], 3600);
+}
+
+TEST(VoiceConfig, TurnUriAcceptsStringOrArray) {
+    auto dir = std::filesystem::temp_directory_path();
+
+    auto single = dir / "bsfchat_test_turn_single.toml";
+    {
+        std::ofstream out(single);
+        out << "[voice]\nturn_uri = \"turn:one.example.com:3478\"\n"
+            << "turn_secret = \"sekrit\"\nturn_ttl = 1200\n";
+    }
+    auto cfg1 = Config::load(single.string());
+    ASSERT_EQ(cfg1.voice.turn_uris.size(), 1u);
+    EXPECT_EQ(cfg1.voice.turn_uris[0], "turn:one.example.com:3478");
+    EXPECT_EQ(cfg1.voice.turn_secret, "sekrit");
+    EXPECT_EQ(cfg1.voice.turn_ttl, 1200);
+
+    auto arr = dir / "bsfchat_test_turn_array.toml";
+    {
+        std::ofstream out(arr);
+        out << "[voice]\nturn_uri = [\n"
+            << "  \"turn:turn.example.com:3478?transport=udp\",\n"
+            << "  \"turn:turn.example.com:3478?transport=tcp\",\n"
+            << "]\n";
+    }
+    auto cfg2 = Config::load(arr.string());
+    ASSERT_EQ(cfg2.voice.turn_uris.size(), 2u);
+    EXPECT_EQ(cfg2.voice.turn_uris[0], "turn:turn.example.com:3478?transport=udp");
+    EXPECT_EQ(cfg2.voice.turn_uris[1], "turn:turn.example.com:3478?transport=tcp");
+    EXPECT_EQ(cfg2.voice.turn_ttl, 3600); // default
+
+    std::filesystem::remove(single);
+    std::filesystem::remove(arr);
+}
+
+// --- Voice handler tests (reaper, leave membership check, TURN credentials) ---
+
+class VoiceHandlerTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        store = std::make_unique<SqliteStore>(":memory:");
+        store->initialize();
+        config.server_name = "test";
+        sync_engine = std::make_unique<SyncEngine>(*store, config);
+        handler = std::make_unique<VoiceHandler>(*store, *sync_engine, config);
+
+        store->create_user("@alice:test", hash_password("pass", 10));
+        store->create_user("@bob:test", hash_password("pass", 10));
+        store->store_access_token("alice-token", "@alice:test", "DEV1");
+        store->store_access_token("bob-token", "@bob:test", "DEV2");
+    }
+
+    void create_voice_room(const std::string& room_id, const std::string& creator) {
+        store->create_room(room_id, creator);
+        store->set_membership(room_id, creator, "join");
+
+        auto eid = generate_event_id("test");
+        json voice_content = {{"enabled", true}, {"max_participants", 0}};
+        store->insert_event(eid, room_id, creator,
+                           std::string(event_type::kRoomVoice), "", voice_content.dump(), 1000);
+    }
+
+    void join_voice(const std::string& room_id, const std::string& user_id) {
+        auto eid = generate_event_id("test");
+        json member = {{"active", true}, {"muted", false}, {"deafened", false}, {"device_id", ""}, {"joined_at", 1000}};
+        store->insert_event(eid, room_id, user_id,
+                           std::string(event_type::kCallMember), user_id, member.dump(), 1000);
+    }
+
+    bool is_active(const std::string& room_id, const std::string& user_id) {
+        auto ev = store->get_state_event(room_id, std::string(event_type::kCallMember), user_id);
+        return ev && ev->content.data.value("active", false);
+    }
+
+    // Handlers leave res.status untouched (-1) on success; httplib turns
+    // that into 200 when sending. Normalize for assertions.
+    static int status_of(const httplib::Response& res) {
+        return res.status == -1 ? 200 : res.status;
+    }
+
+    static httplib::Request make_request(const std::string& method, const std::string& path,
+                                         const std::string& token, const std::string& body = "") {
+        httplib::Request req;
+        req.method = method;
+        req.path = path;
+        req.set_header("Authorization", "Bearer " + token);
+        req.body = body;
+        return req;
+    }
+
+    std::unique_ptr<SqliteStore> store;
+    Config config;
+    std::unique_ptr<SyncEngine> sync_engine;
+    std::unique_ptr<VoiceHandler> handler;
+};
+
+TEST_F(VoiceHandlerTest, ReaperSeedsGracePeriodThenExpiresStaleMember) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    join_voice(room_id, "@alice:test");
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // First sight of an active member with no heartbeat (server-restart
+    // scenario): seeded with a grace period, not reaped.
+    EXPECT_EQ(handler->reap_stale_members(t0), 0u);
+    EXPECT_TRUE(is_active(room_id, "@alice:test"));
+
+    // Still within TTL: not reaped.
+    EXPECT_EQ(handler->reap_stale_members(t0 + std::chrono::seconds(20)), 0u);
+    EXPECT_TRUE(is_active(room_id, "@alice:test"));
+
+    // Heartbeat older than 30s: reaped, active:false emitted.
+    EXPECT_EQ(handler->reap_stale_members(t0 + std::chrono::seconds(31)), 1u);
+    EXPECT_FALSE(is_active(room_id, "@alice:test"));
+}
+
+TEST_F(VoiceHandlerTest, HeartbeatKeepsMemberAlive) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    join_voice(room_id, "@alice:test");
+
+    auto t0 = std::chrono::steady_clock::now();
+    handler->record_heartbeat(room_id, "@alice:test", t0);
+
+    // Fresh heartbeat at t0+20s keeps the member alive past the original TTL.
+    handler->record_heartbeat(room_id, "@alice:test", t0 + std::chrono::seconds(20));
+    EXPECT_EQ(handler->reap_stale_members(t0 + std::chrono::seconds(31)), 0u);
+    EXPECT_TRUE(is_active(room_id, "@alice:test"));
+
+    // Once the heartbeats stop, the member is reaped.
+    EXPECT_EQ(handler->reap_stale_members(t0 + std::chrono::seconds(51)), 1u);
+    EXPECT_FALSE(is_active(room_id, "@alice:test"));
+}
+
+TEST_F(VoiceHandlerTest, MembersPollRecordsHeartbeat) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    join_voice(room_id, "@alice:test");
+
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Stale heartbeat, but a GET voice/members refreshes it.
+    handler->record_heartbeat(room_id, "@alice:test", t0 - std::chrono::seconds(60));
+
+    httplib::Response res;
+    auto req = make_request("GET", "/_matrix/client/v3/rooms/" + room_id + "/voice/members", "alice-token");
+    handler->handle_voice_members(req, res);
+    EXPECT_EQ(status_of(res), 200);
+
+    EXPECT_EQ(handler->reap_stale_members(t0 + std::chrono::seconds(5)), 0u);
+    EXPECT_TRUE(is_active(room_id, "@alice:test"));
+}
+
+TEST_F(VoiceHandlerTest, StaleHeartbeatWithoutPollGetsReaped) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    join_voice(room_id, "@alice:test");
+
+    auto t0 = std::chrono::steady_clock::now();
+    handler->record_heartbeat(room_id, "@alice:test", t0 - std::chrono::seconds(60));
+
+    EXPECT_EQ(handler->reap_stale_members(t0 + std::chrono::seconds(5)), 1u);
+    EXPECT_FALSE(is_active(room_id, "@alice:test"));
+}
+
+TEST_F(VoiceHandlerTest, ReaperThreadStartsAndStopsPromptly) {
+    handler->start_reaper();
+    auto t0 = std::chrono::steady_clock::now();
+    handler->stop_reaper();
+    // The condition_variable must wake the thread immediately rather than
+    // letting it sleep out the full reap interval.
+    EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2));
+    // Idempotent.
+    handler->stop_reaper();
+}
+
+TEST_F(VoiceHandlerTest, LeaveRequiresRoomMembership) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    // Bob is not a member of the room: 403.
+    httplib::Response res;
+    auto req = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/leave", "bob-token");
+    handler->handle_voice_leave(req, res);
+    EXPECT_EQ(res.status, 403);
+    auto err = json::parse(res.body);
+    EXPECT_EQ(err["errcode"], "M_FORBIDDEN");
+
+    // Alice is a member: succeeds.
+    httplib::Response res2;
+    auto req2 = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/leave", "alice-token");
+    handler->handle_voice_leave(req2, res2);
+    EXPECT_EQ(status_of(res2), 200);
+}
+
+TEST_F(VoiceHandlerTest, EphemeralTurnCredentials) {
+    config.voice.stun_uri = "stun:stun.example.com:3478";
+    config.voice.turn_uris = {"turn:turn.example.com:3478?transport=udp",
+                              "turn:turn.example.com:3478?transport=tcp"};
+    config.voice.turn_secret = "coturn-shared-secret";
+    config.voice.turn_ttl = 600;
+
+    auto before = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    httplib::Response res;
+    auto req = make_request("GET", "/_matrix/client/v3/voip/turnServer", "alice-token");
+    handler->handle_turn_server(req, res);
+    EXPECT_EQ(status_of(res), 200);
+
+    auto after = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto resp = json::parse(res.body);
+    EXPECT_EQ(resp["ttl"], 600);
+    ASSERT_EQ(resp["uris"].size(), 3u);
+    EXPECT_EQ(resp["uris"][0], "stun:stun.example.com:3478");
+    EXPECT_EQ(resp["uris"][1], "turn:turn.example.com:3478?transport=udp");
+    EXPECT_EQ(resp["uris"][2], "turn:turn.example.com:3478?transport=tcp");
+
+    // Username is "<unix_expiry>:<user_id>" with expiry = now + ttl.
+    std::string username = resp["username"];
+    auto colon = username.find(':');
+    ASSERT_NE(colon, std::string::npos);
+    int64_t expiry = std::stoll(username.substr(0, colon));
+    EXPECT_GE(expiry, before + 600);
+    EXPECT_LE(expiry, after + 600);
+    EXPECT_EQ(username.substr(colon + 1), "@alice:test");
+
+    // Credential is base64(HMAC-SHA1(turn_secret, username)) — verify
+    // against an independently computed value.
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0;
+    HMAC(EVP_sha1(),
+         config.voice.turn_secret.data(), static_cast<int>(config.voice.turn_secret.size()),
+         reinterpret_cast<const unsigned char*>(username.data()), username.size(),
+         digest, &digest_len);
+    std::string expected((digest_len + 2) / 3 * 4, '\0');
+    int written = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(expected.data()), digest, static_cast<int>(digest_len));
+    expected.resize(written);
+
+    EXPECT_EQ(resp["password"], expected);
+}
+
+TEST_F(VoiceHandlerTest, StaticTurnCredentialsWhenNoSecret) {
+    config.voice.turn_uris = {"turn:turn.example.com:3478"};
+    config.voice.turn_username = "static-user";
+    config.voice.turn_password = "static-pass";
+
+    httplib::Response res;
+    auto req = make_request("GET", "/_matrix/client/v3/voip/turnServer", "alice-token");
+    handler->handle_turn_server(req, res);
+    EXPECT_EQ(status_of(res), 200);
+
+    auto resp = json::parse(res.body);
+    EXPECT_EQ(resp["username"], "static-user");
+    EXPECT_EQ(resp["password"], "static-pass");
+    EXPECT_EQ(resp["ttl"], config.voice.turn_ttl);
 }
 
 TEST(VoiceProtocol, EventTypeConstants) {

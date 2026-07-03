@@ -35,8 +35,16 @@ enabled = true
 stun_uri = "stun:stun.l.google.com:19302"
 
 # For full coverage (symmetric NAT, strict firewalls), run your own TURN
-# relay — e.g. `apt install coturn` on the same box — and point at it:
-# turn_uri = "turn:turn.yourdomain.com:3478"
+# relay — e.g. `apt install coturn` on the same box — and point at it.
+# turn_uri accepts a single string or an array of URIs:
+# turn_uri = ["turn:turn.yourdomain.com:3478?transport=udp", "turn:turn.yourdomain.com:3478?transport=tcp"]
+#
+# Preferred: time-limited credentials (coturn `use-auth-secret`, with
+# `static-auth-secret` set to the same value as turn_secret):
+# turn_secret = "<random-secret>"
+# turn_ttl = 3600
+#
+# Or static credentials (coturn `lt-cred-mech`):
 # turn_username = "bsfchat"
 # turn_password = "<random-secret>"
 

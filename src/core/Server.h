@@ -11,6 +11,7 @@
 namespace bsfchat {
 
 class MediaStorage;
+class VoiceHandler;
 
 class Server {
 public:
@@ -33,6 +34,7 @@ private:
     std::unique_ptr<OidcAuth> oidc_auth_;
     std::unique_ptr<HttpServer> http_server_;
     std::shared_ptr<MediaStorage> media_storage_;
+    std::shared_ptr<VoiceHandler> voice_handler_;
 };
 
 } // namespace bsfchat
