@@ -65,3 +65,88 @@ TEST_F(StoreTest, PasswordVerification) {
     EXPECT_TRUE(verify_password("secret123", *stored));
     EXPECT_FALSE(verify_password("wrongpass", *stored));
 }
+
+// --- AuthHandler HTTP-level tests ---
+
+#include "api/AuthHandler.h"
+#include "sync/SyncEngine.h"
+#include "core/Config.h"
+
+#include <nlohmann/json.hpp>
+
+class AuthHandlerTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        store = std::make_unique<SqliteStore>(":memory:");
+        store->initialize();
+        config.server_name = "test";
+        config.password_hash_cost = 10; // keep tests fast
+        sync_engine = std::make_unique<SyncEngine>(*store, config);
+        handler = std::make_unique<AuthHandler>(*store, *sync_engine, config);
+
+        store->create_user("@alice:test", hash_password("password1", 10));
+        store->store_access_token("alice-token", "@alice:test", "DEV1");
+    }
+
+    httplib::Response do_register(const std::string& username, const std::string& password) {
+        httplib::Request req;
+        req.body = nlohmann::json{{"username", username}, {"password", password}}.dump();
+        httplib::Response res;
+        handler->handle_register(req, res);
+        return res;
+    }
+
+    std::unique_ptr<SqliteStore> store;
+    Config config;
+    std::unique_ptr<SyncEngine> sync_engine;
+    std::unique_ptr<AuthHandler> handler;
+};
+
+TEST_F(AuthHandlerTest, WhoamiReturnsCanonicalUserId) {
+    httplib::Request req;
+    req.set_header("Authorization", "Bearer alice-token");
+    httplib::Response res;
+    handler->handle_whoami(req, res);
+
+    EXPECT_EQ(res.status, 200);
+    auto body = nlohmann::json::parse(res.body);
+    EXPECT_EQ(body["user_id"], "@alice:test");
+}
+
+TEST_F(AuthHandlerTest, WhoamiRejectsMissingToken) {
+    httplib::Request req;
+    httplib::Response res;
+    handler->handle_whoami(req, res);
+    EXPECT_EQ(res.status, 401);
+}
+
+TEST_F(AuthHandlerTest, WhoamiRejectsUnknownToken) {
+    httplib::Request req;
+    req.set_header("Authorization", "Bearer bogus");
+    httplib::Response res;
+    handler->handle_whoami(req, res);
+    EXPECT_EQ(res.status, 401);
+}
+
+// A username containing '@' or ':' must never survive registration —
+// "@" + "@josh" + ":test" would mint the malformed id "@@josh:test",
+// which breaks every string-equality self-check in clients.
+TEST_F(AuthHandlerTest, RegisterRejectsAtSignInUsername) {
+    auto res = do_register("@josh", "password1");
+    EXPECT_EQ(res.status, 400);
+    EXPECT_FALSE(store->user_exists("@@josh:test"));
+}
+
+TEST_F(AuthHandlerTest, RegisterRejectsColonInUsername) {
+    auto res = do_register("josh:evil", "password1");
+    EXPECT_EQ(res.status, 400);
+}
+
+TEST_F(AuthHandlerTest, RegisterAcceptsValidLocalpart) {
+    auto res = do_register("new.user_1-ok", "password1");
+    EXPECT_EQ(res.status, 200);
+    EXPECT_TRUE(store->user_exists("@new.user_1-ok:test"));
+
+    auto body = nlohmann::json::parse(res.body);
+    EXPECT_EQ(body["user_id"], "@new.user_1-ok:test");
+}

@@ -250,4 +250,17 @@ void AuthHandler::handle_logout(const httplib::Request& req, httplib::Response& 
     res.set_content("{}", "application/json");
 }
 
+void AuthHandler::handle_whoami(const httplib::Request& req, httplib::Response& res) {
+    auto user_id = authenticate(store_, req.get_header_value("Authorization"));
+    if (!user_id) {
+        res.status = 401;
+        res.set_content(MatrixError::missing_token().to_json().dump(), "application/json");
+        return;
+    }
+
+    json resp = {{"user_id", *user_id}};
+    res.status = 200;
+    res.set_content(resp.dump(), "application/json");
+}
+
 } // namespace bsfchat

@@ -19,6 +19,7 @@ public:
     void handle_login(const httplib::Request& req, httplib::Response& res);
     void handle_register(const httplib::Request& req, httplib::Response& res);
     void handle_logout(const httplib::Request& req, httplib::Response& res);
+    void handle_whoami(const httplib::Request& req, httplib::Response& res);
 
 private:
     SqliteStore& store_;
