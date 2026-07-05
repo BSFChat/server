@@ -102,6 +102,12 @@ void Server::register_routes() {
              [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_register(req, res); });
     svr.Post(std::string(api_path::kLogout),
              [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_logout(req, res); });
+    // Token-identity introspection. Clients restoring a persisted
+    // session use this to reconcile their stored user id with the
+    // server's canonical one (stale/corrupt stored ids otherwise break
+    // every self-identity comparison client-side).
+    svr.Get("/_matrix/client/v3/account/whoami",
+            [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_whoami(req, res); });
 
     // Room routes
     svr.Post(std::string(api_path::kCreateRoom),
