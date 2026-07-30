@@ -89,6 +89,32 @@ stun_uri = "stun:stun.l.google.com:19302"
 # TURN and want every call forced through the relay (privacy over cost).
 allow_peer_to_peer = true
 
+# LiveKit SFU (optional, and OFF unless all three keys below are set).
+#
+# The peer-to-peer mesh above works well up to ~4 participants: every client
+# uploads its own audio once per other participant, so upload cost grows
+# linearly per person and quadratically for the call. A self-hosted LiveKit
+# SFU makes each client upload once regardless of headcount, which is what
+# raises the practical ceiling on a voice channel.
+#
+# Set all three keys to enable. Any subset is ignored (with a warning) and
+# voice keeps using the mesh, so it is safe to leave this block half-filled
+# while you set up the SFU.
+#
+# api_key/api_secret must match an entry in the LiveKit server's own `keys:`
+# map. Treat api_secret like a password: anything holding it can mint a token
+# for any room on your SFU.
+#
+# [voice.livekit]
+# url = "wss://sfu.yourdomain.com"
+# api_key = "<livekit-api-key>"
+# api_secret = "<livekit-api-secret>"
+# # Join-token lifetime in seconds. Short is correct: LiveKit only checks
+# # expiry when a connection is established and refreshes tokens for
+# # already-connected participants itself, so this does not cut off calls.
+# # Clamped to [30, 21600].
+# token_ttl = 600
+
 # Push notifications.
 #
 # WHAT THIS SERVER DOES: evaluates each message, decides who should be notified

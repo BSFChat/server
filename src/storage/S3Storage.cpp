@@ -28,6 +28,39 @@ std::optional<std::tuple<std::string, std::string>> S3Storage::download(const st
     return std::make_tuple(std::move(obj->data), std::move(obj->content_type));
 }
 
+std::optional<MediaStat> S3Storage::stat(const std::string& media_id) {
+    MediaStat info;
+    if (!client_->head_object(media_id, &info.content_type, &info.size)) {
+        return std::nullopt;
+    }
+    if (info.content_type.empty()) {
+        info.content_type = "application/octet-stream";
+    }
+    return info;
+}
+
+bool S3Storage::download_range(const std::string& media_id, size_t offset, size_t length,
+                               std::string& out) {
+    out.clear();
+
+    if (length == 0) {
+        return true;
+    }
+
+    auto obj = client_->get_object_range(media_id, offset, length);
+    if (!obj) {
+        return false;
+    }
+
+    out = std::move(obj->data);
+    // Never hand back more than was asked for, even if a non-conforming
+    // endpoint over-delivers.
+    if (out.size() > length) {
+        out.resize(length);
+    }
+    return true;
+}
+
 bool S3Storage::remove(const std::string& media_id) {
     return client_->delete_object(media_id);
 }

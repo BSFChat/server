@@ -16,6 +16,11 @@ public:
 
     std::optional<std::tuple<std::string, std::string>> download(const std::string& media_id) override;
 
+    std::optional<MediaStat> stat(const std::string& media_id) override;
+
+    bool download_range(const std::string& media_id, size_t offset, size_t length,
+                        std::string& out) override;
+
     bool remove(const std::string& media_id) override;
 
 private:

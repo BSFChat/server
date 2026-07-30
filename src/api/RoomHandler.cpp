@@ -7,6 +7,7 @@
 #include "core/Logger.h"
 #include "http/Middleware.h"
 #include "http/Router.h"
+#include "identity/Nickname.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
 
@@ -24,6 +25,13 @@ namespace bsfchat {
 using json = nlohmann::json;
 
 namespace {
+
+// The room_id to pass to PermissionsEngine for a SERVER-scoped check. Named
+// rather than spelled `""` at each call site because the difference between
+// `room_id` and `""` in a perms.can() call is the entire difference between "a
+// per-channel override can grant this" and "only a role can" — and that is not
+// a distinction an empty string argument makes visible to a reader.
+const std::string kServerScope;
 
 int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -116,15 +124,8 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
     // Creator joins — include their current display name + avatar so
     // clients don't need a separate profile fetch for the first sender.
     store_.set_membership(room_id, *user_id, std::string(membership::kJoin));
-    {
-        json join_content = {{"membership", membership::kJoin}};
-        auto dn = store_.get_display_name(*user_id);
-        if (dn) join_content["displayname"] = *dn;
-        auto av = store_.get_avatar_url(*user_id);
-        if (av) join_content["avatar_url"] = *av;
-        emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), *user_id,
-                         join_content);
-    }
+    emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), *user_id,
+                     member_event_content(store_, *user_id, std::string(membership::kJoin)));
 
     // Set join rules.
     // Discord-like default: rooms are public unless explicitly marked private
@@ -210,15 +211,12 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
         const auto state = is_direct ? membership::kJoin : membership::kInvite;
         store_.set_membership(room_id, invitee, std::string(state));
 
-        json invite_content = {{"membership", state}};
-        if (is_direct) {
-            auto dn = store_.get_display_name(invitee);
-            if (dn) invite_content["displayname"] = *dn;
-            auto av = store_.get_avatar_url(invitee);
-            if (av) invite_content["avatar_url"] = *av;
-        }
+        // member_event_content fills profile fields for join AND invite; the
+        // previous code filled them only for the direct-room join, so a plain
+        // invite carried no name. Both now carry the effective name, which is what
+        // the invitee's nickname makes it.
         emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), invitee,
-                         invite_content);
+                         member_event_content(store_, invitee, std::string(state)));
     }
 
     // Auto-join all existing users if this is a public, non-category,
@@ -288,11 +286,7 @@ void RoomHandler::handle_join(const httplib::Request& req, httplib::Response& re
 
     store_.set_membership(room_id, *user_id, std::string(membership::kJoin));
 
-    json join_content = {{"membership", membership::kJoin}};
-    auto dn = store_.get_display_name(*user_id);
-    if (dn) join_content["displayname"] = *dn;
-    auto av = store_.get_avatar_url(*user_id);
-    if (av) join_content["avatar_url"] = *av;
+    auto join_content = member_event_content(store_, *user_id, std::string(membership::kJoin));
     emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), *user_id,
                      join_content);
 
@@ -532,7 +526,15 @@ void RoomHandler::handle_kick(const httplib::Request& req, httplib::Response& re
     auto reason = body.value("reason", "");
 
     PermissionsEngine perms(store_, config_);
-    if (!perms.can(*user_id, room_id, permission::kKickMembers)) {
+    // SERVER scope (empty room_id). Kicking is a server-wide capability, as in
+    // Discord: there is no per-channel kick, and no UI to grant one. Evaluating
+    // it against `room_id` meant a per-channel override that allowed
+    // KICK_MEMBERS in one channel conferred the ability to kick there — a grant
+    // nothing in the product could intentionally make, and one an operator
+    // editing an unrelated channel's overrides would not expect to be handing
+    // out. See PermissionsEngine::compute: an empty room_id returns before any
+    // channel override is applied.
+    if (!perms.can(*user_id, kServerScope, permission::kKickMembers)) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Insufficient permissions to kick").to_json().dump(), "application/json");
         return;
@@ -604,7 +606,10 @@ void RoomHandler::handle_ban(const httplib::Request& req, httplib::Response& res
     auto reason = body.value("reason", "");
 
     PermissionsEngine perms(store_, config_);
-    if (!perms.can(*user_id, room_id, permission::kBanMembers)) {
+    // SERVER scope — see handle_kick. A ban is server-wide in intent (the client
+    // applies one by looping every room), so it must not be unlockable by a
+    // per-channel override.
+    if (!perms.can(*user_id, kServerScope, permission::kBanMembers)) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Insufficient permissions to ban").to_json().dump(), "application/json");
         return;
@@ -681,7 +686,10 @@ void RoomHandler::handle_unban(const httplib::Request& req, httplib::Response& r
     auto reason = body.value("reason", "");
 
     PermissionsEngine perms(store_, config_);
-    if (!perms.can(*user_id, room_id, permission::kBanMembers)) {
+    // SERVER scope — must match handle_ban exactly. If unban were channel-scoped
+    // while ban is server-scoped, a per-channel override would let someone lift
+    // bans they could never have placed.
+    if (!perms.can(*user_id, kServerScope, permission::kBanMembers)) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Insufficient permissions to unban").to_json().dump(), "application/json");
         return;
@@ -817,6 +825,17 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         evt_type == std::string(event_type::kServerRoles) ||
         evt_type == std::string(event_type::kMemberRoles);
 
+    // Moderation-by-membership-write. This route will happily set another user's
+    // m.room.member to "ban", which makes it a second, complete implementation of
+    // POST /rooms/{id}/ban — so it has to be gated the same way, at SERVER scope.
+    // While kick/ban were channel-scoped and this was too they at least agreed;
+    // moving only the dedicated endpoints would have left this route as the
+    // bypass, converting a per-channel KICK_MEMBERS override into a server-wide
+    // ban primitive. Self-membership is excluded: it is handled below and is a
+    // genuinely per-channel action (joining and leaving a channel).
+    const bool is_member_moderation =
+        evt_type == std::string(event_type::kRoomMember) && state_key != *user_id;
+
     // Map the state event type to the permission flag that gates it.
     permission::Flags required = permission::kManageChannels;
     if (is_server_scoped || evt_type == std::string(event_type::kChannelPermissions)) {
@@ -830,7 +849,12 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     }
 
     PermissionsEngine perms(store_, config_);
-    const std::string perm_scope = is_server_scoped ? std::string() : room_id;
+    // Two separate notions, deliberately not one flag: `is_server_scoped` also
+    // decides WHERE the write lands (server_state vs room state), while this only
+    // decides how the permission is evaluated. Member moderation is server-scoped
+    // for permissions but still writes ordinary room state.
+    const bool is_server_scoped_permission = is_server_scoped || is_member_moderation;
+    const std::string perm_scope = is_server_scoped_permission ? kServerScope : room_id;
 
     json content;
     try {
@@ -864,13 +888,12 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
 
         store_.set_membership(room_id, *user_id, requested);
 
-        json member_content = {{"membership", requested}};
-        if (requested == membership::kJoin) {
-            auto dn = store_.get_display_name(*user_id);
-            if (dn) member_content["displayname"] = *dn;
-            auto av = store_.get_avatar_url(*user_id);
-            if (av) member_content["avatar_url"] = *av;
-        }
+        // Profile fields come from the server's own records, never from the
+        // request body — that is the fix this branch already carried, and routing
+        // it through member_event_content keeps it true while adding the nickname.
+        // A user CAN change their rendered name here, but only by going through
+        // PUT /profile/{me}/nickname, which is gated on CHANGE_NICKNAME.
+        auto member_content = member_event_content(store_, *user_id, requested);
         auto member_event_id =
             emit_state_event(room_id, *user_id, evt_type, state_key, member_content);
         res.set_content(json{{"event_id", member_event_id}}.dump(), "application/json");
@@ -880,6 +903,19 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     if (!perms.can(*user_id, perm_scope, required)) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Insufficient permissions for this state event").to_json().dump(), "application/json");
+        return;
+    }
+
+    // The dedicated kick/ban/unban endpoints all refuse to act on a user of equal
+    // or higher rank. This route performs the same transitions and did not check,
+    // so a moderator could ban an admin here after being refused at POST
+    // /rooms/{id}/ban. Closing the scope hole without closing this one would have
+    // left the bypass intact in a different direction.
+    if (is_member_moderation && !state_key.empty() && !perms.outranks(*user_id, state_key)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden(
+            "Cannot change the membership of a user with equal or higher role").to_json().dump(),
+            "application/json");
         return;
     }
 

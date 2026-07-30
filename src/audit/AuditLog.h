@@ -30,6 +30,10 @@ constexpr const char* kMemberUnban = "member.unban";
 // A membership transition driven by a moderator through
 // PUT /rooms/{id}/state/m.room.member/{user} that is not a kick, ban or unban.
 constexpr const char* kMemberMembershipSet = "member.membership_set";
+// A moderator setting or clearing SOMEBODY ELSE'S per-server nickname
+// (MANAGE_NICKNAMES). A user renaming themselves is not recorded — that is
+// self-service, like changing an avatar, not an act of authority over anyone.
+constexpr const char* kMemberNicknameSet = "member.nickname_set";
 
 constexpr const char* kRoleCreate = "role.create";
 constexpr const char* kRoleUpdate = "role.update";
@@ -60,6 +64,15 @@ void audit_membership_change(SqliteStore& store, const std::string& actor,
                             const std::string& before_membership,
                             const std::string& after_membership,
                             const std::string& reason);
+
+// Records one moderator-driven nickname change. `before`/`after` are nullopt when
+// there was / is no nickname, so a record distinguishes set, changed and cleared.
+// Writes nothing when the value is unchanged, matching the other audit writers.
+// Not called when actor == target.
+void audit_nickname_change(SqliteStore& store, const std::string& actor,
+                          const std::string& target_user,
+                          const std::optional<std::string>& before,
+                          const std::optional<std::string>& after);
 
 // Records a channel or category deletion. MUST be called BEFORE
 // SqliteStore::delete_room: it reads the room's name, type, parent category and

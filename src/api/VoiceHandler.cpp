@@ -1,4 +1,5 @@
 #include "api/VoiceHandler.h"
+#include "auth/Permissions.h"
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
@@ -9,12 +10,16 @@
 #include <bsfchat/Constants.h>
 #include <bsfchat/ErrorCodes.h>
 #include <bsfchat/Identifiers.h>
+#include <bsfchat/JwtUtils.h>
 #include <bsfchat/MatrixTypes.h>
+#include <bsfchat/Permissions.h>
 
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <algorithm>
 #include <chrono>
+#include <exception>
 
 namespace bsfchat {
 
@@ -439,6 +444,179 @@ void VoiceHandler::handle_turn_server(const httplib::Request& req, httplib::Resp
     }
 
     res.set_content(resp.dump(), "application/json");
+}
+
+std::string VoiceHandler::livekit_room_name(const std::string& server_name,
+                                            const std::string& room_id) {
+    // 0x1f (unit separator) cannot appear in either input, so the two fields
+    // can't be confused for one another (a "\x1f"-free join would let
+    // server="a", room="b!c" and server="a!b", room="c" hash identically).
+    const std::string input = server_name + '\x1f' + room_id;
+
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0;
+    EVP_Digest(input.data(), input.size(), digest, &digest_len, EVP_sha256(), nullptr);
+
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out = "bsfchat-";
+    // 16 bytes = 128 bits of the digest. Collision-free in practice, and short
+    // enough to stay readable in LiveKit's own logs and dashboards.
+    const unsigned int take = digest_len < 16 ? digest_len : 16;
+    for (unsigned int i = 0; i < take; ++i) {
+        out += kHex[digest[i] >> 4];
+        out += kHex[digest[i] & 0x0F];
+    }
+    return out;
+}
+
+void VoiceHandler::handle_livekit_token(const httplib::Request& req, httplib::Response& res) {
+    auto user_id = authenticate(store_, req.get_header_value("Authorization"));
+    if (!user_id) {
+        res.status = 401;
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
+        return;
+    }
+
+    auto match = match_route("/_matrix/client/v3/rooms/{roomId}/voice/livekit_token", req.path);
+    if (!match.matched) {
+        res.status = 404;
+        res.set_content(MatrixError::not_found().to_json().dump(), "application/json");
+        return;
+    }
+    auto& room_id = match.params["roomId"];
+
+    // Not configured is a 404, not a 500: on a mesh-only deployment this
+    // endpoint simply does not exist, and that is how the client should read it
+    // (fall back to mesh). Checked before any store access so an unconfigured
+    // server does no work.
+    if (!config_.voice.enabled || !config_.voice.livekit.configured()) {
+        res.status = 404;
+        res.set_content(
+            MatrixError::not_found("LiveKit SFU is not configured on this server").to_json().dump(),
+            "application/json");
+        return;
+    }
+
+    if (!store_.is_room_member(room_id, *user_id)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(), "application/json");
+        return;
+    }
+
+    // Same voice-capability gate as handle_voice_join: a token for a
+    // non-voice or voice-disabled channel should not exist.
+    auto voice_state = store_.get_state_event(room_id, std::string(event_type::kRoomVoice), "");
+    if (!voice_state) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Room is not voice-capable").to_json().dump(), "application/json");
+        return;
+    }
+    VoiceChannelContent voice_channel;
+    from_json(voice_state->content.data, voice_channel);
+    if (!voice_channel.enabled) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Voice is disabled in this room").to_json().dump(), "application/json");
+        return;
+    }
+
+    // THE security gate. Room membership is server-wide in this data model
+    // (channels are Matrix rooms, but a member of the server is a member of
+    // its channels); visibility is what per-channel permissions control. A
+    // user denied kViewChannel here can see neither the channel nor its
+    // member list, so they must not be able to obtain a token that would put
+    // them inside its SFU room and let them hear everyone in it.
+    //
+    // PermissionsEngine memoises per instance and is documented as
+    // request-scoped — construct it here, do not cache it on the handler.
+    PermissionsEngine perms(store_, config_);
+    const permission::Flags flags = perms.compute(*user_id, room_id);
+    if (!permission::has(flags, permission::kViewChannel)) {
+        res.status = 403;
+        res.set_content(
+            MatrixError::forbidden("You do not have permission to view this channel").to_json().dump(),
+            "application/json");
+        return;
+    }
+
+    // Optional device_id, same body shape as voice/join.
+    //
+    // LiveKit identifies a participant solely by `sub`. Two connections with
+    // the same identity are the same participant, and the SFU disconnects the
+    // older one — so joining from a second device with a user-only identity
+    // would silently kick the first. Suffixing the device keeps them distinct.
+    // The user id is the part before the first '|', which never appears in a
+    // Matrix user id, so the client can recover the owner unambiguously.
+    std::string device_id;
+    if (!req.body.empty()) {
+        try {
+            auto body = json::parse(req.body);
+            device_id = body.value("device_id", "");
+        } catch (...) {}
+    }
+    // '|' is our delimiter, so it must not survive from an attacker-chosen
+    // device_id, or an identity could be forged to look like another user's.
+    for (auto& c : device_id) {
+        if (c == '|') c = '_';
+    }
+    std::string identity = *user_id;
+    if (!device_id.empty()) {
+        identity += '|';
+        identity += device_id;
+    }
+
+    LiveKitGrants grants;
+    grants.room = livekit_room_name(config_.server_name, room_id);
+    grants.room_join = true;
+    // Derived from the permission model as it exists today. There are no
+    // voice-specific permission bits (no CONNECT/SPEAK/VIDEO), so publishing
+    // mirrors the current mesh behaviour: any member who can view a voice
+    // channel can talk, share screen and turn on camera in it. When voice
+    // permission bits land, gate can_publish / can_publish_sources on them
+    // here — this is the single place that decision is made.
+    grants.can_publish = true;
+    grants.can_subscribe = true;
+    // Data messages are not part of the SFU migration yet; chat and
+    // signalling stay on Matrix. Denying this keeps the token from being
+    // usable as an unaudited side-channel between participants.
+    grants.can_publish_data = false;
+    grants.can_publish_sources = {"microphone", "camera", "screen_share", "screen_share_audio"};
+    // Voice moderation (server-side mute, removing a participant) is gated on
+    // the existing channel-management permission rather than a new bit.
+    grants.room_admin = permission::has(flags, permission::kManageChannels);
+
+    std::string token;
+    try {
+        token = livekit_token_sign(
+            config_.voice.livekit.api_key,
+            config_.voice.livekit.api_secret,
+            identity,
+            *user_id, // display name; the client resolves profiles itself
+            grants,
+            config_.voice.livekit.token_ttl);
+    } catch (const std::exception& e) {
+        // Never echo `e.what()` — the signer's messages are safe today, but
+        // this is the one place an api_secret could reach a client.
+        get_logger()->error("LiveKit token signing failed for room {}: {}", room_id, e.what());
+        res.status = 500;
+        res.set_content(MatrixError::unknown("Could not issue a voice token").to_json().dump(),
+                        "application/json");
+        return;
+    }
+
+    // A successful token request is also a liveness signal, exactly as
+    // voice/join and voice/members are — otherwise a client that joins via
+    // LiveKit and renews its token would still be reaped.
+    record_heartbeat(room_id, *user_id);
+
+    res.set_content(json{
+        {"url", config_.voice.livekit.url},
+        {"token", token},
+        {"room", grants.room},
+        {"identity", identity},
+        // Seconds. The client should re-request before this elapses if it
+        // needs to be able to reconnect after a network drop.
+        {"ttl", std::clamp<int64_t>(config_.voice.livekit.token_ttl, kLiveKitMinTtl, kLiveKitMaxTtl)},
+    }.dump(), "application/json");
 }
 
 } // namespace bsfchat

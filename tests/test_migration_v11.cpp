@@ -196,8 +196,9 @@ TEST(MigrationV11, PreExistingV8DatabaseUpgradesAndKeepsItsData) {
     EXPECT_EQ(schema_version_of(path), kTargetSchemaVersion);
     // Pinned on purpose, so bumping the schema is always a conscious edit rather
     // than something that slides past review. 12 -> 13 added the moderation audit
-    // log; a v8 database still upgrades all the way in one go.
-    EXPECT_EQ(kTargetSchemaVersion, 13);
+    // log; 13 -> 14 added users.nickname. A v8 database still upgrades all the way
+    // in one go.
+    EXPECT_EQ(kTargetSchemaVersion, 14);
     std::filesystem::remove(path);
 }
 

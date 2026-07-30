@@ -216,6 +216,32 @@ void audit_membership_change(SqliteStore& store, const std::string& actor,
     store.append_audit_record(record);
 }
 
+void audit_nickname_change(SqliteStore& store, const std::string& actor,
+                          const std::string& target_user,
+                          const std::optional<std::string>& before,
+                          const std::optional<std::string>& after) {
+    // An unchanged value is not an event. Without this a client resubmitting the
+    // same nickname would pad the log with records that record nothing.
+    if (before == after) return;
+
+    // nullopt is recorded as JSON null, not as "", so "cleared the nickname" and
+    // "set the nickname to an empty string" cannot be confused by a reader — the
+    // second is not something the API permits, and the log should not imply it is.
+    const auto as_json = [](const std::optional<std::string>& v) {
+        return (v ? json(*v) : json(nullptr));
+    };
+
+    SqliteStore::AuditRecord record;
+    record.actor = actor;
+    record.action = audit_action::kMemberNicknameSet;
+    record.target_user = target_user;
+    // No target_room: a nickname is server-wide, so naming one room would be
+    // arbitrary and would make the record look narrower than the change was.
+    record.before_json = json{{"nickname", as_json(before)}}.dump();
+    record.after_json = json{{"nickname", as_json(after)}}.dump();
+    store.append_audit_record(record);
+}
+
 void audit_room_deletion(SqliteStore& store, const std::string& actor,
                          const std::string& room_id) {
     std::string room_type = "text";

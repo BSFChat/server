@@ -91,6 +91,42 @@ struct Fixture {
     }
 };
 
+// Appends one extra server-wide role carrying exactly `perms` to whatever role
+// set is currently defined, and returns its id. Used to build a NON-ADMIN role
+// that holds a single capability, which is the whole point of the role system:
+// "users with the appropriate permission can do so" has to be true for a role
+// that is not Admin, or the permission is decorative.
+std::string define_role(Fixture& f, const std::string& id, permission::Flags perms,
+                        int position = 5) {
+    ServerRolesContent c;
+    c.roles = f.store->get_server_roles();
+    ServerRole r;
+    r.id = id;
+    r.name = id;
+    r.color = "#36d6c7";
+    r.position = position;
+    r.permissions = perms;
+    c.roles.push_back(r);
+    json j;
+    to_json(j, c);
+    f.store->set_server_state(std::string(event_type::kServerRoles), "",
+                              "@server:test", j.dump());
+    return id;
+}
+
+// Grants `perms` to `user_id` as a per-channel override inside `room` only.
+void allow_in_channel(Fixture& f, const std::string& room, const std::string& actor,
+                      const std::string& user_id, permission::Flags perms) {
+    ChannelPermissionOverride ov;
+    ov.allow = perms;
+    ov.deny = 0;
+    json ov_json;
+    to_json(ov_json, ov);
+    f.store->insert_event(generate_event_id("test"), room, actor,
+                          std::string(event_type::kChannelPermissions),
+                          "user:" + user_id, ov_json.dump(), now_ms());
+}
+
 } // namespace
 
 // ── S11: migrations ───────────────────────────────────────────────────────
@@ -408,6 +444,109 @@ TEST(RoomHandlerCreate, AdminCanCreateChannelsAndAnyoneCanOpenADm) {
                                      {"invite", json::array({owner})}}.dump());
         handler.handle_create_room(req, res);
         EXPECT_TRUE(IsOk(res));
+    }
+}
+
+// The positive half of the same gate: closing the hole is only half the
+// requirement, the permission also has to actually WORK for a role that is not
+// Admin. Bob holds a custom role whose only power beyond the @everyone default
+// is MANAGE_CHANNELS.
+TEST(RoomHandlerCreate, RoleGrantedManageChannelsLetsANonAdminCreate) {
+    Fixture f;
+    f.add_user("owner"); // first-registered → Admin at bootstrap
+    auto bob = f.add_user("bob");
+    bootstrap_roles(*f.store, *f.sync, f.config);
+    define_role(f, "builder", permission::kEveryoneDefault | permission::kManageChannels);
+    f.grant(bob, "builder");
+
+    {
+        PermissionsEngine check(*f.store, f.config);
+        ASSERT_FALSE(check.can(bob, "", permission::kAdministrator))
+            << "precondition: this test is about a NON-admin role";
+        ASSERT_TRUE(check.can(bob, "", permission::kManageChannels));
+    }
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+
+    std::string channel_id;
+    {
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/createRoom", "token-bob",
+                                json{{"name", "builds"}}.dump());
+        handler.handle_create_room(req, res);
+        ASSERT_TRUE(IsOk(res));
+        channel_id = json::parse(res.body).at("room_id").get<std::string>();
+    }
+    EXPECT_TRUE(f.store->room_exists(channel_id));
+    EXPECT_TRUE(f.store->is_room_member(channel_id, bob));
+
+    {
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/createRoom", "token-bob",
+                                json{{"name", "Projects"}, {"is_category", true}}.dump());
+        handler.handle_create_room(req, res);
+        ASSERT_TRUE(IsOk(res));
+        auto category_id = json::parse(res.body).at("room_id").get<std::string>();
+        auto type = f.store->get_state_event(
+            category_id, std::string(event_type::kRoomType), "");
+        ASSERT_TRUE(type.has_value());
+        EXPECT_EQ(type->content.data.value("type", ""), "category");
+    }
+}
+
+// A user with no channel-management role must be refused for categories too,
+// not only for text channels: a category is server structure just the same, and
+// the is_category branch of the handler runs after the gate.
+TEST(RoomHandlerCreate, PlainUserCannotCreateCategories) {
+    Fixture f;
+    f.add_user("owner");
+    f.add_user("mallory");
+    bootstrap_roles(*f.store, *f.sync, f.config);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request("/_matrix/client/v3/createRoom", "token-mallory",
+                            json{{"name", "spam"}, {"is_category", true}}.dump());
+    handler.handle_create_room(req, res);
+
+    EXPECT_EQ(res.status, 403) << res.body;
+    EXPECT_TRUE(f.store->list_all_non_category_rooms().empty());
+}
+
+// Creation is server structure, so the gate is evaluated at SERVER scope. A
+// per-channel MANAGE_CHANNELS override — which legitimately lets someone rename
+// or configure that one channel — must not become a licence to add channels to
+// the server, the same shape of escalation that
+// ServerRoles.PerChannelManageRolesCannotRewriteServerRoles guards against.
+TEST(RoomHandlerCreate, PerChannelOverrideDoesNotConferServerWideCreation) {
+    Fixture f;
+    auto owner = f.add_user("owner");
+    auto mallory = f.add_user("mallory");
+
+    auto room = generate_room_id("test");
+    f.store->create_room(room, owner);
+    f.store->set_membership(room, owner, "join");
+    f.store->set_membership(room, mallory, "join");
+    bootstrap_roles(*f.store, *f.sync, f.config);
+
+    allow_in_channel(f, room, owner, mallory, permission::kManageChannels);
+
+    {
+        PermissionsEngine check(*f.store, f.config);
+        ASSERT_TRUE(check.can(mallory, room, permission::kManageChannels))
+            << "precondition: the override should grant MANAGE_CHANNELS in this room";
+        EXPECT_FALSE(check.can(mallory, "", permission::kManageChannels))
+            << "a channel override must not contribute to the server-scope answer";
+    }
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    for (const bool is_category : {false, true}) {
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/createRoom", "token-mallory",
+                                json{{"name", "mallory-was-here"},
+                                     {"is_category", is_category}}.dump());
+        handler.handle_create_room(req, res);
+        EXPECT_EQ(res.status, 403) << "is_category=" << is_category << " body: " << res.body;
     }
 }
 

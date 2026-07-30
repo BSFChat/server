@@ -2099,6 +2099,32 @@ std::optional<std::string> SqliteStore::get_display_name(const std::string& user
     return std::nullopt;
 }
 
+void SqliteStore::set_nickname(const std::string& user_id,
+                              const std::optional<std::string>& nickname) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "UPDATE users SET nickname = ? WHERE user_id = ?");
+    // Clearing binds SQL NULL rather than '': get_nickname treats NULL as "none",
+    // and an empty-string nickname would otherwise round-trip as a real nickname
+    // that renders as a blank name in every member list.
+    if (nickname) {
+        sqlite3_bind_text(stmt.get(), 1, nickname->c_str(), -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt.get(), 1);
+    }
+    sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+}
+
+std::optional<std::string> SqliteStore::get_nickname(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT nickname FROM users WHERE user_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW && sqlite3_column_type(stmt.get(), 0) != SQLITE_NULL) {
+        return reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+    }
+    return std::nullopt;
+}
+
 std::optional<std::string> SqliteStore::get_avatar_url(const std::string& user_id) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_, "SELECT avatar_url FROM users WHERE user_id = ?");

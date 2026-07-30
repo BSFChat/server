@@ -46,6 +46,21 @@ std::string LocalStorage::upload(const std::string& media_id, const std::string&
     return file_path;
 }
 
+std::string LocalStorage::read_content_type(const std::string& media_id) const {
+    std::string content_type = "application/octet-stream";
+    auto meta_file = metadata_path(media_id);
+    if (std::filesystem::exists(meta_file)) {
+        std::ifstream meta(meta_file);
+        if (meta) {
+            std::string line;
+            if (std::getline(meta, line) && !line.empty()) {
+                content_type = std::move(line);
+            }
+        }
+    }
+    return content_type;
+}
+
 std::optional<std::tuple<std::string, std::string>> LocalStorage::download(const std::string& media_id) {
     auto file_path = data_path(media_id);
     if (!std::filesystem::exists(file_path)) {
@@ -61,17 +76,58 @@ std::optional<std::tuple<std::string, std::string>> LocalStorage::download(const
     oss << ifs.rdbuf();
     std::string data = oss.str();
 
-    // Read metadata
-    std::string content_type = "application/octet-stream";
-    auto meta_file = metadata_path(media_id);
-    if (std::filesystem::exists(meta_file)) {
-        std::ifstream meta(meta_file);
-        if (meta) {
-            std::getline(meta, content_type);
-        }
+    return std::make_tuple(std::move(data), read_content_type(media_id));
+}
+
+std::optional<MediaStat> LocalStorage::stat(const std::string& media_id) {
+    std::error_code ec;
+    auto file_path = data_path(media_id);
+    auto status = std::filesystem::status(file_path, ec);
+    if (ec || !std::filesystem::is_regular_file(status)) {
+        return std::nullopt;
     }
 
-    return std::make_tuple(std::move(data), std::move(content_type));
+    auto size = std::filesystem::file_size(file_path, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+
+    MediaStat info;
+    info.size = static_cast<size_t>(size);
+    info.content_type = read_content_type(media_id);
+    return info;
+}
+
+bool LocalStorage::download_range(const std::string& media_id, size_t offset, size_t length,
+                                  std::string& out) {
+    out.clear();
+
+    auto file_path = data_path(media_id);
+    std::ifstream ifs(file_path, std::ios::binary);
+    if (!ifs) {
+        return false;
+    }
+
+    if (length == 0) {
+        return true;
+    }
+
+    // seekg past the end is not an error on its own; the subsequent read
+    // simply returns 0 bytes, which we report as a successful empty read.
+    ifs.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    if (!ifs) {
+        return false;
+    }
+
+    // Only the requested window is ever allocated — never the whole file.
+    out.resize(length);
+    ifs.read(out.data(), static_cast<std::streamsize>(length));
+    if (ifs.bad()) {
+        out.clear();
+        return false;
+    }
+    out.resize(static_cast<size_t>(ifs.gcount()));
+    return true;
 }
 
 bool LocalStorage::remove(const std::string& media_id) {

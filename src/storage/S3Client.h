@@ -31,6 +31,17 @@ public:
     /// Download an object from the bucket.
     std::optional<S3Object> get_object(const std::string& key);
 
+    /// Download only [offset, offset + length) of an object, via a ranged GET.
+    /// The service transfers just that window, so a small range on a large
+    /// object costs a small transfer rather than the whole object.
+    ///
+    /// `data` may come back shorter than `length` if the window runs past the
+    /// end of the object (including empty, when the offset is at or past the
+    /// end — S3 answers 416 there, which is reported as a successful 0-byte
+    /// read). nullopt means the object is missing or the request failed.
+    std::optional<S3Object> get_object_range(const std::string& key, size_t offset,
+                                             size_t length);
+
     /// Delete an object from the bucket.
     bool delete_object(const std::string& key);
 

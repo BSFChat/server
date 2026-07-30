@@ -28,6 +28,27 @@ public:
     void handle_voice_state(const httplib::Request& req, httplib::Response& res);
     void handle_turn_server(const httplib::Request& req, httplib::Response& res);
 
+    // POST /_matrix/client/v3/rooms/{roomId}/voice/livekit_token
+    //
+    // Issues a LiveKit join token for the authenticated user on this voice
+    // channel. Gated on room membership, the channel's m.room.voice being
+    // enabled, AND permission::kViewChannel — a user who cannot see the
+    // channel must never receive a token that lets them into its SFU room.
+    void handle_livekit_token(const httplib::Request& req, httplib::Response& res);
+
+    // Maps a Matrix room id to the LiveKit room name.
+    //
+    // Hashed rather than sanitised on purpose. Room ids contain characters
+    // ('!', ':') whose safety in a LiveKit room name is not guaranteed, and any
+    // character-replacement scheme collides — "!a:b" and "!a-b" would both
+    // become "-a-b" and share one SFU room, which is a cross-channel audio
+    // leak. SHA-256 cannot collide by accident. server_name is mixed in so the
+    // mapping differs between deployments sharing one LiveKit instance.
+    //
+    // Exposed (and static) so tests can assert determinism and separation.
+    static std::string livekit_room_name(const std::string& server_name,
+                                         const std::string& room_id);
+
     // Ghost-participant reaper. Clients in voice heartbeat via GET
     // voice/members (and voice/join / voice/state); a background thread
     // marks active members inactive when their heartbeat goes stale.

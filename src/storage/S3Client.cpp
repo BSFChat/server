@@ -270,6 +270,100 @@ std::optional<S3Object> S3Client::get_object(const std::string& key) {
     return std::nullopt;
 }
 
+std::optional<S3Object> S3Client::get_object_range(const std::string& key, size_t offset,
+                                                    size_t length) {
+    auto log = get_logger();
+
+    if (length == 0) {
+        S3Object obj;
+        obj.content_type = "application/octet-stream";
+        return obj;
+    }
+
+    auto parsed = parse_endpoint();
+    auto [amz_date, date_stamp] = get_amz_timestamps();
+    auto path = build_path(key);
+    auto payload_hash = sha256_hex(""); // empty payload for GET
+
+    auto auth = sign_request("GET", path, "", payload_hash, "",
+                             amz_date, date_stamp, parsed.host);
+
+    // HTTP byte ranges are inclusive on both ends.
+    std::string range_value = "bytes=" + std::to_string(offset) + "-" +
+                              std::to_string(offset + length - 1);
+
+    // `Range` is deliberately NOT part of the SigV4 signed header set: the
+    // signature above commits to host;x-amz-content-sha256;x-amz-date only.
+    // SigV4 permits headers outside SignedHeaders, so sending Range unsigned
+    // keeps sign_request() untouched and still validates. Adding it to the
+    // canonical request would require it in SignedHeaders too, and any
+    // mismatch there is a 403 SignatureDoesNotMatch.
+    httplib::Headers headers = {
+        {"Authorization", auth},
+        {"x-amz-date", amz_date},
+        {"x-amz-content-sha256", payload_hash},
+        {"Host", parsed.host},
+        {"Range", range_value}
+    };
+
+    auto client = std::make_unique<httplib::Client>(config_.endpoint);
+    client->set_connection_timeout(10);
+    client->set_read_timeout(60);
+
+    auto res = client->Get(path, headers);
+    if (!res) {
+        log->error("S3 ranged GET failed for {} ({}): connection error", key, range_value);
+        return std::nullopt;
+    }
+
+    if (res->status == 206) {
+        S3Object obj;
+        obj.data = std::move(res->body);
+        obj.content_type = res->get_header_value("Content-Type");
+        if (obj.content_type.empty()) {
+            obj.content_type = "application/octet-stream";
+        }
+        obj.content_length = obj.data.size();
+        return obj;
+    }
+
+    if (res->status == 200) {
+        // The endpoint ignored Range and sent the whole object. Correctness is
+        // preserved by slicing, but the memory win is gone, so say so loudly:
+        // this is the exact failure mode the streaming path exists to avoid.
+        log->warn("S3 endpoint ignored Range for {} (sent {} bytes for {}); "
+                  "slicing client-side", key, res->body.size(), range_value);
+        S3Object obj;
+        if (offset < res->body.size()) {
+            obj.data = res->body.substr(offset, length);
+        }
+        obj.content_type = res->get_header_value("Content-Type");
+        if (obj.content_type.empty()) {
+            obj.content_type = "application/octet-stream";
+        }
+        obj.content_length = obj.data.size();
+        return obj;
+    }
+
+    if (res->status == 416) {
+        // Requested range is entirely past the end of the object. Treat as a
+        // successful short (empty) read so callers see EOF, not an error.
+        S3Object obj;
+        obj.content_type = res->get_header_value("Content-Type");
+        if (obj.content_type.empty()) {
+            obj.content_type = "application/octet-stream";
+        }
+        return obj;
+    }
+
+    if (res->status == 404) {
+        return std::nullopt;
+    }
+
+    log->error("S3 ranged GET {} ({}) failed: HTTP {}", key, range_value, res->status);
+    return std::nullopt;
+}
+
 bool S3Client::delete_object(const std::string& key) {
     auto log = get_logger();
     auto parsed = parse_endpoint();

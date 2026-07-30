@@ -225,6 +225,16 @@ void Server::register_routes() {
             [h = profile_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_avatar_url(req, res); });
     svr.Put(R"(/_matrix/client/v3/profile/([^/]+)/avatar_url)",
             [h = profile_handler](const httplib::Request& req, httplib::Response& res) { h->handle_put_avatar_url(req, res); });
+    // Per-server nickname. Not a Matrix-spec path (the spec has no nickname), so
+    // it sits under profile/ rather than being namespaced elsewhere: it is a
+    // profile field, just one whose write is permission-gated instead of
+    // self-service. PUT accepts a target other than the caller — CHANGE_NICKNAME
+    // for your own, MANAGE_NICKNAMES plus a rank check for anyone else's, both at
+    // server scope.
+    svr.Get(R"(/_matrix/client/v3/profile/([^/]+)/nickname)",
+            [h = profile_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_nickname(req, res); });
+    svr.Put(R"(/_matrix/client/v3/profile/([^/]+)/nickname)",
+            [h = profile_handler](const httplib::Request& req, httplib::Response& res) { h->handle_put_nickname(req, res); });
 
     // Push routes. Registration + listing are spec-shaped; the per-room
     // notification level is namespaced bsfchat.* because it is an enum per room,
@@ -268,6 +278,10 @@ void Server::register_routes() {
             [h = voice_handler_](const httplib::Request& req, httplib::Response& res) { h->handle_voice_state(req, res); });
     svr.Get("/_matrix/client/v3/voip/turnServer",
             [h = voice_handler_](const httplib::Request& req, httplib::Response& res) { h->handle_turn_server(req, res); });
+    // LiveKit SFU join token. 404s when [voice.livekit] is unconfigured, which
+    // is how a client detects a mesh-only server.
+    svr.Post(R"(/_matrix/client/v3/rooms/([^/]+)/voice/livekit_token)",
+             [h = voice_handler_](const httplib::Request& req, httplib::Response& res) { h->handle_livekit_token(req, res); });
 }
 
 void Server::start() {

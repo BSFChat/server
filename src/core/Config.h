@@ -32,8 +32,33 @@ struct StorageConfig {
     StorageS3Config s3;
 };
 
+// LiveKit SFU. Optional: when unset, voice uses the peer-to-peer mesh below.
+// Configured as a [voice.livekit] sub-table.
+struct LiveKitConfig {
+    // Base URL the CLIENT should connect to, e.g. "wss://sfu.example.com".
+    // Handed to clients verbatim; the server never dials it itself.
+    std::string url;
+    // Credential pair matching the LiveKit server's own `keys:` map.
+    std::string api_key;
+    // SECRET. Never logged, never returned in any API response.
+    std::string api_secret;
+    // Join-token lifetime. Short by design: LiveKit only checks `exp` when a
+    // connection is established, and refreshes tokens for already-connected
+    // participants itself, so a short TTL costs nothing during a call and
+    // limits the blast radius of a leaked token. Clamped to
+    // [kLiveKitMinTtl, kLiveKitMaxTtl] at mint time.
+    int64_t token_ttl = 600; // 10 minutes
+    // True when all three of url/api_key/api_secret are present. A partially
+    // configured LiveKit is treated as "not configured" rather than as an
+    // error, so a half-finished config can never mint a broken token.
+    bool configured() const {
+        return !url.empty() && !api_key.empty() && !api_secret.empty();
+    }
+};
+
 struct VoiceConfig {
     bool enabled = true;
+    LiveKitConfig livekit;
     // TURN server URIs. Config key `turn_uri` accepts either a single string
     // or an array of strings (e.g. udp + tcp transport variants).
     std::vector<std::string> turn_uris;

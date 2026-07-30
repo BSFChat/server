@@ -14,7 +14,9 @@
 
 #include <bsfchat/Constants.h>
 #include <bsfchat/Identifiers.h>
+#include <bsfchat/JwtUtils.h>
 #include <bsfchat/MatrixTypes.h>
+#include <bsfchat/Permissions.h>
 
 #include <nlohmann/json.hpp>
 
@@ -333,6 +335,93 @@ TEST(VoiceConfig, TurnUriAcceptsStringOrArray) {
 
     std::filesystem::remove(single);
     std::filesystem::remove(arr);
+}
+
+namespace {
+
+Config load_toml(const std::string& name, const std::string& body) {
+    auto path = std::filesystem::temp_directory_path() / name;
+    {
+        std::ofstream out(path);
+        out << body;
+    }
+    auto cfg = Config::load(path.string());
+    std::filesystem::remove(path);
+    return cfg;
+}
+
+} // namespace
+
+TEST(VoiceConfig, LiveKitSubTableIsParsed) {
+    auto cfg = load_toml("bsfchat_test_lk_ok.toml",
+                         "[voice]\n"
+                         "enabled = true\n"
+                         "\n"
+                         "[voice.livekit]\n"
+                         "url = \"wss://sfu.example.com\"\n"
+                         "api_key = \"APIabc\"\n"
+                         "api_secret = \"shhh\"\n"
+                         "token_ttl = 300\n");
+
+    EXPECT_EQ(cfg.voice.livekit.url, "wss://sfu.example.com");
+    EXPECT_EQ(cfg.voice.livekit.api_key, "APIabc");
+    EXPECT_EQ(cfg.voice.livekit.api_secret, "shhh");
+    EXPECT_EQ(cfg.voice.livekit.token_ttl, 300);
+    EXPECT_TRUE(cfg.voice.livekit.configured());
+    // The SFU config must not disturb the existing TURN settings.
+    EXPECT_TRUE(cfg.voice.enabled);
+    EXPECT_EQ(cfg.voice.turn_ttl, 3600);
+}
+
+TEST(VoiceConfig, LiveKitDefaultsToUnconfigured) {
+    auto cfg = load_toml("bsfchat_test_lk_absent.toml", "[voice]\nenabled = true\n");
+    EXPECT_FALSE(cfg.voice.livekit.configured());
+    EXPECT_TRUE(cfg.voice.livekit.url.empty());
+    EXPECT_EQ(cfg.voice.livekit.token_ttl, 600); // struct default
+}
+
+// This config is a TABLE, not flat keys. An earlier agent misparsed a table as
+// flat keys on this project and silently migrated the owner's database, so
+// pin the shape: flat `livekit_url = ...` under [voice] must be ignored
+// outright rather than half-accepted.
+TEST(VoiceConfig, LiveKitFlatKeysAreNotRecognised) {
+    auto cfg = load_toml("bsfchat_test_lk_flat.toml",
+                         "[voice]\n"
+                         "livekit_url = \"wss://sfu.example.com\"\n"
+                         "livekit_api_key = \"APIabc\"\n"
+                         "livekit_api_secret = \"shhh\"\n");
+
+    EXPECT_TRUE(cfg.voice.livekit.url.empty());
+    EXPECT_TRUE(cfg.voice.livekit.api_key.empty());
+    EXPECT_TRUE(cfg.voice.livekit.api_secret.empty());
+    EXPECT_FALSE(cfg.voice.livekit.configured());
+}
+
+// A partially filled block must read as "not configured" so the server keeps
+// serving mesh voice rather than trying to mint tokens with a missing secret.
+TEST(VoiceConfig, PartialLiveKitConfigIsNotConfigured) {
+    auto no_secret = load_toml("bsfchat_test_lk_partial.toml",
+                               "[voice.livekit]\n"
+                               "url = \"wss://sfu.example.com\"\n"
+                               "api_key = \"APIabc\"\n");
+    EXPECT_FALSE(no_secret.voice.livekit.configured());
+
+    auto only_secret = load_toml("bsfchat_test_lk_partial2.toml",
+                                 "[voice.livekit]\napi_secret = \"shhh\"\n");
+    EXPECT_FALSE(only_secret.voice.livekit.configured());
+}
+
+// validate() clamps nothing itself (the signer does), but it must not reject
+// or mangle an out-of-range ttl — the token endpoint still has to work.
+TEST(VoiceConfig, LiveKitSurvivesAnOutOfRangeTokenTtl) {
+    auto cfg = load_toml("bsfchat_test_lk_ttl.toml",
+                         "[voice.livekit]\n"
+                         "url = \"wss://sfu.example.com\"\n"
+                         "api_key = \"APIabc\"\n"
+                         "api_secret = \"shhh\"\n"
+                         "token_ttl = 999999\n");
+    EXPECT_TRUE(cfg.voice.livekit.configured());
+    EXPECT_EQ(cfg.voice.livekit.token_ttl, 999999);
 }
 
 // --- Voice handler tests (reaper, leave membership check, TURN credentials) ---
@@ -654,4 +743,372 @@ TEST(VoiceProtocol, EventTypeConstants) {
     EXPECT_EQ(event_type::kCallHangup, "m.call.hangup");
     EXPECT_EQ(event_type::kCallMember, "m.call.member");
     EXPECT_EQ(event_type::kRoomVoice, "m.room.voice");
+}
+
+// --- LiveKit join-token issuance -------------------------------------------
+//
+// The security-critical property here is that a token is only ever minted for
+// a channel the caller is allowed to SEE. A LiveKit token is a bearer
+// credential for an SFU room: whoever holds one can join that room and hear
+// everyone in it, entirely outside this server's reach. So the permission gate
+// has to hold on the issuing side — there is no second chance later.
+
+namespace {
+
+// Decodes the payload of a JWT without needing jwt-cpp (which is linked
+// PRIVATE into bsfchat_protocol and so is not visible to tests).
+json lk_payload(const std::string& token) {
+    auto first = token.find('.');
+    auto second = token.find('.', first + 1);
+    auto bytes = base64url_decode(token.substr(first + 1, second - first - 1));
+    return json::parse(std::string(bytes.begin(), bytes.end()));
+}
+
+ServerRole lk_role(const std::string& id, int position, permission::Flags flags) {
+    ServerRole r;
+    r.id = id;
+    r.name = id;
+    r.position = position;
+    r.permissions = flags;
+    return r;
+}
+
+constexpr const char* kLkSecret = "test-livekit-api-secret-do-not-log";
+
+} // namespace
+
+class LiveKitTokenTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        store = std::make_unique<SqliteStore>(":memory:");
+        store->initialize();
+        config = Config::defaults();
+        config.server_name = "test";
+        config.voice.enabled = true;
+        config.voice.livekit.url = "wss://sfu.test";
+        config.voice.livekit.api_key = "APItestkey";
+        config.voice.livekit.api_secret = kLkSecret;
+        config.voice.livekit.token_ttl = 600;
+
+        sync_engine = std::make_unique<SyncEngine>(*store, config);
+        handler = std::make_unique<VoiceHandler>(*store, *sync_engine, config);
+
+        seed_roles();
+        alice = add_user("alice");                                            // plain member
+        mod = add_user("mod", {std::string(permission::role_id::kModerator)}); // MANAGE_CHANNELS
+        outsider = add_user("outsider");                                      // not in the room
+
+        room = add_voice_channel(alice);
+        store->set_membership(room, mod, std::string(membership::kJoin));
+        store->set_membership(room, outsider, std::string(membership::kLeave));
+    }
+
+    // Deliberately gives @everyone only kEveryoneDefault (which includes
+    // kViewChannel) and moderator kManageChannels WITHOUT kAdministrator, so
+    // the gate is exercised on its own flag rather than on the god-mode
+    // short-circuit in PermissionsEngine::compute.
+    void seed_roles() {
+        ServerRolesContent content;
+        content.roles.push_back(lk_role(permission::role_id::kEveryone, 0,
+                                        permission::kEveryoneDefault));
+        content.roles.push_back(lk_role(permission::role_id::kModerator, 10,
+                                        permission::kEveryoneDefault |
+                                            permission::kManageChannels));
+        content.roles.push_back(lk_role(permission::role_id::kAdmin, 100, permission::kAllFlags));
+        json j;
+        to_json(j, content);
+        store->set_server_state(std::string(event_type::kServerRoles), "", "@server:test", j.dump());
+    }
+
+    std::string add_user(const std::string& localpart,
+                         const std::vector<std::string>& extra_roles = {}) {
+        std::string uid = "@" + localpart + ":test";
+        store->create_user(uid, hash_password("password", 10));
+        store->store_access_token("token-" + localpart, uid, "dev-" + localpart);
+
+        MemberRolesContent c;
+        c.role_ids = {std::string(permission::role_id::kEveryone)};
+        for (const auto& r : extra_roles) c.role_ids.push_back(r);
+        json j;
+        to_json(j, c);
+        store->set_server_state(std::string(event_type::kMemberRoles), uid, "@server:test", j.dump());
+        return uid;
+    }
+
+    std::string add_voice_channel(const std::string& creator, bool enabled = true) {
+        auto room_id = generate_room_id("test");
+        store->create_room(room_id, creator);
+        store->set_membership(room_id, creator, std::string(membership::kJoin));
+        store->insert_event(generate_event_id("test"), room_id, creator,
+                            std::string(event_type::kRoomVoice), std::string(""),
+                            json{{"enabled", enabled}, {"max_participants", 0}}.dump(), 1000);
+        return room_id;
+    }
+
+    void deny(const std::string& room_id, const std::string& target, permission::Flags flags) {
+        ChannelPermissionOverride ov;
+        ov.allow = 0;
+        ov.deny = flags;
+        json j;
+        to_json(j, ov);
+        store->insert_event(generate_event_id("test"), room_id, "@server:test",
+                            std::string(event_type::kChannelPermissions), target, j.dump(), 1002);
+    }
+
+    // Marks a user as an active m.call.member, i.e. currently in the channel.
+    void mark_in_voice(const std::string& room_id, const std::string& user_id) {
+        store->insert_event(generate_event_id("test"), room_id, user_id,
+                            std::string(event_type::kCallMember), user_id,
+                            json{{"active", true}, {"muted", false}, {"deafened", false},
+                                 {"device_id", ""}, {"joined_at", 1000}}.dump(), 1000);
+    }
+
+    bool is_active(const std::string& room_id, const std::string& user_id) {
+        auto ev = store->get_state_event(room_id, std::string(event_type::kCallMember), user_id);
+        return ev && ev->content.data.value("active", false);
+    }
+
+    // Old enough that a reap pass at "now" would expire it. Uses the real
+    // steady clock because the handler's own record_heartbeat() defaults to it.
+    static std::chrono::steady_clock::time_point stale_heartbeat_time() {
+        return std::chrono::steady_clock::now() - VoiceHandler::kHeartbeatTtl -
+               std::chrono::seconds(5);
+    }
+
+    static int status_of(const httplib::Response& res) { return res.status == -1 ? 200 : res.status; }
+
+    httplib::Response request(const std::string& room_id, const std::string& token,
+                              const std::string& body = "") {
+        httplib::Request req;
+        req.method = "POST";
+        req.path = "/_matrix/client/v3/rooms/" + room_id + "/voice/livekit_token";
+        if (!token.empty()) req.set_header("Authorization", "Bearer " + token);
+        req.body = body;
+        httplib::Response res;
+        handler->handle_livekit_token(req, res);
+        return res;
+    }
+
+    std::unique_ptr<SqliteStore> store;
+    Config config;
+    std::unique_ptr<SyncEngine> sync_engine;
+    std::unique_ptr<VoiceHandler> handler;
+    std::string alice, mod, outsider, room;
+};
+
+TEST_F(LiveKitTokenTest, IssuesTokenForPermittedMember) {
+    auto res = request(room, "token-alice");
+    ASSERT_EQ(status_of(res), 200) << res.body;
+
+    auto body = json::parse(res.body);
+    EXPECT_EQ(body.value("url", ""), "wss://sfu.test");
+    EXPECT_EQ(body.value("room", ""), VoiceHandler::livekit_room_name("test", room));
+    EXPECT_EQ(body.value("identity", ""), "@alice:test");
+    EXPECT_EQ(body.value("ttl", int64_t{0}), 600);
+    ASSERT_TRUE(body.contains("token"));
+
+    auto p = lk_payload(body["token"]);
+    EXPECT_EQ(p.value("iss", ""), "APItestkey");
+    EXPECT_EQ(p.value("sub", ""), "@alice:test");
+    EXPECT_EQ(p["video"].value("room", ""), body.value("room", ""));
+    EXPECT_TRUE(p["video"].value("roomJoin", false));
+    EXPECT_TRUE(p["video"].value("canPublish", false));
+    EXPECT_TRUE(p["video"].value("canSubscribe", false));
+    // Chat and signalling stay on Matrix; the SFU token is not a side-channel.
+    EXPECT_FALSE(p["video"].value("canPublishData", true));
+}
+
+// THE test. A per-channel deny of VIEW_CHANNEL must stop token issuance dead.
+TEST_F(LiveKitTokenTest, DeniedWhenViewChannelRevokedForUser) {
+    deny(room, "user:" + alice, permission::kViewChannel);
+
+    auto res = request(room, "token-alice");
+    EXPECT_EQ(status_of(res), 403);
+    // No token may leak in the error body.
+    EXPECT_EQ(res.body.find("token"), std::string::npos) << res.body;
+}
+
+// Same property via the @everyone channel override rather than a user override,
+// because those are two different code paths in PermissionsEngine.
+TEST_F(LiveKitTokenTest, DeniedWhenViewChannelRevokedForEveryone) {
+    deny(room, "role:" + std::string(permission::role_id::kEveryone), permission::kViewChannel);
+
+    EXPECT_EQ(status_of(request(room, "token-alice")), 403);
+    EXPECT_EQ(status_of(request(room, "token-mod")), 403);
+}
+
+// Revoking an unrelated permission must NOT block voice — otherwise the gate
+// is just "deny anything" and the test above proves nothing specific.
+TEST_F(LiveKitTokenTest, StillIssuedWhenAnUnrelatedPermissionIsRevoked) {
+    deny(room, "user:" + alice, permission::kSendMessages | permission::kAttachFiles);
+    EXPECT_EQ(status_of(request(room, "token-alice")), 200);
+}
+
+TEST_F(LiveKitTokenTest, DeniedForNonMemberOfTheRoom) {
+    auto res = request(room, "token-outsider");
+    EXPECT_EQ(status_of(res), 403);
+    EXPECT_EQ(res.body.find("token"), std::string::npos);
+}
+
+TEST_F(LiveKitTokenTest, RequiresAuthentication) {
+    EXPECT_EQ(status_of(request(room, "")), 401);
+    EXPECT_EQ(status_of(request(room, "not-a-real-token")), 401);
+}
+
+TEST_F(LiveKitTokenTest, NotFoundWhenLiveKitIsUnconfigured) {
+    config.voice.livekit = LiveKitConfig{};
+    auto res = request(room, "token-alice");
+    EXPECT_EQ(status_of(res), 404);
+    EXPECT_EQ(res.body.find("token"), std::string::npos);
+}
+
+// A half-filled config must behave exactly like no config: never mint a token
+// with a missing secret, and never report itself as available.
+TEST_F(LiveKitTokenTest, NotFoundWhenLiveKitIsPartiallyConfigured) {
+    config.voice.livekit.api_secret.clear();
+    EXPECT_EQ(status_of(request(room, "token-alice")), 404);
+
+    config.voice.livekit.api_secret = kLkSecret;
+    config.voice.livekit.api_key.clear();
+    EXPECT_EQ(status_of(request(room, "token-alice")), 404);
+
+    config.voice.livekit.api_key = "APItestkey";
+    config.voice.livekit.url.clear();
+    EXPECT_EQ(status_of(request(room, "token-alice")), 404);
+}
+
+TEST_F(LiveKitTokenTest, NotFoundWhenVoiceIsGloballyDisabled) {
+    config.voice.enabled = false;
+    EXPECT_EQ(status_of(request(room, "token-alice")), 404);
+}
+
+TEST_F(LiveKitTokenTest, DeniedWhenChannelIsNotVoiceCapable) {
+    auto text_room = generate_room_id("test");
+    store->create_room(text_room, alice);
+    store->set_membership(text_room, alice, std::string(membership::kJoin));
+
+    auto res = request(text_room, "token-alice");
+    EXPECT_EQ(status_of(res), 403);
+    EXPECT_EQ(res.body.find("token"), std::string::npos);
+}
+
+TEST_F(LiveKitTokenTest, DeniedWhenVoiceIsDisabledInTheChannel) {
+    auto off = add_voice_channel(alice, /*enabled=*/false);
+    EXPECT_EQ(status_of(request(off, "token-alice")), 403);
+}
+
+// roomAdmin is what lets a client drive LiveKit-side moderation (server mute,
+// removing a participant), so it must track a real permission rather than
+// being handed to everyone.
+TEST_F(LiveKitTokenTest, RoomAdminGrantFollowsManageChannels) {
+    auto plain = lk_payload(json::parse(request(room, "token-alice").body)["token"]);
+    EXPECT_FALSE(plain["video"].value("roomAdmin", true));
+
+    auto moderator = lk_payload(json::parse(request(room, "token-mod").body)["token"]);
+    EXPECT_TRUE(moderator["video"].value("roomAdmin", false));
+}
+
+// LiveKit treats one identity as one participant and disconnects the older
+// connection, so a second device must not evict the first.
+TEST_F(LiveKitTokenTest, IdentityIsScopedToTheDeviceWhenSupplied) {
+    auto res = request(room, "token-alice", json{{"device_id", "DEV1"}}.dump());
+    ASSERT_EQ(status_of(res), 200);
+    auto body = json::parse(res.body);
+    EXPECT_EQ(body.value("identity", ""), "@alice:test|DEV1");
+    EXPECT_EQ(lk_payload(body["token"]).value("sub", ""), "@alice:test|DEV1");
+
+    auto other = json::parse(request(room, "token-alice", json{{"device_id", "DEV2"}}.dump()).body);
+    EXPECT_NE(body.value("identity", ""), other.value("identity", ""));
+}
+
+// '|' is the user/device delimiter, so it must not survive from a
+// client-supplied device_id — otherwise a device_id could forge an identity
+// that parses as a different user.
+TEST_F(LiveKitTokenTest, DeviceIdCannotForgeAnotherIdentity) {
+    auto body = json::parse(
+        request(room, "token-alice", json{{"device_id", "x|@mod:test"}}.dump()).body);
+    EXPECT_EQ(body.value("identity", ""), "@alice:test|x_@mod:test");
+    // The user part is still unambiguously alice.
+    const std::string identity = body.value("identity", "");
+    EXPECT_EQ(identity.substr(0, identity.find('|')), "@alice:test");
+}
+
+TEST_F(LiveKitTokenTest, MalformedBodyIsToleratedAsNoDeviceId) {
+    auto res = request(room, "token-alice", "{not json");
+    ASSERT_EQ(status_of(res), 200);
+    EXPECT_EQ(json::parse(res.body).value("identity", ""), "@alice:test");
+}
+
+// Distinct channels must never share one SFU room, and the mapping must be
+// stable across calls or participants would land in different rooms.
+TEST_F(LiveKitTokenTest, SfuRoomNameIsStableAndPerChannel) {
+    auto second = add_voice_channel(alice);
+
+    auto a1 = json::parse(request(room, "token-alice").body).value("room", "");
+    auto a2 = json::parse(request(room, "token-mod").body).value("room", "");
+    auto b1 = json::parse(request(second, "token-alice").body).value("room", "");
+
+    EXPECT_EQ(a1, a2);
+    EXPECT_NE(a1, b1);
+    EXPECT_TRUE(a1.starts_with("bsfchat-"));
+    // The raw Matrix room id must not appear verbatim — the name is a digest.
+    EXPECT_EQ(a1.find(room), std::string::npos);
+}
+
+TEST_F(LiveKitTokenTest, SfuRoomNameIsScopedToTheServerName) {
+    EXPECT_NE(VoiceHandler::livekit_room_name("a.example", "!r:a.example"),
+              VoiceHandler::livekit_room_name("b.example", "!r:a.example"));
+    // And the two fields cannot be confused for one another.
+    EXPECT_NE(VoiceHandler::livekit_room_name("a", "b!c"),
+              VoiceHandler::livekit_room_name("a!b", "c"));
+}
+
+TEST_F(LiveKitTokenTest, ApiSecretNeverReachesTheClient) {
+    auto res = request(room, "token-alice");
+    ASSERT_EQ(status_of(res), 200);
+    EXPECT_EQ(res.body.find(kLkSecret), std::string::npos);
+    // Nor inside the token's own claims.
+    EXPECT_EQ(lk_payload(json::parse(res.body)["token"]).dump().find(kLkSecret),
+              std::string::npos);
+}
+
+// A client that joins over LiveKit renews its token instead of calling
+// voice/join repeatedly; without a heartbeat here the reaper would mark it a
+// ghost mid-call.
+//
+// This pair has to be read together. The assertion "nothing was reaped" is
+// only meaningful next to a control showing the same stale heartbeat IS reaped
+// when no token is requested — otherwise the test passes whether or not the
+// handler records anything. (It did exactly that in its first form, and a
+// mutation removing record_heartbeat went undetected.)
+TEST_F(LiveKitTokenTest, TokenRequestCountsAsALivenessHeartbeat) {
+    mark_in_voice(room, alice);
+    handler->record_heartbeat(room, alice, stale_heartbeat_time());
+
+    ASSERT_EQ(status_of(request(room, "token-alice")), 200);
+
+    // The request must have refreshed the heartbeat to ~now.
+    EXPECT_EQ(handler->reap_stale_members(), 0u);
+    EXPECT_TRUE(is_active(room, alice));
+}
+
+TEST_F(LiveKitTokenTest, ControlStaleMemberIsReapedWithoutATokenRequest) {
+    mark_in_voice(room, alice);
+    handler->record_heartbeat(room, alice, stale_heartbeat_time());
+
+    EXPECT_EQ(handler->reap_stale_members(), 1u);
+    EXPECT_FALSE(is_active(room, alice));
+}
+
+TEST_F(LiveKitTokenTest, TokenTtlIsClampedAndReportedConsistently) {
+    config.voice.livekit.token_ttl = 5; // below the floor
+    auto res = request(room, "token-alice");
+    ASSERT_EQ(status_of(res), 200);
+    auto body = json::parse(res.body);
+    EXPECT_EQ(body.value("ttl", int64_t{0}), kLiveKitMinTtl);
+
+    auto p = lk_payload(body["token"]);
+    // The advertised ttl must match the token's actual lifetime, or a client
+    // renewing on schedule would still be refused at reconnect.
+    EXPECT_EQ(p.value("exp", int64_t{0}) - p.value("nbf", int64_t{0}), kLiveKitMinTtl);
 }

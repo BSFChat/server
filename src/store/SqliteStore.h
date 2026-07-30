@@ -475,6 +475,17 @@ public:
     std::optional<std::string> get_display_name(const std::string& user_id);
     std::optional<std::string> get_avatar_url(const std::string& user_id);
 
+    // Per-server nickname (schema v14). Authoritative storage: room state only
+    // ever mirrors this, because four separate code paths rewrite a member
+    // event's displayname from the profile and would otherwise clobber it.
+    //
+    // nullopt CLEARS the nickname, and reading it back returns nullopt — which is
+    // not the same as an empty string, so a cleared nickname is distinguishable
+    // from one that was never set only in that both are absent. That is
+    // deliberate: "no nickname" has exactly one representation.
+    void set_nickname(const std::string& user_id, const std::optional<std::string>& nickname);
+    std::optional<std::string> get_nickname(const std::string& user_id);
+
     // Media
     struct MediaMeta {
         std::string media_id;

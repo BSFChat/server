@@ -18,6 +18,15 @@ public:
     void handle_get_avatar_url(const httplib::Request& req, httplib::Response& res);
     void handle_put_avatar_url(const httplib::Request& req, httplib::Response& res);
 
+    // Per-server nickname. Unlike displayname/avatar_url, which are strictly
+    // self-service, this endpoint accepts a target other than the caller —
+    // setting your own needs CHANGE_NICKNAME, setting anybody else's needs
+    // MANAGE_NICKNAMES plus the same rank check kick and ban apply. Both are
+    // evaluated at SERVER scope: a nickname is one value for the whole server, so
+    // a per-channel override must not be able to grant it.
+    void handle_get_nickname(const httplib::Request& req, httplib::Response& res);
+    void handle_put_nickname(const httplib::Request& req, httplib::Response& res);
+
 private:
     // Re-emit m.room.member in every joined room with the updated
     // displayname/avatar so all connected clients see the change.

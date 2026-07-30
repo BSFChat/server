@@ -1,6 +1,10 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 
+// For kLiveKitMinTtl/kLiveKitMaxTtl — validate() warns using the same bounds
+// the signer clamps to, so the two can't drift apart.
+#include <bsfchat/JwtUtils.h>
+
 #include <toml++/toml.hpp>
 #include <stdexcept>
 
@@ -88,6 +92,16 @@ Config Config::load(const std::string& path) {
             if (auto v = voice->get("turn_ttl")) cfg.voice.turn_ttl = v->value_or(cfg.voice.turn_ttl);
             if (auto v = voice->get("stun_uri")) cfg.voice.stun_uri = v->value_or(cfg.voice.stun_uri);
             if (auto v = voice->get("allow_peer_to_peer")) cfg.voice.allow_peer_to_peer = v->value_or(cfg.voice.allow_peer_to_peer);
+
+            // [voice.livekit] — SFU credentials. Sub-table, same shape as
+            // [storage.s3] above. Flat `livekit_url` style keys are NOT
+            // read: keep one convention.
+            if (auto lk = (*voice)["livekit"].as_table()) {
+                if (auto v = lk->get("url")) cfg.voice.livekit.url = v->value_or(cfg.voice.livekit.url);
+                if (auto v = lk->get("api_key")) cfg.voice.livekit.api_key = v->value_or(cfg.voice.livekit.api_key);
+                if (auto v = lk->get("api_secret")) cfg.voice.livekit.api_secret = v->value_or(cfg.voice.livekit.api_secret);
+                if (auto v = lk->get("token_ttl")) cfg.voice.livekit.token_ttl = v->value_or(cfg.voice.livekit.token_ttl);
+            }
         }
 
         // [push]. No provider credentials here on purpose — see PushConfig.
@@ -155,6 +169,35 @@ void Config::validate(Config& cfg) {
             log->warn("voice.enabled is true but neither voice.stun_uri nor voice.turn_uri is "
                       "set — calls will only connect between clients on the same local network. "
                       "Set voice.stun_uri for NAT traversal.");
+        }
+
+        // LiveKit SFU. Partial config is the dangerous case: a deployment that
+        // sets the URL and forgets the secret would otherwise look configured
+        // to an operator while silently serving mesh voice forever.
+        //
+        // Every message below names only KEYS, never values — api_secret must
+        // not reach the log at any level.
+        auto& lk = cfg.voice.livekit;
+        const bool any_lk = !lk.url.empty() || !lk.api_key.empty() || !lk.api_secret.empty();
+        if (any_lk && !lk.configured()) {
+            log->warn("voice.livekit is partially configured — url={}, api_key={}, api_secret={}. "
+                      "All three are required; ignoring the LiveKit config and using "
+                      "peer-to-peer mesh voice.",
+                      lk.url.empty() ? "missing" : "set",
+                      lk.api_key.empty() ? "missing" : "set",
+                      lk.api_secret.empty() ? "missing" : "set");
+        }
+        if (lk.configured()) {
+            if (lk.token_ttl < kLiveKitMinTtl || lk.token_ttl > kLiveKitMaxTtl) {
+                log->warn("voice.livekit.token_ttl = {}s is outside [{}, {}] and will be clamped "
+                          "when tokens are minted.", lk.token_ttl, kLiveKitMinTtl, kLiveKitMaxTtl);
+            }
+            // A ws:// SFU URL means join tokens — bearer credentials — cross
+            // the network in the clear.
+            if (lk.url.rfind("ws://", 0) == 0) {
+                log->warn("voice.livekit.url uses ws:// (no TLS). Join tokens are bearer "
+                          "credentials; use wss:// for anything but a loopback test.");
+            }
         }
     }
 

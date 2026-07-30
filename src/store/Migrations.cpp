@@ -795,6 +795,35 @@ void migrate_v13(sqlite3* db, bool /*fresh_database*/) {
     // starts recording from the moment it restarts.
 }
 
+// v14: per-server nickname.
+//
+// CHANGE_NICKNAME (bit 11) and MANAGE_NICKNAMES (bit 12) had existed as
+// permission flags since roles were introduced, and CHANGE_NICKNAME has always
+// been part of kEveryoneDefault, so the bit is set in stored role bitfields on
+// every deployment — but nothing anywhere read either flag, because there was no
+// nickname to change. This column is what makes them mean something.
+//
+// Why a column and not the m.room.member `displayname` it will be mirrored into:
+// that field is already REWRITTEN from the global profile by four independent
+// code paths (ProfileHandler::broadcastMemberUpdate, the creator join in
+// handle_create_room, the self-membership branch of handle_set_state, and
+// AutoJoin's force-join). Room state is therefore a cache of the profile, not a
+// place to keep authority — a nickname stored only there would be silently
+// reverted the next time the user changed their avatar or a new channel
+// force-joined them. One authoritative row per user, mirrored outward, is the
+// shape that survives all four.
+//
+// NULL means "no nickname" and is distinct from '': the API accepts an empty
+// string as the instruction to CLEAR a nickname, so the two must not collide.
+void migrate_v14(sqlite3* db, bool /*fresh_database*/) {
+    // ALTER TABLE ADD COLUMN is the whole migration; existing rows get NULL,
+    // which is exactly "this user has no nickname". No backfill: a nickname
+    // nobody has ever set has no prior value to recover.
+    if (!column_exists(db, "users", "nickname")) {
+        exec(db, "ALTER TABLE users ADD COLUMN nickname TEXT");
+    }
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -812,6 +841,7 @@ const std::vector<Step>& steps() {
         migrate_v11,
         migrate_v12,
         migrate_v13,
+        migrate_v14,
     };
     return kMigrations;
 }
