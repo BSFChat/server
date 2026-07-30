@@ -816,62 +816,105 @@ int64_t SqliteStore::insert_event(const std::string& event_id, const std::string
                                    const std::string& content_json, int64_t origin_server_ts) {
     std::lock_guard lock(mutex_);
 
-    // Monotonic — deriving this from MAX(stream_position) + 1 meant that
-    // deleting a room's newest events made positions get reused, and clients
-    // holding a sync token at or above a reused position silently stopped
-    // receiving anything.
-    int64_t stream_pos = claim_stream_position_locked();
-
-    // `replaces` is derived here rather than passed in, so no caller can forget
-    // to set it and quietly reintroduce "an edit counts as a new message". It is
-    // an immutable property of the event's own content.
-    std::optional<std::string> replaces;
-    if (event_type == std::string(event_type::kRoomMessage)) {
-        replaces = replacement_target(content_json);
-    }
-
-    auto stmt = prepare(db_,
-        "INSERT INTO events (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, stream_position, replaces) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
-    sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 3, sender.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 4, event_type.c_str(), -1, SQLITE_TRANSIENT);
-    if (state_key) {
-        sqlite3_bind_text(stmt.get(), 5, state_key->c_str(), -1, SQLITE_TRANSIENT);
-    } else {
-        sqlite3_bind_null(stmt.get(), 5);
-    }
-    sqlite3_bind_text(stmt.get(), 6, content_json.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt.get(), 7, origin_server_ts);
-    sqlite3_bind_int64(stmt.get(), 8, stream_pos);
-    if (replaces) {
-        sqlite3_bind_text(stmt.get(), 9, replaces->c_str(), -1, SQLITE_TRANSIENT);
-    } else {
-        sqlite3_bind_null(stmt.get(), 9);
-    }
-
-    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
-        throw std::runtime_error(std::string("Failed to insert event: ") + sqlite3_errmsg(db_));
-    }
-
-    // Search index. Derived here rather than by the caller for the same reason
-    // `replaces` is: insert_event is the one place every event passes through, so
-    // an index maintained here cannot be bypassed by a new call site.
+    // ONE TRANSACTION over the event row, the stream-position head and the search
+    // index. These are three writes that must not be observable apart.
     //
-    // A replacement is deliberately NOT indexed as itself — apply_edit folds its
-    // text onto the event it replaces, so an edited message stays a single search
-    // hit whose text is current.
-    if (event_type == std::string(event_type::kRoomMessage) && !replaces) {
-        auto content = nlohmann::json::parse(content_json, nullptr, false);
-        std::string body;
-        if (!content.is_discarded() && content.is_object()) body = content.value("body", "");
-        if (!body.empty()) {
-            reindex_search_locked(event_id, room_id, sender, stream_pos, body);
-        }
-    }
+    // The failure this closes: the events INSERT succeeded, then the FTS5 index
+    // write threw (a prepare failure, a constraint, a disk error), and the caller
+    // saw an exception — but the event row was already committed. The message was
+    // in the timeline and permanently invisible to /search, with nothing to notice
+    // it and no reindex path to repair it. Small window, local writes only, but the
+    // damage is silent and permanent, which is the combination worth a transaction.
+    //
+    // Same shape as delete_room: BEGIN IMMEDIATE / COMMIT / ROLLBACK, taken under
+    // the store's global mutex that is already held. IMMEDIATE (not DEFERRED)
+    // because this transaction writes and would otherwise only take the write lock
+    // on first write, turning a busy database into a mid-transaction SQLITE_BUSY.
+    //
+    // Nothing between BEGIN and COMMIT blocks on I/O beyond the local SQLite file:
+    // a stream-position claim, one INSERT, a JSON parse of content already in
+    // memory, and the index write. No network, no filesystem outside the database,
+    // no callback into a handler — so holding the mutex here is no longer than the
+    // uninstrumented version already did.
+    exec("BEGIN IMMEDIATE");
+    try {
+        // Monotonic — deriving this from MAX(stream_position) + 1 meant that
+        // deleting a room's newest events made positions get reused, and clients
+        // holding a sync token at or above a reused position silently stopped
+        // receiving anything.
+        //
+        // Inside the transaction, so a rollback also undoes the persisted head.
+        // The in-memory next_stream_position_ is deliberately NOT rewound: a gap
+        // in the sequence is harmless (positions only ever need to increase),
+        // whereas rewinding could hand the same position out twice, which is the
+        // exact defect v4 exists to fix.
+        const int64_t stream_pos = claim_stream_position_locked();
 
-    return stream_pos;
+        // `replaces` is derived here rather than passed in, so no caller can
+        // forget to set it and quietly reintroduce "an edit counts as a new
+        // message". It is an immutable property of the event's own content.
+        std::optional<std::string> replaces;
+        if (event_type == std::string(event_type::kRoomMessage)) {
+            replaces = replacement_target(content_json);
+        }
+
+        auto stmt = prepare(db_,
+            "INSERT INTO events (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, stream_position, replaces) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 3, sender.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 4, event_type.c_str(), -1, SQLITE_TRANSIENT);
+        if (state_key) {
+            sqlite3_bind_text(stmt.get(), 5, state_key->c_str(), -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt.get(), 5);
+        }
+        sqlite3_bind_text(stmt.get(), 6, content_json.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt.get(), 7, origin_server_ts);
+        sqlite3_bind_int64(stmt.get(), 8, stream_pos);
+        if (replaces) {
+            sqlite3_bind_text(stmt.get(), 9, replaces->c_str(), -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt.get(), 9);
+        }
+
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            throw std::runtime_error(std::string("Failed to insert event: ") +
+                                     sqlite3_errmsg(db_));
+        }
+
+        // Search index. Derived here rather than by the caller for the same reason
+        // `replaces` is: insert_event is the one place every event passes through,
+        // so an index maintained here cannot be bypassed by a new call site.
+        //
+        // A replacement is deliberately NOT indexed as itself — apply_edit folds
+        // its text onto the event it replaces, so an edited message stays a single
+        // search hit whose text is current.
+        if (event_type == std::string(event_type::kRoomMessage) && !replaces) {
+            auto content = nlohmann::json::parse(content_json, nullptr, false);
+            std::string body;
+            if (!content.is_discarded() && content.is_object()) {
+                body = content.value("body", "");
+            }
+            if (!body.empty()) {
+                reindex_search_locked(event_id, room_id, sender, stream_pos, body);
+            }
+        }
+
+        exec("COMMIT");
+        return stream_pos;
+    } catch (...) {
+        // Best-effort rollback: some SQLite errors (SQLITE_FULL, SQLITE_IOERR)
+        // roll the transaction back themselves, and a ROLLBACK that then fails
+        // with "no transaction is active" must not replace the real exception
+        // with a misleading one. Either way the transaction is not left open.
+        try {
+            exec("ROLLBACK");
+        } catch (...) {
+        }
+        throw;
+    }
 }
 
 std::pair<std::vector<RoomEvent>, std::optional<int64_t>>
@@ -2098,23 +2141,87 @@ int64_t SqliteStore::append_audit_record(const AuditRecord& record) {
     return sqlite3_last_insert_rowid(db_);
 }
 
+namespace {
+
+// The WHERE clause for an audit filter, and the values to bind to it in the same
+// order. Built once and reused by the page query and the matching-count query, so
+// the two can never disagree about what "matching" means.
+//
+// The `<> ''` guards on the target columns are not redundant belt-and-braces: the
+// v16 indexes on those columns are PARTIAL (WHERE target_user <> ''), and SQLite
+// will only use a partial index when the statement itself implies the index's
+// condition. A bound `target_user = ?` does not prove `? <> ''`, so without the
+// literal guard the planner falls back to a full table scan. Verified with
+// EXPLAIN QUERY PLAN both ways.
+SqliteStore::AuditQuery build_audit_where(const SqliteStore::AuditFilter& filter) {
+    SqliteStore::AuditQuery out;
+    std::vector<std::string> clauses;
+    const auto add = [&](const std::optional<std::string>& value, const char* column,
+                         bool partial_index) {
+        if (!value) return;
+        std::string clause = std::string(column) + " = ?";
+        if (partial_index) clause += " AND " + std::string(column) + " <> ''";
+        clauses.push_back(std::move(clause));
+        out.binds.push_back(*value);
+    };
+    add(filter.actor, "actor", false);
+    add(filter.action, "action", false);
+    add(filter.target_user, "target_user", true);
+    add(filter.target_room, "target_room", true);
+
+    for (size_t i = 0; i < clauses.size(); ++i) {
+        out.sql += (i == 0 ? " " : " AND ") + clauses[i];
+    }
+    return out;
+}
+
+} // namespace
+
+SqliteStore::AuditQuery SqliteStore::audit_page_query(const AuditFilter& filter,
+                                                      bool with_cursor) {
+    auto where = build_audit_where(filter);
+
+    // Over-fetch one row to learn whether a further page exists without a second
+    // query — the same trick get_room_events_paginated uses. (The caller binds
+    // limit + 1 to the trailing LIMIT parameter.)
+    //
+    // The cursor stays an id predicate whether or not a filter is present, which
+    // is what keeps pagination stable: ids come from an AUTOINCREMENT rowid, so a
+    // concurrent insert always lands ABOVE any cursor a reader is holding and can
+    // neither duplicate nor hide a record on a later page.
+    std::string sql =
+        "SELECT id, created_at, actor, action, target_user, target_room, target_key, "
+        "       reason, before_json, after_json FROM audit_log ";
+    std::string conditions = where.sql;
+    if (with_cursor) conditions += (conditions.empty() ? " " : " AND ") + std::string("id < ?");
+    if (!conditions.empty()) sql += "WHERE" + conditions + " ";
+    sql += "ORDER BY id DESC LIMIT ?";
+
+    where.sql = std::move(sql);
+    return where;
+}
+
+SqliteStore::AuditQuery SqliteStore::audit_match_count_query(const AuditFilter& filter) {
+    auto where = build_audit_where(filter);
+    where.sql = "SELECT COUNT(*) FROM audit_log" +
+                (where.sql.empty() ? std::string() : " WHERE" + where.sql);
+    return where;
+}
+
 SqliteStore::AuditPage SqliteStore::list_audit_records(int limit,
-                                                       std::optional<int64_t> before_id) {
+                                                       std::optional<int64_t> before_id,
+                                                       const AuditFilter& filter) {
     std::lock_guard lock(mutex_);
     if (limit < 1) limit = 1;
 
     AuditPage page;
+    const auto query = audit_page_query(filter, before_id.has_value());
 
-    // Over-fetch one row to learn whether a further page exists without a second
-    // query — the same trick get_room_events_paginated uses.
-    std::string sql =
-        "SELECT id, created_at, actor, action, target_user, target_room, target_key, "
-        "       reason, before_json, after_json FROM audit_log ";
-    if (before_id) sql += "WHERE id < ? ";
-    sql += "ORDER BY id DESC LIMIT ?";
-
-    auto stmt = prepare(db_, sql);
+    auto stmt = prepare(db_, query.sql);
     int bind_index = 1;
+    for (const auto& value : query.binds) {
+        sqlite3_bind_text(stmt.get(), bind_index++, value.c_str(), -1, SQLITE_TRANSIENT);
+    }
     if (before_id) sqlite3_bind_int64(stmt.get(), bind_index++, *before_id);
     sqlite3_bind_int(stmt.get(), bind_index, limit + 1);
 
@@ -2142,10 +2249,30 @@ SqliteStore::AuditPage SqliteStore::list_audit_records(int limit,
 
     // Growth visibility. Unbounded retention is a decision, not an oversight, so
     // the number an operator would need in order to revisit it is in every
-    // response rather than only in the database.
+    // response rather than only in the database. This stays WHOLE-TABLE even when
+    // a filter is applied — a reader who filtered must not come away with a
+    // smaller idea of how big the log is.
     auto count = prepare(db_, "SELECT COUNT(*) FROM audit_log");
     if (sqlite3_step(count.get()) == SQLITE_ROW) {
         page.total = sqlite3_column_int64(count.get(), 0);
+    }
+
+    // How many records the filter matches, in total, across all pages. Only for a
+    // filtered request: unfiltered it would just repeat `total`, and it costs a
+    // second query. Served by the same index as the page itself, so it is a walk
+    // of the matching key run rather than a table scan. Deliberately ignores
+    // `before_id`: it describes the whole result set, not the tail after a cursor,
+    // which is what makes it useful on page three.
+    if (filter.any()) {
+        const auto count_query = audit_match_count_query(filter);
+        auto matching = prepare(db_, count_query.sql);
+        int idx = 1;
+        for (const auto& value : count_query.binds) {
+            sqlite3_bind_text(matching.get(), idx++, value.c_str(), -1, SQLITE_TRANSIENT);
+        }
+        if (sqlite3_step(matching.get()) == SQLITE_ROW) {
+            page.matching = sqlite3_column_int64(matching.get(), 0);
+        }
     }
     return page;
 }

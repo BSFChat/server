@@ -85,6 +85,36 @@ void AuditHandler::handle_get_audit_log(const httplib::Request& req, httplib::Re
         }
     }
 
+    // Filters. Each is an exact match; see SqliteStore::AuditFilter for why there
+    // is no prefix or substring matching.
+    //
+    // An EMPTY value is a 400 rather than a silently-ignored filter, for the same
+    // reason a malformed cursor is (below): a reader who believes they filtered
+    // the log to one moderator, and is actually looking at everything, draws
+    // conclusions from a page that does not mean what they think it means. On an
+    // audit log that is the expensive failure. '' is also this schema's "not
+    // applicable" sentinel, so it is not a value anybody can meaningfully ask for.
+    SqliteStore::AuditFilter filter;
+    struct FilterParam {
+        const char* name;
+        std::optional<std::string>* out;
+    };
+    const FilterParam filter_params[] = {
+        {"actor", &filter.actor},
+        {"target_user", &filter.target_user},
+        {"target_room", &filter.target_room},
+        {"action", &filter.action},
+    };
+    for (const auto& p : filter_params) {
+        if (!req.has_param(p.name)) continue;
+        auto value = req.get_param_value(p.name);
+        if (value.empty()) {
+            return send_error(res, 400, MatrixError::invalid_param(
+                std::string(p.name) + " must not be empty"));
+        }
+        *p.out = std::move(value);
+    }
+
     std::optional<int64_t> before_id;
     if (req.has_param("from")) {
         // Rejected rather than silently ignored. A malformed cursor treated as
@@ -101,18 +131,22 @@ void AuditHandler::handle_get_audit_log(const httplib::Request& req, httplib::Re
         }
     }
 
-    auto page = store_.list_audit_records(limit, before_id);
+    auto page = store_.list_audit_records(limit, before_id, filter);
 
     json records = json::array();
     for (const auto& record : page.records) records.push_back(record_to_json(record));
 
     json out = {
         {"records", std::move(records)},
-        // Total rows in the table. Retention is deliberately unbounded (see
-        // SqliteStore::append_audit_record), so the number an operator would need
-        // in order to revisit that decision is surfaced rather than buried.
+        // Total rows in the table — whole-table even under a filter. Retention is
+        // deliberately unbounded (see SqliteStore::append_audit_record), so the
+        // number an operator would need in order to revisit that decision is
+        // surfaced rather than buried, and filtering must not shrink it.
         {"total", page.total},
     };
+    // Rows matching the filter, across all pages. Present only when a filter was
+    // applied, so `total == matching` is never a confusing tautology.
+    if (page.matching) out["matching"] = *page.matching;
     if (page.next_from) out["next_from"] = *page.next_from;
 
     res.set_content(out.dump(), "application/json");

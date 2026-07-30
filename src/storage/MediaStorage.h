@@ -26,9 +26,20 @@ public:
 
     /// Download file data. Returns {data, content_type} or nullopt if not found.
     ///
-    /// NOTE: this materialises the entire object. handle_download deliberately
-    /// does NOT use it — see stat() + download_range() below. Prefer those for
-    /// anything that might be large.
+    /// NO PRODUCTION CALLER, DELIBERATELY. Nothing under src/ calls this. It
+    /// materialises the ENTIRE object into one std::string, so serving a 50 MB
+    /// upload through it costs 50 MB of resident memory per concurrent request —
+    /// which is exactly the defect handle_download was rewritten to remove. That
+    /// path now uses stat() + download_range() below, and the range tests assert
+    /// `whole_object_reads == 0` against a storage double.
+    ///
+    /// It survives on the interface as a REGRESSION TRIPWIRE rather than as a
+    /// facility: CountingStorage (tests/test_media.cpp) overrides it purely to
+    /// count, so if handle_download ever reaches for it again the range tests go
+    /// red immediately and name the reason. Deleting it would delete that alarm.
+    ///
+    /// So: a new call site in src/ is a bug, not a shortcut. If you want the whole
+    /// object, you want a loop over download_range() with one reused buffer.
     virtual std::optional<std::tuple<std::string, std::string>> download(const std::string& media_id) = 0;
 
     /// Object metadata without the body. nullopt if the object is not found.

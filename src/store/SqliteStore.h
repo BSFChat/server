@@ -499,18 +499,70 @@ public:
     // a config key that quietly does it on a timer.
     int64_t append_audit_record(const AuditRecord& record);
 
+    // Filters for list_audit_records. Every field is an EXACT match; there is no
+    // prefix or substring matching, deliberately. An investigator has the exact
+    // user id, room id or action name in front of them (the log itself is where
+    // they came from), and a LIKE '%…%' would be both unindexable and a way to
+    // accidentally match a different account whose id contains another's.
+    //
+    // A set field must be non-empty. '' is this schema's "not applicable"
+    // sentinel, so filtering for it would mean "records with no user target",
+    // which is not a question anybody investigating an incident asks — and the
+    // partial indexes v16 installs deliberately do not cover those rows.
+    // Callers reject an empty value rather than passing it through; see
+    // AuditHandler, which 400s instead of silently ignoring it.
+    struct AuditFilter {
+        std::optional<std::string> actor;
+        std::optional<std::string> target_user;
+        std::optional<std::string> target_room;
+        std::optional<std::string> action;
+
+        bool any() const {
+            return actor || target_user || target_room || action;
+        }
+    };
+
     struct AuditPage {
         std::vector<AuditRecord> records;  // newest first
         // Cursor for the following page: pass it back as `before_id` to get
         // records strictly older than the last one returned here. Absent when
         // this page reached the end of the table.
+        //
+        // The cursor is an id, NOT an offset, and that is what keeps it correct
+        // under a filter: "the matching records older than id N" is a stable set
+        // no matter how many rows (matching or not) land while the reader pages.
+        // An OFFSET-based cursor would skip a record every time a new one landed.
         std::optional<int64_t> next_from;
         int64_t total = 0;                 // rows in the table, for growth visibility
+        // Rows matching the filter. Absent when no filter was applied, where it
+        // would just repeat `total`. `total` deliberately stays whole-table: it
+        // exists so an operator can see the log growing under unbounded retention
+        // (see append_audit_record), and a filtered request must not make that
+        // number look smaller than it is.
+        std::optional<int64_t> matching;
     };
 
     // Newest-first page of at most `limit` records, restricted to ids strictly
-    // below `before_id` when one is given.
-    AuditPage list_audit_records(int limit, std::optional<int64_t> before_id);
+    // below `before_id` when one is given and to rows matching `filter`.
+    AuditPage list_audit_records(int limit, std::optional<int64_t> before_id,
+                                 const AuditFilter& filter = {});
+
+    // The exact statements list_audit_records() runs, and the filter values bound
+    // to them in order (the trailing cursor / limit parameters are bound by the
+    // caller after these).
+    //
+    // Public because whether the v16 indexes are USED is invisible in the results:
+    // an unindexed full scan returns byte-identical rows. The only way to assert
+    // it is EXPLAIN QUERY PLAN, and a test that EXPLAINs a hand-copied lookalike
+    // asserts nothing about this file. So the builder is the seam, and the test
+    // plans the real statement. In particular the `<> ''` guards that make the
+    // partial indexes usable live here and nowhere else.
+    struct AuditQuery {
+        std::string sql;
+        std::vector<std::string> binds;
+    };
+    static AuditQuery audit_page_query(const AuditFilter& filter, bool with_cursor);
+    static AuditQuery audit_match_count_query(const AuditFilter& filter);
 
     // Profile
     void set_display_name(const std::string& user_id, const std::string& display_name);

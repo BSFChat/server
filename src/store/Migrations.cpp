@@ -770,6 +770,8 @@ void migrate_v13(sqlite3* db, bool /*fresh_database*/) {
     // id, which the rowid primary key already serves optimally, and this table is
     // on the write path of every moderation action — an index that no query uses
     // is pure write cost. Add one alongside the filter that needs it, not before.
+    // (v16 does exactly that, when actor/target/action filters arrived. This step
+    // is left alone: an already-migrated deployment has run it.)
 
     exec(db, R"(
         CREATE TRIGGER IF NOT EXISTS audit_log_is_append_only_update
@@ -880,6 +882,72 @@ void migrate_v15(sqlite3* db, bool /*fresh_database*/) {
     )");
 }
 
+// v16: the indexes the audit-log filters need, and nothing more.
+//
+// v13 deliberately created NO secondary index on audit_log: the only query was
+// "newest first by id", which the rowid primary key already serves optimally, and
+// this table sits on the write path of every moderation action. That comment ended
+// "add one alongside the filter that needs it, not before". This is that moment —
+// GET /audit_log now filters by actor, target user, target room and action.
+//
+// One index per exposed filter, no composite indexes. A composite would only pay
+// off for one particular AND-combination and cost a write on every insert
+// regardless; with four single-column indexes SQLite picks the most selective one
+// and evaluates the rest as a residual test over the (already tiny) matching run,
+// which is the right trade for a table measured in tens of rows a day.
+//
+// WRITE COST, per appended audit record (measured against the shape of the
+// queries in SqliteStore::list_audit_records):
+//   * idx_audit_log_actor   — one b-tree insert on EVERY record. `actor` is never
+//                             empty (an audited action always has an authenticated
+//                             performer), so this index is as tall as the table.
+//   * idx_audit_log_action  — one b-tree insert on EVERY record, same reasoning.
+//                             Low cardinality (~13 action names), so the index is
+//                             a handful of long key runs; still worth it, because
+//                             "show me every ban" otherwise scans the whole table
+//                             to fill one page.
+//   * idx_audit_log_target_user — PARTIAL (WHERE target_user <> ''). Records with
+//                             no user target — channel/category deletions, role
+//                             definition edits — are not indexed at all and pay
+//                             nothing on insert.
+//   * idx_audit_log_target_room — PARTIAL (WHERE target_room <> ''). Likewise:
+//                             nickname changes and role writes are server-wide and
+//                             stay out of this index.
+// So the worst case is 4 extra b-tree inserts on one row of a few hundred bytes,
+// for an action that already performed a permission check, a state write and a
+// sync broadcast. The table's volume is bounded by privilege rather than by
+// traffic (see SqliteStore::append_audit_record), so this is not a hot path in
+// the sense that `events` is.
+//
+// Why the target indexes are PARTIAL: '' is the "not applicable" sentinel and is
+// by far the most common value in both columns, so a full index would be mostly
+// one enormous key run that no query ever probes. The consequence is that the
+// planner only uses them when the statement itself proves the row is in the index
+// — a bound `target_user = ?` cannot prove `? <> ''` — so list_audit_records emits
+// the matching `AND target_user <> ''` guard alongside the equality. Dropping that
+// guard does not break correctness, it silently degrades to a full scan.
+//
+// No explicit `id` column in any of these. For a rowid table with
+// `id INTEGER PRIMARY KEY`, the rowid IS `id` and is already the implicit last
+// column of every index, so `WHERE actor = ? AND id < ? ORDER BY id DESC` is
+// served as a range seek inside the actor's key run with no sort step. Naming
+// `id` explicitly would store it twice per entry and buy nothing. Verified with
+// EXPLAIN QUERY PLAN: SEARCH ... USING COVERING INDEX (actor=? AND rowid<?), and
+// no "USE TEMP B-TREE FOR ORDER BY".
+//
+// Indexes do NOT weaken the append-only guarantee. The v13 triggers fire BEFORE
+// UPDATE and BEFORE DELETE on audit_log; index maintenance happens in the b-tree
+// layer under an INSERT and issues no UPDATE or DELETE statement, and CREATE INDEX
+// only reads rows. Both triggers are left exactly as v13 wrote them.
+void migrate_v16(sqlite3* db, bool /*fresh_database*/) {
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor)");
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action)");
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_audit_log_target_user "
+             "ON audit_log(target_user) WHERE target_user <> ''");
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_audit_log_target_room "
+             "ON audit_log(target_room) WHERE target_room <> ''");
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -899,6 +967,7 @@ const std::vector<Step>& steps() {
         migrate_v13,
         migrate_v14,
         migrate_v15,
+        migrate_v16,
     };
     return kMigrations;
 }

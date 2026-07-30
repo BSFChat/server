@@ -22,6 +22,22 @@ max_upload_size_mb = 500
 # because the image/video widgets cannot set request headers.
 # Turn this off only to serve clients older than token-bearing media URLs.
 require_auth = true
+#
+# NOT CONFIGURABLE, but worth knowing about because it is a deliberate deviation
+# from what an operator migrating off Apache or nginx will expect:
+#
+#   * Media downloads support HTTP Range (Accept-Ranges: bytes) and stream in
+#     64 KB chunks, so a range request costs its own size in memory and not the
+#     size of the object. HEAD is supported and reads nothing.
+#   * A single Range header may ask for AT MOST 4 ranges. A request for more is
+#     answered 416 with `Content-Range: bytes */<size>`, not served. Each range
+#     in a multipart/byteranges response is a separate storage read, so an
+#     unbounded count is a request-amplification lever — httplib's own default
+#     cap is 1024, which is far more fan-out than any media client asks for.
+#     RFC 9110 section 14.2 explicitly permits refusing such a header. Apache and
+#     nginx allow considerably more, so a client or CDN that stitches many small
+#     ranges into one request will see 416 here where it saw 206 there.
+#   * Zero-length uploads are refused with 400.
 
 [auth]
 registration_enabled = true

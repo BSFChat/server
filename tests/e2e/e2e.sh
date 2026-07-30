@@ -237,11 +237,23 @@ fi
 echo
 echo "== schema =="
 SV=$(sqlite3 "$RUN/data/bsfchat.db" "PRAGMA user_version" 2>/dev/null || echo "?")
-check "database is at schema v12" "^12$" "$SV"
+# Pinned on purpose, so bumping the schema is a conscious edit rather than
+# something that slides past review — the same convention the C++ migration tests
+# use (kTargetSchemaVersion in server/src/store/Migrations.h). This pin had gone
+# stale at 12 while the schema moved to 15, so the check was failing for its own
+# reasons rather than reporting anything: 13 added the moderation audit log, 14
+# users.nickname, 15 server_bans, 16 the audit_log filter indexes.
+check "database is at schema v16" "^16$" "$SV"
 TB=$(sqlite3 "$RUN/data/bsfchat.db" ".tables" 2>/dev/null | tr -s ' \n' ' ')
 check "event_mentions exists" "event_mentions" "$TB"
 check "pushers exists" "pushers" "$TB"
 check "event_search exists" "event_search" "$TB"
+check "audit_log exists" "audit_log" "$TB"
+check "server_bans exists" "server_bans" "$TB"
+IDX=$(sqlite3 "$RUN/data/bsfchat.db" \
+  "SELECT group_concat(name) FROM sqlite_master WHERE type='index' AND name LIKE 'idx_audit_log_%'" \
+  2>/dev/null || echo "?")
+check "audit_log filter indexes exist (v16)" "idx_audit_log_target_room" "$IDX"
 
 echo
 echo "== server log: no errors =="

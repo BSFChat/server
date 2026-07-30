@@ -1319,3 +1319,141 @@ TEST_F(FakeS3Test, HandlerStreamsFromS3InBoundedChunks) {
     // Exactly one ranged GET for the window, and it was a ranged GET.
     EXPECT_EQ(last_range_, "bytes=200-299");
 }
+
+// ── HEAD on the download endpoint ─────────────────────────────────────────
+//
+// Nothing registers a HEAD route: Server::setup_routes calls svr_.Get() only.
+// httplib dispatches HEAD to the Get handler table, so HEAD "should" work — but
+// nobody had ever verified it, and "should" is not a test. Two things matter and
+// neither is visible in a normal GET test:
+//   1. the metadata a client uses to decide whether to range-request at all
+//      (Content-Length, Accept-Ranges, Content-Type) must be right;
+//   2. HEAD must not READ the object. A HEAD that walks the content provider to
+//      completion would be a full-size storage read serving a zero-byte response
+//      — invisible to every existing assertion, and a free amplification lever
+//      for anyone who can reach the endpoint.
+class MediaHeadTest : public ::testing::Test {
+protected:
+    static constexpr size_t kSize = 8 * 1024 * 1024;
+
+    void SetUp() override {
+        storage_ = std::make_shared<CountingStorage>(kSize);
+        config_ = Config::defaults();
+        config_.server_name = "test";
+        config_.require_media_auth = true;
+        store_ = std::make_unique<SqliteStore>(":memory:");
+        store_->initialize();
+        store_->create_user("@alice:test", "x");
+        store_->store_access_token(token_, "@alice:test", "dev");
+        store_->insert_media("obj", "@alice:test", "video/mp4", "clip.mp4",
+                             static_cast<int64_t>(kSize), "counting://object");
+
+        handler_ = std::make_shared<MediaHandler>(*store_, config_, storage_);
+        svr_.Get(R"(/_matrix/media/v3/download/([^/]+)/([^/]+))",
+                 [h = handler_](const httplib::Request& rq, httplib::Response& rs) {
+                     h->handle_download(rq, rs);
+                 });
+        port_ = svr_.bind_to_any_port("127.0.0.1");
+        ASSERT_GT(port_, 0);
+        thread_ = std::thread([this] { svr_.listen_after_bind(); });
+        svr_.wait_until_ready();
+    }
+
+    void TearDown() override {
+        svr_.stop();
+        if (thread_.joinable()) thread_.join();
+    }
+
+    httplib::Headers auth(const std::string& range = "") const {
+        httplib::Headers h{{"Authorization", "Bearer " + token_}};
+        if (!range.empty()) h.emplace("Range", range);
+        return h;
+    }
+
+    httplib::Client client() const {
+        httplib::Client cli("127.0.0.1", port_);
+        cli.set_read_timeout(20);
+        return cli;
+    }
+
+    std::shared_ptr<CountingStorage> storage_;
+    std::unique_ptr<SqliteStore> store_;
+    std::shared_ptr<MediaHandler> handler_;
+    Config config_;
+    httplib::Server svr_;
+    std::thread thread_;
+    int port_ = 0;
+    std::string token_ = "media-token";
+};
+
+TEST_F(MediaHeadTest, HeadIsRoutedToTheGetHandlerAndReturnsTheMetadata) {
+    auto res = client().Head("/_matrix/media/v3/download/test/obj", auth());
+    ASSERT_TRUE(res) << "HEAD did not reach a handler at all";
+    EXPECT_EQ(res->status, 200);
+    EXPECT_EQ(res->get_header_value("Content-Length"), std::to_string(kSize));
+    // The client-visible contract. Note this assertion does NOT pin
+    // MediaHandler's own set_header call: httplib adds `Accept-Ranges: bytes` to
+    // a HEAD response when the handler did not (see `req.method == "HEAD" &&
+    // !res.has_header("Accept-Ranges")` in httplib.h), so it would still hold
+    // with our line deleted. The GET path, which httplib does not backstop, is
+    // what pins it — see MediaHttpTest.NoRangeServesWholeObjectWithAcceptRanges.
+    // Confirmed by mutation: deleting the handler's header fails the GET test and
+    // not this one.
+    EXPECT_EQ(res->get_header_value("Accept-Ranges"), "bytes")
+        << "a client cannot know it may range-request without this";
+    EXPECT_EQ(res->get_header_value("Content-Type"), "video/mp4");
+    EXPECT_TRUE(res->body.empty()) << "HEAD returned a body of " << res->body.size() << " bytes";
+
+    // The metadata came from stat(), which is the cheap path.
+    EXPECT_GE(storage_->stat_calls, 1);
+}
+
+TEST_F(MediaHeadTest, HeadDoesNotReadTheObject) {
+    auto res = client().Head("/_matrix/media/v3/download/test/obj", auth());
+    ASSERT_TRUE(res);
+    ASSERT_EQ(res->status, 200);
+
+    // The property. A HEAD that drained the content provider would read all
+    // 8 MB to produce nothing, and every existing test would still pass.
+    EXPECT_EQ(storage_->whole_object_reads, 0)
+        << "HEAD reached MediaStorage::download() — the whole-object read is back";
+    EXPECT_EQ(storage_->bytes_read, 0u)
+        << "HEAD read " << storage_->bytes_read << " bytes to serve a zero-byte response";
+
+    // Control: the very same object over GET DOES read, so the zero above is
+    // HEAD's doing and not a broken fixture.
+    auto get = client().Get("/_matrix/media/v3/download/test/obj", auth());
+    ASSERT_TRUE(get);
+    ASSERT_EQ(get->status, 200);
+    EXPECT_EQ(storage_->bytes_read, kSize);
+}
+
+TEST_F(MediaHeadTest, HeadHonoursARangeWithoutReadingIt) {
+    auto res = client().Head("/_matrix/media/v3/download/test/obj", auth("bytes=0-99"));
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 206);
+    EXPECT_EQ(res->get_header_value("Content-Range"), "bytes 0-99/" + std::to_string(kSize));
+    EXPECT_TRUE(res->body.empty());
+    EXPECT_EQ(storage_->bytes_read, 0u) << "a ranged HEAD still read the range";
+}
+
+TEST_F(MediaHeadTest, HeadIsRefusedAndCappedExactlyLikeGet) {
+    // Unauthenticated: HEAD must not become a metadata oracle that GET is not.
+    auto anon = client().Head("/_matrix/media/v3/download/test/obj");
+    ASSERT_TRUE(anon);
+    EXPECT_EQ(anon->status, 401);
+
+    // Unknown object.
+    auto missing = client().Head("/_matrix/media/v3/download/test/nope", auth());
+    ASSERT_TRUE(missing);
+    EXPECT_EQ(missing->status, 404);
+
+    // The multi-range cap applies to HEAD too — otherwise HEAD would be the
+    // cheaper way to make the server do the fan-out work.
+    auto capped = client().Head("/_matrix/media/v3/download/test/obj",
+                                auth("bytes=0-0,2-2,4-4,6-6,8-8"));
+    ASSERT_TRUE(capped);
+    EXPECT_EQ(capped->status, 416);
+    EXPECT_EQ(capped->get_header_value("Content-Range"), "bytes */" + std::to_string(kSize));
+    EXPECT_EQ(storage_->bytes_read, 0u);
+}

@@ -23,6 +23,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include <sqlite3.h>
+#include <unistd.h>
+
+#include <filesystem>
+#include <memory>
 #include <set>
 #include <string>
 
@@ -587,4 +592,188 @@ TEST(Search, BackfillIndexesPreExistingMessages) {
                           std::string(event_type::kRoomMessage), std::nullopt,
                           R"({"msgtype":"m.text","body":"historic watermelon"})", 1);
     EXPECT_EQ(f.run("alice", {{"search_term", "watermelon"}})["count"], 1);
+}
+
+// ══ Atomicity of insert_event and its search-index write ══════════════════
+//
+// The defect: insert_event wrote the `events` row and then, as a separate
+// statement, the `event_search` row. A throw between the two left an event that
+// was permanently in the timeline and permanently invisible to /search. Nothing
+// notices — the sender sees their message, the reader sees it, and only a search
+// that should have matched quietly does not. There is no reindex pass anywhere in
+// the server that would ever repair it.
+//
+// A happy-path test proves NOTHING about this: both writes succeed whether or not
+// they share a transaction. The only honest proof is an injected failure between
+// them, so a SECOND connection to the same database file installs a BEFORE INSERT
+// trigger on `event_search` that RAISEs ABORT. That makes the index write — and
+// only the index write — fail after the events row has already been written,
+// which is precisely the window in question.
+//
+// RAISE(ABORT) is the right injection shape here: ABORT undoes the current
+// statement and leaves the enclosing transaction OPEN, so the events row survives
+// unless insert_event explicitly rolls back. A fault that auto-rolled-back
+// (SQLITE_FULL) would let a broken implementation pass.
+
+namespace {
+
+std::string atomicity_db_path(const std::string& name) {
+    return (std::filesystem::temp_directory_path() /
+            ("bsfchat-atomicity-" + name + "-" + std::to_string(::getpid()) + ".db")).string();
+}
+
+void remove_atomicity_db(const std::string& path) {
+    std::filesystem::remove(path);
+    std::filesystem::remove(path + "-wal");
+    std::filesystem::remove(path + "-shm");
+}
+
+// Runs SQL on a SEPARATE connection to the same file, so the fault is installed
+// in the DATABASE rather than by reaching inside SqliteStore. Returns the sqlite
+// result code.
+int fault_exec(const std::string& path, const std::string& sql) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) return SQLITE_ERROR;
+    sqlite3_busy_timeout(db, 5000);
+    char* err = nullptr;
+    int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err);
+    if (err) sqlite3_free(err);
+    sqlite3_close(db);
+    return rc;
+}
+
+int64_t raw_scalar(const std::string& path, const std::string& sql) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) return -1;
+    sqlite3_busy_timeout(db, 5000);
+    sqlite3_stmt* stmt = nullptr;
+    int64_t out = -1;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) out = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return out;
+}
+
+std::string message_json(const std::string& body) {
+    return json{{"msgtype", "m.text"}, {"body", body}}.dump();
+}
+
+// A file-backed store (not ":memory:") so a second connection can reach the same
+// data to install the fault.
+struct AtomicityFixture {
+    std::string path;
+    std::unique_ptr<SqliteStore> store;
+    static constexpr const char* kRoom = "!atomic:test";
+
+    explicit AtomicityFixture(const std::string& name) {
+        path = atomicity_db_path(name);
+        remove_atomicity_db(path);
+        store = std::make_unique<SqliteStore>(path);
+        store->initialize();
+        store->create_room(kRoom, "@alice:test");
+    }
+    ~AtomicityFixture() {
+        store.reset();
+        remove_atomicity_db(path);
+    }
+
+    int64_t events_rows(const std::string& event_id) {
+        return raw_scalar(path, "SELECT COUNT(*) FROM events WHERE event_id = '" + event_id + "'");
+    }
+    int64_t index_rows(const std::string& event_id) {
+        return raw_scalar(path,
+                          "SELECT COUNT(*) FROM event_search WHERE event_id = '" + event_id + "'");
+    }
+    int install_fault() {
+        return fault_exec(path,
+            "CREATE TRIGGER fault_on_index BEFORE INSERT ON event_search "
+            "BEGIN SELECT RAISE(ABORT, 'injected search-index failure'); END");
+    }
+    int remove_fault() { return fault_exec(path, "DROP TRIGGER fault_on_index"); }
+};
+
+} // namespace
+
+TEST(SearchIndexAtomicity, AFailedIndexWriteLeavesNoOrphanedEvent) {
+    AtomicityFixture f("orphan");
+
+    // Positive control, BEFORE anything is broken: a normal insert really does
+    // populate both tables. Without this the assertions below could pass because
+    // insert_event never writes anything at all.
+    ASSERT_NO_THROW(f.store->insert_event("$ok", AtomicityFixture::kRoom, "@alice:test",
+                                          std::string(event_type::kRoomMessage), std::nullopt,
+                                          message_json("indexable pineapple"), 1000));
+    ASSERT_EQ(f.events_rows("$ok"), 1);
+    ASSERT_EQ(f.index_rows("$ok"), 1);
+
+    // Now the SECOND write, and only the second write, fails.
+    ASSERT_EQ(f.install_fault(), SQLITE_OK);
+
+    // Control that the fault is real and is aimed where we think: an insert that
+    // would NOT be indexed (a state event) is untouched by it. If this threw, the
+    // trigger would be breaking something other than the index write and the
+    // assertion below would be proving the wrong thing.
+    ASSERT_NO_THROW(f.store->insert_event("$state", AtomicityFixture::kRoom, "@alice:test",
+                                          std::string(event_type::kRoomName), std::string(""),
+                                          json{{"name", "atomic"}}.dump(), 1001));
+    ASSERT_EQ(f.events_rows("$state"), 1);
+
+    // The message insert must fail...
+    EXPECT_THROW(f.store->insert_event("$bad", AtomicityFixture::kRoom, "@alice:test",
+                                       std::string(event_type::kRoomMessage), std::nullopt,
+                                       message_json("orphan watermelon"), 1002),
+                 std::exception);
+
+    // ...and must have left NOTHING behind. Checked on the raw tables through a
+    // separate connection, so no read-path filtering can hide a surviving row.
+    // Note the fault is still installed here: these are pure reads, and removing
+    // it first would let a rollback that happened for the wrong reason pass.
+    EXPECT_EQ(f.events_rows("$bad"), 0) << "the event row survived a failed index write";
+    EXPECT_EQ(f.index_rows("$bad"), 0);
+
+    // Belt and braces on the read path too.
+    EXPECT_FALSE(f.store->get_event_by_id("$bad").has_value());
+    EXPECT_EQ(f.store->count_search_index_rows(), 1) << "only $ok should be indexed";
+
+    // The store must still be usable: a rolled-back transaction must not have
+    // been left open, which would make every later write fail.
+    ASSERT_EQ(f.remove_fault(), SQLITE_OK);
+    ASSERT_NO_THROW(f.store->insert_event("$after", AtomicityFixture::kRoom, "@alice:test",
+                                          std::string(event_type::kRoomMessage), std::nullopt,
+                                          message_json("recovered mango"), 1003));
+    EXPECT_EQ(f.events_rows("$after"), 1);
+    EXPECT_EQ(f.index_rows("$after"), 1);
+}
+
+TEST(SearchIndexAtomicity, ARolledBackInsertIsInvisibleToSearchAndToTheTimeline) {
+    AtomicityFixture f("invisible");
+    f.store->set_membership(AtomicityFixture::kRoom, "@alice:test", "join");
+
+    ASSERT_EQ(f.install_fault(), SQLITE_OK);
+    EXPECT_THROW(f.store->insert_event("$ghost", AtomicityFixture::kRoom, "@alice:test",
+                                       std::string(event_type::kRoomMessage), std::nullopt,
+                                       message_json("ghost blueberry"), 2000),
+                 std::exception);
+    ASSERT_EQ(f.remove_fault(), SQLITE_OK);
+
+    // The half-written state this test exists to rule out is "in the timeline,
+    // absent from search". Assert BOTH halves: an implementation that rolled back
+    // only the index would pass the search check alone.
+    auto timeline = f.store->get_room_events(AtomicityFixture::kRoom, 50);
+    for (const auto& e : timeline) {
+        EXPECT_NE(e.event_id, "$ghost") << "a rolled-back event is in the timeline";
+    }
+    auto hits = f.store->search_messages({AtomicityFixture::kRoom}, {"blueberry"}, {}, 10, 0, true);
+    EXPECT_TRUE(hits.hits.empty()) << "a rolled-back event is in the search index";
+
+    // And the SAME body inserted afterwards is fully searchable, which proves the
+    // emptiness above is the rollback and not a broken search fixture.
+    ASSERT_NO_THROW(f.store->insert_event("$real", AtomicityFixture::kRoom, "@alice:test",
+                                          std::string(event_type::kRoomMessage), std::nullopt,
+                                          message_json("ghost blueberry"), 2001));
+    auto after = f.store->search_messages({AtomicityFixture::kRoom}, {"blueberry"}, {}, 10, 0, true);
+    ASSERT_EQ(after.hits.size(), 1u);
+    EXPECT_EQ(after.hits[0].event_id, "$real");
 }

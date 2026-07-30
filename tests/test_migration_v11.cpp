@@ -197,9 +197,9 @@ TEST(MigrationV11, PreExistingV8DatabaseUpgradesAndKeepsItsData) {
     // Pinned on purpose, so bumping the schema is always a conscious edit rather
     // than something that slides past review. 12 -> 13 added the moderation audit
     // log; 13 -> 14 added users.nickname; 14 -> 15 added the server_bans table and
-    // its backfill from existing room_members ban rows. A v8 database still
-    // upgrades all the way in one go.
-    EXPECT_EQ(kTargetSchemaVersion, 15);
+    // its backfill from existing room_members ban rows; 15 -> 16 added the
+    // audit_log filter indexes. A v8 database still upgrades all the way in one go.
+    EXPECT_EQ(kTargetSchemaVersion, 16);
     std::filesystem::remove(path);
 }
 

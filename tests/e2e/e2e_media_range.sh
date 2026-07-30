@@ -10,7 +10,10 @@
 set -uo pipefail
 
 SRV=/Users/josh/dev/gamechat/server
-BIN=$SRV/build-media/bsfchat-server
+# build-fix is the build directory this repo's test runs use; build-media was a
+# scratch tree from the streaming work and is not guaranteed to exist.
+BIN=${BSFCHAT_SERVER_BIN:-$SRV/build-fix/bsfchat-server}
+[ -x "$BIN" ] || { echo "server binary not found at $BIN (build it first)" >&2; exit 1; }
 ROOT=$(mktemp -d /tmp/bsfchat-media-e2e.XXXXXX)
 PORT=18${RANDOM:0:3}
 [ "$PORT" -lt 1024 ] && PORT=18449
@@ -121,6 +124,15 @@ hdr() { # url range -> raw headers
 status()      { hdr "$1" "$2" | head -1 | awk '{print $2}'; }
 header_val()  { hdr "$1" "$2" | tr -d '\r' | grep -i "^$3:" | head -1 | cut -d' ' -f2-; }
 body_range()  { curl -s -H "$H" -H "Range: $2" "$1"; }
+# A real HEAD (-I), not a GET whose body is thrown away. Nothing registers a HEAD
+# route — Server::setup_routes calls svr_.Get() only — so this is verifying
+# httplib's HEAD-to-Get dispatch against the actual routing table.
+head_hdr() {
+    if [ -z "${2:-}" ]; then curl -sI -H "$H" "$1"
+    else curl -sI -H "$H" -H "Range: $2" "$1"; fi
+}
+head_status() { head_hdr "$1" "${2:-}" | head -1 | awk '{print $2}'; }
+head_val()    { head_hdr "$1" "${2:-}" | tr -d '\r' | grep -i "^$3:" | head -1 | cut -d' ' -f2-; }
 
 # --- 1. plain GET ---
 check "200 for a plain GET"          "200"   "$(status "$DL" "")"
@@ -244,12 +256,27 @@ else
 fi
 
 # --- 9. zero-length media ---
+#
+# This block used to infer "rejected" from the ABSENCE of a content_uri and print
+# ok. A 500, a 413 or a dropped connection would all have scored the same, so it
+# was a check that could not fail for the reason it claimed. Assert the status
+# code and the errcode instead, and only then decide which branch to take.
 : > "$ROOT/empty.bin"
-EURI=$(curl -s -X POST "http://127.0.0.1:$PORT/_matrix/media/v3/upload?filename=e.txt" \
-    -H "$H" -H 'Content-Type: text/plain' --data-binary "@$ROOT/empty.bin" \
-    | sed -n 's/.*"content_uri":"\([^"]*\)".*/\1/p')
-if [ -z "$EURI" ]; then
-    ok "empty upload rejected by the server (400), so no empty-media case to serve"
+ESTATUS=$(curl -s -o "$ROOT/empty.resp" -w '%{http_code}' \
+    -X POST "http://127.0.0.1:$PORT/_matrix/media/v3/upload?filename=e.txt" \
+    -H "$H" -H 'Content-Type: text/plain' --data-binary "@$ROOT/empty.bin")
+EURI=$(sed -n 's/.*"content_uri":"\([^"]*\)".*/\1/p' "$ROOT/empty.resp")
+if [ "$ESTATUS" = "400" ]; then
+    check "empty upload rejected with 400" "400" "$ESTATUS"
+    if grep -q '"errcode"' "$ROOT/empty.resp"; then
+        ok "empty upload 400 carries an errcode: $(cat "$ROOT/empty.resp")"
+    else
+        bad "empty upload 400 has no errcode" "$(cat "$ROOT/empty.resp")"
+    fi
+    [ -z "$EURI" ] || bad "empty upload was refused but still returned a content_uri" "$EURI"
+    ok "server refuses zero-length uploads, so there is no empty object to serve"
+elif [ -z "$EURI" ]; then
+    bad "empty upload failed with status $ESTATUS, not the documented 400" "$(cat "$ROOT/empty.resp")"
 else
     EMID=${EURI##*/}
     EDL="http://127.0.0.1:$PORT/_matrix/media/v3/download/e2e.test/$EMID"
@@ -264,6 +291,27 @@ check "unknown media id -> 404" "404" \
     "$(status "http://127.0.0.1:$PORT/_matrix/media/v3/download/e2e.test/deadbeef" "bytes=0-0")"
 check "foreign server name -> 404" "404" \
     "$(status "http://127.0.0.1:$PORT/_matrix/media/v3/download/elsewhere.example/$MID" "")"
+
+# --- 11. HEAD ---
+#
+# Previously unverified: no HEAD route is registered anywhere, so HEAD working at
+# all depends on httplib dispatching it to the Get handler table. Unit tests can
+# only show that through an in-process server; this is the real binary's real
+# routing table.
+check "HEAD -> 200"                "200"   "$(head_status "$DL")"
+check "HEAD Content-Length"        "$SIZE" "$(head_val "$DL" "" Content-Length)"
+check "HEAD Accept-Ranges"         "bytes" "$(head_val "$DL" "" Accept-Ranges)"
+HEAD_BODY=$(curl -s -I -H "$H" "$DL" -o /dev/null -w '%{size_download}')
+check "HEAD sends no body"         "0"     "$HEAD_BODY"
+check "ranged HEAD -> 206"         "206"   "$(head_status "$DL" "bytes=0-99")"
+check "ranged HEAD Content-Range"  "bytes 0-99/$SIZE" "$(head_val "$DL" "bytes=0-99" Content-Range)"
+# The same refusals as GET: HEAD must not be a cheaper oracle or a cheaper way to
+# make the server do multi-range fan-out work.
+check "HEAD past the range cap -> 416" "416" "$(head_status "$DL" "bytes=0-0,2-2,4-4,6-6,8-8")"
+check "HEAD unknown media -> 404" "404" \
+    "$(head_status "http://127.0.0.1:$PORT/_matrix/media/v3/download/e2e.test/deadbeef")"
+UNAUTH_HEAD=$(curl -sI -o /dev/null -w '%{http_code}' "$DL")
+check "unauthenticated HEAD -> 401" "401" "$UNAUTH_HEAD"
 
 # --- final: server still healthy, real DB still untouched ---
 if curl -sf "http://127.0.0.1:$PORT/_matrix/client/versions" >/dev/null; then

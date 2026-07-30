@@ -126,6 +126,28 @@ std::string raw_text(const std::string& path, const std::string& sql) {
     return out;
 }
 
+// The query plan SQLite chooses for a statement, as the concatenated `detail`
+// column of EXPLAIN QUERY PLAN. Whether an index is USED is invisible in a
+// result set — an unindexed scan returns byte-identical rows — so this is the
+// only way to assert it.
+std::string explain_plan(const std::string& path, const std::string& sql) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) return {};
+    sqlite3_stmt* stmt = nullptr;
+    std::string out;
+    const std::string explained = "EXPLAIN QUERY PLAN " + sql;
+    if (sqlite3_prepare_v2(db, explained.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            // Column 3 is `detail`.
+            auto* text = sqlite3_column_text(stmt, 3);
+            if (text) out += std::string(reinterpret_cast<const char*>(text)) + "\n";
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return out;
+}
+
 int schema_version_of(const std::string& path) {
     sqlite3* db = nullptr;
     if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) return -1;
@@ -381,6 +403,74 @@ void create_v12_database(const std::string& path) {
     sqlite3_close(db);
 }
 
+
+// ── A real v15 database, populated, WITH audit history ────────────────────
+//
+// The state an existing deployment is actually in the moment before v16 runs:
+// the v12 fixture above plus v13's audit_log and its two append-only triggers,
+// v14's users.nickname column and v15's server_bans table — applied as raw DDL
+// rather than by letting a v16-aware SqliteStore build it, so the "before" really
+// is the shape the earlier migrations left behind.
+//
+// The audit rows are deliberately varied: different actors, some with a user
+// target, some with a room target, some with neither. v16 adds PARTIAL indexes
+// keyed on `<> ''`, and a fixture where every row had every field populated would
+// not exercise the rows those indexes deliberately exclude.
+void create_v15_database_with_audit_history(const std::string& path) {
+    create_v12_database(path);
+
+    const char* upgrade = R"SQL(
+        -- v13
+        CREATE TABLE audit_log (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at   INTEGER NOT NULL,
+            actor        TEXT NOT NULL,
+            action       TEXT NOT NULL,
+            target_user  TEXT NOT NULL DEFAULT '',
+            target_room  TEXT NOT NULL DEFAULT '',
+            target_key   TEXT NOT NULL DEFAULT '',
+            reason       TEXT NOT NULL DEFAULT '',
+            before_json  TEXT NOT NULL DEFAULT '',
+            after_json   TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TRIGGER audit_log_is_append_only_update
+        BEFORE UPDATE ON audit_log
+        BEGIN
+            SELECT RAISE(ABORT, 'audit_log is append-only: UPDATE is not permitted');
+        END;
+        CREATE TRIGGER audit_log_is_append_only_delete
+        BEFORE DELETE ON audit_log
+        BEGIN
+            SELECT RAISE(ABORT, 'audit_log is append-only: DELETE is not permitted');
+        END;
+
+        -- v14
+        ALTER TABLE users ADD COLUMN nickname TEXT;
+
+        -- v15
+        CREATE TABLE server_bans (
+            user_id    TEXT PRIMARY KEY,
+            actor      TEXT NOT NULL DEFAULT '',
+            reason     TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL
+        );
+
+        -- History recorded by the running v13-v15 deployment.
+        INSERT INTO audit_log (created_at, actor, action, target_user, target_room, reason)
+        VALUES
+          (1000, '@mallory:test', 'member.kick', '@bob:test',   '!general:test', 'spam'),
+          (1001, '@mallory:test', 'member.ban',  '@bob:test',   '!general:test', 'again'),
+          (1002, '@alice:test',   'member.ban',  '@carol:test', '!general:test', ''),
+          (1003, '@alice:test',   'channel.delete', '',         '!gone:test',    ''),
+          (1004, '@mallory:test', 'role.update', '',            '',              '');
+
+        PRAGMA user_version = 15;
+    )SQL";
+
+    std::string err;
+    ASSERT_EQ(raw_exec(path, upgrade, &err), SQLITE_OK) << err;
+}
+
 } // namespace
 
 // ══ 1. Migration ══════════════════════════════════════════════════════════
@@ -388,10 +478,10 @@ void create_v12_database(const std::string& path) {
 TEST(AuditMigration, FreshDatabaseGetsV13WithAnAppendOnlySchema) {
     Fixture f("fresh-v13");
     EXPECT_EQ(schema_version_of(f.db_path), kTargetSchemaVersion);
-    // v13 is the audit log; the pin tracks the latest schema, now 15 (v14
-    // users.nickname, v15 server_bans). This test's subject remains the v13
-    // audit_log shape below.
-    EXPECT_EQ(kTargetSchemaVersion, 15);
+    // v13 is the audit log; the pin tracks the latest schema, now 16 (v14
+    // users.nickname, v15 server_bans, v16 the audit_log filter indexes). This
+    // test's subject remains the v13 audit_log shape below.
+    EXPECT_EQ(kTargetSchemaVersion, 16);
 
     // AUTOINCREMENT, not a bare INTEGER PRIMARY KEY. Without it SQLite reuses
     // max(rowid) + 1, which is exactly the position-reuse defect v4 fixed for
@@ -1236,4 +1326,565 @@ TEST(AuditSearch, RecordsNeverEnterTheMessageSearchIndex) {
         "SELECT sql FROM sqlite_master WHERE name = 'event_search_fts'");
     EXPECT_NE(fts_sql.find("content='event_search'"), std::string::npos) << fts_sql;
     EXPECT_EQ(fts_sql.find("audit"), std::string::npos) << fts_sql;
+}
+
+// ══ 8. Filtering (schema v16) ═════════════════════════════════════════════
+//
+// The properties, in order:
+//   a. v16 applies to a real, populated, pre-existing v15 database: history
+//      intact, both append-only triggers untouched and still aborting.
+//   b. Every exposed filter is actually SERVED BY ITS INDEX. This is invisible in
+//      the results (a full scan returns the same rows), so it is asserted on the
+//      query plan of the REAL statement the store builds.
+//   c. Filters select correctly, AND together, and a filter that matches nothing
+//      returns nothing rather than degrading to "everything".
+//   d. Pagination stays stable under a filter while inserts land concurrently.
+//   e. The endpoint's SERVER-scope gate still holds on the filtered path — a
+//      per-channel MANAGE_SERVER override must not unlock it.
+
+// ── a. Migration against a populated pre-existing v15 database ─────────────
+
+TEST(AuditFilterMigration, PreExistingV15DatabaseGainsTheIndexesAndKeepsEverythingElse) {
+    auto path = temp_db_path("v15-to-v16");
+    create_v15_database_with_audit_history(path);
+    ASSERT_EQ(schema_version_of(path), 15) << "the fixture must start BELOW the target";
+
+    // The pre-migration facts, so "nothing was lost" is measured rather than
+    // assumed.
+    ASSERT_EQ(raw_text(path, "SELECT COUNT(*) FROM audit_log"), "5");
+    // Ordered in a SUBQUERY, not with a trailing ORDER BY on the aggregate: the
+    // latter orders the one-row result and leaves group_concat at the mercy of
+    // whatever scan the planner picks — which v16 changes, by design.
+    const auto kOrderedIds =
+        "SELECT group_concat(id) FROM (SELECT id FROM audit_log ORDER BY id)";
+    const auto ids_before = raw_text(path, kOrderedIds);
+    const auto events_before = raw_text(path, "SELECT COUNT(*) FROM events");
+
+    {
+        SqliteStore store(path);
+        store.initialize();
+        EXPECT_EQ(schema_version_of(path), kTargetSchemaVersion);
+
+        // Nothing lost: the audit history, its ids (cursors handed to clients
+        // before the upgrade must still resolve), and the unrelated tables.
+        EXPECT_EQ(raw_text(path, "SELECT COUNT(*) FROM audit_log"), "5");
+        EXPECT_EQ(raw_text(path, kOrderedIds), ids_before);
+        EXPECT_EQ(raw_text(path, "SELECT COUNT(*) FROM events"), events_before);
+        EXPECT_EQ(raw_text(path, "SELECT COUNT(*) FROM event_search"), "1");
+
+        // The AUTOINCREMENT high-water mark survives, which is what keeps a
+        // pre-upgrade cursor meaningful.
+        EXPECT_EQ(raw_text(path, "SELECT seq FROM sqlite_sequence WHERE name = 'audit_log'"),
+                  "5");
+
+        // And the filters work on rows written long before the filters existed.
+        SqliteStore::AuditFilter by_mallory;
+        by_mallory.actor = "@mallory:test";
+        auto page = store.list_audit_records(50, std::nullopt, by_mallory);
+        EXPECT_EQ(page.records.size(), 3u);
+        ASSERT_TRUE(page.matching.has_value());
+        EXPECT_EQ(*page.matching, 3);
+        EXPECT_EQ(page.total, 5) << "total stays whole-table under a filter";
+    }
+
+    // All four indexes exist, and the two target ones are PARTIAL. The partial
+    // predicate is load-bearing, not decoration: without it the index covers every
+    // '' sentinel row, and list_audit_records' matching `<> ''` guard would exclude
+    // the index rather than enable it.
+    EXPECT_NE(raw_text(path, "SELECT sql FROM sqlite_master WHERE name='idx_audit_log_actor'")
+                  .find("audit_log(actor)"), std::string::npos);
+    EXPECT_NE(raw_text(path, "SELECT sql FROM sqlite_master WHERE name='idx_audit_log_action'")
+                  .find("audit_log(action)"), std::string::npos);
+    EXPECT_NE(raw_text(path,
+                       "SELECT sql FROM sqlite_master WHERE name='idx_audit_log_target_user'")
+                  .find("WHERE target_user <> ''"), std::string::npos);
+    EXPECT_NE(raw_text(path,
+                       "SELECT sql FROM sqlite_master WHERE name='idx_audit_log_target_room'")
+                  .find("WHERE target_room <> ''"), std::string::npos);
+
+    // The append-only triggers are UNTOUCHED — still there, still by name.
+    EXPECT_EQ(raw_text(path, "SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' "
+                             "AND tbl_name='audit_log'"), "2");
+
+    // ...and still ABORT. Presence in sqlite_master is not the property; refusal
+    // is. Asserted against a second connection, so this is what the DATABASE
+    // permits and not what SqliteStore declines to offer.
+    std::string update_err;
+    EXPECT_NE(raw_exec(path, "UPDATE audit_log SET reason = 'tampered' WHERE id = 1",
+                       &update_err), SQLITE_OK);
+    EXPECT_NE(update_err.find("append-only"), std::string::npos)
+        << "refused for the wrong reason: " << update_err;
+    std::string delete_err;
+    EXPECT_NE(raw_exec(path, "DELETE FROM audit_log WHERE id = 1", &delete_err), SQLITE_OK);
+    EXPECT_NE(delete_err.find("append-only"), std::string::npos)
+        << "refused for the wrong reason: " << delete_err;
+    EXPECT_EQ(raw_text(path, "SELECT reason FROM audit_log WHERE id = 1"), "spam");
+
+    remove_db(path);
+}
+
+TEST(AuditFilterMigration, UpgradeToV16IsIdempotent) {
+    auto path = temp_db_path("v16-idempotent");
+    create_v15_database_with_audit_history(path);
+    for (int i = 0; i < 3; ++i) {
+        SqliteStore store(path);
+        store.initialize();
+        EXPECT_EQ(schema_version_of(path), kTargetSchemaVersion);
+    }
+    EXPECT_EQ(raw_text(path, "SELECT COUNT(*) FROM audit_log"), "5");
+    EXPECT_EQ(raw_text(path, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' "
+                             "AND name LIKE 'idx_audit_log_%'"), "4");
+    remove_db(path);
+}
+
+// ── b. Every filter is served by its index ────────────────────────────────
+
+TEST(AuditFilterPlan, EveryFilterIsServedByItsOwnIndex) {
+    Fixture f("filter-plan");
+    // A populated table, so the planner is choosing rather than shrugging at an
+    // empty one.
+    for (int i = 0; i < 500; ++i) {
+        SqliteStore::AuditRecord r;
+        r.actor = "@a" + std::to_string(i % 7) + ":test";
+        r.action = i % 5 == 0 ? audit_action::kMemberBan : audit_action::kRoleUpdate;
+        if (i % 3 == 0) r.target_user = "@v" + std::to_string(i % 11) + ":test";
+        if (i % 4 == 0) r.target_room = "!r" + std::to_string(i % 13) + ":test";
+        f.store->append_audit_record(r);
+    }
+    ASSERT_EQ(raw_exec(f.db_path, "ANALYZE"), SQLITE_OK);
+
+    struct Case {
+        const char* name;
+        SqliteStore::AuditFilter filter;
+        const char* index;
+    };
+    std::vector<Case> cases;
+    {
+        SqliteStore::AuditFilter x; x.actor = "@a3:test";
+        cases.push_back({"actor", x, "idx_audit_log_actor"});
+    }
+    {
+        SqliteStore::AuditFilter x; x.action = audit_action::kMemberBan;
+        cases.push_back({"action", x, "idx_audit_log_action"});
+    }
+    {
+        SqliteStore::AuditFilter x; x.target_user = "@v5:test";
+        cases.push_back({"target_user", x, "idx_audit_log_target_user"});
+    }
+    {
+        SqliteStore::AuditFilter x; x.target_room = "!r7:test";
+        cases.push_back({"target_room", x, "idx_audit_log_target_room"});
+    }
+
+    for (const auto& c : cases) {
+        // The REAL statement the store runs, not a hand-copied lookalike — the
+        // partial-index guards live in audit_page_query and nowhere else, so a
+        // test that rebuilt the SQL itself would assert nothing about production.
+        for (bool with_cursor : {false, true}) {
+            const auto query = SqliteStore::audit_page_query(c.filter, with_cursor);
+            const auto plan = explain_plan(f.db_path, query.sql);
+            EXPECT_NE(plan.find(c.index), std::string::npos)
+                << c.name << " (cursor=" << with_cursor << ") is not using " << c.index
+                << "\nsql:  " << query.sql << "\nplan: " << plan;
+            // A residual sort would mean the index served the lookup but not the
+            // newest-first ordering, which is where the cost actually is on a big
+            // log: SQLite would have to materialise every match to return 50.
+            EXPECT_EQ(plan.find("TEMP B-TREE"), std::string::npos)
+                << c.name << " needs a sort pass:\n" << plan;
+        }
+        // The matching-count query rides the same index.
+        const auto count_query = SqliteStore::audit_match_count_query(c.filter);
+        EXPECT_NE(explain_plan(f.db_path, count_query.sql).find(c.index), std::string::npos)
+            << c.name << " count query is not using " << c.index;
+    }
+
+    // The unfiltered page is unchanged by v16: still a plain reverse walk of the
+    // rowid, with no index and no sort. If this ever starts naming an index, an
+    // index is being consulted for a query that never needed one.
+    const auto plain = SqliteStore::audit_page_query({}, false);
+    const auto plain_plan = explain_plan(f.db_path, plain.sql);
+    EXPECT_EQ(plain_plan.find("idx_audit_log_"), std::string::npos) << plain_plan;
+    EXPECT_EQ(plain_plan.find("TEMP B-TREE"), std::string::npos) << plain_plan;
+}
+
+// ── c. Filters select correctly ───────────────────────────────────────────
+
+namespace {
+
+// Ten records covering every combination the filters have to separate.
+void seed_filterable_history(Fixture& f) {
+    const auto add = [&](const char* actor, const char* action, const char* target_user,
+                         const char* target_room) {
+        SqliteStore::AuditRecord r;
+        r.actor = actor;
+        r.action = action;
+        r.target_user = target_user;
+        r.target_room = target_room;
+        f.store->append_audit_record(r);
+    };
+    add("@mallory:test", audit_action::kMemberKick, "@bob:test",   "!general:test");
+    add("@mallory:test", audit_action::kMemberBan,  "@bob:test",   "!general:test");
+    add("@mallory:test", audit_action::kMemberBan,  "@carol:test", "!lounge:test");
+    add("@alice:test",   audit_action::kMemberBan,  "@bob:test",   "!lounge:test");
+    add("@alice:test",   audit_action::kMemberKick, "@dave:test",  "!general:test");
+    add("@alice:test",   audit_action::kChannelDelete, "",         "!gone:test");
+    add("@alice:test",   audit_action::kRoleUpdate, "",            "");
+    add("@bob:test",     audit_action::kRoleAssign, "@mallory:test", "");
+    add("@bob:test",     audit_action::kMemberNicknameSet, "@carol:test", "");
+    add("@bob:test",     audit_action::kChannelPermissionsSet, "@dave:test", "!general:test");
+}
+
+std::vector<std::string> actors_of(const SqliteStore::AuditPage& page) {
+    std::vector<std::string> out;
+    for (const auto& r : page.records) out.push_back(r.actor);
+    return out;
+}
+
+} // namespace
+
+TEST(AuditFilter, ByActorReturnsOnlyThatActorsRecords) {
+    Fixture f("filter-actor");
+    seed_filterable_history(f);
+
+    SqliteStore::AuditFilter filter;
+    filter.actor = "@mallory:test";
+    auto page = f.store->list_audit_records(50, std::nullopt, filter);
+
+    ASSERT_EQ(page.records.size(), 3u) << "expected exactly Mallory's three records";
+    for (const auto& r : page.records) EXPECT_EQ(r.actor, "@mallory:test");
+    // Newest first, unchanged by filtering.
+    EXPECT_GT(page.records.front().id, page.records.back().id);
+    ASSERT_TRUE(page.matching.has_value());
+    EXPECT_EQ(*page.matching, 3);
+    EXPECT_EQ(page.total, 10) << "total is the whole table, not the filtered subset";
+}
+
+TEST(AuditFilter, ByTargetUserFindsEveryActionAimedAtThem) {
+    Fixture f("filter-target-user");
+    seed_filterable_history(f);
+
+    SqliteStore::AuditFilter filter;
+    filter.target_user = "@bob:test";
+    auto page = f.store->list_audit_records(50, std::nullopt, filter);
+
+    ASSERT_EQ(page.records.size(), 3u);
+    for (const auto& r : page.records) EXPECT_EQ(r.target_user, "@bob:test");
+    // Two actors did things to Bob; a filter that quietly also matched on actor
+    // would miss one of them.
+    const auto actors = actors_of(page);
+    EXPECT_EQ(std::set<std::string>(actors.begin(), actors.end()),
+              (std::set<std::string>{"@mallory:test", "@alice:test"}));
+    EXPECT_EQ(*page.matching, 3);
+}
+
+TEST(AuditFilter, ByTargetRoomFindsEveryActionInThatChannel) {
+    Fixture f("filter-target-room");
+    seed_filterable_history(f);
+
+    SqliteStore::AuditFilter filter;
+    filter.target_room = "!general:test";
+    auto page = f.store->list_audit_records(50, std::nullopt, filter);
+
+    ASSERT_EQ(page.records.size(), 4u);
+    for (const auto& r : page.records) EXPECT_EQ(r.target_room, "!general:test");
+    EXPECT_EQ(*page.matching, 4);
+}
+
+TEST(AuditFilter, ByActionSeparatesTheVocabulary) {
+    Fixture f("filter-action");
+    seed_filterable_history(f);
+
+    SqliteStore::AuditFilter bans;
+    bans.action = audit_action::kMemberBan;
+    auto page = f.store->list_audit_records(50, std::nullopt, bans);
+    ASSERT_EQ(page.records.size(), 3u);
+    for (const auto& r : page.records) EXPECT_EQ(r.action, audit_action::kMemberBan);
+
+    // Kicks and bans are distinct action names, so a ban filter must not sweep up
+    // kicks — that distinction is the whole reason membership_audit_action exists.
+    SqliteStore::AuditFilter kicks;
+    kicks.action = audit_action::kMemberKick;
+    EXPECT_EQ(f.store->list_audit_records(50, std::nullopt, kicks).records.size(), 2u);
+}
+
+TEST(AuditFilter, FiltersAreAndedNotOred) {
+    Fixture f("filter-combined");
+    seed_filterable_history(f);
+
+    SqliteStore::AuditFilter filter;
+    filter.actor = "@mallory:test";
+    filter.action = audit_action::kMemberBan;
+    auto page = f.store->list_audit_records(50, std::nullopt, filter);
+    ASSERT_EQ(page.records.size(), 2u) << "Mallory's bans, not her bans plus everyone's";
+    for (const auto& r : page.records) {
+        EXPECT_EQ(r.actor, "@mallory:test");
+        EXPECT_EQ(r.action, audit_action::kMemberBan);
+    }
+
+    // All four at once, narrowing to a single record.
+    SqliteStore::AuditFilter all_four;
+    all_four.actor = "@mallory:test";
+    all_four.action = audit_action::kMemberBan;
+    all_four.target_user = "@bob:test";
+    all_four.target_room = "!general:test";
+    auto one = f.store->list_audit_records(50, std::nullopt, all_four);
+    ASSERT_EQ(one.records.size(), 1u);
+    EXPECT_EQ(*one.matching, 1);
+}
+
+TEST(AuditFilter, AFilterThatMatchesNothingReturnsNothing) {
+    Fixture f("filter-empty-result");
+    seed_filterable_history(f);
+
+    // The failure mode worth naming: a filter that is silently dropped returns the
+    // WHOLE log, and the reader believes they have looked and found nothing.
+    SqliteStore::AuditFilter nobody;
+    nobody.actor = "@nobody:test";
+    auto page = f.store->list_audit_records(50, std::nullopt, nobody);
+    EXPECT_TRUE(page.records.empty());
+    ASSERT_TRUE(page.matching.has_value());
+    EXPECT_EQ(*page.matching, 0);
+    EXPECT_EQ(page.total, 10) << "the log is still ten records; the filter matched none";
+    EXPECT_FALSE(page.next_from.has_value());
+
+    // A combination where each half matches on its own but the pair does not.
+    SqliteStore::AuditFilter impossible;
+    impossible.actor = "@bob:test";
+    impossible.target_room = "!lounge:test";
+    EXPECT_TRUE(f.store->list_audit_records(50, std::nullopt, impossible).records.empty());
+}
+
+TEST(AuditFilter, TargetFiltersNeverMatchTheNotApplicableSentinel) {
+    Fixture f("filter-sentinel");
+    seed_filterable_history(f);
+
+    // '' is "this action has no user target" (role edits, channel deletions), and
+    // the v16 indexes deliberately exclude those rows. Asking for '' must return
+    // nothing rather than every unrelated record — and must not silently become an
+    // unfiltered query.
+    SqliteStore::AuditFilter empty_user;
+    empty_user.target_user = "";
+    auto page = f.store->list_audit_records(50, std::nullopt, empty_user);
+    EXPECT_TRUE(page.records.empty()) << "'' matched " << page.records.size() << " records";
+    EXPECT_EQ(*page.matching, 0);
+}
+
+// ── d. Pagination under a filter ──────────────────────────────────────────
+
+TEST(AuditFilterPagination, CursorStaysStableWhileMatchingAndNonMatchingRecordsLand) {
+    Fixture f("filter-page-stable");
+    const auto append = [&](const char* actor) {
+        SqliteStore::AuditRecord r;
+        r.actor = actor;
+        r.action = audit_action::kMemberKick;
+        return f.store->append_audit_record(r);
+    };
+
+    std::set<int64_t> expected;
+    for (int i = 0; i < 9; ++i) {
+        expected.insert(append("@mallory:test"));
+        append("@alice:test"); // noise the filter must not surface
+    }
+
+    SqliteStore::AuditFilter filter;
+    filter.actor = "@mallory:test";
+
+    std::vector<int64_t> seen;
+    std::optional<int64_t> cursor;
+    for (int page_no = 0; page_no < 10; ++page_no) {
+        auto page = f.store->list_audit_records(2, cursor, filter);
+        for (const auto& r : page.records) {
+            EXPECT_EQ(r.actor, "@mallory:test");
+            seen.push_back(r.id);
+        }
+        if (!page.next_from) break;
+        cursor = page.next_from;
+        // Writes land BETWEEN pages, both matching and not. Ids are AUTOINCREMENT,
+        // so every new row is above the cursor and cannot disturb the walk.
+        append("@alice:test");
+        append("@mallory:test");
+    }
+
+    // Every record that existed when the walk began was returned exactly once, and
+    // nothing that arrived mid-walk was injected into an earlier page.
+    std::set<int64_t> unique_seen(seen.begin(), seen.end());
+    EXPECT_EQ(unique_seen.size(), seen.size()) << "a record was returned twice";
+    for (int64_t id : expected) {
+        EXPECT_TRUE(unique_seen.count(id)) << "record " << id << " was skipped";
+    }
+}
+
+// ── e. The endpoint ───────────────────────────────────────────────────────
+
+TEST(AuditEndpoint, FilterParametersReachTheQuery) {
+    Fixture f("endpoint-filters");
+    f.seed_roles();
+    f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    seed_filterable_history(f);
+    AuditHandler handler(*f.store, f.config);
+
+    auto by_actor = call_with_params(handler, "token-admin", {{"actor", "@mallory:test"}});
+    ASSERT_TRUE(IsOk(by_actor));
+    auto body = json::parse(by_actor.body);
+    ASSERT_EQ(body.at("records").size(), 3u);
+    for (const auto& r : body.at("records")) EXPECT_EQ(r.at("actor"), "@mallory:test");
+    EXPECT_EQ(body.at("matching"), 3);
+    EXPECT_EQ(body.at("total"), 10);
+
+    auto by_room = call_with_params(handler, "token-admin", {{"target_room", "!general:test"}});
+    ASSERT_TRUE(IsOk(by_room));
+    EXPECT_EQ(json::parse(by_room.body).at("records").size(), 4u);
+
+    auto by_user = call_with_params(handler, "token-admin", {{"target_user", "@bob:test"}});
+    ASSERT_TRUE(IsOk(by_user));
+    EXPECT_EQ(json::parse(by_user.body).at("records").size(), 3u);
+
+    auto by_action = call_with_params(handler, "token-admin",
+                                      {{"action", audit_action::kMemberBan}});
+    ASSERT_TRUE(IsOk(by_action));
+    EXPECT_EQ(json::parse(by_action.body).at("records").size(), 3u);
+
+    auto combined = call_with_params(
+        handler, "token-admin",
+        {{"actor", "@mallory:test"}, {"action", audit_action::kMemberBan}});
+    ASSERT_TRUE(IsOk(combined));
+    EXPECT_EQ(json::parse(combined.body).at("records").size(), 2u);
+
+    // Unfiltered responses must not sprout a `matching` field that just repeats
+    // `total`.
+    auto unfiltered = call_with_params(handler, "token-admin", {});
+    ASSERT_TRUE(IsOk(unfiltered));
+    EXPECT_FALSE(json::parse(unfiltered.body).contains("matching"));
+}
+
+TEST(AuditEndpoint, FilteredPaginationWalksTheWholeMatchingSet) {
+    Fixture f("endpoint-filter-pages");
+    f.seed_roles();
+    f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    for (int i = 0; i < 7; ++i) {
+        SqliteStore::AuditRecord r;
+        r.actor = "@mallory:test";
+        r.action = audit_action::kMemberBan;
+        f.store->append_audit_record(r);
+        SqliteStore::AuditRecord noise;
+        noise.actor = "@alice:test";
+        noise.action = audit_action::kMemberBan;
+        f.store->append_audit_record(noise);
+    }
+    AuditHandler handler(*f.store, f.config);
+
+    std::set<int64_t> seen;
+    httplib::Params params{{"actor", "@mallory:test"}, {"limit", "3"}};
+    for (int page_no = 0; page_no < 10; ++page_no) {
+        auto res = call_with_params(handler, "token-admin", params);
+        ASSERT_TRUE(IsOk(res));
+        auto body = json::parse(res.body);
+        EXPECT_EQ(body.at("matching"), 7) << "matching describes the whole set, not the page";
+        for (const auto& r : body.at("records")) {
+            EXPECT_EQ(r.at("actor"), "@mallory:test");
+            EXPECT_TRUE(seen.insert(r.at("id").get<int64_t>()).second) << "duplicate record";
+        }
+        if (!body.contains("next_from")) break;
+        params = {{"actor", "@mallory:test"},
+                  {"limit", "3"},
+                  {"from", std::to_string(body.at("next_from").get<int64_t>())}};
+    }
+    EXPECT_EQ(seen.size(), 7u) << "the filtered walk did not reach every matching record";
+}
+
+TEST(AuditEndpoint, RejectsAnEmptyFilterValueRatherThanIgnoringIt) {
+    Fixture f("endpoint-empty-filter");
+    f.seed_roles();
+    f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    seed_filterable_history(f);
+    AuditHandler handler(*f.store, f.config);
+
+    // Silently dropping an empty filter would hand the reader the WHOLE log while
+    // they believed they had narrowed it — the same class of quiet lie as a
+    // malformed cursor being treated as "start from the newest".
+    for (const char* name : {"actor", "target_user", "target_room", "action"}) {
+        auto res = call_with_params(handler, "token-admin", {{name, ""}});
+        ASSERT_EQ(res.status, 400) << name << " -> " << res.body;
+        auto body = json::parse(res.body);
+        EXPECT_EQ(body.value("errcode", ""), "M_INVALID_PARAM") << name;
+        // Assert on the REASON, not merely that it was refused: a 400 produced by
+        // some unrelated guard would prove nothing about this one.
+        EXPECT_NE(body.value("error", "").find(name), std::string::npos)
+            << name << " was refused for a different reason: " << res.body;
+        EXPECT_EQ(res.body.find("records"), std::string::npos);
+    }
+}
+
+// The escalation shape that was a real bug in the role-write path, re-asserted on
+// the FILTERED path: a per-channel override granting MANAGE_SERVER inside one
+// channel must not unlock the server-wide log, and adding query parameters must
+// not route around the gate.
+TEST(AuditEndpoint, PerChannelOverrideDoesNotGrantFilteredAccessEither) {
+    Fixture f("endpoint-filter-override-escalation");
+    f.seed_roles();
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto room = f.add_channel(admin, "bobs-corner");
+    f.store->set_membership(room, bob, std::string(membership::kJoin));
+
+    // A record that Bob's filters WOULD match if he were allowed to read at all.
+    // Without this the 403 below could pass simply because the log is empty.
+    {
+        SqliteStore::AuditRecord r;
+        r.actor = admin;
+        r.action = audit_action::kMemberBan;
+        r.target_user = bob;
+        r.target_room = room;
+        f.store->append_audit_record(r);
+    }
+
+    f.set_override(room, "user:" + bob,
+                   permission::kManageServer | permission::kAdministrator, 0);
+
+    // Positive controls. Without these the test would still pass if the override
+    // had silently failed to apply, or if the seeded record were unmatchable.
+    {
+        PermissionsEngine perms(*f.store, f.config);
+        ASSERT_TRUE(perms.can(bob, room, permission::kManageServer))
+            << "override did not apply; the rest of this test would prove nothing";
+        ASSERT_FALSE(perms.can(bob, "", permission::kManageServer));
+    }
+    {
+        SqliteStore::AuditFilter filter;
+        filter.target_user = bob;
+        ASSERT_EQ(f.store->list_audit_records(50, std::nullopt, filter).records.size(), 1u)
+            << "the record Bob must not be shown is not actually matchable";
+    }
+
+    AuditHandler handler(*f.store, f.config);
+    // Every filter shape, including the one aimed squarely at himself and at the
+    // very channel his override covers.
+    const std::vector<httplib::Params> attempts = {
+        {{"actor", admin}},
+        {{"target_user", bob}},
+        {{"target_room", room}},
+        {{"action", std::string(audit_action::kMemberBan)}},
+        {{"target_room", room}, {"target_user", bob}},
+        {{"target_room", room}, {"limit", "1"}},
+    };
+    for (const auto& params : attempts) {
+        auto res = call_with_params(handler, "token-bob", params);
+        ASSERT_EQ(res.status, 403) << res.body;
+        auto body = json::parse(res.body);
+        // Refused by the PERMISSION gate, not by parameter validation — a 403 is
+        // only the right answer if it came from the server-scope check.
+        EXPECT_EQ(body.value("errcode", ""), "M_FORBIDDEN");
+        EXPECT_NE(body.value("error", "").find("audit log"), std::string::npos)
+            << "refused for the wrong reason: " << res.body;
+        EXPECT_EQ(res.body.find("records"), std::string::npos)
+            << "no records may leak in a 403";
+        EXPECT_EQ(res.body.find(admin), std::string::npos)
+            << "no record content may leak in a 403";
+    }
+
+    // And the same filters DO work for someone with the flag at server scope, so
+    // the refusal above is about Bob and not about the filters being broken.
+    auto ok = call_with_params(handler, "token-admin", {{"target_user", bob}});
+    ASSERT_TRUE(IsOk(ok));
+    EXPECT_EQ(json::parse(ok.body).at("records").size(), 1u);
 }
