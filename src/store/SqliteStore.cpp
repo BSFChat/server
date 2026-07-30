@@ -1363,7 +1363,12 @@ std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id,
 
     std::vector<RoomEvent> events;
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-        out_max_position = std::max(out_max_position, sqlite3_column_int64(stmt.get(), 11));
+        // Explicit template argument: int64_t is `long` on 64-bit Linux but
+        // `long long` on macOS, while sqlite3_int64 is always `long long`.
+        // Unqualified std::max() therefore deduces two different types and
+        // fails to compile on Linux — which is what the Docker image builds.
+        out_max_position = std::max<int64_t>(
+            out_max_position, sqlite3_column_int64(stmt.get(), 11));
         events.push_back(read_event_row(stmt.get()));
     }
     return events;
