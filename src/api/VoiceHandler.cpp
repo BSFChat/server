@@ -17,9 +17,13 @@
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <openssl/kdf.h>
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <memory>
+#include <stdexcept>
+#include <vector>
 
 namespace bsfchat {
 
@@ -446,6 +450,73 @@ void VoiceHandler::handle_turn_server(const httplib::Request& req, httplib::Resp
     res.set_content(resp.dump(), "application/json");
 }
 
+std::vector<unsigned char> VoiceHandler::livekit_room_key(const std::string& key_material,
+                                                          const std::string& server_name,
+                                                          const std::string& room_id,
+                                                          uint64_t generation) {
+    // AES-GCM-256 to match livekit::EncryptionType::GCM, which is the SDK's
+    // default and recommended mode.
+    static constexpr size_t kKeyLen = 32;
+
+    // Refuse to derive from nothing. An empty ikm would still produce
+    // well-formed-looking bytes, and every deployment with an empty secret
+    // would produce the SAME bytes for the same room — a shared "encryption"
+    // key across unrelated servers. Fail loudly instead.
+    if (key_material.empty()) {
+        throw std::runtime_error("livekit_room_key: empty key material");
+    }
+
+    // Length-prefixed field packing. Plain concatenation would let
+    // (room "a", generation 1) and (room "a1", generation "") collide once
+    // the generation is rendered as text; prefixing each field with its
+    // length makes the encoding injective, so distinct inputs cannot share a
+    // derivation.
+    std::string info;
+    auto append_field = [&info](const std::string& s) {
+        const uint32_t n = static_cast<uint32_t>(s.size());
+        for (int i = 3; i >= 0; --i) {
+            info.push_back(static_cast<char>((n >> (i * 8)) & 0xFF));
+        }
+        info += s;
+    };
+    append_field(server_name);
+    append_field(room_id);
+    for (int i = 7; i >= 0; --i) {
+        info.push_back(static_cast<char>((generation >> (i * 8)) & 0xFF));
+    }
+
+    // Domain separation. If key_material is api_secret (the default when no
+    // dedicated room_key_secret is set), this salt is what guarantees a room
+    // key can never coincide with anything the JWT signer produces from the
+    // same secret.
+    static constexpr char kSalt[] = "bsfchat/livekit-room-key/v1";
+
+    auto ctx = std::unique_ptr<EVP_PKEY_CTX, decltype(&EVP_PKEY_CTX_free)>(
+        EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, nullptr), EVP_PKEY_CTX_free);
+    if (!ctx) {
+        throw std::runtime_error("livekit_room_key: HKDF context allocation failed");
+    }
+
+    std::vector<unsigned char> key(kKeyLen);
+    size_t out_len = kKeyLen;
+    if (EVP_PKEY_derive_init(ctx.get()) <= 0 ||
+        EVP_PKEY_CTX_set_hkdf_md(ctx.get(), EVP_sha256()) <= 0 ||
+        EVP_PKEY_CTX_set1_hkdf_salt(ctx.get(),
+                                    reinterpret_cast<const unsigned char*>(kSalt),
+                                    static_cast<int>(sizeof(kSalt) - 1)) <= 0 ||
+        EVP_PKEY_CTX_set1_hkdf_key(ctx.get(),
+                                   reinterpret_cast<const unsigned char*>(key_material.data()),
+                                   static_cast<int>(key_material.size())) <= 0 ||
+        EVP_PKEY_CTX_add1_hkdf_info(ctx.get(),
+                                    reinterpret_cast<const unsigned char*>(info.data()),
+                                    static_cast<int>(info.size())) <= 0 ||
+        EVP_PKEY_derive(ctx.get(), key.data(), &out_len) <= 0 ||
+        out_len != kKeyLen) {
+        throw std::runtime_error("livekit_room_key: HKDF derivation failed");
+    }
+    return key;
+}
+
 std::string VoiceHandler::livekit_room_name(const std::string& server_name,
                                             const std::string& room_id) {
     // 0x1f (unit separator) cannot appear in either input, so the two fields
@@ -608,7 +679,7 @@ void VoiceHandler::handle_livekit_token(const httplib::Request& req, httplib::Re
     // LiveKit and renews its token would still be reaped.
     record_heartbeat(room_id, *user_id);
 
-    res.set_content(json{
+    json body{
         {"url", config_.voice.livekit.url},
         {"token", token},
         {"room", grants.room},
@@ -616,6 +687,128 @@ void VoiceHandler::handle_livekit_token(const httplib::Request& req, httplib::Re
         // Seconds. The client should re-request before this elapses if it
         // needs to be able to reconnect after a network drop.
         {"ttl", std::clamp<int64_t>(config_.voice.livekit.token_ttl, kLiveKitMinTtl, kLiveKitMaxTtl)},
+    };
+
+    // Media key. Reaching this point already required room membership, a
+    // voice-enabled channel, and kViewChannel — the same gate as the token,
+    // and deliberately so: the key is exactly as sensitive as the token,
+    // because either one alone is useless and both together are what let a
+    // participant hear the room.
+    //
+    // Delivered in the RESPONSE BODY over TLS, never in a URL. Query strings
+    // land in access logs, proxy logs and browser history.
+    if (config_.voice.livekit.room_encryption) {
+        uint64_t generation = 0;
+        {
+            std::lock_guard<std::mutex> lock(key_generation_mutex_);
+            auto it = key_generations_.find(room_id);
+            if (it != key_generations_.end()) {
+                generation = it->second;
+            }
+        }
+        try {
+            const auto key = livekit_room_key(config_.voice.livekit.key_material(),
+                                              config_.server_name, room_id, generation);
+            body["encryption"] = json{
+                {"mode", "shared_key"},
+                {"key", base64_encode(key.data(), key.size())},
+                {"key_generation", generation},
+            };
+        } catch (const std::exception& e) {
+            // Never echo e.what() to the client and never fall through to an
+            // unencrypted response. A client that asked for an encrypted
+            // session and silently got a plaintext one is the worst possible
+            // outcome — it would believe it had a property it does not have.
+            get_logger()->error("LiveKit room key derivation failed for room {}: {}",
+                                room_id, e.what());
+            res.status = 500;
+            res.set_content(MatrixError::unknown("Could not issue a voice key").to_json().dump(),
+                            "application/json");
+            return;
+        }
+    }
+
+    res.set_content(body.dump(), "application/json");
+}
+
+void VoiceHandler::handle_livekit_rekey(const httplib::Request& req, httplib::Response& res) {
+    auto user_id = authenticate(store_, req.get_header_value("Authorization"));
+    if (!user_id) {
+        res.status = 401;
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
+        return;
+    }
+
+    auto match = match_route("/_matrix/client/v3/rooms/{roomId}/voice/livekit_rekey", req.path);
+    if (!match.matched) {
+        res.status = 404;
+        res.set_content(MatrixError::not_found().to_json().dump(), "application/json");
+        return;
+    }
+    auto& room_id = match.params["roomId"];
+
+    // Same "unconfigured is a 404" contract as the token endpoint. Also 404
+    // when encryption is off: there is no key to rotate, and saying so
+    // plainly beats pretending a rotation happened.
+    if (!config_.voice.enabled || !config_.voice.livekit.configured() ||
+        !config_.voice.livekit.room_encryption) {
+        res.status = 404;
+        res.set_content(
+            MatrixError::not_found("LiveKit media encryption is not configured on this server")
+                .to_json().dump(),
+            "application/json");
+        return;
+    }
+
+    if (!store_.is_room_member(room_id, *user_id)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(), "application/json");
+        return;
+    }
+
+    auto voice_state = store_.get_state_event(room_id, std::string(event_type::kRoomVoice), "");
+    if (!voice_state) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Room is not voice-capable").to_json().dump(), "application/json");
+        return;
+    }
+    VoiceChannelContent voice_channel;
+    from_json(voice_state->content.data, voice_channel);
+    if (!voice_channel.enabled) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Voice is disabled in this room").to_json().dump(), "application/json");
+        return;
+    }
+
+    // Rotating is a moderation action, not a user action: it interrupts
+    // every participant still holding the old key until they re-fetch. Gate
+    // it on channel management, the same bit that grants LiveKit roomAdmin.
+    // kViewChannel is implied — the permission engine cannot grant
+    // kManageChannels on a channel the user cannot see — but check it
+    // explicitly anyway rather than relying on that.
+    PermissionsEngine perms(store_, config_);
+    const permission::Flags flags = perms.compute(*user_id, room_id);
+    if (!permission::has(flags, permission::kViewChannel) ||
+        !permission::has(flags, permission::kManageChannels)) {
+        res.status = 403;
+        res.set_content(
+            MatrixError::forbidden("You do not have permission to rotate this channel's media key")
+                .to_json().dump(),
+            "application/json");
+        return;
+    }
+
+    uint64_t generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(key_generation_mutex_);
+        generation = ++key_generations_[room_id];
+    }
+
+    // The new key is NOT returned here. The caller re-fetches it from the
+    // token endpoint like everyone else, so there is exactly one code path
+    // that hands out key material and exactly one permission gate on it.
+    res.set_content(json{
+        {"key_generation", generation},
     }.dump(), "application/json");
 }
 

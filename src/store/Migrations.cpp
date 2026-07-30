@@ -824,6 +824,62 @@ void migrate_v14(sqlite3* db, bool /*fresh_database*/) {
     }
 }
 
+// v15: the server-wide ban list.
+//
+// "Ban from server" had no server-side representation at all. It was a CLIENT
+// loop over the rooms its sync happened to have surfaced, calling
+// POST /rooms/{id}/ban once per room, with a comment conceding that rooms the
+// client had not synced "fall through the cracks". So a banned user stayed a
+// joined member of every channel the moderator's client had not seen, and
+// auto-join could put them back into the ones it had.
+//
+// Why its OWN table and not the `server_state` (event_type, state_key) blob that
+// server-wide roles use:
+//   * server_state holds one JSON document per key. A ban list kept there is
+//     read-modify-written on every ban, so two moderators banning at the same
+//     moment lose one of the two bans — the exact lost-update shape that
+//     set_server_state's read-inside-the-write exists to avoid for roles, and
+//     roles get away with it only because the client always submits the WHOLE
+//     list. A ban is a single-row fact and belongs in a row.
+//   * "is this user banned" is on the hot path of /join, every auto-join and
+//     every /sync. That must be an indexed primary-key lookup, not a JSON parse
+//     of an unbounded document.
+// It is a table rather than room state for the reason server-wide roles stopped
+// being room state earlier: delete_room hard-deletes a room's events, so a ban
+// kept in room state is lifted by whoever deletes the channel it was recorded
+// in. Nothing here references rooms(room_id) or users(user_id) by foreign key —
+// a ban must outlive the channel it was placed from, and must survive an account
+// row being removed, or deletion becomes a way to launder a ban.
+void migrate_v15(sqlite3* db, bool /*fresh_database*/) {
+    exec(db, R"(
+        CREATE TABLE IF NOT EXISTS server_bans (
+            user_id    TEXT PRIMARY KEY,
+            actor      TEXT NOT NULL DEFAULT '',
+            reason     TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL
+        )
+    )");
+
+    // Backfill from room_members. Every existing membership='ban' row was placed
+    // by POST /rooms/{id}/ban, and the only thing that has ever called it is the
+    // client's "ban from server" loop — so each of those rows is the surviving
+    // fragment of an intended SERVER ban, and dropping them on the floor would
+    // silently un-ban everybody the moment this migration ran.
+    //
+    // `actor` is left empty because room_members does not record one: the table
+    // has (room_id, user_id, membership, updated_at) and nothing else. An honest
+    // blank is better than naming a plausible moderator that the database never
+    // stored. created_at takes the newest updated_at across that user's ban rows,
+    // which is the closest thing to "when they were banned" that exists.
+    exec(db, R"(
+        INSERT OR IGNORE INTO server_bans (user_id, actor, reason, created_at)
+        SELECT user_id, '', '', MAX(updated_at)
+        FROM room_members
+        WHERE membership = 'ban'
+        GROUP BY user_id
+    )");
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -842,6 +898,7 @@ const std::vector<Step>& steps() {
         migrate_v12,
         migrate_v13,
         migrate_v14,
+        migrate_v15,
     };
     return kMigrations;
 }

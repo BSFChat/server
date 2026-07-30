@@ -282,6 +282,11 @@ void Server::register_routes() {
     // is how a client detects a mesh-only server.
     svr.Post(R"(/_matrix/client/v3/rooms/([^/]+)/voice/livekit_token)",
              [h = voice_handler_](const httplib::Request& req, httplib::Response& res) { h->handle_livekit_token(req, res); });
+    // Rotates a channel's media key. Requires kManageChannels — rotating
+    // interrupts everyone still holding the old key. This is the only way to
+    // stop a departed member decrypting; see LiveKitConfig::room_encryption.
+    svr.Post(R"(/_matrix/client/v3/rooms/([^/]+)/voice/livekit_rekey)",
+             [h = voice_handler_](const httplib::Request& req, httplib::Response& res) { h->handle_livekit_rekey(req, res); });
 }
 
 void Server::start() {

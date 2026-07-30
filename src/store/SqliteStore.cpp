@@ -716,6 +716,84 @@ std::vector<std::pair<std::string, std::string>> SqliteStore::get_room_members(c
     return members;
 }
 
+std::vector<std::pair<std::string, std::string>>
+SqliteStore::get_user_memberships(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT room_id, membership FROM room_members WHERE user_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::vector<std::pair<std::string, std::string>> rows;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        rows.emplace_back(
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)),
+            reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1))
+        );
+    }
+    return rows;
+}
+
+// Server-wide bans
+
+void SqliteStore::set_server_ban(const std::string& user_id, const std::string& actor,
+                                 const std::string& reason, int64_t created_at) {
+    std::lock_guard lock(mutex_);
+    const int64_t ts = created_at != 0 ? created_at : audit_now_ms();
+    auto stmt = prepare(db_,
+        "INSERT INTO server_bans (user_id, actor, reason, created_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET actor = excluded.actor, reason = excluded.reason, "
+        "created_at = excluded.created_at");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, actor.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, reason.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 4, ts);
+    sqlite3_step(stmt.get());
+}
+
+bool SqliteStore::clear_server_ban(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "DELETE FROM server_bans WHERE user_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+    return sqlite3_changes(db_) > 0;
+}
+
+bool SqliteStore::is_server_banned(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT 1 FROM server_bans WHERE user_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    return sqlite3_step(stmt.get()) == SQLITE_ROW;
+}
+
+std::optional<SqliteStore::ServerBan> SqliteStore::get_server_ban(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT user_id, actor, reason, created_at FROM server_bans WHERE user_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    ServerBan ban;
+    ban.user_id = column_text_or_empty(stmt.get(), 0);
+    ban.actor = column_text_or_empty(stmt.get(), 1);
+    ban.reason = column_text_or_empty(stmt.get(), 2);
+    ban.created_at = sqlite3_column_int64(stmt.get(), 3);
+    return ban;
+}
+
+std::vector<SqliteStore::ServerBan> SqliteStore::list_server_bans() {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT user_id, actor, reason, created_at FROM server_bans ORDER BY created_at DESC");
+    std::vector<ServerBan> bans;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        ServerBan ban;
+        ban.user_id = column_text_or_empty(stmt.get(), 0);
+        ban.actor = column_text_or_empty(stmt.get(), 1);
+        ban.reason = column_text_or_empty(stmt.get(), 2);
+        ban.created_at = sqlite3_column_int64(stmt.get(), 3);
+        bans.push_back(std::move(ban));
+    }
+    return bans;
+}
+
 // Events
 
 int64_t SqliteStore::claim_stream_position_locked() {

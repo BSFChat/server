@@ -25,6 +25,7 @@ add_executable(server_tests
     test_search.cpp
     test_audit.cpp
     test_permission_scope.cpp
+    test_server_ban.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

@@ -30,6 +30,17 @@ void join_user_to_room(SqliteStore& store, SyncEngine& sync_engine,
     // Skip if already joined
     if (store.is_room_member(room_id, user_id)) return;
 
+    // A server-wide ban wins over every force-join in the server.
+    //
+    // Placed HERE, at the one function all three auto-join sweeps funnel through
+    // (auto_join_public_rooms on registration, auto_join_all_users on channel
+    // creation, backfill_auto_join at boot), rather than in each caller. Auto-join
+    // is what made the client's ban loop not merely incomplete but self-undoing:
+    // creating any public channel force-joined EVERY user on the server into it,
+    // banned ones included, so a banned account was silently re-admitted by the
+    // next channel anybody made — and the moderator had no way to know.
+    if (store.is_server_banned(user_id)) return;
+
     // Snapshot current max position BEFORE writing the join event — this is the
     // point up to which we consider everything "already read" for this user.
     int64_t mark_pos = store.get_room_max_stream_position(room_id);

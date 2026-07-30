@@ -1,0 +1,740 @@
+// The server-wide ban list, and the entry points it has to hold.
+//
+// Before this, "ban from server" was implemented in the CLIENT: a loop over the
+// rooms its own sync had surfaced, calling POST /rooms/{id}/ban once per room,
+// with a comment in ServerConnection::banFromServer conceding that rooms the
+// client had not synced "fall through the cracks — acceptable". They were not
+// acceptable. A banned user stayed a fully joined member of every channel the
+// moderator's client had not seen, and because creating any public channel
+// force-joins every user on the server, the next channel anybody made silently
+// re-admitted them.
+//
+// The properties under test, in the order they appear:
+//   1. A ban prevents joining, and reaches channels the moderator never touched.
+//   2. Both auto-join paths refuse a banned user — on registration, and on
+//      channel creation.
+//   3. A ban survives the deletion of the channel it was placed from. This is why
+//      it is a table and not room state: delete_room hard-deletes room events.
+//   4. Unban clears it and restores access, and the per-room unban endpoint is
+//      the server-wide unban.
+//   5. The rank check still holds, and is refused for the RIGHT reason.
+//   6. Sync, invite and registration are all closed to a banned identity.
+//   7. Migration v15 recovers the bans a pre-existing deployment already had.
+
+#include <gtest/gtest.h>
+
+#include "api/AuthHandler.h"
+#include "api/RoomHandler.h"
+#include "audit/AuditLog.h"
+#include "auth/AutoJoin.h"
+#include "auth/LocalAuth.h"
+#include "auth/Permissions.h"
+#include "core/Config.h"
+#include "store/Migrations.h"
+#include "store/SqliteStore.h"
+#include "sync/SyncEngine.h"
+
+#include <bsfchat/Constants.h>
+#include <bsfchat/Identifiers.h>
+#include <bsfchat/MatrixTypes.h>
+#include <bsfchat/Permissions.h>
+
+#include <nlohmann/json.hpp>
+
+#include <sqlite3.h>
+#include <unistd.h>
+
+#include <filesystem>
+#include <string>
+#include <vector>
+
+using namespace bsfchat;
+using json = nlohmann::json;
+
+namespace {
+
+std::string temp_db_path(const std::string& name) {
+    return (std::filesystem::temp_directory_path() /
+            ("bsfchat-ban-" + name + "-" + std::to_string(::getpid()) + ".db")).string();
+}
+
+void remove_db(const std::string& path) {
+    std::filesystem::remove(path);
+    std::filesystem::remove(path + "-wal");
+    std::filesystem::remove(path + "-shm");
+}
+
+httplib::Request make_request(const std::string& path, const std::string& token,
+                              const std::string& body = "") {
+    httplib::Request req;
+    req.path = path;
+    req.body = body;
+    req.set_header("Authorization", "Bearer " + token);
+    return req;
+}
+
+::testing::AssertionResult IsOk(const httplib::Response& res) {
+    if (res.status == -1 || res.status == 200) return ::testing::AssertionSuccess();
+    return ::testing::AssertionFailure() << "status " << res.status << ", body: " << res.body;
+}
+
+// A 403 refused for the REASON given, not merely a 403.
+//
+// Load-bearing here for the same reason it is in test_permission_scope: every
+// moderation path can refuse for several separate reasons, and a test that only
+// checks the status code passes when the refusal came from somewhere else
+// entirely. A prior sweep found five tests green with the fix reverted because a
+// rank check was refusing regardless of the property under test.
+::testing::AssertionResult IsForbiddenBecause(const httplib::Response& res,
+                                              const std::string& needle) {
+    if (res.status != 403) {
+        return ::testing::AssertionFailure() << "expected 403, got status " << res.status
+                                             << ", body: " << res.body;
+    }
+    if (res.body.find(needle) == std::string::npos) {
+        return ::testing::AssertionFailure()
+               << "403 for the wrong reason: expected a message containing \"" << needle
+               << "\", got: " << res.body;
+    }
+    return ::testing::AssertionSuccess();
+}
+
+template <typename Handler, typename Method>
+httplib::Response call(Handler& handler, Method method, const std::string& path,
+                       const std::string& token, const std::string& body = "") {
+    auto req = make_request(path, token, body);
+    httplib::Response res;
+    (handler.*method)(req, res);
+    return res;
+}
+
+ServerRole role(const std::string& id, int position, permission::Flags flags) {
+    ServerRole r;
+    r.id = id;
+    r.name = id;
+    r.position = position;
+    r.permissions = flags;
+    return r;
+}
+
+struct Fixture {
+    std::string db_path;
+    Config config;
+    std::unique_ptr<SqliteStore> store;
+    std::unique_ptr<SyncEngine> sync;
+
+    explicit Fixture(const std::string& name) {
+        db_path = temp_db_path(name);
+        remove_db(db_path);
+        config = Config::defaults();
+        config.server_name = "test";
+        store = std::make_unique<SqliteStore>(db_path);
+        store->initialize();
+        sync = std::make_unique<SyncEngine>(*store, config);
+    }
+
+    ~Fixture() {
+        sync.reset();
+        store.reset();
+        remove_db(db_path);
+    }
+
+    void seed_roles() {
+        ServerRolesContent content;
+        content.roles.push_back(role(permission::role_id::kEveryone, 0,
+                                     permission::kEveryoneDefault));
+        content.roles.push_back(role(permission::role_id::kModerator, 10,
+                                     permission::kEveryoneDefault | permission::kKickMembers |
+                                         permission::kBanMembers));
+        content.roles.push_back(role(permission::role_id::kAdmin, 100, permission::kAllFlags));
+        json j;
+        to_json(j, content);
+        store->set_server_state(std::string(event_type::kServerRoles), "", "@server:test",
+                                j.dump());
+    }
+
+    std::string add_user(const std::string& localpart,
+                         const std::vector<std::string>& extra_roles = {}) {
+        std::string uid = "@" + localpart + ":test";
+        store->create_user(uid, hash_password("password", 10));
+        store->store_access_token("token-" + localpart, uid, "dev");
+
+        MemberRolesContent c;
+        c.role_ids = {std::string(permission::role_id::kEveryone)};
+        for (const auto& r : extra_roles) c.role_ids.push_back(r);
+        json j;
+        to_json(j, c);
+        store->set_server_state(std::string(event_type::kMemberRoles), uid, "@server:test",
+                                j.dump());
+        return uid;
+    }
+
+    // A public text channel, in the shape auto-join recognises: list_public_rooms
+    // requires a public join_rule and a non-category bsfchat.room.type.
+    std::string add_channel(const std::string& creator, const std::string& name) {
+        auto room_id = generate_room_id("test");
+        store->create_room(room_id, creator);
+        store->set_membership(room_id, creator, std::string(membership::kJoin));
+        store->insert_event(generate_event_id("test"), room_id, creator,
+                            std::string(event_type::kRoomName), std::string(""),
+                            json{{"name", name}}.dump(), 1000);
+        store->insert_event(generate_event_id("test"), room_id, creator,
+                            std::string(event_type::kRoomType), std::string(""),
+                            json{{"type", "text"}}.dump(), 1001);
+        store->insert_event(generate_event_id("test"), room_id, creator,
+                            std::string(event_type::kRoomJoinRules), std::string(""),
+                            json{{"join_rule", "public"}}.dump(), 1002);
+        return room_id;
+    }
+
+    void join(const std::string& room_id, const std::string& user_id) {
+        store->set_membership(room_id, user_id, std::string(membership::kJoin));
+        store->insert_event(generate_event_id("test"), room_id, user_id,
+                            std::string(event_type::kRoomMember), user_id,
+                            json{{"membership", membership::kJoin}}.dump(), 1003);
+    }
+
+    std::vector<SqliteStore::AuditRecord> records() {
+        return store->list_audit_records(limits::kMaxAuditLimit, std::nullopt).records;
+    }
+};
+
+const std::string kRoomsPrefix = "/_matrix/client/v3/rooms/";
+
+std::string ban_path(const std::string& room) { return kRoomsPrefix + room + "/ban"; }
+std::string unban_path(const std::string& room) { return kRoomsPrefix + room + "/unban"; }
+std::string kick_path(const std::string& room) { return kRoomsPrefix + room + "/kick"; }
+std::string invite_path(const std::string& room) { return kRoomsPrefix + room + "/invite"; }
+std::string join_path(const std::string& room) {
+    return "/_matrix/client/v3/rooms/" + room + "/join";
+}
+
+std::string target_body(const std::string& user, const std::string& reason = "") {
+    json j = {{"user_id", user}};
+    if (!reason.empty()) j["reason"] = reason;
+    return j.dump();
+}
+
+} // namespace
+
+// ══ 1. A ban actually prevents joining, everywhere ════════════════════════
+
+TEST(ServerBan, BanPreventsJoining) {
+    Fixture f("prevents-join");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel(mod, "general");
+    f.join(room, victim);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(room), "token-mod",
+                          target_body(victim, "spam"))));
+    ASSERT_TRUE(f.store->is_server_banned(victim));
+
+    // The channel is public, so before the ban list existed this join succeeded:
+    // handle_join checked only the join_rules event.
+    EXPECT_TRUE(IsForbiddenBecause(call(handler, &RoomHandler::handle_join, join_path(room),
+                                        "token-victim"),
+                                   "You are banned from this server"));
+    EXPECT_FALSE(f.store->is_room_member(room, victim));
+}
+
+TEST(ServerBan, BanReachesChannelsTheModeratorNeverTouched) {
+    Fixture f("reaches-all");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+
+    // Three channels. The ban is placed through `general` only — which is exactly
+    // what the client's loop did for the rooms it had synced, and it did nothing
+    // at all for the ones it had not.
+    auto general = f.add_channel(mod, "general");
+    auto unsynced = f.add_channel(mod, "off-topic");
+    auto also_unsynced = f.add_channel(mod, "secret-plans");
+    f.join(general, victim);
+    f.join(unsynced, victim);
+    f.join(also_unsynced, victim);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(general), "token-mod",
+                          target_body(victim))));
+
+    // The membership row, not just the event: every server-side check reads the row.
+    for (const auto& room : {general, unsynced, also_unsynced}) {
+        EXPECT_EQ(f.store->get_membership(room, victim), membership::kBan) << "room " << room;
+        EXPECT_FALSE(f.store->is_room_member(room, victim)) << "room " << room;
+    }
+    // ...and clients, which rebuild member lists from events, agree.
+    auto ev = f.store->get_state_event(unsynced, std::string(event_type::kRoomMember), victim);
+    ASSERT_TRUE(ev.has_value());
+    EXPECT_EQ(ev->content.data.value("membership", ""), membership::kBan);
+}
+
+TEST(ServerBan, BanAppliesToARoomTheTargetWasNeverAMemberOf) {
+    Fixture f("nonmember-room");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel(mod, "general");
+    // Deliberately NOT joined: POST /rooms/{id}/ban on a non-member must still
+    // produce a ban in the room the request named.
+    ASSERT_FALSE(f.store->is_room_member(room, victim));
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(room), "token-mod",
+                          target_body(victim))));
+
+    EXPECT_EQ(f.store->get_membership(room, victim), membership::kBan);
+    EXPECT_TRUE(f.store->is_server_banned(victim));
+}
+
+// ══ 2. Both auto-join paths refuse a banned user ══════════════════════════
+
+TEST(ServerBan, AutoJoinOnRegistrationRefusesABannedUser) {
+    Fixture f("autojoin-registration");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto general = f.add_channel(mod, "general");
+    auto other = f.add_channel(mod, "off-topic");
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(general), "token-mod",
+                          target_body(victim))));
+
+    // The sweep a registration runs. It force-joins every public channel, which is
+    // how a banned account used to walk straight back in.
+    auto_join_public_rooms(*f.store, *f.sync, f.config, victim);
+
+    EXPECT_FALSE(f.store->is_room_member(general, victim));
+    EXPECT_FALSE(f.store->is_room_member(other, victim));
+    EXPECT_TRUE(f.store->get_joined_rooms(victim).empty());
+}
+
+TEST(ServerBan, AutoJoinOnChannelCreationRefusesABannedUser) {
+    Fixture f("autojoin-creation");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto innocent = f.add_user("innocent");
+    auto general = f.add_channel(mod, "general");
+    f.join(general, victim);
+    f.join(general, innocent);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(general), "token-mod",
+                          target_body(victim))));
+
+    // A channel created AFTER the ban. There is no membership row for the ban
+    // projection to have touched, so this is the case the projection alone cannot
+    // cover and the ban list must.
+    auto fresh = f.add_channel(mod, "new-channel");
+    auto_join_all_users(*f.store, *f.sync, f.config, fresh, mod);
+
+    EXPECT_FALSE(f.store->is_room_member(fresh, victim));
+    // The sweep still works for everybody else — this is not a test that passes
+    // because auto_join_all_users stopped doing anything.
+    EXPECT_TRUE(f.store->is_room_member(fresh, innocent));
+}
+
+TEST(ServerBan, BootBackfillRefusesABannedUser) {
+    Fixture f("autojoin-backfill");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto innocent = f.add_user("innocent");
+    auto general = f.add_channel(mod, "general");
+    f.join(general, victim);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(general), "token-mod",
+                          target_body(victim))));
+
+    // The third auto-join path: the one that runs on every server start. If a ban
+    // did not hold here, a restart would undo it.
+    backfill_auto_join(*f.store, *f.sync, f.config);
+
+    EXPECT_FALSE(f.store->is_room_member(general, victim));
+    EXPECT_TRUE(f.store->is_room_member(general, innocent));
+}
+
+// ══ 3. A ban survives channel deletion ════════════════════════════════════
+
+TEST(ServerBan, BanSurvivesDeletionOfTheChannelItWasPlacedFrom) {
+    Fixture f("survives-delete");
+    f.seed_roles();
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto victim = f.add_user("victim");
+    auto general = f.add_channel(admin, "general");
+    auto other = f.add_channel(admin, "off-topic");
+    f.join(general, victim);
+    f.join(other, victim);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(general), "token-admin",
+                          target_body(victim, "the reason"))));
+
+    // delete_room hard-deletes every event in the room. A ban recorded as room
+    // state — or inferred from the timeline — would be destroyed here, which is
+    // exactly why server-wide roles were moved out of room state earlier, and why
+    // the ban list is a table of its own.
+    f.store->delete_room(general);
+    ASSERT_FALSE(f.store->room_exists(general));
+
+    EXPECT_TRUE(f.store->is_server_banned(victim));
+    auto ban = f.store->get_server_ban(victim);
+    ASSERT_TRUE(ban.has_value());
+    EXPECT_EQ(ban->actor, admin);
+    EXPECT_EQ(ban->reason, "the reason");
+
+    // And it still bites: the surviving channel is still closed to them.
+    EXPECT_TRUE(IsForbiddenBecause(call(handler, &RoomHandler::handle_join, join_path(other),
+                                        "token-victim"),
+                                   "You are banned from this server"));
+}
+
+// ══ 4. Unban ══════════════════════════════════════════════════════════════
+
+TEST(ServerBan, UnbanRestoresAccessEverywhere) {
+    Fixture f("unban-restores");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto general = f.add_channel(mod, "general");
+    auto other = f.add_channel(mod, "off-topic");
+    f.join(general, victim);
+    f.join(other, victim);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(general), "token-mod",
+                          target_body(victim))));
+    ASSERT_EQ(f.store->get_membership(other, victim), membership::kBan);
+
+    // Unbanned through `general`, and it must lift in `other` too — the same
+    // "rooms the client never synced" problem in the opposite direction.
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_unban, unban_path(general), "token-mod",
+                          target_body(victim))));
+
+    EXPECT_FALSE(f.store->is_server_banned(victim));
+    // "leave", not "join": lifting a ban restores the ability to come back, it
+    // does not decide for them that they have.
+    EXPECT_EQ(f.store->get_membership(general, victim), membership::kLeave);
+    EXPECT_EQ(f.store->get_membership(other, victim), membership::kLeave);
+
+    // And they can actually come back.
+    EXPECT_TRUE(IsOk(call(handler, &RoomHandler::handle_join, join_path(other), "token-victim")));
+    EXPECT_TRUE(f.store->is_room_member(other, victim));
+}
+
+TEST(ServerBan, UnbanningSomebodyWhoIsNotBannedIsRefusedForThatReason) {
+    Fixture f("unban-notbanned");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel(mod, "general");
+    f.join(room, victim);
+
+    // The actor HAS ban permission and outranks the target, so neither of those
+    // can be what refuses this — the precondition is the only thing left.
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    EXPECT_TRUE(IsForbiddenBecause(call(handler, &RoomHandler::handle_unban, unban_path(room),
+                                        "token-mod", target_body(victim)),
+                                   "User is not banned"));
+    // Critically, it did not silently kick them instead: "set leave on a user who
+    // is not banned" is the wire shape of a kick, and an endpoint named unban must
+    // not perform one.
+    EXPECT_EQ(f.store->get_membership(room, victim), membership::kJoin);
+}
+
+TEST(ServerBan, KickingABannedUserDoesNotLiftTheBan) {
+    Fixture f("kick-not-unban");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel(mod, "general");
+    f.join(room, victim);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(room), "token-mod",
+                          target_body(victim))));
+
+    // A kick sets membership to "leave". Inferring intent from that transition
+    // would read it as an unban, because the target IS banned — so the dedicated
+    // endpoints declare what they are instead of inferring.
+    call(handler, &RoomHandler::handle_kick, kick_path(room), "token-mod", target_body(victim));
+    EXPECT_TRUE(f.store->is_server_banned(victim))
+        << "POST /kick lifted a ban";
+    EXPECT_EQ(f.store->get_membership(room, victim), membership::kBan);
+}
+
+// ══ 5. The rank check still holds ═════════════════════════════════════════
+
+TEST(ServerBan, ModeratorCannotBanAnAdminAndNoBanIsRecorded) {
+    Fixture f("rank");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto room = f.add_channel(mod, "general");
+    f.join(room, admin);
+
+    // The actor holds BAN_MEMBERS at server scope, so the permission check passes
+    // and rank is the only thing that can refuse. Asserted, so this test cannot
+    // quietly become a permission test.
+    PermissionsEngine perms(*f.store, f.config);
+    ASSERT_TRUE(perms.can(mod, std::string(), permission::kBanMembers));
+    ASSERT_FALSE(perms.outranks(mod, admin));
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    EXPECT_TRUE(IsForbiddenBecause(call(handler, &RoomHandler::handle_ban, ban_path(room),
+                                        "token-mod", target_body(admin)),
+                                   "Cannot ban a user with equal or higher role"));
+
+    // A refusal must leave NOTHING behind — not a ban row, not a membership
+    // change, not an audit record.
+    EXPECT_FALSE(f.store->is_server_banned(admin));
+    EXPECT_EQ(f.store->get_membership(room, admin), membership::kJoin);
+    EXPECT_TRUE(f.records().empty());
+}
+
+// ══ 6. Sync, invite and registration ══════════════════════════════════════
+
+TEST(ServerBan, SyncReturnsNothingForABannedUser) {
+    Fixture f("sync");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel(mod, "general");
+    f.join(room, victim);
+
+    // Sync works first, so the emptiness below is caused by the ban and not by a
+    // fixture that never had anything to return.
+    ASSERT_FALSE(f.sync->handle_sync(victim, "", 0).rooms.join.empty());
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(room), "token-mod",
+                          target_body(victim))));
+
+    EXPECT_TRUE(f.sync->handle_sync(victim, "", 0).rooms.join.empty());
+    // And an incremental sync, which takes a different code path.
+    EXPECT_TRUE(f.sync->handle_sync(victim, "s0", 0).rooms.join.empty());
+}
+
+// The sync guard specifically, isolated from the ban projection.
+//
+// The test above cannot fail if the guard is deleted: a full ban sets every
+// room_members row to "ban", so get_joined_rooms returns nothing and sync is empty
+// for that reason alone. Mutation testing caught it passing with the guard removed
+// — the exact "green for the wrong reason" shape a prior sweep found five of.
+//
+// Here the ban row is written with NO projection, which is the state the server is
+// in if it dies between the ban-list write and the membership rewrite, or if some
+// future code path adds a membership row for a banned user. The guard is what
+// makes that state fail closed, so this is the only test that can see it.
+TEST(ServerBan, SyncIsClosedByTheBanListEvenWhenMembershipStillSaysJoin) {
+    Fixture f("sync-failclosed");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel(mod, "general");
+    f.join(room, victim);
+
+    f.store->set_server_ban(victim, mod, "no projection", 0);
+
+    // The membership row deliberately still says "join" — if the projection had
+    // run, this test would be the one above and would prove nothing.
+    ASSERT_TRUE(f.store->is_room_member(room, victim));
+    ASSERT_FALSE(f.store->get_joined_rooms(victim).empty());
+
+    EXPECT_TRUE(f.sync->handle_sync(victim, "", 0).rooms.join.empty());
+    EXPECT_TRUE(f.sync->handle_sync(victim, "s0", 0).rooms.join.empty());
+}
+
+TEST(ServerBan, ABannedUserCannotBeInvitedBackIntoAFreshChannel) {
+    Fixture f("invite");
+    f.seed_roles();
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto victim = f.add_user("victim");
+    auto general = f.add_channel(admin, "general");
+    f.join(general, victim);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(general), "token-admin",
+                          target_body(victim))));
+
+    // A channel created after the ban: the target has no membership row in it, so
+    // the pre-existing "is their membership 'ban' in this room" check reads
+    // "leave" and would let the invite through.
+    auto fresh = f.add_channel(admin, "fresh");
+    EXPECT_TRUE(IsForbiddenBecause(call(handler, &RoomHandler::handle_invite, invite_path(fresh),
+                                        "token-admin", target_body(victim)),
+                                   "User is banned from this server"));
+    EXPECT_EQ(f.store->get_membership(fresh, victim), membership::kLeave);
+}
+
+TEST(ServerBan, ABannedIdentityCannotReRegister) {
+    Fixture f("register");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel(mod, "general");
+    f.join(room, victim);
+
+    RoomHandler rooms(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(rooms, &RoomHandler::handle_ban, ban_path(room), "token-mod",
+                          target_body(victim))));
+
+    // The account still exists, so this would ordinarily be refused as
+    // "user in use" (400). The ban is checked FIRST and refuses with 403, which is
+    // what keeps holding if the account row is ever removed — the ban list has no
+    // foreign key to users(user_id) precisely so deleting the account cannot
+    // launder the ban.
+    //
+    // NOT tested, because it is not true: that the same human cannot register a
+    // DIFFERENT username. Nothing binds an account to a person on an
+    // open-registration deployment. See the comment in AuthHandler::handle_register.
+    AuthHandler auth(*f.store, *f.sync, f.config);
+    auto res = call(auth, &AuthHandler::handle_register, "/_matrix/client/v3/register", "",
+                    json{{"username", "victim"}, {"password", "hunter2hunter2"}}.dump());
+    EXPECT_TRUE(IsForbiddenBecause(res, "banned"));
+}
+
+// ══ 7. Audit records are preserved ════════════════════════════════════════
+
+TEST(ServerBanAudit, BanAndUnbanEachRecordExactlyOneRecord) {
+    Fixture f("audit");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto general = f.add_channel(mod, "general");
+    auto other = f.add_channel(mod, "off-topic");
+    f.join(general, victim);
+    f.join(other, victim);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(general), "token-mod",
+                          target_body(victim, "spam"))));
+
+    // ONE record, not one per projected room. The ban touched two channels but it
+    // was one act of authority, and a 40-channel server must not bury its audit
+    // log under 40 rows describing the mechanical consequence of one click.
+    auto after_ban = f.records();
+    ASSERT_EQ(after_ban.size(), 1u);
+    EXPECT_EQ(after_ban[0].action, audit_action::kMemberBan);
+    EXPECT_EQ(after_ban[0].actor, mod);
+    EXPECT_EQ(after_ban[0].target_user, victim);
+    EXPECT_EQ(after_ban[0].target_room, general);
+    EXPECT_EQ(after_ban[0].reason, "spam");
+
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_unban, unban_path(general), "token-mod",
+                          target_body(victim))));
+    auto after_unban = f.records();
+    ASSERT_EQ(after_unban.size(), 2u);
+    EXPECT_EQ(after_unban[0].action, audit_action::kMemberUnban);
+}
+
+// ══ 8. Migration v15 against a populated pre-existing database ════════════
+
+namespace {
+
+int scalar(const std::string& path, const std::string& sql) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) return -1;
+    sqlite3_stmt* stmt = nullptr;
+    int out = -1;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) out = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return out;
+}
+
+void exec_raw(const std::string& path, const std::string& sql) {
+    sqlite3* db = nullptr;
+    ASSERT_EQ(sqlite3_open(path.c_str(), &db), SQLITE_OK);
+    char* err = nullptr;
+    ASSERT_EQ(sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err), SQLITE_OK)
+        << (err ? err : "?");
+    sqlite3_close(db);
+}
+
+} // namespace
+
+// The v15 step has a BACKFILL, and a backfill is exactly the kind of step that
+// passes on an empty database and does the wrong thing on a populated one. So it
+// is exercised against a database that already has rooms, users and — the point —
+// pre-existing membership='ban' rows placed by the old client-side loop.
+TEST(ServerBanMigration, ExistingPerRoomBansAreRecoveredIntoTheBanList) {
+    auto path = temp_db_path("v14-upgrade");
+    remove_db(path);
+
+    std::string banned_a = "@banned-a:test";
+    std::string banned_b = "@banned-b:test";
+    std::string innocent = "@innocent:test";
+    std::string room_one = generate_room_id("test");
+    std::string room_two = generate_room_id("test");
+
+    // Build a populated database, then wind it back to the v14 shape: drop the
+    // table v15 adds and reset user_version. What remains is what a real
+    // deployment running yesterday's build looks like.
+    {
+        SqliteStore store(path);
+        store.initialize();
+        store.create_user(banned_a, "");
+        store.create_user(banned_b, "");
+        store.create_user(innocent, "");
+        store.create_room(room_one, banned_a);
+        store.create_room(room_two, banned_a);
+
+        // banned_a: banned in both rooms, as the client's loop would have left
+        // them. banned_b: banned in one room only, because the loop reached one.
+        store.set_membership(room_one, banned_a, std::string(membership::kBan));
+        store.set_membership(room_two, banned_a, std::string(membership::kBan));
+        store.set_membership(room_one, banned_b, std::string(membership::kBan));
+        store.set_membership(room_two, banned_b, std::string(membership::kJoin));
+        store.set_membership(room_one, innocent, std::string(membership::kJoin));
+    }
+
+    ASSERT_EQ(scalar(path, "PRAGMA user_version"), kTargetSchemaVersion);
+    exec_raw(path, "DROP TABLE server_bans; PRAGMA user_version = 14;");
+    ASSERT_EQ(scalar(path, "PRAGMA user_version"), 14);
+
+    // Reopening runs the migration.
+    {
+        SqliteStore store(path);
+        store.initialize();
+
+        EXPECT_EQ(scalar(path, "PRAGMA user_version"), kTargetSchemaVersion);
+
+        // Both users had at least one ban row, so both are banned. Dropping them
+        // would have silently un-banned everybody the instant this migration ran.
+        EXPECT_TRUE(store.is_server_banned(banned_a));
+        EXPECT_TRUE(store.is_server_banned(banned_b));
+        EXPECT_FALSE(store.is_server_banned(innocent));
+
+        // One row per user, not one per (user, room): banned_a had two ban rows.
+        EXPECT_EQ(scalar(path, "SELECT COUNT(*) FROM server_bans"), 2);
+
+        // The actor is honestly blank rather than invented — room_members never
+        // recorded who placed the ban.
+        auto ban = store.get_server_ban(banned_a);
+        ASSERT_TRUE(ban.has_value());
+        EXPECT_EQ(ban->actor, "");
+        EXPECT_GT(ban->created_at, 0);
+
+        // Everything else survived the upgrade.
+        EXPECT_TRUE(store.user_exists(innocent));
+        EXPECT_TRUE(store.is_room_member(room_one, innocent));
+        EXPECT_EQ(store.get_membership(room_two, banned_b), membership::kJoin);
+    }
+
+    remove_db(path);
+}
+
+TEST(ServerBanMigration, AFreshDatabaseGetsAnEmptyBanList) {
+    Fixture f("fresh");
+    EXPECT_EQ(scalar(f.db_path, "PRAGMA user_version"), kTargetSchemaVersion);
+    EXPECT_EQ(scalar(f.db_path, "SELECT COUNT(*) FROM server_bans"), 0);
+    EXPECT_TRUE(f.store->list_server_bans().empty());
+}

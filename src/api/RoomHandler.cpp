@@ -18,6 +18,7 @@
 #include <bsfchat/Permissions.h>
 
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <chrono>
 
 namespace bsfchat {
@@ -57,6 +58,111 @@ bool can_read_room(SqliteStore& store, const Config& config,
     return perms.can(user_id, room_id, permission::kViewChannel);
 }
 
+// What a membership transition IS, and therefore what gates it.
+//
+// Derived from the (before, after) pair and the ban list — NOT from which URL the
+// request arrived at. That is the whole point: POST /rooms/{id}/ban and
+// PUT /rooms/{id}/state/m.room.member/{user} describe the same act, so they must
+// not be able to disagree about which permission it needs, whether rank applies,
+// or what it writes.
+struct MembershipIntent {
+    bool recognised = false;
+    permission::Flags required = 0;
+    bool server_scope = false;       // where `required` is evaluated
+    bool needs_rank = false;         // acting against the target, so rank applies
+    bool places_server_ban = false;
+    bool lifts_server_ban = false;
+    bool require_target_in_room = false;
+    bool require_target_banned = false;
+    const char* verb = "";           // "ban"/"unban"/"kick"/"invite", for messages
+};
+
+MembershipIntent ban_intent() {
+    // BAN_MEMBERS, not KICK_MEMBERS. The generic state route used to gate every
+    // member write on KICK_MEMBERS, so a kick-only moderator could ban there after
+    // being refused at POST /rooms/{id}/ban.
+    MembershipIntent i;
+    i.recognised = true;
+    i.required = permission::kBanMembers;
+    i.server_scope = true;
+    i.needs_rank = true;
+    i.places_server_ban = true;
+    i.verb = "ban";
+    return i;
+}
+
+MembershipIntent unban_intent() {
+    // Lifting a ban needs the permission that imposed it, per the Matrix spec and
+    // per the endpoint this replaces.
+    MembershipIntent i;
+    i.recognised = true;
+    i.required = permission::kBanMembers;
+    i.server_scope = true;
+    i.needs_rank = true;
+    i.lifts_server_ban = true;
+    i.require_target_banned = true;
+    i.verb = "unban";
+    return i;
+}
+
+MembershipIntent kick_intent() {
+    MembershipIntent i;
+    i.recognised = true;
+    i.required = permission::kKickMembers;
+    i.server_scope = true;
+    i.needs_rank = true;
+    i.require_target_in_room = true;
+    i.verb = "kick";
+    return i;
+}
+
+MembershipIntent invite_intent() {
+    // Matches the dedicated invite endpoint: there is no separate invite flag, and
+    // pulling somebody into one channel is a per-channel act, so it stays
+    // channel-scoped. Deliberately NO rank check — you must be able to invite an
+    // admin to a channel.
+    MembershipIntent i;
+    i.recognised = true;
+    i.required = permission::kManageChannels;
+    i.verb = "invite";
+    return i;
+}
+
+MembershipIntent classify_transition(MembershipAction declared, const std::string& after,
+                                     const std::string& before, bool target_server_banned) {
+    switch (declared) {
+        case MembershipAction::kKick: return kick_intent();
+        case MembershipAction::kBan: return ban_intent();
+        case MembershipAction::kUnban: return unban_intent();
+        case MembershipAction::kInvite: return invite_intent();
+        case MembershipAction::kInfer: break;
+    }
+
+    // Only the generic state route infers, because it is the only caller that
+    // does not know what it is doing: the client sends a target membership and the
+    // meaning comes from where the target currently stands. A dedicated endpoint
+    // must NOT infer — POST /rooms/{id}/kick against an already-banned user would
+    // otherwise be read as "leave a banned user" and quietly LIFT the ban.
+    if (after == membership::kBan) return ban_intent();
+    if (after == membership::kLeave) {
+        if (before == membership::kBan || target_server_banned) {
+            // A Matrix client lifts a ban exactly this way, so the state route has
+            // to honour it — and honour it as an unban, at BAN_MEMBERS.
+            auto i = unban_intent();
+            i.require_target_banned = false;  // already established
+            return i;
+        }
+        auto i = kick_intent();
+        // The state route has always tolerated writing "leave" for a user who is
+        // not currently joined; keeping that avoids turning a harmless no-op write
+        // by a Matrix client into a 403.
+        i.require_target_in_room = false;
+        return i;
+    }
+    if (after == membership::kInvite || after == membership::kJoin) return invite_intent();
+    return {};
+}
+
 } // namespace
 
 RoomHandler::RoomHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config)
@@ -69,6 +175,147 @@ std::string RoomHandler::emit_state_event(const std::string& room_id, const std:
     store_.insert_event(event_id, room_id, sender, event_type, state_key, content.dump(), now_ms());
     sync_engine_.notify_new_event();
     return event_id;
+}
+
+std::string RoomHandler::project_membership_everywhere(const std::string& actor,
+                                                       const std::string& origin_room,
+                                                       const std::string& target_user,
+                                                       const std::string& membership_value,
+                                                       const std::string& reason,
+                                                       const std::string& only_when) {
+    json content = {{"membership", membership_value}};
+    if (!reason.empty()) content["reason"] = reason;
+
+    // get_user_memberships is a single indexed query over room_members, so this
+    // reaches EVERY channel the user has a row in — including the ones the
+    // moderator's client had never synced, which is precisely the set the client's
+    // loop silently skipped.
+    std::vector<std::string> rooms;
+    for (const auto& [room_id, current] : store_.get_user_memberships(target_user)) {
+        if (!only_when.empty() && current != only_when) continue;
+        if (current == membership_value) continue;  // already there; no event spam
+        rooms.push_back(room_id);
+    }
+
+    // A ban rewrites every row (only_when empty), so the room the request named
+    // must be written even when the target has no row in it at all — POST
+    // /rooms/{id}/ban on a non-member must still produce a ban there, and the
+    // audit record names this room. An unban is filtered (only_when = "ban") and
+    // gets no such override on purpose: forcing "leave" into the origin room would
+    // eject a user from a channel they were still joined to.
+    if (only_when.empty() && !origin_room.empty() &&
+        store_.get_membership(origin_room, target_user) != membership_value) {
+        if (std::find(rooms.begin(), rooms.end(), origin_room) == rooms.end()) {
+            rooms.push_back(origin_room);
+        }
+    }
+
+    std::string origin_event_id;
+    for (const auto& room_id : rooms) {
+        store_.set_membership(room_id, target_user, membership_value);
+        auto event_id = emit_state_event(room_id, actor, std::string(event_type::kRoomMember),
+                                        target_user, content);
+        if (room_id == origin_room) origin_event_id = event_id;
+    }
+    return origin_event_id;
+}
+
+RoomHandler::ModerationResult RoomHandler::apply_membership_moderation(
+    const std::string& actor, const std::string& room_id, const std::string& target_user,
+    const std::string& target_membership, const std::string& reason,
+    MembershipAction declared) {
+    ModerationResult refusal;
+    if (target_user.empty()) {
+        refusal.status = 400;
+        refusal.message = "Missing user_id";
+        return refusal;
+    }
+
+    const std::string before = store_.get_membership(room_id, target_user);
+    const bool target_banned = store_.is_server_banned(target_user);
+
+    const auto intent = classify_transition(declared, target_membership, before, target_banned);
+    if (!intent.recognised) {
+        refusal.message = "Unsupported membership: " + target_membership;
+        return refusal;
+    }
+
+    PermissionsEngine perms(store_, config_);
+    // SERVER scope (empty room_id) for kick/ban/unban: these are server-wide
+    // capabilities, as in Discord — there is no per-channel kick and no UI to
+    // grant one, so a per-channel override must not confer them. See
+    // PermissionsEngine::compute: an empty room_id returns before any channel
+    // override is applied.
+    const std::string scope = intent.server_scope ? kServerScope : room_id;
+    if (!perms.can(actor, scope, intent.required)) {
+        refusal.message = std::string("Insufficient permissions to ") + intent.verb;
+        return refusal;
+    }
+    if (intent.needs_rank && !perms.outranks(actor, target_user)) {
+        refusal.message =
+            std::string("Cannot ") + intent.verb + " a user with equal or higher role";
+        return refusal;
+    }
+    // These are ordered AFTER the permission and rank checks so an unauthorised
+    // caller learns nothing about the target's state from the refusal it gets.
+    if (intent.require_target_in_room && before != membership::kJoin &&
+        before != membership::kInvite) {
+        refusal.message = "User is not in the room";
+        return refusal;
+    }
+    if (intent.require_target_banned && before != membership::kBan && !target_banned) {
+        refusal.message = "User is not banned";
+        return refusal;
+    }
+    // An invite is not a way around a ban. This is one of the entry points a
+    // client-side ban loop could never protect.
+    if (target_banned && !intent.lifts_server_ban && !intent.places_server_ban) {
+        refusal.message = "User is banned from this server";
+        return refusal;
+    }
+
+    ModerationResult ok;
+    ok.ok = true;
+    ok.status = 200;
+
+    if (intent.places_server_ban) {
+        // The ban list first, then the projection. Order matters: the list is the
+        // authoritative record and the membership rows are its projection, so a
+        // crash between the two leaves a ban that is enforced at /join, auto-join
+        // and /sync — fail-closed — rather than membership rows nobody can explain.
+        store_.set_server_ban(target_user, actor, reason, now_ms());
+        ok.event_id = project_membership_everywhere(actor, room_id, target_user,
+                                                    std::string(membership::kBan), reason, "");
+    } else if (intent.lifts_server_ban) {
+        store_.clear_server_ban(target_user);
+        // "leave", not "join": lifting a ban restores the user's ability to come
+        // back, it does not decide for them that they have.
+        ok.event_id = project_membership_everywhere(actor, room_id, target_user,
+                                                    std::string(membership::kLeave), reason,
+                                                    std::string(membership::kBan));
+    } else {
+        // A kick or an invite is genuinely per-channel and touches one room.
+        //
+        // THE MEMBERSHIP ROW AND THE EVENT ARE WRITTEN TOGETHER, ALWAYS. The
+        // generic state route used to emit only the event, so a ban placed there
+        // left room_members saying "join": clients hid the user while every
+        // server-side check (sync, room reads, search, push, and the membership
+        // guard on the route itself) still treated them as a joined member.
+        store_.set_membership(room_id, target_user, target_membership);
+        json content = {{"membership", target_membership}};
+        if (!reason.empty()) content["reason"] = reason;
+        ok.event_id = emit_state_event(room_id, actor, std::string(event_type::kRoomMember),
+                                       target_user, content);
+    }
+
+    // ONE record per moderator decision, naming the room the request arrived
+    // through. Deliberately not one per projected room: a server ban is a single
+    // act of authority, and a 40-channel server would otherwise bury the log under
+    // 40 rows describing the mechanical consequence of one click.
+    audit_membership_change(store_, actor, room_id, target_user, before, target_membership,
+                            reason);
+
+    return ok;
 }
 
 void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Response& res) {
@@ -207,6 +454,10 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
     for (const auto& invitee : room_req.invite) {
         if (invitee == *user_id) continue;
         if (!store_.user_exists(invitee)) continue;
+        // Creating a room with a banned user in `invite` is otherwise a way to
+        // hand them a fresh channel: the room is new, so there is no membership
+        // row for the ban projection to have touched.
+        if (store_.is_server_banned(invitee)) continue;
 
         const auto state = is_direct ? membership::kJoin : membership::kInvite;
         store_.set_membership(room_id, invitee, std::string(state));
@@ -239,6 +490,19 @@ void RoomHandler::handle_join(const httplib::Request& req, httplib::Response& re
     if (!user_id) {
         res.status = 401;
         res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
+        return;
+    }
+
+    // A server-wide ban is checked BEFORE the room is even looked up, so a banned
+    // user cannot use this endpoint to probe which room ids exist. This is the
+    // check that makes a ban mean something: the projection across room_members
+    // stops them being a member of today's channels, and this stops them walking
+    // back into any of them — or into a channel created after the ban, which has
+    // no membership row to project onto.
+    if (store_.is_server_banned(*user_id)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("You are banned from this server").to_json().dump(),
+                        "application/json");
         return;
     }
 
@@ -525,41 +789,20 @@ void RoomHandler::handle_kick(const httplib::Request& req, httplib::Response& re
     auto target_user = body["user_id"].get<std::string>();
     auto reason = body.value("reason", "");
 
-    PermissionsEngine perms(store_, config_);
-    // SERVER scope (empty room_id). Kicking is a server-wide capability, as in
-    // Discord: there is no per-channel kick, and no UI to grant one. Evaluating
-    // it against `room_id` meant a per-channel override that allowed
-    // KICK_MEMBERS in one channel conferred the ability to kick there — a grant
-    // nothing in the product could intentionally make, and one an operator
-    // editing an unrelated channel's overrides would not expect to be handing
-    // out. See PermissionsEngine::compute: an empty room_id returns before any
-    // channel override is applied.
-    if (!perms.can(*user_id, kServerScope, permission::kKickMembers)) {
-        res.status = 403;
-        res.set_content(MatrixError::forbidden("Insufficient permissions to kick").to_json().dump(), "application/json");
+    // Permission scope, rank, the membership row, the event and the audit record
+    // all live in apply_membership_moderation — see its declaration for why this
+    // endpoint no longer carries its own copy of any of them.
+    auto outcome = apply_membership_moderation(*user_id, room_id, target_user,
+                                              std::string(membership::kLeave), reason,
+                                              MembershipAction::kKick);
+    if (!outcome.ok) {
+        res.status = outcome.status;
+        res.set_content((outcome.status == 400 ? MatrixError::bad_json(outcome.message)
+                                              : MatrixError::forbidden(outcome.message))
+                            .to_json().dump(),
+                        "application/json");
         return;
     }
-    if (!perms.outranks(*user_id, target_user)) {
-        res.status = 403;
-        res.set_content(MatrixError::forbidden("Cannot kick a user with equal or higher role").to_json().dump(), "application/json");
-        return;
-    }
-
-    if (!store_.is_room_member(room_id, target_user)) {
-        res.status = 403;
-        res.set_content(MatrixError::forbidden("User is not in the room").to_json().dump(), "application/json");
-        return;
-    }
-
-    const auto previous_membership = store_.get_membership(room_id, target_user);
-
-    store_.set_membership(room_id, target_user, std::string(membership::kLeave));
-    json member_content = {{"membership", membership::kLeave}};
-    if (!reason.empty()) member_content["reason"] = reason;
-    emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), target_user, member_content);
-
-    audit_membership_change(store_, *user_id, room_id, target_user, previous_membership,
-                            std::string(membership::kLeave), reason);
 
     res.set_content("{}", "application/json");
     get_logger()->info("User {} kicked {} from room {}", *user_id, target_user, room_id);
@@ -605,33 +848,31 @@ void RoomHandler::handle_ban(const httplib::Request& req, httplib::Response& res
     auto target_user = body["user_id"].get<std::string>();
     auto reason = body.value("reason", "");
 
-    PermissionsEngine perms(store_, config_);
-    // SERVER scope — see handle_kick. A ban is server-wide in intent (the client
-    // applies one by looping every room), so it must not be unlockable by a
-    // per-channel override.
-    if (!perms.can(*user_id, kServerScope, permission::kBanMembers)) {
-        res.status = 403;
-        res.set_content(MatrixError::forbidden("Insufficient permissions to ban").to_json().dump(), "application/json");
+    // A ban is SERVER-WIDE, and this endpoint is where it is placed.
+    //
+    // It was already server-wide in intent — the client implemented "ban from
+    // server" by looping this endpoint over every room its sync had surfaced, and
+    // the permission has been evaluated at server scope since that intent was
+    // recognised. What was missing was anywhere for the ban to LIVE, so channels
+    // the moderator's client had not synced kept the user and auto-join could put
+    // them back. apply_membership_moderation now writes the ban list and projects
+    // it across every room in one server-side act; `room_id` survives only as the
+    // context recorded in the audit trail.
+    auto outcome = apply_membership_moderation(*user_id, room_id, target_user,
+                                              std::string(membership::kBan), reason,
+                                              MembershipAction::kBan);
+    if (!outcome.ok) {
+        res.status = outcome.status;
+        res.set_content((outcome.status == 400 ? MatrixError::bad_json(outcome.message)
+                                              : MatrixError::forbidden(outcome.message))
+                            .to_json().dump(),
+                        "application/json");
         return;
     }
-    if (!perms.outranks(*user_id, target_user)) {
-        res.status = 403;
-        res.set_content(MatrixError::forbidden("Cannot ban a user with equal or higher role").to_json().dump(), "application/json");
-        return;
-    }
-
-    const auto previous_membership = store_.get_membership(room_id, target_user);
-
-    store_.set_membership(room_id, target_user, std::string(membership::kBan));
-    json member_content = {{"membership", membership::kBan}};
-    if (!reason.empty()) member_content["reason"] = reason;
-    emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), target_user, member_content);
-
-    audit_membership_change(store_, *user_id, room_id, target_user, previous_membership,
-                            std::string(membership::kBan), reason);
 
     res.set_content("{}", "application/json");
-    get_logger()->info("User {} banned {} from room {}", *user_id, target_user, room_id);
+    get_logger()->info("User {} banned {} from the server (requested via room {})", *user_id,
+                       target_user, room_id);
 }
 
 // POST /rooms/{roomId}/unban
@@ -685,41 +926,31 @@ void RoomHandler::handle_unban(const httplib::Request& req, httplib::Response& r
     auto target_user = body["user_id"].get<std::string>();
     auto reason = body.value("reason", "");
 
-    PermissionsEngine perms(store_, config_);
-    // SERVER scope — must match handle_ban exactly. If unban were channel-scoped
-    // while ban is server-scoped, a per-channel override would let someone lift
-    // bans they could never have placed.
-    if (!perms.can(*user_id, kServerScope, permission::kBanMembers)) {
-        res.status = 403;
-        res.set_content(MatrixError::forbidden("Insufficient permissions to unban").to_json().dump(), "application/json");
-        return;
-    }
-    if (!perms.outranks(*user_id, target_user)) {
-        res.status = 403;
-        res.set_content(MatrixError::forbidden("Cannot unban a user with equal or higher role").to_json().dump(), "application/json");
-        return;
-    }
-
-    const auto previous_membership = store_.get_membership(room_id, target_user);
-    if (previous_membership != membership::kBan) {
-        res.status = 403;
-        res.set_content(MatrixError::forbidden("User is not banned from this room").to_json().dump(),
+    // Interoperates with the server-wide ban by BEING the server-wide unban: it
+    // clears the ban-list row and restores every room where the projection had set
+    // "ban" back to "leave". The client's per-room unban loop therefore still
+    // works — the first call lifts the ban and the rest are idempotent no-ops —
+    // and it is no longer the only thing standing between a banned user and a
+    // channel the loop forgot.
+    //
+    // A row in room_members that says "ban" with no ban-list entry (a legacy
+    // per-room ban, or one recovered by migrate_v15 and since cleared) is still
+    // liftable: the precondition is "banned here OR banned server-wide".
+    auto outcome = apply_membership_moderation(*user_id, room_id, target_user,
+                                              std::string(membership::kLeave), reason,
+                                              MembershipAction::kUnban);
+    if (!outcome.ok) {
+        res.status = outcome.status;
+        res.set_content((outcome.status == 400 ? MatrixError::bad_json(outcome.message)
+                                              : MatrixError::forbidden(outcome.message))
+                            .to_json().dump(),
                         "application/json");
         return;
     }
 
-    // "leave", not "join": lifting a ban restores the user's ability to come back,
-    // it does not decide for them that they have.
-    store_.set_membership(room_id, target_user, std::string(membership::kLeave));
-    json member_content = {{"membership", membership::kLeave}};
-    if (!reason.empty()) member_content["reason"] = reason;
-    emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), target_user, member_content);
-
-    audit_membership_change(store_, *user_id, room_id, target_user, previous_membership,
-                            std::string(membership::kLeave), reason);
-
     res.set_content("{}", "application/json");
-    get_logger()->info("User {} unbanned {} in room {}", *user_id, target_user, room_id);
+    get_logger()->info("User {} unbanned {} (requested via room {})", *user_id, target_user,
+                       room_id);
 }
 
 void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& res) {
@@ -776,6 +1007,16 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
         res.set_content(MatrixError::forbidden("User is banned from this room").to_json().dump(), "application/json");
         return;
     }
+    // The per-room check above is not enough on its own: a channel created AFTER
+    // the ban has no membership row for the banned user, so get_membership returns
+    // "leave" and the invite would go through. The ban list is the thing that
+    // knows, and it is the only thing that keeps working as channels come and go.
+    if (store_.is_server_banned(target_user)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("User is banned from this server").to_json().dump(),
+                        "application/json");
+        return;
+    }
 
     store_.set_membership(room_id, target_user, std::string(membership::kInvite));
     emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), target_user,
@@ -826,13 +1067,23 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         evt_type == std::string(event_type::kMemberRoles);
 
     // Moderation-by-membership-write. This route will happily set another user's
-    // m.room.member to "ban", which makes it a second, complete implementation of
-    // POST /rooms/{id}/ban — so it has to be gated the same way, at SERVER scope.
-    // While kick/ban were channel-scoped and this was too they at least agreed;
-    // moving only the dedicated endpoints would have left this route as the
-    // bypass, converting a per-channel KICK_MEMBERS override into a server-wide
-    // ban primitive. Self-membership is excluded: it is handled below and is a
-    // genuinely per-channel action (joining and leaving a channel).
+    // m.room.member to "ban", which makes it a second route to the same act as
+    // POST /rooms/{id}/ban — and Matrix clients legitimately use it, so it cannot
+    // simply be refused. It is therefore no longer implemented here AT ALL: it
+    // delegates to apply_membership_moderation below, which is the same code the
+    // dedicated endpoints run.
+    //
+    // Reimplementing it here is what produced every defect this route has had. It
+    // gated a ban on KICK_MEMBERS while /ban required BAN_MEMBERS; it evaluated at
+    // channel scope after the dedicated endpoints had moved to server scope; it
+    // lacked their rank check; and it wrote the m.room.member EVENT while never
+    // calling set_membership, so a ban placed here left room_members saying "join"
+    // — clients hid the user while sync, room reads, search, push and the
+    // permission engine all still saw a joined member. Four divergences in one
+    // duplicated code path.
+    //
+    // Self-membership is excluded: it is handled below and is a genuinely
+    // per-channel action (joining and leaving a channel).
     const bool is_member_moderation =
         evt_type == std::string(event_type::kRoomMember) && state_key != *user_id;
 
@@ -842,19 +1093,12 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         required = permission::kManageRoles;
     } else if (evt_type == std::string(event_type::kServerInfo)) {
         required = permission::kManageServer;
-    } else if (evt_type == std::string(event_type::kRoomMember)) {
-        // Self-membership is handled separately below; anything targeting
-        // another user goes through the kick/ban permission.
-        required = permission::kKickMembers;
     }
 
     PermissionsEngine perms(store_, config_);
-    // Two separate notions, deliberately not one flag: `is_server_scoped` also
-    // decides WHERE the write lands (server_state vs room state), while this only
-    // decides how the permission is evaluated. Member moderation is server-scoped
-    // for permissions but still writes ordinary room state.
-    const bool is_server_scoped_permission = is_server_scoped || is_member_moderation;
-    const std::string perm_scope = is_server_scoped_permission ? kServerScope : room_id;
+    // `is_server_scoped` also decides WHERE the write lands (server_state vs room
+    // state), which is why it is not folded into the scope expression below.
+    const std::string perm_scope = is_server_scoped ? kServerScope : room_id;
 
     json content;
     try {
@@ -900,22 +1144,40 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         return;
     }
 
-    if (!perms.can(*user_id, perm_scope, required)) {
-        res.status = 403;
-        res.set_content(MatrixError::forbidden("Insufficient permissions for this state event").to_json().dump(), "application/json");
+    // Moderating another user's membership: hand the whole decision to the shared
+    // implementation and return. Permission scope, the rank check, the ban list,
+    // the membership row, the member event and the audit record are all its job —
+    // this route contributes nothing of its own, which is the only arrangement in
+    // which it cannot drift from the dedicated endpoints again.
+    //
+    // The empty-state_key guard matters: this route also matches
+    // /state/m.room.member with no state key at all, which names no target.
+    if (is_member_moderation) {
+        if (state_key.empty()) {
+            res.status = 400;
+            res.set_content(MatrixError::bad_json("Missing user id in state key").to_json().dump(),
+                            "application/json");
+            return;
+        }
+        auto outcome = apply_membership_moderation(*user_id, room_id, state_key,
+                                                  content.value("membership", ""),
+                                                  content.value("reason", ""),
+                                                  MembershipAction::kInfer);
+        if (!outcome.ok) {
+            res.status = outcome.status;
+            res.set_content((outcome.status == 400 ? MatrixError::bad_json(outcome.message)
+                                                  : MatrixError::forbidden(outcome.message))
+                                .to_json().dump(),
+                            "application/json");
+            return;
+        }
+        res.set_content(json{{"event_id", outcome.event_id}}.dump(), "application/json");
         return;
     }
 
-    // The dedicated kick/ban/unban endpoints all refuse to act on a user of equal
-    // or higher rank. This route performs the same transitions and did not check,
-    // so a moderator could ban an admin here after being refused at POST
-    // /rooms/{id}/ban. Closing the scope hole without closing this one would have
-    // left the bypass intact in a different direction.
-    if (is_member_moderation && !state_key.empty() && !perms.outranks(*user_id, state_key)) {
+    if (!perms.can(*user_id, perm_scope, required)) {
         res.status = 403;
-        res.set_content(MatrixError::forbidden(
-            "Cannot change the membership of a user with equal or higher role").to_json().dump(),
-            "application/json");
+        res.set_content(MatrixError::forbidden("Insufficient permissions for this state event").to_json().dump(), "application/json");
         return;
     }
 
@@ -939,24 +1201,15 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     // types above there is no shared write function to hook — the capture has to
     // happen here, and it has to happen before the new event is inserted.
     const bool is_channel_override = evt_type == std::string(event_type::kChannelPermissions);
-    // This is also a moderator acting on somebody ELSE's membership: the
-    // self-membership case returned above. Auditing it matters because it is a
-    // second, entirely separate route to a ban — a ban placed through here would
-    // otherwise be invisible while the same ban through POST /rooms/{id}/ban was
-    // recorded.
-    // The empty-state_key guard matters: this route also matches
-    // /state/m.room.member with no state key at all, which names no target. A
-    // record whose target_user is "" would be an audit entry nobody can act on.
-    const bool is_other_membership =
-        evt_type == std::string(event_type::kRoomMember) && !state_key.empty();
 
+    // No m.room.member case here any more: self-membership returned above and
+    // moderation of another user returned at the delegation block. The audit write
+    // for a membership change lives in apply_membership_moderation, which is the
+    // single place every route that can produce one now passes through.
     std::optional<std::string> previous_state;
-    std::string previous_membership;
     if (is_channel_override) {
         auto existing = store_.get_state_event(room_id, evt_type, state_key);
         if (existing) previous_state = existing->content.data.dump();
-    } else if (is_other_membership) {
-        previous_membership = store_.get_membership(room_id, state_key);
     }
 
     // Echo back the id that was actually stored — this used to generate a
@@ -966,9 +1219,6 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     if (is_channel_override) {
         audit_channel_override_change(store_, *user_id, room_id, state_key, previous_state,
                                       content.dump());
-    } else if (is_other_membership) {
-        audit_membership_change(store_, *user_id, room_id, state_key, previous_membership,
-                                content.value("membership", ""), content.value("reason", ""));
     }
 
     res.set_content(json{{"event_id", event_id}}.dump(), "application/json");

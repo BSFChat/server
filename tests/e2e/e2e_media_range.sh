@@ -226,8 +226,14 @@ fi
 # 10 GB of transfer, so instead do 8 concurrent FULL downloads and confirm the
 # process still does not hold 8 x 50 MB.
 RSS2=$(ps -o rss= -p "$PID" | tr -d ' ')
-for i in 1 2 3 4 5 6 7 8; do curl -s -o /dev/null -H "$H" "$DL" & done
-wait
+# Wait on the curl PIDs specifically. A bare `wait` also waits on the server,
+# which was started with & and never exits — that hung the whole script here.
+DL_PIDS=""
+for i in 1 2 3 4 5 6 7 8; do
+    curl -s -o /dev/null -H "$H" "$DL" &
+    DL_PIDS="$DL_PIDS $!"
+done
+for p in $DL_PIDS; do wait "$p"; done
 RSS3=$(ps -o rss= -p "$PID" | tr -d ' ')
 CONC_MB=$(( (RSS3 - RSS2) / 1024 ))
 echo "     server RSS: ${RSS2}K -> ${RSS3}K (delta ${CONC_MB} MB) over 8 concurrent full downloads"

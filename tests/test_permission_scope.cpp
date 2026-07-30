@@ -375,18 +375,76 @@ TEST(StatePutBypass, PerChannelKickOverrideCannotBanThroughStatePut) {
     // This route writes m.room.member for another user, which IS a ban. Had only
     // the dedicated endpoints moved to server scope, this would still convert a
     // per-channel KICK_MEMBERS override into a working ban.
+    //
+    // The refusal now names "ban", not "this state event", and that is the second
+    // property this assertion carries: the route no longer has a permission map of
+    // its own. It used to gate EVERY member write on KICK_MEMBERS, so a
+    // kick-only moderator could ban here after being refused at POST
+    // /rooms/{id}/ban; the transition is classified once, in
+    // apply_membership_moderation, and a ban means BAN_MEMBERS wherever it arrives.
     RoomHandler handler(*f.store, *f.sync, f.config);
     EXPECT_TRUE(IsForbiddenBecause(call(handler, &RoomHandler::handle_set_state,
                                         member_state_path(room, victim), "token-member",
                                         json{{"membership", membership::kBan}}.dump()),
-                                   "Insufficient permissions for this state event"));
+                                   "Insufficient permissions to ban"));
 
-    // Asserted on the EVENT, not on get_membership. This route only ever wrote the
-    // member event and never touched the room_members table (see
-    // StatePutWritesOnlyTheEvent below), so a get_membership assertion here would
-    // have passed even if the write had been permitted — a test that could not
-    // fail is worse than no test.
+    // Both halves, because they can no longer disagree: the event and the
+    // membership row are written together or not at all.
     EXPECT_EQ(f.member_content(room, victim).value("membership", ""), membership::kJoin);
+    EXPECT_EQ(f.store->get_membership(room, victim), membership::kJoin);
+    EXPECT_FALSE(f.store->is_server_banned(victim));
+}
+
+// A KICK-only moderator cannot ban through the state route.
+//
+// This is the divergence the old route hid: it mapped every m.room.member write
+// to KICK_MEMBERS, so BAN_MEMBERS was enforced at POST /rooms/{id}/ban and
+// nowhere else. The actor here holds KICK_MEMBERS at SERVER scope — the real
+// thing, not a channel override — and outranks the target, so the permission
+// check is the only thing that can refuse, and it must refuse for the ban and
+// allow the kick.
+TEST(StatePutBypass, KickPermissionDoesNotConferBanThroughStatePut) {
+    Fixture f("statput-kickonly");
+    f.seed_roles();
+    // "kickonly" sits above a plain member and carries KICK_MEMBERS but NOT
+    // BAN_MEMBERS. seed_roles' moderator has both, which is why it cannot be used.
+    {
+        ServerRolesContent content;
+        content.roles.push_back(role(permission::role_id::kEveryone, 0,
+                                     permission::kEveryoneDefault));
+        content.roles.push_back(role("kickonly", 10,
+                                     permission::kEveryoneDefault | permission::kKickMembers));
+        json j;
+        to_json(j, content);
+        f.store->set_server_state(std::string(event_type::kServerRoles), "", "@server:test",
+                                  j.dump());
+    }
+    auto mod = f.add_user("mod", {"kickonly"});
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel(mod, "general");
+    f.join(room, victim);
+
+    PermissionsEngine perms(*f.store, f.config);
+    ASSERT_TRUE(perms.can(mod, std::string(), permission::kKickMembers));
+    ASSERT_FALSE(perms.can(mod, std::string(), permission::kBanMembers))
+        << "actor must lack BAN_MEMBERS or this test proves nothing";
+    ASSERT_TRUE(perms.outranks(mod, victim))
+        << "actor must outrank the target, or the rank check refuses regardless";
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    EXPECT_TRUE(IsForbiddenBecause(call(handler, &RoomHandler::handle_set_state,
+                                        member_state_path(room, victim), "token-mod",
+                                        json{{"membership", membership::kBan}}.dump()),
+                                   "Insufficient permissions to ban"));
+    EXPECT_FALSE(f.store->is_server_banned(victim));
+    EXPECT_EQ(f.store->get_membership(room, victim), membership::kJoin);
+
+    // The same actor CAN kick, so the refusal above is about the flag and not
+    // about this actor being powerless.
+    EXPECT_TRUE(IsOk(call(handler, &RoomHandler::handle_set_state,
+                          member_state_path(room, victim), "token-mod",
+                          json{{"membership", membership::kLeave}}.dump())));
+    EXPECT_EQ(f.store->get_membership(room, victim), membership::kLeave);
 }
 
 TEST(StatePutBypass, ServerWideKickPermissionStillWorksThroughStatePut) {
@@ -404,32 +462,46 @@ TEST(StatePutBypass, ServerWideKickPermissionStillWorksThroughStatePut) {
     EXPECT_EQ(f.member_content(room, victim).value("membership", ""), membership::kLeave);
 }
 
-// A PRE-EXISTING defect this work uncovered but deliberately did not change:
-// the generic state route writes the m.room.member EVENT and never calls
-// set_membership, so the room_members table still says "join" after a ban placed
-// here. Clients rebuild member lists from events and so do hide the user, and the
-// audit log records it, but every server-side membership check
-// (is_room_member/get_membership — including the one guarding this very route)
-// still treats them as a member. Pinned as the current behaviour rather than
-// asserted as correct, so that fixing it is a deliberate change with a failing
-// test to point at, and so no reader mistakes the assertions above for proof that
-// a state-PUT ban takes effect server-side.
-TEST(StatePutBypass, StatePutWritesOnlyTheEventAndNotTheMembershipRow) {
-    Fixture f("statput-ghost");
+// REPLACES StatePutWritesOnlyTheEventAndNotTheMembershipRow, which pinned the
+// defect: the generic state route wrote the m.room.member EVENT and never called
+// set_membership, so room_members still said "join" after a ban placed here.
+// Clients rebuild member lists from events and so did hide the user, and the audit
+// log recorded the ban — while every server-side membership check (sync, room
+// reads, search, push, and the membership guard on this very route) still treated
+// them as a joined member. A moderator was told they had banned somebody who was,
+// server-side, still fully present.
+//
+// The two now move together because there is only one implementation left: this
+// route delegates to apply_membership_moderation, the same function POST
+// /rooms/{id}/ban runs.
+//
+// This test CAN fail — the previous one could not. Under the old code
+// get_membership returns "join" and is_room_member returns true, so the first two
+// expectations below both flip. (The test it replaces asserted exactly that, which
+// is why it stayed green through every change to this route.)
+TEST(StatePutBypass, StatePutWritesTheMembershipRowAndNotJustTheEvent) {
+    Fixture f("statput-consistent");
     f.seed_roles();
     auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
     auto victim = f.add_user("victim");
     auto room = f.add_channel(mod, "general");
     f.join(room, victim);
 
+    ASSERT_TRUE(f.store->is_room_member(room, victim))
+        << "victim must start as a real member, or the assertions below prove nothing";
+
     RoomHandler handler(*f.store, *f.sync, f.config);
     ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_set_state,
                           member_state_path(room, victim), "token-mod",
                           json{{"membership", membership::kBan}}.dump())));
 
+    EXPECT_EQ(f.store->get_membership(room, victim), membership::kBan);
+    EXPECT_FALSE(f.store->is_room_member(room, victim));
+    // And the event still says the same thing the row does.
     EXPECT_EQ(f.member_content(room, victim).value("membership", ""), membership::kBan);
-    EXPECT_EQ(f.store->get_membership(room, victim), membership::kJoin);
-    EXPECT_TRUE(f.store->is_room_member(room, victim));
+    // A ban is a ban wherever it is placed: the state route reaches the same
+    // server-wide ban list as the dedicated endpoint.
+    EXPECT_TRUE(f.store->is_server_banned(victim));
 }
 
 TEST(StatePutBypass, CannotModerateAUserOfHigherRankThroughStatePut) {

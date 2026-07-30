@@ -101,6 +101,10 @@ Config Config::load(const std::string& path) {
                 if (auto v = lk->get("api_key")) cfg.voice.livekit.api_key = v->value_or(cfg.voice.livekit.api_key);
                 if (auto v = lk->get("api_secret")) cfg.voice.livekit.api_secret = v->value_or(cfg.voice.livekit.api_secret);
                 if (auto v = lk->get("token_ttl")) cfg.voice.livekit.token_ttl = v->value_or(cfg.voice.livekit.token_ttl);
+                if (auto v = lk->get("room_encryption"))
+                    cfg.voice.livekit.room_encryption = v->value_or(cfg.voice.livekit.room_encryption);
+                if (auto v = lk->get("room_key_secret"))
+                    cfg.voice.livekit.room_key_secret = v->value_or(cfg.voice.livekit.room_key_secret);
             }
         }
 

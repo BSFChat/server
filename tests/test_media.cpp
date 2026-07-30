@@ -1133,24 +1133,26 @@ protected:
                 return;
             }
             if (mode_ == Mode::IgnoreRange || !got_range_header_) {
+                // Pinning status 200 is what makes this the "endpoint ignored
+                // Range" case: httplib only slices a body when the status is
+                // 206, so an explicit 200 sends the whole object back.
                 rs.status = 200;
                 rs.set_content(object_, "video/mp4");
                 return;
             }
-            // Honour the range the way S3 does.
-            size_t first = 0, last = object_.size() - 1;
-            std::sscanf(last_range_.c_str(), "bytes=%zu-%zu", &first, &last);
-            if (first >= object_.size()) {
-                rs.status = 416;
-                rs.set_content("<Error/>", "application/xml");
-                return;
-            }
-            last = std::min(last, object_.size() - 1);
-            rs.status = 206;
-            rs.set_header("Content-Range", "bytes " + std::to_string(first) + "-" +
-                                               std::to_string(last) + "/" +
-                                               std::to_string(object_.size()));
-            rs.set_content(object_.substr(first, last - first + 1), "video/mp4");
+
+            // Honour the range the way a real origin does — by handing over the
+            // whole representation and letting the serving layer apply the
+            // range. Slicing here by hand AND setting 206 makes httplib apply
+            // the client's range a second time, to the already-sliced body:
+            // `bytes=100-149` against a 50-byte body is unsatisfiable, so the
+            // fake origin answered 416 and every ranged-GET test failed against
+            // a bug in the test double rather than in S3Client.
+            //
+            // Leaving status unset lets httplib pick 206, derive Content-Range
+            // from the full length, and slice — and answer 416 by itself when
+            // the window really is past the end.
+            rs.set_content(object_, "video/mp4");
         });
 
         port_ = svr_.bind_to_any_port("127.0.0.1");

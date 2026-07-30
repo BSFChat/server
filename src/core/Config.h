@@ -48,11 +48,51 @@ struct LiveKitConfig {
     // limits the blast radius of a leaked token. Clamped to
     // [kLiveKitMinTtl, kLiveKitMaxTtl] at mint time.
     int64_t token_ttl = 600; // 10 minutes
+
+    // Media encryption between clients, with a per-room key this server
+    // mints and hands out alongside the join token.
+    //
+    // READ THIS BEFORE DESCRIBING THE FEATURE ANYWHERE.
+    //
+    // This is NOT end-to-end encryption, and must never be called that.
+    // What it buys is precisely one thing: the LiveKit SFU relays media it
+    // cannot read. That is worth having when the SFU runs on separate
+    // infrastructure or on someone else's cloud. It is not confidentiality
+    // from THIS server.
+    //
+    // Two limitations, both deliberate and both permanent under this design:
+    //
+    //   1. This server generates and holds the key. Anyone who can read the
+    //      server's config or memory can decrypt the media.
+    //   2. A member who leaves keeps the ability to decrypt that room's
+    //      traffic until the key is rotated. LiveKit's ratchet cannot fix
+    //      this — the ratchet derives the next key from the current one with
+    //      a public salt and no secret input, so anyone who ever held a
+    //      generation can compute every later one. Only issuing a fresh
+    //      unrelated key excludes them, which is what rekey does.
+    //
+    // Rekey-on-leave is not automatic; call the rekey endpoint.
+    bool room_encryption = true;
+
+    // Key-derivation secret for room keys. Optional: when empty, api_secret
+    // is used instead, under a distinct HKDF info string so the two uses can
+    // never produce the same bytes.
+    //
+    // Set this to a dedicated high-entropy value if you would rather not
+    // have one secret serving two purposes. Either way it is a KDF input and
+    // never leaves the server.
+    std::string room_key_secret;
+
     // True when all three of url/api_key/api_secret are present. A partially
     // configured LiveKit is treated as "not configured" rather than as an
     // error, so a half-finished config can never mint a broken token.
     bool configured() const {
         return !url.empty() && !api_key.empty() && !api_secret.empty();
+    }
+
+    // The secret room keys are derived from. Never logged, never returned.
+    const std::string& key_material() const {
+        return room_key_secret.empty() ? api_secret : room_key_secret;
     }
 };
 

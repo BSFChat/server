@@ -296,6 +296,29 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
 
     std::string user_id = "@" + username + ":" + config_.server_name;
 
+    // A banned identity cannot be re-registered.
+    //
+    // What this DOES guarantee: the ban outlives the account row. If an operator
+    // ever deletes a banned user, or a future account-deletion feature does, the
+    // freed username cannot be claimed back by the person who was banned from it —
+    // the ban list holds no foreign key to users(user_id) precisely so that
+    // deleting the account cannot launder the ban.
+    //
+    // What it CANNOT guarantee: that the same human does not simply register a
+    // different username. Nothing here binds an account to a person — there is no
+    // email verification, no invite gating, no IP or device record, and OIDC
+    // identities land in a separate "oidc_*" namespace. A ban is a ban on an
+    // IDENTITY, not on a human being, and on an open-registration deployment it
+    // stays that way. Closing that gap is a registration-policy problem
+    // (invite-only signup, or identity-provider-only login), not something the ban
+    // list can solve on its own.
+    if (store_.is_server_banned(user_id)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("This user is banned from this server")
+                            .to_json().dump(), "application/json");
+        return;
+    }
+
     if (store_.user_exists(user_id)) {
         res.status = 400;
         res.set_content(MatrixError::user_in_use().to_json().dump(), "application/json");

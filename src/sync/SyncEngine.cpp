@@ -50,6 +50,21 @@ void SyncEngine::notify_ephemeral() {
 SyncResponse SyncEngine::handle_sync(const std::string& user_id,
                                       const std::string& since_token,
                                       int timeout_ms) {
+    // A banned user sees nothing, whatever their membership rows say.
+    //
+    // The ban projection already sets every room_members row to "ban", so this is
+    // belt and braces — but it is the cheap kind: one primary-key lookup at the
+    // top of the one endpoint a client polls continuously, and it fails closed for
+    // any room whose projection was missed (a crash between the ban-list write and
+    // the projection, or a row written by some future code path). It also returns
+    // immediately rather than long-polling, so a banned client stops holding a
+    // request thread open.
+    if (store_.is_server_banned(user_id)) {
+        SyncResponse response;
+        response.next_batch = "s" + std::to_string(store_.get_current_stream_position());
+        return response;
+    }
+
     if (since_token.empty()) {
         return build_initial_sync(user_id);
     }

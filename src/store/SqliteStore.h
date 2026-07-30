@@ -126,6 +126,40 @@ public:
     void set_membership(const std::string& room_id, const std::string& user_id, const std::string& membership);
     std::string get_membership(const std::string& room_id, const std::string& user_id);
     std::vector<std::pair<std::string, std::string>> get_room_members(const std::string& room_id);
+    // Every (room_id, membership) row this user has, in any state. This is the
+    // list a server-wide ban has to be projected across, and it is deliberately
+    // NOT get_joined_rooms(): a ban must also reach rooms where the user is
+    // merely invited, and an unban must find the rooms where they are banned.
+    // It is also the query the CLIENT could not do — it looped over the rooms its
+    // own sync had surfaced, which is why unsynced channels kept the user.
+    std::vector<std::pair<std::string, std::string>> get_user_memberships(const std::string& user_id);
+
+    // ── Server-wide bans (schema v15) ─────────────────────────────────────
+    //
+    // The single authoritative record of "this identity is banned from this
+    // server". Per-room membership='ban' rows are a PROJECTION of this list, not
+    // a second source of truth — see RoomHandler::apply_membership_moderation.
+    //
+    // Lives in its own table rather than in room state or server_state so it
+    // survives channel deletion and so "is this user banned" is a primary-key
+    // lookup on the hot path of /join, auto-join and /sync. See migrate_v15.
+    struct ServerBan {
+        std::string user_id;
+        std::string actor;     // who placed it; "" for rows recovered by migrate_v15
+        std::string reason;    // "" if none given
+        int64_t created_at = 0;  // ms; filled with "now" when left at 0
+    };
+
+    // Idempotent: re-banning an already-banned user REPLACES the record, so the
+    // actor and reason are the most recent ones rather than the first.
+    void set_server_ban(const std::string& user_id, const std::string& actor,
+                        const std::string& reason, int64_t created_at = 0);
+    // True when a ban row existed and was removed. The return value is what lets
+    // an unban distinguish "lifted a ban" from "there was nothing to lift".
+    bool clear_server_ban(const std::string& user_id);
+    bool is_server_banned(const std::string& user_id);
+    std::optional<ServerBan> get_server_ban(const std::string& user_id);
+    std::vector<ServerBan> list_server_bans();
 
     // Events
     int64_t insert_event(const std::string& event_id, const std::string& room_id,
