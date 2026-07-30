@@ -114,6 +114,39 @@ allow_peer_to_peer = true
 # # already-connected participants itself, so this does not cut off calls.
 # # Clamped to [30, 21600].
 # token_ttl = 600
+# #
+# # Media encryption. On by default when LiveKit is configured.
+# #
+# # WHAT THIS IS: this server mints a per-channel key and hands it to clients
+# # over TLS alongside their join token. Clients encrypt media with it, so the
+# # LiveKit SFU relays audio and video it cannot read. That is worth having,
+# # and it matters most if your SFU runs on separate infrastructure or on
+# # someone else's cloud.
+# #
+# # WHAT THIS IS NOT: end-to-end encryption. Do not describe it as E2EE.
+# # Two limitations, both permanent under this design:
+# #
+# #   1. THIS SERVER HOLDS THE KEY. Anyone who can read its config, its
+# #      memory, or the api_secret below can decrypt the media. Confidentiality
+# #      is from the SFU, not from your own server.
+# #
+# #   2. SOMEONE WHO LEAVES CAN STILL DECRYPT until you rotate the key.
+# #      LiveKit's key ratchet cannot fix this: the next key is derived from
+# #      the current one with a public salt and no secret input, so anyone who
+# #      ever held a key can compute every later one. Only a fresh, unrelated
+# #      key excludes them. Rotate with:
+# #        POST /_matrix/client/v3/rooms/{roomId}/voice/livekit_rekey
+# #      (requires MANAGE_CHANNELS). Rotation is never automatic, including on
+# #      leave, and generations reset if the server restarts.
+# #
+# # Set false to have clients connect without media encryption.
+# room_encryption = true
+# #
+# # Key-derivation secret for channel keys. Optional: api_secret is used when
+# # this is unset, under a separate KDF domain so the two uses can never
+# # produce the same bytes. Set a dedicated high-entropy value if you would
+# # rather not have one secret serving two purposes. Never leaves the server.
+# room_key_secret = "<32+ random bytes, base64 or hex>"
 
 # Push notifications.
 #

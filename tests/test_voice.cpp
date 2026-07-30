@@ -889,12 +889,220 @@ protected:
         return res;
     }
 
+    httplib::Response rekey(const std::string& room_id, const std::string& token) {
+        httplib::Request req;
+        req.method = "POST";
+        req.path = "/_matrix/client/v3/rooms/" + room_id + "/voice/livekit_rekey";
+        if (!token.empty()) req.set_header("Authorization", "Bearer " + token);
+        httplib::Response res;
+        handler->handle_livekit_rekey(req, res);
+        return res;
+    }
+
+    // The base64 media key from a token response, or "" when absent.
+    static std::string key_of(const httplib::Response& res) {
+        auto body = json::parse(res.body);
+        if (!body.contains("encryption")) return "";
+        return body["encryption"].value("key", "");
+    }
+
     std::unique_ptr<SqliteStore> store;
     Config config;
     std::unique_ptr<SyncEngine> sync_engine;
     std::unique_ptr<VoiceHandler> handler;
     std::string alice, mod, outsider, room;
 };
+
+// ---------------------------------------------------------------------------
+// Media key issuance and rotation.
+//
+// What this feature is: the SFU relays media it cannot read, because the key
+// comes from THIS server and never reaches LiveKit. What it is NOT: end-to-end
+// encryption. The server holds the key, and a departed member keeps decrypting
+// until rotation. The tests below pin both the property and its limits so
+// neither drifts into an overstated claim.
+// ---------------------------------------------------------------------------
+
+TEST_F(LiveKitTokenTest, TokenResponseCarriesASharedMediaKey) {
+    auto res = request(room, "token-alice");
+    ASSERT_EQ(status_of(res), 200);
+    auto body = json::parse(res.body);
+    ASSERT_TRUE(body.contains("encryption"));
+    EXPECT_EQ(body["encryption"]["mode"], "shared_key");
+    EXPECT_EQ(body["encryption"]["key_generation"], 0);
+    // 32 raw bytes -> 44 base64 chars with one '=' of padding.
+    EXPECT_EQ(key_of(res).size(), 44u);
+}
+
+TEST_F(LiveKitTokenTest, MediaKeyIsAes256Sized) {
+    auto key = VoiceHandler::livekit_room_key(kLkSecret, "test", "!room:test", 0);
+    EXPECT_EQ(key.size(), 32u);
+}
+
+TEST_F(LiveKitTokenTest, MediaKeyIsStableAcrossRequests) {
+    // Two participants in the same room MUST derive the same bytes or they
+    // cannot decode each other. This is the whole feature working.
+    EXPECT_EQ(key_of(request(room, "token-alice")), key_of(request(room, "token-mod")));
+}
+
+TEST_F(LiveKitTokenTest, MediaKeyDiffersPerRoom) {
+    auto other = add_voice_channel(alice);
+    EXPECT_NE(key_of(request(room, "token-alice")), key_of(request(other, "token-alice")));
+}
+
+TEST_F(LiveKitTokenTest, MediaKeyDiffersPerServerName) {
+    auto a = VoiceHandler::livekit_room_key(kLkSecret, "one.example", "!r:test", 0);
+    auto b = VoiceHandler::livekit_room_key(kLkSecret, "two.example", "!r:test", 0);
+    EXPECT_NE(a, b);
+}
+
+TEST_F(LiveKitTokenTest, MediaKeyDiffersPerSecret) {
+    auto a = VoiceHandler::livekit_room_key("secret-one", "test", "!r:test", 0);
+    auto b = VoiceHandler::livekit_room_key("secret-two", "test", "!r:test", 0);
+    EXPECT_NE(a, b);
+}
+
+TEST_F(LiveKitTokenTest, MediaKeyDiffersPerGeneration) {
+    auto a = VoiceHandler::livekit_room_key(kLkSecret, "test", "!r:test", 0);
+    auto b = VoiceHandler::livekit_room_key(kLkSecret, "test", "!r:test", 1);
+    EXPECT_NE(a, b);
+}
+
+// The info string is length-prefixed so field boundaries cannot be shifted.
+// Without that, ("!r", gen) and ("!r" + gen-bytes, 0) could hash identically
+// and two different rooms would share a key.
+TEST_F(LiveKitTokenTest, MediaKeyFieldsCannotBeConfused) {
+    auto a = VoiceHandler::livekit_room_key(kLkSecret, "ab", "c", 0);
+    auto b = VoiceHandler::livekit_room_key(kLkSecret, "a", "bc", 0);
+    EXPECT_NE(a, b);
+}
+
+// Deriving from nothing would give every deployment with an unset secret the
+// same "encryption" key for the same room name.
+TEST_F(LiveKitTokenTest, MediaKeyRefusesEmptyKeyMaterial) {
+    EXPECT_THROW(VoiceHandler::livekit_room_key("", "test", "!r:test", 0), std::exception);
+}
+
+TEST_F(LiveKitTokenTest, DedicatedRoomKeySecretIsUsedWhenSet) {
+    auto before = key_of(request(room, "token-alice"));
+    config.voice.livekit.room_key_secret = "a-dedicated-room-key-secret";
+    auto after = key_of(request(room, "token-alice"));
+    EXPECT_NE(before, after);
+}
+
+// api_secret doubles as the default key material, so domain separation is the
+// only thing keeping a media key from colliding with token-signing output.
+TEST_F(LiveKitTokenTest, MediaKeyIsNotTheApiSecret) {
+    auto res = request(room, "token-alice");
+    ASSERT_EQ(status_of(res), 200);
+    EXPECT_EQ(res.body.find(kLkSecret), std::string::npos);
+    auto key = VoiceHandler::livekit_room_key(kLkSecret, "test", "!r:test", 0);
+    const std::string key_str(key.begin(), key.end());
+    EXPECT_NE(key_str, kLkSecret);
+}
+
+TEST_F(LiveKitTokenTest, NoMediaKeyWhenRoomEncryptionIsDisabled) {
+    config.voice.livekit.room_encryption = false;
+    auto res = request(room, "token-alice");
+    ASSERT_EQ(status_of(res), 200);
+    EXPECT_FALSE(json::parse(res.body).contains("encryption"));
+}
+
+// The key is exactly as sensitive as the token. Anyone the token gate refuses
+// must not receive key material either — and since both ride the same
+// response, that is structural rather than a second check.
+TEST_F(LiveKitTokenTest, NoMediaKeyWithoutViewChannel) {
+    deny(room, "user:" + alice, permission::kViewChannel);
+    auto res = request(room, "token-alice");
+    ASSERT_EQ(status_of(res), 403);
+    EXPECT_EQ(res.body.find("encryption"), std::string::npos);
+}
+
+TEST_F(LiveKitTokenTest, NoMediaKeyForNonMember) {
+    auto res = request(room, "token-outsider");
+    ASSERT_EQ(status_of(res), 403);
+    EXPECT_EQ(res.body.find("encryption"), std::string::npos);
+}
+
+TEST_F(LiveKitTokenTest, NoMediaKeyWithoutAuthentication) {
+    auto res = request(room, "");
+    ASSERT_EQ(status_of(res), 401);
+    EXPECT_EQ(res.body.find("encryption"), std::string::npos);
+}
+
+// ---- rotation ----
+
+TEST_F(LiveKitTokenTest, RekeyChangesTheIssuedKey) {
+    const auto before = key_of(request(room, "token-alice"));
+    auto rot = rekey(room, "token-mod"); // mod has kManageChannels
+    ASSERT_EQ(status_of(rot), 200);
+    EXPECT_EQ(json::parse(rot.body)["key_generation"], 1);
+    const auto after = key_of(request(room, "token-alice"));
+    EXPECT_NE(before, after);
+}
+
+TEST_F(LiveKitTokenTest, RekeyAdvancesGenerationMonotonically) {
+    EXPECT_EQ(json::parse(rekey(room, "token-mod").body)["key_generation"], 1);
+    EXPECT_EQ(json::parse(rekey(room, "token-mod").body)["key_generation"], 2);
+    auto body = json::parse(request(room, "token-alice").body);
+    EXPECT_EQ(body["encryption"]["key_generation"], 2);
+}
+
+TEST_F(LiveKitTokenTest, RekeyIsScopedToOneChannel) {
+    auto other = add_voice_channel(alice);
+    const auto other_before = key_of(request(other, "token-alice"));
+    ASSERT_EQ(status_of(rekey(room, "token-mod")), 200);
+    EXPECT_EQ(key_of(request(other, "token-alice")), other_before);
+}
+
+// Rotation interrupts everyone still holding the old key, so it is a
+// moderation action. A plain member must not be able to trigger it.
+TEST_F(LiveKitTokenTest, RekeyRequiresManageChannels) {
+    auto res = rekey(room, "token-alice");
+    EXPECT_EQ(status_of(res), 403);
+}
+
+TEST_F(LiveKitTokenTest, RekeyDeniedWithoutViewChannel) {
+    deny(room, "user:" + mod, permission::kViewChannel);
+    EXPECT_EQ(status_of(rekey(room, "token-mod")), 403);
+}
+
+TEST_F(LiveKitTokenTest, RekeyDeniedForNonMember) {
+    EXPECT_EQ(status_of(rekey(room, "token-outsider")), 403);
+}
+
+TEST_F(LiveKitTokenTest, RekeyRequiresAuthentication) {
+    EXPECT_EQ(status_of(rekey(room, "")), 401);
+}
+
+TEST_F(LiveKitTokenTest, RekeyNotFoundWhenLiveKitIsUnconfigured) {
+    config.voice.livekit.api_secret.clear();
+    EXPECT_EQ(status_of(rekey(room, "token-mod")), 404);
+}
+
+TEST_F(LiveKitTokenTest, RekeyNotFoundWhenEncryptionIsDisabled) {
+    config.voice.livekit.room_encryption = false;
+    EXPECT_EQ(status_of(rekey(room, "token-mod")), 404);
+}
+
+// A failed rotation must not silently succeed: no generation bump, so the
+// key everyone is using stays valid rather than half the room rotating.
+TEST_F(LiveKitTokenTest, DeniedRekeyDoesNotBumpTheGeneration) {
+    const auto before = key_of(request(room, "token-alice"));
+    ASSERT_EQ(status_of(rekey(room, "token-alice")), 403);
+    EXPECT_EQ(key_of(request(room, "token-alice")), before);
+}
+
+// Rotation never returns key material. One code path hands out keys, with one
+// permission gate on it.
+TEST_F(LiveKitTokenTest, RekeyResponseCarriesNoKeyMaterial) {
+    auto res = rekey(room, "token-mod");
+    ASSERT_EQ(status_of(res), 200);
+    auto body = json::parse(res.body);
+    EXPECT_FALSE(body.contains("key"));
+    EXPECT_FALSE(body.contains("encryption"));
+    EXPECT_EQ(res.body.find(kLkSecret), std::string::npos);
+}
 
 TEST_F(LiveKitTokenTest, IssuesTokenForPermittedMember) {
     auto res = request(room, "token-alice");
