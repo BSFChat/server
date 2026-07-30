@@ -455,9 +455,14 @@ do it before committing to the rest.
 5. **Simulcast / dynacast policy.** Not investigated. Relevant for CPU on a
    10-person call with cameras on.
 6. **E2EE.** The SDK lists end-to-end encryption support
-   (`include/livekit/e2ee.h`). The mesh path is DTLS hop-by-hop (Opus over an
-   SCTP data channel — there is NO SRTP; see `PeerConnectionManager.cpp:367,559`
-   and the note at `VoiceRoom.qml:179-183`), so an SFU
+   (`include/livekit/e2ee.h`). The mesh path is DTLS hop-by-hop, and the two
+   media types differ: **audio** is Opus over an SCTP data channel with NO
+   SRTP, while **video** is RTP and IS SRTP-protected, keyed by the same DTLS
+   handshake (`cmake/Dependencies.cmake:38-40` vendors libsrtp for exactly
+   this; `PeerConnectionManager.cpp:367,559` treat "transport with no SRTP" as
+   the failure to avoid). Do not state "the mesh is DTLS-SRTP" (wrong for
+   audio) or "there is no SRTP" (wrong for video) — both errors have been
+   made in this repo. An SFU
    is a *reduction* in confidentiality unless E2EE is enabled — the server can
    decrypt otherwise. For a product whose pitch is self-hosting and no
    middlemen, this deserves a deliberate decision rather than a default.
