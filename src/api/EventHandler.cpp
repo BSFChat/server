@@ -332,13 +332,28 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
     // ping people out of nowhere with no visible new message to explain it.
     //
     // So the mention set is fixed at the moment of the original send and an edit
-    // can neither add to it nor move it. Removal-on-edit is intentionally NOT
-    // implemented either: the shipped client strips `m.mentions` from its edit
-    // payload entirely (client/src/net/MatrixClient.cpp editMessage), so
-    // "absent" cannot be told apart from "deliberately cleared", and treating it
-    // as cleared would make mention badges vanish whenever a sender fixed a
-    // typo. See the report for the client-side follow-up that would let us
-    // support narrowing safely.
+    // can neither add to it nor move it.
+    //
+    // Removal-on-edit is intentionally NOT implemented either, and the reason is
+    // NOT the one this comment used to give. It used to say the shipped client
+    // stripped `m.mentions` from its edit payload; that is no longer true —
+    // MatrixClient::editMessage now sends it deliberately in BOTH places, inside
+    // `m.new_content` (so the folded-in content keeps it) and at the top level
+    // (because that is the copy this handler validates `room: true` against).
+    //
+    // The reason that still stands is that `m.mentions` is OPTIONAL in the
+    // protocol and always will be. Our client sending it does not make its
+    // absence meaningful: a third-party or older client that edits a message
+    // without the field would have "absent" read as "deliberately cleared", and
+    // every mention badge on that message would vanish because somebody fixed a
+    // typo. There is no way to distinguish the two on the wire, so narrowing an
+    // existing mention set would require a positive signal the protocol does not
+    // have — an explicit empty `user_ids`, say, which our own client also does not
+    // emit (applyMentions omits the key entirely when there are no mentions).
+    //
+    // Adding is unsafe (forgery, see above) and removing is ambiguous, so the set
+    // is immutable. The skip below is load-bearing for the forgery half and must
+    // not be relaxed.
     if (!edit_target && !mentions.empty()) {
         store_.record_mentions(event_id, room_id, *user_id, stream_pos, mentions.to_rows());
     }

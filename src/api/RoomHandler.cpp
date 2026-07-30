@@ -976,6 +976,101 @@ void RoomHandler::handle_unban(const httplib::Request& req, httplib::Response& r
                        room_id);
 }
 
+void RoomHandler::handle_list_server_bans(const httplib::Request& req, httplib::Response& res) {
+    auto user_id = authenticate(store_, req.get_header_value("Authorization"));
+    if (!user_id) {
+        res.status = 401;
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(),
+                        "application/json");
+        return;
+    }
+
+    const auto refuse = [&](int status, const MatrixError& err) {
+        res.status = status;
+        res.set_content(err.to_json().dump(), "application/json");
+    };
+
+    // SERVER scope. kServerScope is the empty room id, and PermissionsEngine::
+    // compute returns before any channel override is applied for it — so a
+    // per-channel BAN_MEMBERS override cannot unlock the server-wide ban list.
+    // That escalation shape has been a real bug here twice (the role-write path
+    // and, nearly, the audit log), and this endpoint is exactly the sort of
+    // server-wide read that invites it. ADMINISTRATOR still passes: compute()
+    // short-circuits it from the ROLE base before overrides are considered.
+    //
+    // BAN_MEMBERS rather than MANAGE_SERVER, matching ban_intent()/unban_intent()
+    // above: the permission that places and lifts a ban is the permission that
+    // sees them. See the note in RoomHandler.h.
+    PermissionsEngine perms(store_, config_);
+    if (!perms.can(*user_id, kServerScope, permission::kBanMembers)) {
+        return refuse(403, MatrixError::forbidden(
+            "Insufficient permissions to read the server ban list"));
+    }
+
+    int limit = limits::kDefaultServerBanLimit;
+    if (req.has_param("limit")) {
+        try {
+            limit = std::clamp(std::stoi(req.get_param_value("limit")), 1,
+                               limits::kMaxServerBanLimit);
+        } catch (const std::exception&) {
+            return refuse(400, MatrixError::invalid_param("limit must be an integer"));
+        }
+    }
+
+    std::optional<std::string> after;
+    if (req.has_param("after")) {
+        // Rejected rather than silently ignored, for the same reason the audit
+        // log's cursor is: a cursor treated as "start from the beginning" hands a
+        // paginating caller page one forever while looking like progress, and a
+        // moderator would conclude the ban list ends where it does not.
+        auto value = req.get_param_value("after");
+        if (value.empty()) {
+            return refuse(400, MatrixError::invalid_param("after must not be empty"));
+        }
+        after = std::move(value);
+    }
+
+    auto page = store_.list_server_bans(limit, after);
+
+    json bans = json::array();
+    for (const auto& ban : page.bans) {
+        json entry = {{"user_id", ban.user_id}, {"created_at", ban.created_at}};
+        // Omitted rather than emitted as "": migrate_v15 recovered pre-existing
+        // per-room bans that the database never recorded an actor for, and an
+        // empty string there would render as a moderator with no name rather than
+        // as "unknown". Same for a ban placed without a reason.
+        if (!ban.actor.empty()) entry["actor"] = ban.actor;
+        if (!ban.reason.empty()) entry["reason"] = ban.reason;
+        // The name a moderator recognises. Included because the client cannot
+        // work it out for exactly the users this endpoint exists to surface: it
+        // reads display names out of the m.room.member events its sync delivered,
+        // and a user banned while holding no membership row anywhere has none — so
+        // without this they would appear in the bans tab as a bare MXID.
+        //
+        // Via effective_display_name so nickname-over-profile precedence is the
+        // one definition every member event already uses, rather than a second
+        // rule invented here. Absent when the account row is gone: a ban
+        // deliberately outlives the account it names (see migrate_v15), so this
+        // being missing is normal and means "no name on record", not an error.
+        //
+        // Cost: two primary-key lookups on `users` per row, so up to 1000 for a
+        // full 500-row page. That is an N+1 and could be a LEFT JOIN, but this is
+        // an admin-only read a moderator opens occasionally, and reusing the one
+        // authoritative helper is worth more here than collapsing the query.
+        if (auto name = effective_display_name(store_, ban.user_id)) {
+            entry["display_name"] = *name;
+        }
+        bans.push_back(std::move(entry));
+    }
+
+    json out = {
+        {"bans", std::move(bans)},
+        {"total", page.total},
+    };
+    if (page.next_from) out["next_from"] = *page.next_from;
+    res.set_content(out.dump(), "application/json");
+}
+
 void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& res) {
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {

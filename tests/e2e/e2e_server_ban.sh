@@ -13,7 +13,10 @@
 # TOML would show up).
 set -uo pipefail
 
-BIN=/Users/josh/dev/gamechat/server/build-ban/bsfchat-server
+# build-fix is the build directory this repo's test runs use; build-ban was a
+# scratch tree from the ban work and is not guaranteed to exist or to be current.
+BIN=${BSFCHAT_SERVER_BIN:-/Users/josh/dev/gamechat/server/build-fix/bsfchat-server}
+[[ -x "$BIN" ]] || { echo "server binary not found at $BIN (build it first)" >&2; exit 1; }
 WORK=$(mktemp -d /tmp/bsfchat-ban-e2e-XXXXXX)
 REALDATA=/Users/josh/dev/gamechat/data
 PORT=8901
@@ -301,6 +304,94 @@ req GET "/bsfchat/audit_log?limit=50" "$T_ALICE" > /dev/null
 check_body "the ban is recorded"                      "member.ban"
 check_body "the unban is recorded"                    "member.unban"
 check_body "the channel deletion is recorded"         "channel.delete"
+
+echo
+echo "── T8: the server ban LIST is readable over HTTP ────────────────────"
+#
+# SqliteStore::list_server_bans had no route and no caller, so the client rebuilt
+# its bans tab from the membership rows its own sync surfaced — and a user banned
+# while holding no membership row anywhere was invisible in it and could not be
+# unbanned from it. These checks run against the real routing table.
+
+check "unauthenticated cannot read the ban list" 401 "$(req GET "/bsfchat/server_bans" "")"
+
+# A plain member is refused, and learns nothing.
+check "plain member cannot read the ban list" 403 "$(req GET "/bsfchat/server_bans" "$T_BOB")"
+check_body "...refused by the permission gate" "M_FORBIDDEN"
+check_body "...and for the right reason"       "server ban list"
+check_no_body "...leaking no ban list"         "bans"
+
+# A FRESH channel and a FRESH account for this section. Earlier phases left bob
+# and carol in states that varied by channel (kicked, banned, rejoined), and
+# building on that made two of these checks pass vacuously the first time round:
+# the ban silently failed and carol's override silently failed to apply, so the
+# escalation 403s below were proving nothing.
+BANLIST=$(create_room "$T_ALICE" banlist-e2e)
+[[ -n "$BANLIST" ]] || die "could not create the banlist channel"
+T_DAVE=$(register dave)
+[[ -n "$T_DAVE" ]] || die "could not register dave"
+D="@dave:e2e"
+
+check "dave is a member of the new channel" 200 "$(req POST "/rooms/$BANLIST/join" "$T_DAVE")"
+check "carol is a member of the new channel" 200 "$(req POST "/rooms/$BANLIST/join" "$T_CAROL")"
+
+# Built in a variable rather than inline: the backslash escaping does not survive
+# a nested command substitution, which silently produced M_BAD_JSON and left the
+# three list assertions below inspecting an empty ban list.
+BAN_BODY='{"user_id":"'"$D"'","reason":"list e2e"}'
+check "alice bans dave" 200 "$(req POST "/rooms/$BANLIST/ban" "$T_ALICE" "$BAN_BODY")"
+
+req GET "/bsfchat/server_bans" "$T_ALICE" > /dev/null
+check_body "admin sees the banned user"        "$D"
+check_body "...with the actor who placed it"   "$A"
+check_body "...with the reason"                "list e2e"
+check_body "...and a total"                    '"total"'
+
+# Pagination over the real query string.
+check "limit=1 is accepted" 200 "$(req GET "/bsfchat/server_bans?limit=1" "$T_ALICE")"
+check "a malformed limit is refused" 400 "$(req GET "/bsfchat/server_bans?limit=lots" "$T_ALICE")"
+check_body "...as an invalid parameter" "M_INVALID_PARAM"
+check "an empty cursor is refused rather than restarting" 400 \
+  "$(req GET "/bsfchat/server_bans?after=" "$T_ALICE")"
+
+# The escalation shape: a per-channel BAN_MEMBERS (bit 8 = 0x100) override must
+# not unlock the SERVER-WIDE ban list. MANAGE_CHANNELS (bit 5 = 0x20) rides along
+# purely so the positive control has something channel-scoped to demonstrate —
+# PermissionsEngine applies the ADMINISTRATOR short-circuit to the ROLE base
+# before overrides, so an override-granted ADMINISTRATOR does not expand.
+req PUT "/rooms/$BANLIST/state/bsfchat.channel.permissions/user:$C" "$T_ALICE" \
+  '{"allow":"0x120","deny":"0x0"}' > /dev/null
+# Read it back: a PUT answers {"event_id":...}, so asserting on the PUT's body
+# would pass whatever was written.
+req GET "/rooms/$BANLIST/state/bsfchat.channel.permissions/user:$C" "$T_ALICE" > /dev/null
+check_body "carol has a per-channel BAN_MEMBERS override" "0x120"
+
+# Positive control: the override really is live inside that channel, and only
+# there. Without this every 403 below could be passing because it never applied.
+check "carol can rename the channel her override covers" 200 \
+  "$(req PUT "/rooms/$BANLIST/state/m.room.name/" "$T_CAROL" '{"name":"carol-was-here"}')"
+check "...and cannot rename one it does not" 403 \
+  "$(req PUT "/rooms/$SECRET/state/m.room.name/" "$T_CAROL" '{"name":"nope"}')"
+
+# room_id/channel are parameters this endpoint does NOT define, and they are here
+# on purpose: the plausible way to reintroduce the escalation is for somebody to
+# add a room filter later and pass it to the permission check as the scope. A
+# request that never names a room cannot tell a server-scoped check apart from a
+# room-scoped one handed an empty string.
+for Q in "" "?limit=1" "?after=%40a%3Ae2e" "?room_id=$BANLIST" "?channel=$BANLIST" \
+         "?room_id=$BANLIST&limit=1"; do
+  check "channel override does NOT unlock the ban list [$Q]" 403 \
+    "$(req GET "/bsfchat/server_bans$Q" "$T_CAROL")"
+  check_body "...refused by the permission gate [$Q]" "server ban list"
+  check_no_body "...leaking no banned user [$Q]"      "$D"
+done
+
+# The round trip the bans tab needs: read the list, unban from it, read again.
+UNBAN_BODY='{"user_id":"'"$D"'"}'
+check "alice unbans dave from the list" 200 \
+  "$(req POST "/rooms/$BANLIST/unban" "$T_ALICE" "$UNBAN_BODY")"
+req GET "/bsfchat/server_bans" "$T_ALICE" > /dev/null
+check_no_body "an unban removes the entry from the list" "$D"
 
 stop_server
 

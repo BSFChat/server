@@ -168,7 +168,46 @@ public:
     bool clear_server_ban(const std::string& user_id);
     bool is_server_banned(const std::string& user_id);
     std::optional<ServerBan> get_server_ban(const std::string& user_id);
+
+    // Every ban, newest first. Convenience for tests and for callers that know the
+    // list is small; the HTTP read path uses the paginated overload below.
     std::vector<ServerBan> list_server_bans();
+
+    struct ServerBanPage {
+        std::vector<ServerBan> bans;  // ordered by user_id ASC — see below
+        // Cursor for the following page: pass it back as `after` to get the bans
+        // ordered strictly after the last one returned here. Absent at the end.
+        std::optional<std::string> next_from;
+        int64_t total = 0;            // rows in the table
+    };
+
+    // A page of at most `limit` bans, ordered by user_id ASCENDING, restricted to
+    // ids strictly greater than `after` when one is given.
+    //
+    // WHY user_id AND NOT created_at, even though created_at is what an operator
+    // would rather sort by: a cursor has to name something that does not move.
+    //   * created_at is not unique — two bans in the same millisecond share it, so
+    //     a cursor of "older than T" either repeats or skips whichever of them
+    //     falls on the boundary.
+    //   * created_at is not even STABLE. set_server_ban is deliberately idempotent
+    //     by REPLACE, so re-banning an already-banned user rewrites created_at and
+    //     the row MOVES in a created_at ordering. A reader paging through the list
+    //     while that happens can be handed the same ban twice or miss one
+    //     entirely.
+    //   * user_id is the PRIMARY KEY. It is unique, and it never changes for the
+    //     lifetime of a row: a re-ban replaces the row in place and keeps the same
+    //     key. So a page boundary is a fixed point in the key order.
+    // The guarantee this buys is weaker than the audit log's, because unlike
+    // audit_log this table is mutable and rows can be deleted, and it is stated
+    // rather than implied: a ban that existed when the walk began and still exists
+    // when it ends is returned EXACTLY ONCE. A ban lifted mid-walk simply does not
+    // appear, and a ban PLACED mid-walk appears only if its user_id happens to
+    // sort after the cursor. Neither can corrupt the walk.
+    //
+    // Ordering by user_id is also the cheaper query: it is served by the table's
+    // own primary-key index with no sort step, whereas ORDER BY created_at DESC is
+    // a full scan plus a temp b-tree. No new index, and so no migration.
+    ServerBanPage list_server_bans(int limit, const std::optional<std::string>& after);
 
     // Events
     int64_t insert_event(const std::string& event_id, const std::string& room_id,

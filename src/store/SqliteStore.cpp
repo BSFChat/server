@@ -795,6 +795,54 @@ std::vector<SqliteStore::ServerBan> SqliteStore::list_server_bans() {
     return bans;
 }
 
+SqliteStore::ServerBanPage SqliteStore::list_server_bans(
+    int limit, const std::optional<std::string>& after) {
+    std::lock_guard lock(mutex_);
+    if (limit < 1) limit = 1;
+
+    ServerBanPage page;
+
+    // Ordered by user_id, not created_at. See the header for why: created_at is
+    // neither unique nor stable under set_server_ban's REPLACE, so a cursor on it
+    // can hand a paging reader the same ban twice or hide one. user_id is the
+    // primary key and never moves.
+    //
+    // Over-fetch one row to learn whether a further page exists without a second
+    // query — the same trick get_room_events_paginated and list_audit_records use.
+    std::string sql = "SELECT user_id, actor, reason, created_at FROM server_bans ";
+    if (after) sql += "WHERE user_id > ? ";
+    sql += "ORDER BY user_id ASC LIMIT ?";
+
+    auto stmt = prepare(db_, sql);
+    int bind_index = 1;
+    if (after) {
+        sqlite3_bind_text(stmt.get(), bind_index++, after->c_str(), -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_int(stmt.get(), bind_index, limit + 1);
+
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        ServerBan ban;
+        ban.user_id = column_text_or_empty(stmt.get(), 0);
+        ban.actor = column_text_or_empty(stmt.get(), 1);
+        ban.reason = column_text_or_empty(stmt.get(), 2);
+        ban.created_at = sqlite3_column_int64(stmt.get(), 3);
+        page.bans.push_back(std::move(ban));
+    }
+
+    if (page.bans.size() > static_cast<size_t>(limit)) {
+        page.bans.pop_back();
+        // Exclusive cursor: the next page is everything strictly after the last
+        // row we are returning, so no ban can be served twice or skipped.
+        page.next_from = page.bans.back().user_id;
+    }
+
+    auto count = prepare(db_, "SELECT COUNT(*) FROM server_bans");
+    if (sqlite3_step(count.get()) == SQLITE_ROW) {
+        page.total = sqlite3_column_int64(count.get(), 0);
+    }
+    return page;
+}
+
 // Events
 
 int64_t SqliteStore::claim_stream_position_locked() {

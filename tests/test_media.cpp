@@ -1457,3 +1457,31 @@ TEST_F(MediaHeadTest, HeadIsRefusedAndCappedExactlyLikeGet) {
     EXPECT_EQ(capped->get_header_value("Content-Range"), "bytes */" + std::to_string(kSize));
     EXPECT_EQ(storage_->bytes_read, 0u);
 }
+
+// ── Upload rejections ─────────────────────────────────────────────────────
+//
+// The empty-upload refusal previously answered `M_NOT_JSON` on an endpoint that
+// takes a raw binary body and never parses JSON at all — a code that pointed at a
+// problem which could not exist. The status was always right; only the code was
+// misleading, and nothing anywhere compared against it.
+TEST_F(MediaHeadTest, AnEmptyUploadIsRefusedAsAnInvalidParameterNotAsBadJson) {
+    httplib::Request req;
+    req.path = "/_matrix/media/v3/upload";
+    req.body = "";
+    req.set_header("Authorization", "Bearer " + token_);
+    req.set_header("Content-Type", "image/png");
+    httplib::Response res;
+    handler_->handle_upload(req, res);
+
+    ASSERT_EQ(res.status, 400) << res.body;
+    auto body = nlohmann::json::parse(res.body);
+    EXPECT_EQ(body.value("errcode", ""), "M_INVALID_PARAM");
+    EXPECT_NE(body.value("errcode", ""), "M_NOT_JSON")
+        << "this endpoint takes a binary body and never parses JSON";
+    // Assert on the reason, not merely the status: a 400 from some other guard
+    // (auth, content type, size) would be the right code for the wrong cause.
+    EXPECT_NE(body.value("error", "").find("file data"), std::string::npos) << res.body;
+
+    // And nothing was stored — a refused upload must not leave a media row behind.
+    EXPECT_EQ(storage_->stat_calls, 0);
+}

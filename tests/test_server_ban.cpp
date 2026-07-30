@@ -930,3 +930,380 @@ TEST(ServerBanMigration, AFreshDatabaseGetsAnEmptyBanList) {
     EXPECT_EQ(scalar(f.db_path, "SELECT COUNT(*) FROM server_bans"), 0);
     EXPECT_TRUE(f.store->list_server_bans().empty());
 }
+
+// ══ 8. The ban-list read endpoint ═════════════════════════════════════════
+//
+// SqliteStore::list_server_bans existed from v15 but had NO HTTP route and NO
+// caller anywhere in server/. The consequence was on the client: its bans tab was
+// rebuilt from the m.room.member rows its own sync had surfaced, so a user banned
+// while holding no membership row in any synced room never appeared in it — and
+// therefore could not be unbanned from it. That is the same blind spot the
+// server-wide ban list exists to close, reappearing on the read side.
+//
+// The properties, in order:
+//   a. It is gated on BAN_MEMBERS at SERVER scope — the same permission that
+//      places and lifts a ban — and a per-channel override does not grant it.
+//   b. It returns bans that NO membership row anywhere could have revealed.
+//   c. Pagination is keyset on user_id and stays correct while bans are placed
+//      and lifted underneath a reader.
+
+namespace {
+
+// A request with query parameters (the ban list's limit/after).
+httplib::Response call_bans(RoomHandler& handler, const std::string& token,
+                            const httplib::Params& params = {}) {
+    auto req = make_request(std::string(api_path::kServerBans), token);
+    req.params = params;
+    httplib::Response res;
+    handler.handle_list_server_bans(req, res);
+    return res;
+}
+
+std::vector<std::string> banned_ids(const json& body) {
+    std::vector<std::string> out;
+    for (const auto& b : body.at("bans")) out.push_back(b.at("user_id").get<std::string>());
+    return out;
+}
+
+// Writes a per-channel allow/deny override the way handle_set_state does.
+void set_override(Fixture& f, const std::string& room_id, const std::string& target,
+                  permission::Flags allow, permission::Flags deny) {
+    ChannelPermissionOverride ov;
+    ov.allow = allow;
+    ov.deny = deny;
+    json j;
+    to_json(j, ov);
+    f.store->insert_event(generate_event_id("test"), room_id, "@server:test",
+                          std::string(event_type::kChannelPermissions), target, j.dump(), 1002);
+}
+
+} // namespace
+
+TEST(ServerBanList, RequiresAuthentication) {
+    Fixture f("banlist-401");
+    f.seed_roles();
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    EXPECT_EQ(call_bans(handler, "bogus-token").status, 401);
+}
+
+TEST(ServerBanList, PlainMemberIsRefusedForTheRightReason) {
+    Fixture f("banlist-403");
+    f.seed_roles();
+    f.add_user("bob");
+    f.store->set_server_ban("@mallory:test", "@admin:test", "spam", 1000);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    auto res = call_bans(handler, "token-bob");
+    ASSERT_TRUE(IsForbiddenBecause(res, "server ban list")) << res.body;
+    EXPECT_EQ(res.body.find("bans"), std::string::npos) << "no ban list may leak in a 403";
+    EXPECT_EQ(res.body.find("@mallory"), std::string::npos) << "no ban content may leak";
+}
+
+TEST(ServerBanList, BanMembersCanReadAndKickOnlyModeratorCannot) {
+    Fixture f("banlist-permission");
+    // A role with KICK_MEMBERS but deliberately NOT BAN_MEMBERS, so the gate is
+    // exercised on its own flag rather than on a moderator role that happens to
+    // carry both.
+    ServerRolesContent content;
+    content.roles.push_back(role(permission::role_id::kEveryone, 0,
+                                 permission::kEveryoneDefault));
+    content.roles.push_back(role("kicker", 10,
+                                 permission::kEveryoneDefault | permission::kKickMembers));
+    content.roles.push_back(role("banner", 20,
+                                 permission::kEveryoneDefault | permission::kBanMembers));
+    content.roles.push_back(role(permission::role_id::kAdmin, 100, permission::kAllFlags));
+    json j;
+    to_json(j, content);
+    f.store->set_server_state(std::string(event_type::kServerRoles), "", "@server:test",
+                              j.dump());
+
+    f.add_user("kicker", {"kicker"});
+    f.add_user("banner", {"banner"});
+    f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    f.store->set_server_ban("@mallory:test", "@banner:test", "spam", 1000);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+
+    // The permission that places a ban is the permission that sees the list.
+    // Anything stricter (MANAGE_SERVER) would mean a moderator who may ban cannot
+    // see or undo their own bans, which is the bug this endpoint fixes.
+    auto banner = call_bans(handler, "token-banner");
+    ASSERT_TRUE(IsOk(banner)) << banner.body;
+    EXPECT_EQ(json::parse(banner.body).at("bans").size(), 1u);
+
+    // KICK_MEMBERS is not enough: kicking is not banning.
+    EXPECT_TRUE(IsForbiddenBecause(call_bans(handler, "token-kicker"), "server ban list"));
+
+    // ADMINISTRATOR short-circuits to every flag, so an admin reads it too.
+    EXPECT_TRUE(IsOk(call_bans(handler, "token-admin")));
+}
+
+// The escalation shape that has been a real bug here twice.
+TEST(ServerBanList, PerChannelOverrideDoesNotGrantAccess) {
+    Fixture f("banlist-override-escalation");
+    f.seed_roles();
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto room = f.add_channel(admin, "bobs-corner");
+    f.join(room, bob);
+    f.store->set_server_ban("@mallory:test", admin, "spam", 1000);
+
+    // Bob is handed BAN_MEMBERS — and ADMINISTRATOR for good measure — inside this
+    // one channel.
+    set_override(f, room, "user:" + bob,
+                 permission::kBanMembers | permission::kAdministrator, 0);
+
+    // Positive control: the override really is in effect at CHANNEL scope.
+    // Without this the assertion below would pass just as well if the override had
+    // silently failed to apply, and would prove nothing.
+    {
+        PermissionsEngine perms(*f.store, f.config);
+        ASSERT_TRUE(perms.can(bob, room, permission::kBanMembers))
+            << "override did not apply; the rest of this test would prove nothing";
+        EXPECT_FALSE(perms.can(bob, "", permission::kBanMembers));
+    }
+    // And a control that the list is not simply empty.
+    ASSERT_EQ(f.store->list_server_bans(50, std::nullopt).bans.size(), 1u);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    // `room_id` and `channel` are parameters this endpoint does NOT define, and
+    // they are here on purpose. The permission scope must never be taken from the
+    // request: the plausible way to reintroduce this bug is for somebody to add a
+    // room filter later and pass it to perms.can() as the scope, at which point
+    // Bob's channel override would unlock the server-wide list. Without a request
+    // that actually names a room, a test cannot tell a server-scoped check from a
+    // room-scoped one that happened to receive an empty string — mutation testing
+    // caught exactly that hole here.
+    for (const auto& params : std::vector<httplib::Params>{
+             {},
+             {{"limit", "1"}},
+             {{"after", "@a:test"}},
+             {{"room_id", room}},
+             {{"channel", room}},
+             {{"room_id", room}, {"limit", "1"}}}) {
+        auto res = call_bans(handler, "token-bob", params);
+        ASSERT_TRUE(IsForbiddenBecause(res, "server ban list")) << res.body;
+        EXPECT_EQ(res.body.find("@mallory"), std::string::npos)
+            << "no ban content may leak in a 403";
+    }
+
+    // And the same requests DO work for someone holding BAN_MEMBERS at server
+    // scope, so the refusals above are about Bob and not about the parameters.
+    auto ok = call_bans(handler, "token-admin", {{"room_id", room}});
+    ASSERT_TRUE(IsOk(ok)) << ok.body;
+    EXPECT_EQ(json::parse(ok.body).at("bans").size(), 1u)
+        << "an unknown parameter must not filter the list either";
+}
+
+TEST(ServerBanList, SurfacesABanNoMembershipRowCouldReveal) {
+    Fixture f("banlist-invisible");
+    f.seed_roles();
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto ghost = f.add_user("ghost");
+    f.store->set_display_name(ghost, "Ghost");
+
+    // The exact case the client could not see: banned while a member of NOTHING,
+    // so there is no m.room.member row anywhere for a sync to deliver.
+    ASSERT_TRUE(f.store->get_user_memberships(ghost).empty())
+        << "the ghost must have no membership rows or this test proves nothing";
+    f.store->set_server_ban(ghost, admin, "ban placed out of band", 4242);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    auto res = call_bans(handler, "token-admin");
+    ASSERT_TRUE(IsOk(res)) << res.body;
+    auto body = json::parse(res.body);
+    ASSERT_EQ(body.at("bans").size(), 1u);
+    const auto& ban = body.at("bans")[0];
+    EXPECT_EQ(ban.at("user_id"), ghost);
+    EXPECT_EQ(ban.at("actor"), admin);
+    EXPECT_EQ(ban.at("reason"), "ban placed out of band");
+    EXPECT_EQ(ban.at("created_at"), 4242);
+    // The name a moderator recognises. The client cannot derive this for a user
+    // with no member events, so a bans tab would otherwise show a bare MXID.
+    EXPECT_EQ(ban.at("display_name"), "Ghost");
+    EXPECT_EQ(body.at("total"), 1);
+}
+
+TEST(ServerBanList, OmitsFieldsTheDatabaseHasNoValueFor) {
+    Fixture f("banlist-omissions");
+    f.seed_roles();
+    f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    // The shape migrate_v15 recovers from pre-existing per-room bans: no actor,
+    // no reason, and (here) no account row at all, because a ban deliberately
+    // outlives the account it names.
+    f.store->set_server_ban("@recovered:test", "", "", 7);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    auto res = call_bans(handler, "token-admin");
+    ASSERT_TRUE(IsOk(res)) << res.body;
+    // Held in a named local: binding a reference into json::parse(...)'s temporary
+    // dangles the moment the statement ends.
+    const auto body = json::parse(res.body);
+    ASSERT_EQ(body.at("bans").size(), 1u);
+    const auto& ban = body.at("bans")[0];
+
+    EXPECT_EQ(ban.at("user_id"), "@recovered:test");
+    // Absent, not "". An empty string renders as a moderator with no name rather
+    // than as "unknown", and the two mean different things here.
+    EXPECT_FALSE(ban.contains("actor"));
+    EXPECT_FALSE(ban.contains("reason"));
+    EXPECT_FALSE(ban.contains("display_name"));
+}
+
+TEST(ServerBanList, PaginatesOverTheWholeListWithoutRepeatingOrSkipping) {
+    Fixture f("banlist-pages");
+    f.seed_roles();
+    f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+
+    std::set<std::string> expected;
+    for (int i = 0; i < 17; ++i) {
+        // Zero-padded so lexicographic order is also numeric order, making an
+        // out-of-order page obvious rather than plausible.
+        auto uid = "@u" + std::string(2 - std::to_string(i).size(), '0') +
+                   std::to_string(i) + ":test";
+        // created_at runs DELIBERATELY BACKWARDS relative to user_id. With the two
+        // orderings agreeing, this test could not tell which column the query
+        // ordered by, and a mutation swapping ORDER BY user_id for ORDER BY
+        // created_at survived it. Anti-correlated, the two disagree on every pair,
+        // so ordering by the wrong column fails the strictly-increasing assertion
+        // below immediately.
+        f.store->set_server_ban(uid, "@admin:test", "r", 9000 - i);
+        expected.insert(uid);
+    }
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    std::vector<std::string> seen;
+    httplib::Params params{{"limit", "5"}};
+    std::string last;
+    for (int page = 0; page < 10; ++page) {
+        auto res = call_bans(handler, "token-admin", params);
+        ASSERT_TRUE(IsOk(res)) << res.body;
+        auto body = json::parse(res.body);
+        EXPECT_EQ(body.at("total"), 17) << "total is the whole table on every page";
+        for (const auto& id : banned_ids(body)) {
+            EXPECT_GT(id, last) << "pagination repeated or went backwards";
+            last = id;
+            seen.push_back(id);
+        }
+        if (!body.contains("next_from")) break;
+        params = {{"limit", "5"}, {"after", body.at("next_from").get<std::string>()}};
+    }
+
+    EXPECT_EQ(seen.size(), 17u) << "the walk did not reach every ban";
+    EXPECT_EQ(std::set<std::string>(seen.begin(), seen.end()), expected);
+}
+
+TEST(ServerBanList, ACursorSurvivesBansPlacedAndLiftedMidWalk) {
+    Fixture f("banlist-cursor-stability");
+    f.seed_roles();
+    f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+
+    // Bans that exist before the walk starts and are never touched during it.
+    std::set<std::string> stable;
+    for (int i = 0; i < 8; ++i) {
+        auto uid = "@m" + std::to_string(i) + ":test";
+        // Anti-correlated with user_id, for the same reason as above: the churn
+        // below re-bans @m0 and rewrites its created_at, and that can only be
+        // shown to be harmless if created_at is not already the ordering.
+        f.store->set_server_ban(uid, "@admin:test", "r", 9000 - i);
+        stable.insert(uid);
+    }
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    std::vector<std::string> seen;
+    httplib::Params params{{"limit", "2"}};
+    for (int page = 0; page < 20; ++page) {
+        auto res = call_bans(handler, "token-admin", params);
+        ASSERT_TRUE(IsOk(res)) << res.body;
+        auto body = json::parse(res.body);
+        for (const auto& id : banned_ids(body)) seen.push_back(id);
+        if (!body.contains("next_from")) break;
+        auto cursor = body.at("next_from").get<std::string>();
+        params = {{"limit", "2"}, {"after", cursor}};
+
+        // Churn between pages, of every kind the table permits:
+        //  * a brand-new ban far after the cursor (@z...) — may or may not be
+        //    seen, but must not disturb anything;
+        //  * a RE-ban of an already-listed user, which is a REPLACE that rewrites
+        //    created_at. This is precisely why the cursor is user_id and not
+        //    created_at: the row moves in a created_at ordering and a reader would
+        //    be handed it twice or lose it.
+        f.store->set_server_ban("@z" + std::to_string(page) + ":test", "@admin:test", "late",
+                                9000 + page);
+        f.store->set_server_ban("@m0:test", "@admin:test", "re-banned", 9999);
+    }
+
+    // No stable row was returned twice...
+    std::set<std::string> unique_seen(seen.begin(), seen.end());
+    EXPECT_EQ(unique_seen.size(), seen.size()) << "a ban was returned twice";
+    // ...and every stable row was returned at least once, despite the churn.
+    for (const auto& id : stable) {
+        EXPECT_TRUE(unique_seen.count(id)) << "ban " << id << " was skipped";
+    }
+}
+
+TEST(ServerBanList, RejectsAMalformedLimitOrAnEmptyCursor) {
+    Fixture f("banlist-params");
+    f.seed_roles();
+    f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    RoomHandler handler(*f.store, *f.sync, f.config);
+
+    auto bad_limit = call_bans(handler, "token-admin", {{"limit", "lots"}});
+    ASSERT_EQ(bad_limit.status, 400) << bad_limit.body;
+    EXPECT_EQ(json::parse(bad_limit.body).value("errcode", ""), "M_INVALID_PARAM");
+    EXPECT_NE(json::parse(bad_limit.body).value("error", "").find("limit"), std::string::npos)
+        << "refused for the wrong reason: " << bad_limit.body;
+
+    // An empty cursor is refused rather than treated as "start from the
+    // beginning": silently restarting would hand a paginating moderator page one
+    // forever while looking like progress.
+    auto empty_cursor = call_bans(handler, "token-admin", {{"after", ""}});
+    ASSERT_EQ(empty_cursor.status, 400) << empty_cursor.body;
+    EXPECT_NE(json::parse(empty_cursor.body).value("error", "").find("after"),
+              std::string::npos)
+        << "refused for the wrong reason: " << empty_cursor.body;
+}
+
+TEST(ServerBanList, ClampsAnOversizedLimit) {
+    Fixture f("banlist-limit-clamp");
+    f.seed_roles();
+    f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    for (int i = 0; i < limits::kMaxServerBanLimit + 5; ++i) {
+        f.store->set_server_ban("@u" + std::string(4 - std::to_string(i).size(), '0') +
+                                    std::to_string(i) + ":test",
+                                "@admin:test", "r", 1000 + i);
+    }
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    auto res = call_bans(handler, "token-admin", {{"limit", "100000"}});
+    ASSERT_TRUE(IsOk(res)) << res.body;
+    auto body = json::parse(res.body);
+    EXPECT_EQ(body.at("bans").size(), static_cast<size_t>(limits::kMaxServerBanLimit));
+    EXPECT_TRUE(body.contains("next_from"));
+}
+
+TEST(ServerBanList, AnUnbanRemovesTheEntry) {
+    Fixture f("banlist-unban");
+    f.seed_roles();
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto room = f.add_channel(admin, "general");
+    f.join(room, bob);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(room), "token-admin",
+                          json{{"user_id", bob}, {"reason", "spam"}}.dump())));
+
+    auto after_ban = json::parse(call_bans(handler, "token-admin").body);
+    ASSERT_EQ(after_ban.at("bans").size(), 1u);
+    EXPECT_EQ(after_ban.at("bans")[0].at("user_id"), bob);
+    EXPECT_EQ(after_ban.at("bans")[0].at("reason"), "spam");
+
+    // The round trip the client's bans tab needs: read the list, unban from it,
+    // read again. This is what could not be done at all before the endpoint
+    // existed for a user with no synced membership row.
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_unban, unban_path(room), "token-admin",
+                          json{{"user_id", bob}}.dump())));
+    auto after_unban = json::parse(call_bans(handler, "token-admin").body);
+    EXPECT_TRUE(after_unban.at("bans").empty());
+    EXPECT_EQ(after_unban.at("total"), 0);
+}

@@ -161,9 +161,23 @@ void MediaHandler::handle_upload(const httplib::Request& req, httplib::Response&
     }
 
     if (body.empty()) {
+        // M_INVALID_PARAM, not M_NOT_JSON. This endpoint takes a raw binary body —
+        // an image, a video, a zip — and never parses JSON at all, so telling a
+        // client "your request body is not JSON" pointed at a problem that could
+        // not exist and sent anyone debugging it looking for a serialisation bug.
+        // The actual fault is a request parameter (the body) being unusable, which
+        // is what M_INVALID_PARAM means, and it sits alongside the M_TOO_LARGE
+        // above as the other end of the same size check.
+        //
+        // Safe to change: no client compares against this code. The upload error
+        // path is errcode-agnostic — MatrixClient's uploadMedia handler passes the
+        // raw response body straight through to a toast without parsing it — and
+        // the only errcode comparisons anywhere in the client are on the message
+        // send and /sync paths, neither of which this reaches.
         res.status = 400;
-        res.set_content(R"({"errcode":"M_NOT_JSON","error":"No file data provided"})",
-                        "application/json");
+        res.set_content(
+            MatrixError::invalid_param("No file data provided").to_json().dump(),
+            "application/json");
         return;
     }
 

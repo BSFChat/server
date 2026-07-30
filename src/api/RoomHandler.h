@@ -40,6 +40,23 @@ public:
     // recorded but never lifted.
     void handle_unban(const httplib::Request& req, httplib::Response& res);
     void handle_invite(const httplib::Request& req, httplib::Response& res);
+
+    // GET /_matrix/client/v3/bsfchat/server_bans — the server-wide ban list.
+    //
+    // Server-scoped, so it lives here rather than under /rooms/{id}/ despite the
+    // path: SqliteStore::list_server_bans had no route and no caller at all, which
+    // meant a client could only reconstruct the ban list from the membership rows
+    // its own sync happened to surface. A user banned while holding no membership
+    // row in any synced room was therefore invisible in the client's bans tab and
+    // could not be unbanned from it — the same blind spot the server-wide ban list
+    // exists to close, reappearing on the read side.
+    //
+    // Gated on BAN_MEMBERS at SERVER scope, which is exactly what ban_intent() and
+    // unban_intent() require of the writes. Deliberately not MANAGE_SERVER: a
+    // moderator who may place and lift bans but may not see the list cannot use
+    // the tab the list is for, and would be reduced to guessing user ids. Reading
+    // who is banned is strictly less than the power to ban them.
+    void handle_list_server_bans(const httplib::Request& req, httplib::Response& res);
     void handle_set_state(const httplib::Request& req, httplib::Response& res);
     void handle_move_channel(const httplib::Request& req, httplib::Response& res);
     void handle_set_order(const httplib::Request& req, httplib::Response& res);

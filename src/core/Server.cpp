@@ -161,6 +161,17 @@ void Server::register_routes() {
     svr.Post(R"(/_matrix/client/v3/rooms/([^/]+)/invite)",
              [h = room_handler](const httplib::Request& req, httplib::Response& res) { h->handle_invite(req, res); });
 
+    // The server-wide ban list. Read-only: bans are placed and lifted through the
+    // /rooms/{id}/ban and /unban routes above, which is where the rank check lives.
+    // SqliteStore::list_server_bans previously had no route and no caller, so the
+    // client could only rebuild the list from the membership rows its own sync had
+    // surfaced — and a user banned while holding no membership row anywhere was
+    // invisible in the bans tab and could not be unbanned from it. Permission is
+    // evaluated at SERVER scope inside the handler, so a per-channel override
+    // cannot unlock it.
+    svr.Get(std::string(api_path::kServerBans),
+            [h = room_handler](const httplib::Request& req, httplib::Response& res) { h->handle_list_server_bans(req, res); });
+
     // Category and order routes (must be before state PUT to avoid conflict)
     svr.Put(R"(/_matrix/client/v3/rooms/([^/]+)/category)",
             [h = room_handler](const httplib::Request& req, httplib::Response& res) { h->handle_move_channel(req, res); });

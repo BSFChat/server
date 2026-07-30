@@ -268,10 +268,12 @@ ESTATUS=$(curl -s -o "$ROOT/empty.resp" -w '%{http_code}' \
 EURI=$(sed -n 's/.*"content_uri":"\([^"]*\)".*/\1/p' "$ROOT/empty.resp")
 if [ "$ESTATUS" = "400" ]; then
     check "empty upload rejected with 400" "400" "$ESTATUS"
-    if grep -q '"errcode"' "$ROOT/empty.resp"; then
-        ok "empty upload 400 carries an errcode: $(cat "$ROOT/empty.resp")"
-    else
-        bad "empty upload 400 has no errcode" "$(cat "$ROOT/empty.resp")"
+    # M_INVALID_PARAM, not M_NOT_JSON: this endpoint takes a raw binary body and
+    # never parses JSON, so M_NOT_JSON named a fault that could not occur.
+    ECODE=$(sed -n 's/.*"errcode":"\([^"]*\)".*/\1/p' "$ROOT/empty.resp")
+    check "empty upload errcode is M_INVALID_PARAM" "M_INVALID_PARAM" "$ECODE"
+    if [ "$ECODE" = "M_NOT_JSON" ]; then
+        bad "empty upload still reports M_NOT_JSON" "binary endpoint, never parses JSON"
     fi
     [ -z "$EURI" ] || bad "empty upload was refused but still returned a content_uri" "$EURI"
     ok "server refuses zero-length uploads, so there is no empty object to serve"
