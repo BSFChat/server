@@ -23,6 +23,8 @@ add_executable(bsfchat-server
     src/auth/Permissions.cpp
     src/auth/PowerLevels.cpp
     src/auth/RoleBootstrap.cpp
+    src/audit/AuditLog.cpp
+    src/api/AuditHandler.cpp
     src/api/AuthHandler.cpp
     src/api/RoomHandler.cpp
     src/api/EventHandler.cpp
@@ -32,6 +34,9 @@ add_executable(bsfchat-server
     src/api/MediaHandler.cpp
     src/api/ProfileHandler.cpp
     src/api/VoiceHandler.cpp
+    src/api/PushHandler.cpp
+    src/api/SearchHandler.cpp
+    src/push/PushService.cpp
     src/storage/LocalStorage.cpp
     src/storage/S3Client.cpp
     src/storage/S3Storage.cpp

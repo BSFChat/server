@@ -2,6 +2,9 @@
 name = "localhost"
 bind_address = "0.0.0.0"
 port = 8448
+# Size of the HTTP worker thread pool. Every /sync long-poll occupies a
+# worker for up to its timeout, so this is effectively a concurrent-client
+# ceiling — raise it well above your expected simultaneous user count.
 workers = 4
 
 [database]
@@ -9,11 +12,45 @@ path = "./data/bsfchat.db"
 
 [media]
 path = "./data/media/"
+# Also enforced at the HTTP layer, so an oversized request is rejected while
+# streaming rather than after being buffered in memory.
 max_upload_size_mb = 500
+# Require an access token on media downloads (Authorization header or
+# ?access_token=). On by default: media ids are 128-bit random, so with this
+# off a download URL is an unguessable capability URL with no revocation and
+# no per-room ACL. The desktop client sends the token as a query parameter
+# because the image/video widgets cannot set request headers.
+# Turn this off only to serve clients older than token-bearing media URLs.
+require_auth = true
 
 [auth]
 registration_enabled = true
-password_hash_cost = 12
+# PBKDF2-HMAC-SHA256 work factor as a power of two: iterations = 2^cost.
+# 19 => 524,288, in line with current OWASP guidance. Values below 12 are
+# clamped up at startup. Each stored hash records the cost it was created
+# with, so raising this is safe: existing passwords keep verifying and are
+# transparently re-hashed at the owner's next successful login.
+password_hash_cost = 19
+
+# Access-token lifetime, in days.
+#
+# Tokens are stored only as SHA-256 digests, expire, and can be revoked:
+#   * POST /_matrix/client/v3/logout          — this session
+#   * POST /_matrix/client/v3/logout/all      — every session for the account
+#   * POST /_matrix/client/v3/account/password — every OTHER session, by
+#     default (pass "logout_devices": false to keep them)
+#
+# 90 days is deliberately long. The desktop client stores a single access token
+# and has no background refresh, so a short lifetime would log people out while
+# they are still using the app. Expiry slides forward on use — any
+# authenticated request past the halfway point of the lifetime renews it — so an
+# active client never lapses, while a token that stops being used (including one
+# that leaked and is sitting idle in a dump) dies on schedule.
+#
+# Clients that send "refresh_token": true on login/register also receive a
+# refresh token and can rotate the pair via POST /_matrix/client/v3/refresh.
+# Values below 1 or above 3650 are clamped at startup.
+access_token_lifetime_days = 90
 
 # Storage backend for media files
 # type = "local" stores files on disk, "s3" uses S3-compatible object storage
@@ -52,6 +89,105 @@ stun_uri = "stun:stun.l.google.com:19302"
 # TURN and want every call forced through the relay (privacy over cost).
 allow_peer_to_peer = true
 
+# Push notifications.
+#
+# WHAT THIS SERVER DOES: evaluates each message, decides who should be notified
+# (mentions, DMs, or a per-room preference the client sets via
+# PUT /_matrix/client/v3/bsfchat/rooms/{roomId}/notify_level), and POSTs the
+# Matrix push-gateway "notify" payload to whatever URL each client registered on
+# its pusher with POST /_matrix/client/v3/pushers/set. Delivery is queued and
+# performed by a background worker, so a slow or dead gateway never delays a
+# message send or a /sync.
+#
+# WHAT A DEPLOYMENT MUST SUPPLY: a push gateway. This server is deliberately
+# provider-agnostic and holds NO FCM or APNs credentials — those belong to the
+# gateway. Run sygnal (github.com/matrix-org/sygnal) or any service that accepts
+# `POST <url> {"notification": {...}}` and answers
+# `{"rejected": ["<pushkey>", ...]}`, give it your FCM service-account JSON
+# and/or APNs .p8 key, and point allowed_gateway_prefixes at it. Without a
+# gateway, mobile push simply does not happen; everything else keeps working.
+[push]
+enabled = true
+
+# URL prefixes clients may register as a push gateway. LEAVE THIS SET.
+#
+# /pushers/set is the only endpoint where an ordinary user names a URL that the
+# SERVER then requests, which makes it a server-side request forgery primitive:
+# with no restriction, any account can aim it at cloud metadata endpoints
+# (169.254.169.254), at your database's admin port, or at anything else reachable
+# from this host, and use notification behaviour as the oracle. An empty list
+# accepts any absolute http(s) URL and logs a warning at startup — only
+# acceptable on an instance where every account is trusted.
+allowed_gateway_prefixes = ["https://push.example.com/"]
+
+# Delivery worker. The worker is woken immediately when a notification is
+# queued, so worker_poll_ms is only the ceiling on noticing a retry falling due.
+# worker_poll_ms = 1000
+# connect_timeout_s = 5
+# request_timeout_s = 10
+
+# Retry schedule. Exponential backoff from base_backoff_ms, doubling per attempt
+# up to max_backoff_ms; after max_attempts the notification is dropped. A pusher
+# the gateway reports as `rejected` is deleted immediately rather than retried —
+# a rejection means the device is gone (app uninstalled, token revoked).
+# max_attempts = 6
+# base_backoff_ms = 5000
+# max_backoff_ms = 3600000
+
+# Rows claimed per wakeup, and how long a claimed row stays invisible while it is
+# in flight. lease_ms must exceed the HTTP timeouts or a slow gateway would be
+# sent duplicates; it is raised automatically at startup if it does not.
+# batch_size = 20
+# lease_ms = 60000
+
+# Moderation audit log — GET /_matrix/client/v3/bsfchat/audit_log
+#
+# Kicks, bans, unbans, role creation/modification/deletion, role assignment
+# changes, channel and category deletions, and per-channel permission override
+# changes are recorded with the acting user, the target, a before/after payload and
+# a timestamp. Reading it needs MANAGE_SERVER (or ADMINISTRATOR) at SERVER scope —
+# a per-channel permission override deliberately cannot unlock it. There is no
+# config for any of this and no write endpoint: records are written by the server
+# at the moment the action happens.
+#
+# THERE IS NO RETENTION SETTING, ON PURPOSE. Nothing in the server ever updates or
+# deletes an audit record, and the database enforces that with triggers rather than
+# trusting the code. Two reasons:
+#
+#   * The table is tiny and its size is bounded by privilege rather than by
+#     traffic. Every recorded action requires KICK_MEMBERS, BAN_MEMBERS,
+#     MANAGE_ROLES or MANAGE_CHANNELS, so ordinary users cannot grow it. A row is a
+#     few hundred bytes; 100 moderation actions a day — a very turbulent server —
+#     is roughly 15 MB per YEAR, against message history and media that are already
+#     unbounded and orders of magnitude larger.
+#   * A retention window is a documented way to outwait your own audit trail, and a
+#     prune path is an evidence-destruction primitive waiting for the next bug that
+#     exposes it. For this one table, "the log is complete" is worth more than
+#     bounded disk.
+#
+# If you truly must prune (e.g. a legal retention limit), do it deliberately and
+# visibly with the server stopped:
+#
+#   sqlite3 ./data/bsfchat.db \
+#     "DROP TRIGGER audit_log_is_append_only_delete; \
+#      DELETE FROM audit_log WHERE created_at < <cutoff-ms>; \
+#      CREATE TRIGGER audit_log_is_append_only_delete BEFORE DELETE ON audit_log \
+#        BEGIN SELECT RAISE(ABORT, 'audit_log is append-only: DELETE is not permitted'); END;"
+#
+# Record ids are never reused even after that, so pagination cursors stay valid.
+# Every response carries a `total` so you can watch growth before deciding.
+
+# Message search requires SQLite built with FTS5 (-DSQLITE_ENABLE_FTS5), which
+# is the default in essentially every distribution package and in the amalgamation.
+# If it is missing, the server still starts and still records message text
+# locally, but POST /_matrix/client/v3/search reports search as unavailable and
+# logs an error at startup naming the cause. There is no config for this.
+
+# TLS is NOT implemented in the server — there is no SSLServer path. This
+# block is still parsed so existing configs load, but setting enabled = true
+# makes the server refuse to start rather than silently serve plaintext on a
+# port you believe is HTTPS. Terminate TLS at a reverse proxy
+# (nginx / Caddy / Traefik) and leave this false.
 [tls]
 enabled = false
 cert_file = ""
@@ -62,3 +198,8 @@ key_file = ""
 provider_url = "http://localhost:8480"
 required = false
 allow_local_accounts = true
+# Expected `aud` claim on identity tokens — the client_id this chat server is
+# registered under with the identity provider. Without it, an ID token minted
+# for ANY other OAuth client of the same provider would be accepted as a chat
+# login. Defaults to the id the shipped desktop client uses.
+client_id = "bsfchat-desktop"

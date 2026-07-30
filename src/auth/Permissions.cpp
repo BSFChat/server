@@ -47,11 +47,23 @@ std::vector<ServerRole> resolve_user_roles(
 PermissionsEngine::PermissionsEngine(SqliteStore& store, const Config& config)
     : store_(store), config_(config) {}
 
+const std::vector<ServerRole>& PermissionsEngine::server_roles() {
+    if (!server_roles_cache_) server_roles_cache_ = store_.get_server_roles();
+    return *server_roles_cache_;
+}
+
+const std::vector<std::string>& PermissionsEngine::member_role_ids(const std::string& user_id) {
+    auto it = member_roles_cache_.find(user_id);
+    if (it != member_roles_cache_.end()) return it->second;
+    auto [inserted, _] = member_roles_cache_.emplace(user_id, store_.get_member_role_ids(user_id));
+    return inserted->second;
+}
+
 permission::Flags PermissionsEngine::compute(const std::string& user_id, const std::string& room_id) {
     if (is_server_actor(user_id, config_)) return permission::kAllFlags;
 
-    auto all_roles = store_.get_server_roles();
-    auto user_role_ids = store_.get_member_role_ids(user_id);
+    const auto& all_roles = server_roles();
+    const auto& user_role_ids = member_role_ids(user_id);
 
     // Fallback: if the server hasn't been bootstrapped yet (no roles at all
     // and no member.roles events), grant the default @everyone permissions
@@ -95,8 +107,8 @@ permission::Flags PermissionsEngine::compute(const std::string& user_id, const s
 int PermissionsEngine::highest_role_position(const std::string& user_id) {
     if (is_server_actor(user_id, config_)) return std::numeric_limits<int>::max();
 
-    auto all_roles = store_.get_server_roles();
-    auto ids = store_.get_member_role_ids(user_id);
+    const auto& all_roles = server_roles();
+    const auto& ids = member_role_ids(user_id);
     int highest = 0;
     for (const auto& id : ids) {
         auto it = std::find_if(all_roles.begin(), all_roles.end(),

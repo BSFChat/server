@@ -138,7 +138,7 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
         res.status = 401;
-        res.set_content(MatrixError::missing_token().to_json().dump(), "application/json");
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
         return;
     }
 
@@ -247,7 +247,7 @@ void VoiceHandler::handle_voice_leave(const httplib::Request& req, httplib::Resp
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
         res.status = 401;
-        res.set_content(MatrixError::missing_token().to_json().dump(), "application/json");
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
         return;
     }
 
@@ -283,7 +283,7 @@ void VoiceHandler::handle_voice_members(const httplib::Request& req, httplib::Re
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
         res.status = 401;
-        res.set_content(MatrixError::missing_token().to_json().dump(), "application/json");
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
         return;
     }
 
@@ -334,7 +334,7 @@ void VoiceHandler::handle_voice_state(const httplib::Request& req, httplib::Resp
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
         res.status = 401;
-        res.set_content(MatrixError::missing_token().to_json().dump(), "application/json");
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
         return;
     }
 
@@ -390,7 +390,7 @@ void VoiceHandler::handle_turn_server(const httplib::Request& req, httplib::Resp
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
         res.status = 401;
-        res.set_content(MatrixError::missing_token().to_json().dump(), "application/json");
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
         return;
     }
 

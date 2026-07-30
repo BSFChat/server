@@ -24,7 +24,7 @@ void PresenceHandler::handle_put_presence(const httplib::Request& req,
         req.get_header_value("Authorization"));
     if (!user_id) {
         res.status = 401;
-        res.set_content(MatrixError::missing_token().to_json().dump(),
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(),
                         "application/json");
         return;
     }
@@ -80,11 +80,18 @@ void PresenceHandler::handle_put_presence(const httplib::Request& req,
     }
 
     // Wake any longpolling /sync waiters so other clients see
-    // the new presence quickly.
-    sync_engine_.notify_new_event();
+    // the new presence quickly. Ephemeral notifier — no event row is
+    // written, so the stream position the normal notifier publishes is
+    // unchanged and nothing would actually wake.
+    sync_engine_.notify_ephemeral();
 
     res.status = 200;
     res.set_content("{}", "application/json");
+}
+
+bool PresenceHandler::is_expired_locked(
+    const Entry& e, std::chrono::steady_clock::time_point now) const {
+    return now - e.last_active_at > kExpiry;
 }
 
 std::optional<PresenceHandler::Entry>
@@ -92,7 +99,23 @@ PresenceHandler::get_for(const std::string& user_id) const {
     std::lock_guard lock(mutex_);
     auto it = entries_.find(user_id);
     if (it == entries_.end()) return std::nullopt;
+    // Don't report a stale entry as live even if the sweep hasn't run yet.
+    if (is_expired_locked(it->second, std::chrono::steady_clock::now())) {
+        return std::nullopt;
+    }
     return it->second;
+}
+
+void PresenceHandler::sweep_expired() {
+    auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex_);
+    for (auto it = entries_.begin(); it != entries_.end(); ) {
+        if (is_expired_locked(it->second, now)) {
+            it = entries_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void PresenceHandler::touch(const std::string& user_id) {

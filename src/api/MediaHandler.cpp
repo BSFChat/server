@@ -41,8 +41,15 @@ void MediaHandler::handle_upload(const httplib::Request& req, httplib::Response&
         return;
     }
 
-    // Check content length
-    auto body = req.body;
+    // No copy: `auto body = req.body` duplicated the entire upload, doubling
+    // peak memory for every request. MediaStorage::upload takes a const ref.
+    //
+    // Note this size check is a backstop only — by the time a handler runs,
+    // httplib has already buffered the whole request body. The real cap is
+    // Server::set_payload_max_length(), configured from max_upload_size_mb, so
+    // an oversized POST is rejected while streaming instead of after it has
+    // been fully materialised in memory.
+    const std::string& body = req.body;
     size_t max_bytes = config_.max_upload_size_mb * 1024 * 1024;
     if (body.size() > max_bytes) {
         res.status = 413;
@@ -99,8 +106,39 @@ void MediaHandler::handle_upload(const httplib::Request& req, httplib::Response&
     }
 }
 
+std::optional<std::string> MediaHandler::authenticate_media(const httplib::Request& req) {
+    // Header first — that's what every other endpoint uses.
+    auto user_id = authenticate(store_, req.get_header_value("Authorization"));
+    if (user_id) return user_id;
+
+    // Fall back to ?access_token=, the legacy Matrix media auth mechanism.
+    // Media URLs are handed straight to image/video widgets, which cannot
+    // attach an Authorization header, so this is the only way an authenticated
+    // download can work from a plain <img>-style consumer.
+    if (req.has_param("access_token")) {
+        return store_.get_user_by_token(req.get_param_value("access_token"));
+    }
+    return std::nullopt;
+}
+
 void MediaHandler::handle_download(const httplib::Request& req, httplib::Response& res) {
     auto log = get_logger();
+
+    // Media ids are 128-bit random, so an unauthenticated download is
+    // capability-URL security: no revocation, no per-room ACL, and the URL
+    // leaks through any surface that records it. When require_media_auth is
+    // on, a valid access token is required.
+    //
+    // Defaults ON. The desktop client appends ?access_token= to every media
+    // URL it builds (client/src/util/MediaUrl.h) because QML Image.source
+    // cannot attach an Authorization header. A deployment fronting clients
+    // older than that has to set [media] require_auth = false.
+    if (config_.require_media_auth && !authenticate_media(req)) {
+        res.status = 401;
+        res.set_content(R"({"errcode":"M_UNKNOWN_TOKEN","error":"Invalid or missing access token"})",
+                        "application/json");
+        return;
+    }
 
     // Extract serverName and mediaId from path
     // Pattern: /_matrix/media/v3/download/{serverName}/{mediaId}

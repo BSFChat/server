@@ -2,6 +2,7 @@
 #include "core/Logger.h"
 #include "auth/AutoJoin.h"
 #include "auth/RoleBootstrap.h"
+#include "api/AuditHandler.h"
 #include "api/AuthHandler.h"
 #include "api/RoomHandler.h"
 #include "api/EventHandler.h"
@@ -11,6 +12,9 @@
 #include "api/TypingHandler.h"
 #include "api/PresenceHandler.h"
 #include "api/VoiceHandler.h"
+#include "api/PushHandler.h"
+#include "api/SearchHandler.h"
+#include "push/PushService.h"
 #include "http/Router.h"
 #include "storage/LocalStorage.h"
 #include "storage/S3Storage.h"
@@ -47,6 +51,7 @@ Server::Server(Config config)
     }
 
     sync_engine_ = std::make_unique<SyncEngine>(*store_, config_);
+    push_service_ = std::make_unique<PushService>(*store_, config_);
 
     // Initialize OIDC auth if identity provider is configured
     if (config_.identity) {
@@ -88,7 +93,8 @@ void Server::register_routes() {
 
     auto auth_handler = std::make_shared<AuthHandler>(*store_, *sync_engine_, config_, oidc_auth_.get());
     auto room_handler = std::make_shared<RoomHandler>(*store_, *sync_engine_, config_);
-    auto event_handler = std::make_shared<EventHandler>(*store_, *sync_engine_, config_);
+    auto event_handler =
+        std::make_shared<EventHandler>(*store_, *sync_engine_, config_, push_service_.get());
     auto sync_handler = std::make_shared<SyncHandler>(*store_, *sync_engine_);
 
     // Auth routes
@@ -102,11 +108,22 @@ void Server::register_routes() {
              [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_register(req, res); });
     svr.Post(std::string(api_path::kLogout),
              [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_logout(req, res); });
+    svr.Post(std::string(api_path::kLogoutAll),
+             [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_logout_all(req, res); });
+    // Authenticated password change. Local-auth users previously had no way to
+    // change their password at all, which is also why token invalidation had
+    // nowhere to hook.
+    svr.Post(std::string(api_path::kPasswordChange),
+             [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_password_change(req, res); });
+    // Renewal path for clients that opt in with `refresh_token: true`, so a
+    // finite access-token lifetime doesn't mean a forced re-login.
+    svr.Post(std::string(api_path::kRefresh),
+             [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_refresh(req, res); });
     // Token-identity introspection. Clients restoring a persisted
     // session use this to reconcile their stored user id with the
     // server's canonical one (stale/corrupt stored ids otherwise break
     // every self-identity comparison client-side).
-    svr.Get("/_matrix/client/v3/account/whoami",
+    svr.Get(std::string(api_path::kWhoami),
             [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_whoami(req, res); });
 
     // Room routes
@@ -136,6 +153,11 @@ void Server::register_routes() {
              [h = room_handler](const httplib::Request& req, httplib::Response& res) { h->handle_kick(req, res); });
     svr.Post(R"(/_matrix/client/v3/rooms/([^/]+)/ban)",
              [h = room_handler](const httplib::Request& req, httplib::Response& res) { h->handle_ban(req, res); });
+    // Unban. The client has always called this path (MatrixClient::unbanUser);
+    // the server never served it, so unbanning silently 404'd and every ban was
+    // effectively permanent.
+    svr.Post(R"(/_matrix/client/v3/rooms/([^/]+)/unban)",
+             [h = room_handler](const httplib::Request& req, httplib::Response& res) { h->handle_unban(req, res); });
     svr.Post(R"(/_matrix/client/v3/rooms/([^/]+)/invite)",
              [h = room_handler](const httplib::Request& req, httplib::Response& res) { h->handle_invite(req, res); });
 
@@ -204,6 +226,34 @@ void Server::register_routes() {
     svr.Put(R"(/_matrix/client/v3/profile/([^/]+)/avatar_url)",
             [h = profile_handler](const httplib::Request& req, httplib::Response& res) { h->handle_put_avatar_url(req, res); });
 
+    // Push routes. Registration + listing are spec-shaped; the per-room
+    // notification level is namespaced bsfchat.* because it is an enum per room,
+    // not Matrix's full push-rules model.
+    auto push_handler = std::make_shared<PushHandler>(*store_, *push_service_, config_);
+
+    svr.Post("/_matrix/client/v3/pushers/set",
+             [h = push_handler](const httplib::Request& req, httplib::Response& res) { h->handle_set_pusher(req, res); });
+    svr.Get("/_matrix/client/v3/pushers",
+            [h = push_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_pushers(req, res); });
+    svr.Get(R"(/_matrix/client/v3/bsfchat/rooms/([^/]+)/notify_level)",
+            [h = push_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_notify_level(req, res); });
+    svr.Put(R"(/_matrix/client/v3/bsfchat/rooms/([^/]+)/notify_level)",
+            [h = push_handler](const httplib::Request& req, httplib::Response& res) { h->handle_put_notify_level(req, res); });
+
+    // Search. Spec-shaped POST /search; permission filtering happens inside the
+    // query rather than over its output (see SearchHandler).
+    auto search_handler = std::make_shared<SearchHandler>(*store_, config_);
+    svr.Post("/_matrix/client/v3/search",
+             [h = search_handler](const httplib::Request& req, httplib::Response& res) { h->handle_search(req, res); });
+
+    // Moderation audit log. Read-only — there is no write endpoint, because
+    // records are written at the action sites and nothing may inject one.
+    // Permission is evaluated at SERVER scope inside the handler, so a
+    // per-channel override cannot unlock it.
+    auto audit_handler = std::make_shared<AuditHandler>(*store_, config_);
+    svr.Get(std::string(api_path::kAuditLog),
+            [h = audit_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_audit_log(req, res); });
+
     // Voice routes — handler is kept as a member so start()/stop() can
     // manage the ghost-participant reaper thread.
     voice_handler_ = std::make_shared<VoiceHandler>(*store_, *sync_engine_, config_);
@@ -238,12 +288,14 @@ void Server::start() {
     bootstrap_roles(*store_, *sync_engine_, config_);
 
     voice_handler_->start_reaper();
+    push_service_->start();
 
     http_server_->start();
 }
 
 void Server::stop() {
     if (voice_handler_) voice_handler_->stop_reaper();
+    if (push_service_) push_service_->stop();
     if (http_server_) http_server_->stop();
 }
 

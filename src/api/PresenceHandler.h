@@ -44,7 +44,8 @@ public:
         std::chrono::steady_clock::time_point last_active_at;
     };
 
-    // Look up by user; nullopt if we've never seen them.
+    // Look up by user; nullopt if we've never seen them, or if their
+    // entry has gone stale (treated as "not online" by callers).
     std::optional<Entry> get_for(const std::string& user_id) const;
 
     // Bump last_active_at for a user — invoked by other handlers
@@ -52,7 +53,23 @@ public:
     // recent activity even if the user hasn't called PUT /presence.
     void touch(const std::string& user_id);
 
+    // Drops entries whose last_active_at is older than kExpiry. Without
+    // this, entries_ was an unbounded in-memory map and a user who ever
+    // set "online" stayed online forever — until the process restarted.
+    // Every /sync touches the requester, so a live client is refreshed
+    // well inside the window.
+    void sweep_expired();
+
+    // A client that has stopped syncing is considered gone after this.
+    // Comfortably longer than the 30s default long-poll so a slow or
+    // briefly-disconnected client isn't flapped offline.
+    static constexpr std::chrono::seconds kExpiry{150};
+
 private:
+    // Caller must hold mutex_.
+    bool is_expired_locked(const Entry& e,
+                            std::chrono::steady_clock::time_point now) const;
+
     mutable std::mutex mutex_;
     std::map<std::string, Entry> entries_;
     SqliteStore& store_;

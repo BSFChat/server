@@ -1,6 +1,7 @@
 #include "auth/AutoJoin.h"
 
 #include "core/Config.h"
+#include "core/Logger.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
 
@@ -79,27 +80,63 @@ void auto_join_all_users(SqliteStore& store, SyncEngine& sync_engine,
     if (any) sync_engine.notify_new_event();
 }
 
-void backfill_auto_join(SqliteStore& store, SyncEngine& sync_engine,
-                         const Config& config) {
-    // First, convert all non-category rooms to public.
-    // Channels were historically created as private; this makes them accessible
-    // to everyone as the Discord-like model expects.
-    auto all_rooms = store.list_all_non_category_rooms();
-    for (const auto& room_id : all_rooms) {
+namespace {
+
+// Marker recorded once the historical "make legacy channels public" migration
+// has run. A fresh database gets this pre-set by schema migration v1.
+constexpr const char* kPublicizeMarker = "migration.publicize_legacy_channels";
+
+void publicize_legacy_channels(SqliteStore& store, const Config& config) {
+    // ONE-TIME historical migration, not a boot-time sweep.
+    //
+    // This used to run on every Server::start(), walking every non-category
+    // room and rewriting any non-public join_rule to "public" as
+    // @server:<name>. Both DM rooms (created with visibility=private) and
+    // deliberately-private channels are non-category, so both were swept up:
+    // every restart re-publicized every DM on the instance and silently
+    // reverted admins' private-channel settings. It now runs at most once per
+    // database, and only over rooms that genuinely predate the Discord-like
+    // channel model.
+    if (store.get_meta(kPublicizeMarker)) return;
+
+    // Only rooms with no bsfchat.room.type state event qualify: every room
+    // created since the Discord-like model landed carries one, so a private
+    // room with a type event was made private on purpose. list_legacy_untyped_rooms
+    // additionally excludes DMs.
+    auto legacy_rooms = store.list_legacy_untyped_rooms();
+
+    int converted = 0;
+    for (const auto& room_id : legacy_rooms) {
         auto jr = store.get_state_event(room_id,
             std::string(event_type::kRoomJoinRules), "");
         std::string current_rule = jr ? jr->content.data.value("join_rule", "") : "";
-        if (current_rule != "public") {
-            auto event_id = generate_event_id(config.server_name);
-            nlohmann::json content = {{"join_rule", "public"}};
-            store.insert_event(event_id, room_id, "@server:" + config.server_name,
-                std::string(event_type::kRoomJoinRules), "",
-                content.dump(),
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count());
-        }
+        if (current_rule == "public") continue;
+
+        auto event_id = generate_event_id(config.server_name);
+        nlohmann::json content = {{"join_rule", "public"}};
+        store.insert_event(event_id, room_id, "@server:" + config.server_name,
+            std::string(event_type::kRoomJoinRules), "",
+            content.dump(), now_ms());
+        ++converted;
     }
 
+    store.set_meta(kPublicizeMarker, "applied");
+    if (converted > 0) {
+        get_logger()->info(
+            "One-time migration: made {} legacy channel(s) public. This will not run again.",
+            converted);
+    }
+}
+
+} // namespace
+
+void backfill_auto_join(SqliteStore& store, SyncEngine& sync_engine,
+                         const Config& config) {
+    publicize_legacy_channels(store, config);
+
+    // list_public_rooms() excludes categories AND direct rooms, so a DM can
+    // never be force-joined here regardless of what join_rules events it
+    // carries.
     auto rooms = store.list_public_rooms();
     auto users = store.list_all_users();
     if (rooms.empty() || users.empty()) return;

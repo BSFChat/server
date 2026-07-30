@@ -1,0 +1,1653 @@
+// Regression tests for the correctness/security defects fixed in this pass.
+// Each test names the behaviour that used to be wrong.
+
+#include <gtest/gtest.h>
+
+#include "api/AuthHandler.h"
+#include "api/EventHandler.h"
+#include "api/RoomHandler.h"
+#include "auth/AutoJoin.h"
+#include "auth/LocalAuth.h"
+#include "auth/Permissions.h"
+#include "auth/RoleBootstrap.h"
+#include "core/Config.h"
+#include "http/Middleware.h"
+#include "store/Migrations.h"
+#include "store/SqliteStore.h"
+#include "sync/SyncEngine.h"
+
+#include <bsfchat/Constants.h>
+#include <bsfchat/Identifiers.h>
+#include <bsfchat/JwtUtils.h>
+#include <bsfchat/Permissions.h>
+
+#include <nlohmann/json.hpp>
+
+#include <sqlite3.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <filesystem>
+#include <thread>
+
+using namespace bsfchat;
+using json = nlohmann::json;
+
+namespace {
+
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// Builds a request the handlers can consume: they parse parameters out of
+// req.path via match_route, and read the bearer token from the header.
+httplib::Request make_request(const std::string& path, const std::string& token,
+                              const std::string& body = "") {
+    httplib::Request req;
+    req.path = path;
+    req.body = body;
+    req.set_header("Authorization", "Bearer " + token);
+    return req;
+}
+
+// httplib initialises Response::status to -1 and only substitutes 200 when
+// the response is actually written to the socket, so a handler that succeeds
+// typically never touches it. Treat "untouched" as success.
+::testing::AssertionResult IsOk(const httplib::Response& res) {
+    if (res.status == -1 || res.status == 200) return ::testing::AssertionSuccess();
+    return ::testing::AssertionFailure()
+           << "status " << res.status << ", body: " << res.body;
+}
+
+struct Fixture {
+    Config config;
+    std::unique_ptr<SqliteStore> store;
+    std::unique_ptr<SyncEngine> sync;
+
+    Fixture() {
+        config = Config::defaults();
+        config.server_name = "test";
+        store = std::make_unique<SqliteStore>(":memory:");
+        store->initialize();
+        sync = std::make_unique<SyncEngine>(*store, config);
+    }
+
+    std::string add_user(const std::string& localpart) {
+        std::string uid = "@" + localpart + ":test";
+        store->create_user(uid, hash_password("password", 10));
+        std::string token = "token-" + localpart;
+        store->store_access_token(token, uid, "dev");
+        return uid;
+    }
+
+    void grant(const std::string& user_id, const std::string& role_id) {
+        MemberRolesContent c;
+        c.role_ids = {std::string(permission::role_id::kEveryone), role_id};
+        json j;
+        to_json(j, c);
+        store->set_server_state(std::string(event_type::kMemberRoles), user_id,
+                                "@server:test", j.dump());
+    }
+};
+
+} // namespace
+
+// ── S11: migrations ───────────────────────────────────────────────────────
+
+TEST(Migrations, InitializeReachesTargetVersionAndIsIdempotent) {
+    SqliteStore store(":memory:");
+    store.initialize();
+    // Re-running initialize() must be a no-op, not an error.
+    store.initialize();
+    SUCCEED();
+}
+
+TEST(Migrations, FreshDatabaseSkipsTheOneTimePublicizeMigration) {
+    Fixture f;
+    // A brand-new database has no legacy channels, so the historical
+    // publicize migration is pre-marked as applied and can never run.
+    EXPECT_TRUE(f.store->get_meta("migration.publicize_legacy_channels").has_value());
+}
+
+namespace {
+
+// Builds a database with the ORIGINAL schema (no is_direct, no server_meta,
+// no server_state, user_version 0) so the upgrade path can be exercised for
+// real rather than assumed.
+void create_legacy_database(const std::string& path) {
+    sqlite3* db = nullptr;
+    ASSERT_EQ(sqlite3_open(path.c_str(), &db), SQLITE_OK);
+    const char* schema = R"(
+        CREATE TABLE users (user_id TEXT PRIMARY KEY, password_hash TEXT NOT NULL,
+            display_name TEXT, avatar_url TEXT,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000));
+        CREATE TABLE access_tokens (token TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000));
+        CREATE TABLE rooms (room_id TEXT PRIMARY KEY, creator TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000));
+        CREATE TABLE room_members (room_id TEXT NOT NULL, user_id TEXT NOT NULL,
+            membership TEXT NOT NULL DEFAULT 'join',
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+            PRIMARY KEY (room_id, user_id));
+        CREATE TABLE events (event_id TEXT PRIMARY KEY, room_id TEXT NOT NULL,
+            sender TEXT NOT NULL, event_type TEXT NOT NULL, state_key TEXT,
+            content TEXT NOT NULL, origin_server_ts INTEGER NOT NULL,
+            stream_position INTEGER NOT NULL UNIQUE);
+        CREATE TABLE read_markers (user_id TEXT NOT NULL, room_id TEXT NOT NULL,
+            last_read_pos INTEGER NOT NULL, PRIMARY KEY (user_id, room_id));
+        CREATE TABLE media (media_id TEXT PRIMARY KEY, uploader TEXT NOT NULL,
+            content_type TEXT NOT NULL, filename TEXT, file_size INTEGER NOT NULL,
+            file_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000));
+
+        INSERT INTO users (user_id, password_hash) VALUES
+            ('@alice:test',''), ('@bob:test',''), ('@carol:test','');
+
+        -- A DM alice opened with bob, which the old boot-time backfill had
+        -- already publicized and force-joined carol into.
+        INSERT INTO rooms (room_id, creator) VALUES ('!dm:test','@alice:test');
+        INSERT INTO room_members (room_id,user_id,membership) VALUES
+            ('!dm:test','@alice:test','join'),
+            ('!dm:test','@bob:test','join'),
+            ('!dm:test','@carol:test','join');
+        INSERT INTO events VALUES
+            ('$1','!dm:test','@alice:test','m.room.member','@bob:test',
+             '{"membership":"invite"}',1,1),
+            ('$2','!dm:test','@alice:test','m.room.join_rules','',
+             '{"join_rule":"public"}',2,2),
+            ('$3','!dm:test','@alice:test','m.room.message',NULL,
+             '{"body":"private"}',3,3);
+
+        -- A genuinely legacy channel: private, and with no bsfchat.room.type.
+        INSERT INTO rooms (room_id, creator) VALUES ('!legacy:test','@alice:test');
+        INSERT INTO room_members (room_id,user_id,membership) VALUES
+            ('!legacy:test','@alice:test','join');
+        INSERT INTO events VALUES
+            ('$4','!legacy:test','@alice:test','m.room.join_rules','',
+             '{"join_rule":"invite"}',4,4),
+            ('$5','!legacy:test','@alice:test','m.room.name','',
+             '{"name":"general"}',5,5);
+
+        -- Server roles living inside a deletable channel, the old arrangement.
+        INSERT INTO events VALUES
+            ('$6','!legacy:test','@server:test','bsfchat.server.roles','',
+             '{"roles":[{"id":"everyone","name":"@everyone","position":0,"permissions":"0x1f"}]}',6,6),
+            ('$7','!legacy:test','@server:test','bsfchat.member.roles','@alice:test',
+             '{"role_ids":["everyone","admin"]}',7,7);
+    )";
+    char* err = nullptr;
+    ASSERT_EQ(sqlite3_exec(db, schema, nullptr, nullptr, &err), SQLITE_OK)
+        << (err ? err : "unknown");
+    sqlite3_close(db);
+}
+
+int get_schema_version_for_test(const std::string& path) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) return -1;
+    int v = get_schema_version(db);
+    sqlite3_close(db);
+    return v;
+}
+
+std::string temp_db_path(const std::string& name) {
+    return (std::filesystem::temp_directory_path() /
+            ("bsfchat-test-" + name + "-" + std::to_string(::getpid()) + ".db")).string();
+}
+
+} // namespace
+
+TEST(LegacyUpgrade, ExistingDatabaseMigratesWithoutLeakingDms) {
+    auto path = temp_db_path("legacy");
+    std::filesystem::remove(path);
+    create_legacy_database(path);
+
+    Config config = Config::defaults();
+    config.server_name = "test";
+
+    {
+        SqliteStore store(path);
+        store.initialize();
+        SyncEngine sync(store, config);
+
+        // The DM is retro-detected: no name, not a category, exactly one
+        // explicit invite, at most two participants.
+        EXPECT_TRUE(store.is_direct_room("!dm:test"));
+        EXPECT_FALSE(store.is_direct_room("!legacy:test"));
+
+        // Carol's force-join into the DM is undone; the two real
+        // participants stay.
+        EXPECT_FALSE(store.is_room_member("!dm:test", "@carol:test"));
+        EXPECT_TRUE(store.is_room_member("!dm:test", "@alice:test"));
+        EXPECT_TRUE(store.is_room_member("!dm:test", "@bob:test"));
+
+        // Roles were carried into server_state, so they no longer depend on
+        // the channel they happened to be written into.
+        EXPECT_FALSE(store.get_server_roles().empty());
+        EXPECT_FALSE(store.get_member_role_ids("@alice:test").empty());
+
+        // The legitimate historical intent is preserved exactly once: the
+        // untyped legacy channel becomes public.
+        backfill_auto_join(store, sync, config);
+        auto jr = store.get_state_event("!legacy:test", "m.room.join_rules", "");
+        ASSERT_TRUE(jr.has_value());
+        EXPECT_EQ(jr->content.data.value("join_rule", ""), "public");
+        EXPECT_TRUE(store.is_room_member("!legacy:test", "@carol:test"));
+
+        // ...and the DM is untouched by it.
+        EXPECT_FALSE(store.is_room_member("!dm:test", "@carol:test"));
+        auto dm_rooms = store.list_public_rooms();
+        EXPECT_EQ(std::find(dm_rooms.begin(), dm_rooms.end(), "!dm:test"), dm_rooms.end());
+    }
+
+    // Reopen (i.e. restart): migrations must not re-run, and the one-time
+    // publicize must not fire again.
+    {
+        SqliteStore store(path);
+        store.initialize();
+        SyncEngine sync(store, config);
+        EXPECT_EQ(get_schema_version_for_test(path), kTargetSchemaVersion);
+        backfill_auto_join(store, sync, config);
+        EXPECT_FALSE(store.is_room_member("!dm:test", "@carol:test"));
+        EXPECT_TRUE(store.is_direct_room("!dm:test"));
+    }
+
+    std::filesystem::remove(path);
+}
+
+// ── S1: the backfill must never publicize a DM ────────────────────────────
+
+TEST(AutoJoinBackfill, DirectRoomStaysPrivateAndUnjoinedAcrossRestarts) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+
+    // A DM between alice and bob.
+    auto dm = generate_room_id("test");
+    f.store->create_room(dm, alice, /*is_direct=*/true);
+    f.store->set_membership(dm, alice, "join");
+    f.store->set_membership(dm, bob, "join");
+    f.store->insert_event(generate_event_id("test"), dm, alice,
+                          std::string(event_type::kRoomJoinRules), std::string(""),
+                          json{{"join_rule", "invite"}}.dump(), now_ms());
+    f.store->insert_event(generate_event_id("test"), dm, alice,
+                          std::string(event_type::kRoomMessage), std::nullopt,
+                          json{{"msgtype", "m.text"}, {"body", "secret"}}.dump(), now_ms());
+
+    // Simulate several server restarts.
+    for (int i = 0; i < 3; ++i) {
+        backfill_auto_join(*f.store, *f.sync, f.config);
+    }
+
+    // Still private...
+    auto jr = f.store->get_state_event(dm, std::string(event_type::kRoomJoinRules), "");
+    ASSERT_TRUE(jr.has_value());
+    EXPECT_EQ(jr->content.data.value("join_rule", ""), "invite");
+
+    // ...never listed as a public room...
+    auto public_rooms = f.store->list_public_rooms();
+    EXPECT_EQ(std::find(public_rooms.begin(), public_rooms.end(), dm), public_rooms.end());
+
+    // ...and carol was never dragged in.
+    EXPECT_FALSE(f.store->is_room_member(dm, carol));
+    EXPECT_TRUE(f.store->is_room_member(dm, alice));
+    EXPECT_TRUE(f.store->is_room_member(dm, bob));
+}
+
+TEST(AutoJoinBackfill, DeliberatelyPrivateChannelSurvivesRestarts) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    f.add_user("bob");
+
+    // A private channel created by the current code path: it carries a
+    // bsfchat.room.type event, which is what marks it as "not legacy".
+    auto chan = generate_room_id("test");
+    f.store->create_room(chan, alice);
+    f.store->set_membership(chan, alice, "join");
+    f.store->insert_event(generate_event_id("test"), chan, alice,
+                          std::string(event_type::kRoomJoinRules), std::string(""),
+                          json{{"join_rule", "invite"}}.dump(), now_ms());
+    f.store->insert_event(generate_event_id("test"), chan, alice,
+                          std::string(event_type::kRoomType), std::string(""),
+                          json{{"type", "text"}}.dump(), now_ms());
+
+    for (int i = 0; i < 3; ++i) {
+        backfill_auto_join(*f.store, *f.sync, f.config);
+    }
+
+    auto jr = f.store->get_state_event(chan, std::string(event_type::kRoomJoinRules), "");
+    ASSERT_TRUE(jr.has_value());
+    EXPECT_EQ(jr->content.data.value("join_rule", ""), "invite")
+        << "a channel deliberately created private was re-publicized";
+    EXPECT_FALSE(f.store->is_room_member(chan, "@bob:test"));
+}
+
+TEST(AutoJoinBackfill, PublicChannelStillAutoJoinsEveryone) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+
+    auto chan = generate_room_id("test");
+    f.store->create_room(chan, alice);
+    f.store->set_membership(chan, alice, "join");
+    f.store->insert_event(generate_event_id("test"), chan, alice,
+                          std::string(event_type::kRoomJoinRules), std::string(""),
+                          json{{"join_rule", "public"}}.dump(), now_ms());
+
+    backfill_auto_join(*f.store, *f.sync, f.config);
+    EXPECT_TRUE(f.store->is_room_member(chan, bob));
+}
+
+TEST(RoomHandlerCreate, DirectRoomIsPersistedPrivateAndPeerJoined) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    f.add_user("carol");
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request("/_matrix/client/v3/createRoom", "token-alice",
+                            json{{"is_direct", true},
+                                 {"visibility", "private"},
+                                 {"invite", json::array({bob})}}.dump());
+    handler.handle_create_room(req, res);
+
+    ASSERT_TRUE(IsOk(res));
+    auto room_id = json::parse(res.body).at("room_id").get<std::string>();
+
+    // is_direct must actually be persisted — the client has always sent the
+    // flag and the server never read it.
+    EXPECT_TRUE(f.store->is_direct_room(room_id));
+    EXPECT_TRUE(f.store->is_room_member(room_id, bob));
+    EXPECT_FALSE(f.store->is_room_member(room_id, "@carol:test"));
+
+    // And a restart must not change any of that.
+    backfill_auto_join(*f.store, *f.sync, f.config);
+    EXPECT_FALSE(f.store->is_room_member(room_id, "@carol:test"));
+}
+
+// ── S2: room creation authorization ───────────────────────────────────────
+
+TEST(RoomHandlerCreate, PlainUserCannotCreateChannels) {
+    Fixture f;
+    f.add_user("owner");
+    auto mallory = f.add_user("mallory");
+    bootstrap_roles(*f.store, *f.sync, f.config);
+    ASSERT_FALSE(f.store->get_member_role_ids(mallory).empty());
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request("/_matrix/client/v3/createRoom", "token-mallory",
+                            json{{"name", "spam"}}.dump());
+    handler.handle_create_room(req, res);
+
+    EXPECT_EQ(res.status, 403) << res.body;
+}
+
+TEST(RoomHandlerCreate, AdminCanCreateChannelsAndAnyoneCanOpenADm) {
+    Fixture f;
+    auto owner = f.add_user("owner");
+    auto mallory = f.add_user("mallory");
+    bootstrap_roles(*f.store, *f.sync, f.config);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    {
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/createRoom", "token-owner",
+                                json{{"name", "general"}}.dump());
+        handler.handle_create_room(req, res);
+        EXPECT_TRUE(IsOk(res));
+    }
+    {
+        // A DM is a per-user capability, not channel management.
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/createRoom", "token-mallory",
+                                json{{"is_direct", true},
+                                     {"invite", json::array({owner})}}.dump());
+        handler.handle_create_room(req, res);
+        EXPECT_TRUE(IsOk(res));
+    }
+}
+
+// ── S5: sync must not silently drop events ────────────────────────────────
+
+TEST(SyncEngineIncremental, DeliversEveryEventAcrossMoreThanOneBatch) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+
+    // get_events_since caps at 1000 rows per call; the old code then set
+    // next_batch to the GLOBAL stream head, so everything past the cap was
+    // skipped forever.
+    constexpr int kTotal = 2500;
+    for (int i = 0; i < kTotal; ++i) {
+        f.store->insert_event(generate_event_id("test"), room, alice,
+                              std::string(event_type::kRoomMessage), std::nullopt,
+                              json{{"msgtype", "m.text"}, {"body", std::to_string(i)}}.dump(),
+                              now_ms());
+    }
+
+    std::set<std::string> seen_bodies;
+    std::string since = "s0";
+    for (int page = 0; page < 20; ++page) {
+        auto resp = f.sync->handle_sync(alice, since, 0);
+        auto it = resp.rooms.join.find(room);
+        if (it == resp.rooms.join.end()) break;
+        for (const auto& ev : it->second.timeline.events) {
+            if (ev.type == std::string(event_type::kRoomMessage)) {
+                seen_bodies.insert(ev.content.data.value("body", ""));
+            }
+        }
+        ASSERT_NE(resp.next_batch, since) << "sync token failed to advance";
+        since = resp.next_batch;
+    }
+
+    EXPECT_EQ(seen_bodies.size(), static_cast<size_t>(kTotal))
+        << "incremental sync lost events past the fetch limit";
+}
+
+TEST(SyncEngineIncremental, NextBatchNeverSkipsPastUndeliveredEvents) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto visible = generate_room_id("test");
+    auto other = generate_room_id("test");
+    f.store->create_room(visible, alice);
+    f.store->create_room(other, alice);
+    f.store->set_membership(visible, alice, "join");
+
+    f.store->insert_event(generate_event_id("test"), visible, alice,
+                          std::string(event_type::kRoomMessage), std::nullopt,
+                          json{{"body", "one"}}.dump(), now_ms());
+
+    auto resp = f.sync->handle_sync(alice, "s0", 0);
+    ASSERT_EQ(resp.rooms.join.count(visible), 1u);
+
+    // The token must be the position actually delivered, so a later event in
+    // a room alice isn't in can't push it past undelivered data.
+    f.store->insert_event(generate_event_id("test"), other, alice,
+                          std::string(event_type::kRoomMessage), std::nullopt,
+                          json{{"body", "unrelated"}}.dump(), now_ms());
+    f.store->insert_event(generate_event_id("test"), visible, alice,
+                          std::string(event_type::kRoomMessage), std::nullopt,
+                          json{{"body", "two"}}.dump(), now_ms());
+
+    auto resp2 = f.sync->handle_sync(alice, resp.next_batch, 0);
+    ASSERT_EQ(resp2.rooms.join.count(visible), 1u);
+    bool saw_two = false;
+    for (const auto& ev : resp2.rooms.join[visible].timeline.events) {
+        if (ev.content.data.value("body", "") == "two") saw_two = true;
+    }
+    EXPECT_TRUE(saw_two);
+}
+
+TEST(SyncEngine, MalformedSinceTokenDoesNotThrow) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    EXPECT_NO_THROW(f.sync->handle_sync(alice, "snot-a-number", 0));
+    EXPECT_NO_THROW(f.sync->handle_sync(alice, "s99999999999999999999999", 0));
+    EXPECT_NO_THROW(f.sync->handle_sync(alice, "garbage", 0));
+}
+
+TEST(SqliteStoreStream, PositionsAreMonotonicAcrossRoomDeletion) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto keep = generate_room_id("test");
+    auto doomed = generate_room_id("test");
+    f.store->create_room(keep, alice);
+    f.store->create_room(doomed, alice);
+
+    f.store->insert_event(generate_event_id("test"), keep, alice, "m.room.message",
+                          std::nullopt, "{}", now_ms());
+    int64_t high = 0;
+    for (int i = 0; i < 5; ++i) {
+        high = f.store->insert_event(generate_event_id("test"), doomed, alice,
+                                     "m.room.message", std::nullopt, "{}", now_ms());
+    }
+
+    f.store->delete_room(doomed);
+
+    // Deleting the newest events must not rewind the head; reusing positions
+    // stranded any client holding a token at or above a reused value.
+    EXPECT_GE(f.store->get_current_stream_position(), high);
+    int64_t next = f.store->insert_event(generate_event_id("test"), keep, alice,
+                                         "m.room.message", std::nullopt, "{}", now_ms());
+    EXPECT_GT(next, high) << "stream position was reused after delete_room";
+}
+
+// ── S4: typing/presence must wake the long poll ───────────────────────────
+
+TEST(SyncEngineWait, EphemeralNotifyWakesALongPoll) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+
+    auto since = f.sync->handle_sync(alice, "s0", 0).next_batch;
+
+    auto start = std::chrono::steady_clock::now();
+    std::thread waker([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        f.sync->notify_ephemeral();
+    });
+    f.sync->handle_sync(alice, since, 5000);
+    waker.join();
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    // notify_new_event() re-reads an unchanged stream position for an EDU, so
+    // the waiter's predicate stayed false and the poll ran to its full
+    // timeout — typing/presence were invisible until then.
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 2000);
+}
+
+// ── S7: server-wide roles ─────────────────────────────────────────────────
+
+TEST(ServerRoles, SurviveDeletionOfEveryRoom) {
+    Fixture f;
+    auto owner = f.add_user("owner");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, owner);
+    f.store->set_membership(room, owner, "join");
+
+    bootstrap_roles(*f.store, *f.sync, f.config);
+    ASSERT_FALSE(f.store->get_server_roles().empty());
+    ASSERT_FALSE(f.store->get_member_role_ids(owner).empty());
+
+    // Roles used to live as events inside whichever room came back first from
+    // an unordered query; deleting it destroyed every role server-wide.
+    f.store->delete_room(room);
+
+    EXPECT_FALSE(f.store->get_server_roles().empty())
+        << "deleting a channel wiped the server role definitions";
+    EXPECT_FALSE(f.store->get_member_role_ids(owner).empty())
+        << "deleting a channel wiped role assignments";
+
+    PermissionsEngine perms(*f.store, f.config);
+    EXPECT_TRUE(perms.can(owner, "", permission::kAdministrator));
+}
+
+TEST(ServerRoles, PerChannelManageRolesCannotRewriteServerRoles) {
+    Fixture f;
+    auto owner = f.add_user("owner");
+    auto mallory = f.add_user("mallory");
+
+    auto room = generate_room_id("test");
+    f.store->create_room(room, owner);
+    f.store->set_membership(room, owner, "join");
+    f.store->set_membership(room, mallory, "join");
+    bootstrap_roles(*f.store, *f.sync, f.config);
+
+    // Mallory is granted MANAGE_ROLES in ONE unimportant channel.
+    ChannelPermissionOverride ov;
+    ov.allow = permission::kManageRoles;
+    ov.deny = 0;
+    json ov_json;
+    to_json(ov_json, ov);
+    f.store->insert_event(generate_event_id("test"), room, owner,
+                          std::string(event_type::kChannelPermissions),
+                          "user:" + mallory, ov_json.dump(), now_ms());
+
+    PermissionsEngine check(*f.store, f.config);
+    ASSERT_TRUE(check.can(mallory, room, permission::kManageRoles))
+        << "precondition: the channel override should grant MANAGE_ROLES here";
+
+    // She now tries to rewrite the SERVER-wide roles, making @everyone an
+    // administrator. The old code evaluated MANAGE_ROLES per-channel while the
+    // role reader ignored room_id, so this succeeded server-wide.
+    ServerRolesContent evil;
+    ServerRole everyone;
+    everyone.id = permission::role_id::kEveryone;
+    everyone.name = "@everyone";
+    everyone.position = 0;
+    everyone.permissions = permission::kAllFlags;
+    evil.roles.push_back(everyone);
+    json evil_json;
+    to_json(evil_json, evil);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request(
+        "/_matrix/client/v3/rooms/" + room + "/state/" +
+            std::string(event_type::kServerRoles) + "/",
+        "token-mallory", evil_json.dump());
+    handler.handle_set_state(req, res);
+
+    EXPECT_EQ(res.status, 403) << res.body;
+
+    PermissionsEngine perms(*f.store, f.config);
+    EXPECT_FALSE(perms.can(mallory, "", permission::kAdministrator))
+        << "privilege escalation: a per-channel override granted server-wide admin";
+}
+
+// ── S9: VIEW_CHANNEL on read endpoints, and self-membership forgery ───────
+
+TEST(RoomReads, DeniedViewChannelBlocksStateAndMemberList) {
+    Fixture f;
+    auto owner = f.add_user("owner");
+    auto bob = f.add_user("bob");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, owner);
+    f.store->set_membership(room, owner, "join");
+    f.store->set_membership(room, bob, "join");
+    bootstrap_roles(*f.store, *f.sync, f.config);
+
+    f.store->insert_event(generate_event_id("test"), room, owner,
+                          std::string(event_type::kRoomName), std::string(""),
+                          json{{"name", "secret-channel"}}.dump(), now_ms());
+
+    ChannelPermissionOverride ov;
+    ov.allow = 0;
+    ov.deny = permission::kViewChannel;
+    json ov_json;
+    to_json(ov_json, ov);
+    f.store->insert_event(generate_event_id("test"), room, owner,
+                          std::string(event_type::kChannelPermissions),
+                          "user:" + bob, ov_json.dump(), now_ms());
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+
+    // Everyone is force-joined to every public room, so membership alone was
+    // never authorization: bob could still read the name, topic and roster.
+    {
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/rooms/" + room + "/state", "token-bob");
+        handler.handle_room_state(req, res);
+        EXPECT_EQ(res.status, 403) << res.body;
+    }
+    {
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/rooms/" + room + "/members", "token-bob");
+        handler.handle_room_members(req, res);
+        EXPECT_EQ(res.status, 403) << res.body;
+    }
+}
+
+TEST(RoomSetState, SelfMembershipCannotForgeADisplayName) {
+    Fixture f;
+    auto owner = f.add_user("owner");
+    auto mallory = f.add_user("mallory");
+    f.store->set_display_name(mallory, "mallory");
+
+    auto room = generate_room_id("test");
+    f.store->create_room(room, owner);
+    f.store->set_membership(room, mallory, "join");
+    bootstrap_roles(*f.store, *f.sync, f.config);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request(
+        "/_matrix/client/v3/rooms/" + room + "/state/m.room.member/" + mallory,
+        "token-mallory",
+        json{{"membership", "join"}, {"displayname", "owner"}}.dump());
+    handler.handle_set_state(req, res);
+
+    ASSERT_TRUE(IsOk(res));
+    auto stored = f.store->get_state_event(room, std::string(event_type::kRoomMember), mallory);
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->content.data.value("displayname", ""), "mallory")
+        << "client-supplied displayname was written verbatim";
+
+    // The response must name an event that actually exists.
+    auto echoed = json::parse(res.body).value("event_id", "");
+    EXPECT_EQ(echoed, stored->event_id);
+    EXPECT_TRUE(f.store->get_event_by_id(echoed).has_value());
+}
+
+// ── S8: redaction and transaction idempotency ─────────────────────────────
+
+TEST(Redaction, TargetContentIsActuallyRemoved) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+
+    auto target = generate_event_id("test");
+    f.store->insert_event(target, room, alice, std::string(event_type::kRoomMessage),
+                          std::nullopt,
+                          json{{"msgtype", "m.text"}, {"body", "please delete me"}}.dump(),
+                          now_ms());
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request(
+        "/_matrix/client/v3/rooms/" + room + "/redact/" + target + "/txn1",
+        "token-alice", json{{"reason", "oops"}}.dump());
+    handler.handle_redact(req, res);
+    ASSERT_TRUE(IsOk(res));
+
+    // Redaction used to append a tombstone and leave the original readable
+    // through /rooms/{id}/messages.
+    auto stored = f.store->get_event_by_id(target);
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->content.data.value("body", ""), "");
+
+    auto [events, _] = f.store->get_room_events_paginated(room, 50, "b");
+    for (const auto& ev : events) {
+        EXPECT_NE(ev.content.data.value("body", ""), "please delete me")
+            << "redacted content still retrievable via /messages";
+    }
+}
+
+TEST(SendEvent, RetryWithSameTransactionIdDoesNotDuplicate) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    const std::string path =
+        "/_matrix/client/v3/rooms/" + room + "/send/m.room.message/txn-42";
+    const std::string body = json{{"msgtype", "m.text"}, {"body", "hi"}}.dump();
+
+    httplib::Response res1;
+    auto req1 = make_request(path, "token-alice", body);
+    handler.handle_send_event(req1, res1);
+    ASSERT_TRUE(IsOk(res1));
+
+    httplib::Response res2;
+    auto req2 = make_request(path, "token-alice", body);
+    handler.handle_send_event(req2, res2);
+    ASSERT_TRUE(IsOk(res2));
+
+    EXPECT_EQ(json::parse(res1.body).at("event_id"), json::parse(res2.body).at("event_id"));
+
+    auto [events, _] = f.store->get_room_events_paginated(room, 50, "b");
+    int messages = 0;
+    for (const auto& ev : events) {
+        if (ev.type == std::string(event_type::kRoomMessage)) ++messages;
+    }
+    EXPECT_EQ(messages, 1) << "a client retry duplicated the message";
+}
+
+// ── S10: auth hardening ───────────────────────────────────────────────────
+
+TEST(PasswordHashing, OldLowCostHashesStillVerify) {
+    // Raising the default cost must not lock out existing accounts: the cost
+    // travels with the stored hash.
+    auto legacy = hash_password("correct horse", 12);
+    EXPECT_TRUE(verify_password("correct horse", legacy));
+    EXPECT_FALSE(verify_password("wrong", legacy));
+    ASSERT_TRUE(password_hash_cost(legacy).has_value());
+    EXPECT_EQ(*password_hash_cost(legacy), 12);
+}
+
+TEST(PasswordHashing, RejectsMalformedAndAbsurdCostValues) {
+    EXPECT_FALSE(verify_password("x", ""));
+    EXPECT_FALSE(verify_password("x", "$pbkdf2$"));
+    EXPECT_FALSE(verify_password("x", "$pbkdf2$notanumber$aa$bb"));
+    // A cost of 60 would be 2^60 iterations, and shifting by 60 into an int
+    // is undefined behaviour.
+    EXPECT_FALSE(verify_password("x", "$pbkdf2$60$aa$bb"));
+}
+
+// Lives here rather than in protocol/tests so this pass stays confined to
+// server/ plus the one JwtUtils change it was asked to make.
+TEST(JwtAudience, TokenMintedForAnotherClientIsRejected) {
+    auto [priv, pub] = generate_rsa_keypair();
+
+    JwtClaims claims;
+    claims.iss = "https://id.example.com";
+    claims.sub = "user-123";
+    claims.aud = "some-other-app";   // NOT this chat server
+    claims.iat = std::time(nullptr);
+    claims.exp = claims.iat + 3600;
+    auto token = jwt_sign(claims, priv, "kid1");
+
+    // Signature, issuer and expiry are all fine — only the audience is wrong.
+    // Without an audience check this verified, so an ID token minted for any
+    // other client of the same identity provider was a valid chat login.
+    EXPECT_FALSE(jwt_verify(token, pub, claims.iss, "bsfchat-desktop").has_value());
+    EXPECT_TRUE(jwt_verify(token, pub, claims.iss, "some-other-app").has_value());
+    // Empty expected audience preserves the old unchecked behaviour.
+    EXPECT_TRUE(jwt_verify(token, pub, claims.iss).has_value());
+}
+
+TEST(JwtAudience, TokenWithNoAudienceIsRejectedWhenOneIsRequired) {
+    auto [priv, pub] = generate_rsa_keypair();
+
+    JwtClaims claims;
+    claims.iss = "https://id.example.com";
+    claims.sub = "user-123";
+    claims.aud = "";
+    claims.iat = std::time(nullptr);
+    claims.exp = claims.iat + 3600;
+    auto token = jwt_sign(claims, priv, "kid1");
+
+    EXPECT_FALSE(jwt_verify(token, pub, claims.iss, "bsfchat-desktop").has_value());
+}
+
+TEST(ConfigValidation, VoiceEnabledWithRelayOnlyAndNoTurnFallsBackToP2p) {
+    Config cfg = Config::defaults();
+    cfg.voice.enabled = true;
+    cfg.voice.allow_peer_to_peer = false;
+    cfg.voice.turn_uris.clear();
+    Config::validate(cfg);
+    // Relay-only with zero relays means 100% call failure.
+    EXPECT_TRUE(cfg.voice.allow_peer_to_peer);
+}
+
+TEST(ConfigValidation, ClampsDangerouslyLowPasswordCost) {
+    Config cfg = Config::defaults();
+    cfg.password_hash_cost = 4;
+    Config::validate(cfg);
+    EXPECT_GE(cfg.password_hash_cost, 12);
+}
+
+// ── S12: password change, access-token lifecycle, edit reconciliation ──────
+
+namespace {
+
+// Sends a request through a handler and returns the response, mirroring how
+// Server::register_routes wires them up.
+template <typename Handler, typename Method>
+httplib::Response call(Handler& handler, Method method, const std::string& path,
+                       const std::string& token, const std::string& body = "") {
+    auto req = make_request(path, token, body);
+    httplib::Response res;
+    (handler.*method)(req, res);
+    return res;
+}
+
+json password_change_body(const std::string& current, const std::string& next,
+                          std::optional<bool> logout_devices = std::nullopt) {
+    json body = {
+        {"auth", {{"type", "m.login.password"}, {"password", current}}},
+        {"new_password", next},
+    };
+    if (logout_devices) body["logout_devices"] = *logout_devices;
+    return body;
+}
+
+// Reads a single text value straight out of the database file, bypassing
+// SqliteStore — used to prove what is actually persisted.
+std::optional<std::string> raw_query_text(const std::string& path, const std::string& sql) {
+    sqlite3* db = nullptr;
+    if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) return std::nullopt;
+    sqlite3_stmt* stmt = nullptr;
+    std::optional<std::string> out;
+    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+            out = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return out;
+}
+
+const char* kPasswordPath = "/_matrix/client/v3/account/password";
+
+} // namespace
+
+// There was no password-change endpoint on the chat server at all: a local-auth
+// user could never change their password, and access-token invalidation
+// consequently had nowhere to hook.
+TEST(PasswordChange, RotatesTheHashAndRevokesOtherSessions) {
+    Fixture f;
+    f.config.password_hash_cost = 12; // keep the test fast
+    auto alice = f.add_user("alice");
+    f.store->store_access_token("alice-phone", alice, "PHONE");
+    f.store->store_access_token("alice-laptop", alice, "LAPTOP");
+
+    auto before = f.store->get_password_hash(alice);
+    ASSERT_TRUE(before.has_value());
+
+    AuthHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &AuthHandler::handle_password_change, kPasswordPath,
+                    "alice-phone", password_change_body("password", "brand-new-password").dump());
+    ASSERT_TRUE(IsOk(res));
+
+    // The stored hash actually rotated, and to the currently configured cost.
+    auto after = f.store->get_password_hash(alice);
+    ASSERT_TRUE(after.has_value());
+    EXPECT_NE(*after, *before);
+    EXPECT_FALSE(verify_password("password", *after));
+    EXPECT_TRUE(verify_password("brand-new-password", *after));
+    ASSERT_TRUE(password_hash_cost(*after).has_value());
+    EXPECT_EQ(*password_hash_cost(*after), f.config.password_hash_cost);
+
+    // Other sessions are gone; the one that re-authenticated survives, so the
+    // user isn't kicked out of the client they just used.
+    EXPECT_FALSE(f.store->get_user_by_token("alice-laptop").has_value());
+    EXPECT_FALSE(f.store->get_user_by_token("token-alice").has_value());
+    EXPECT_TRUE(f.store->get_user_by_token("alice-phone").has_value());
+}
+
+// A valid access token proves only that a client holds a token. Without
+// re-authentication, a leaked token could be used to lock the owner out.
+TEST(PasswordChange, RequiresTheCurrentPassword) {
+    Fixture f;
+    f.config.password_hash_cost = 12;
+    auto alice = f.add_user("alice");
+    auto before = f.store->get_password_hash(alice);
+
+    AuthHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &AuthHandler::handle_password_change, kPasswordPath, "token-alice",
+                    password_change_body("not-my-password", "brand-new-password").dump());
+    EXPECT_EQ(res.status, 403);
+    EXPECT_EQ(json::parse(res.body).value("errcode", ""), "M_FORBIDDEN");
+    EXPECT_EQ(f.store->get_password_hash(alice), before) << "hash changed on a failed attempt";
+    EXPECT_TRUE(f.store->get_user_by_token("token-alice").has_value());
+}
+
+TEST(PasswordChange, WithoutReauthReturnsAnAuthChallenge) {
+    Fixture f;
+    f.add_user("alice");
+    AuthHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &AuthHandler::handle_password_change, kPasswordPath, "token-alice",
+                    json{{"new_password", "brand-new-password"}}.dump());
+    ASSERT_EQ(res.status, 401);
+    auto body = json::parse(res.body);
+    ASSERT_TRUE(body.contains("flows"));
+    EXPECT_EQ(body["flows"][0]["stages"][0], "m.login.password");
+}
+
+TEST(PasswordChange, RejectsAnUnauthenticatedCaller) {
+    Fixture f;
+    f.add_user("alice");
+    AuthHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &AuthHandler::handle_password_change, kPasswordPath, "bogus-token",
+                    password_change_body("password", "brand-new-password").dump());
+    EXPECT_EQ(res.status, 401);
+}
+
+TEST(PasswordChange, RejectsAShortNewPassword) {
+    Fixture f;
+    f.config.password_hash_cost = 12;
+    auto alice = f.add_user("alice");
+    AuthHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &AuthHandler::handle_password_change, kPasswordPath, "token-alice",
+                    password_change_body("password", "short").dump());
+    EXPECT_EQ(res.status, 400);
+    EXPECT_TRUE(verify_password("password", *f.store->get_password_hash(alice)));
+}
+
+// OIDC accounts are created with an empty hash so password login can never work
+// for them. They must get a comprehensible error, not a wrong-password one.
+TEST(PasswordChange, OidcBackedAccountGetsAClearError) {
+    Fixture f;
+    f.config.password_hash_cost = 12;
+    const std::string oidc_user = "@oidc_sub123:test";
+    f.store->create_user(oidc_user, ""); // exactly how handle_login creates them
+    f.store->store_access_token("oidc-token", oidc_user, "DEV");
+
+    AuthHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &AuthHandler::handle_password_change, kPasswordPath, "oidc-token",
+                    password_change_body("", "brand-new-password").dump());
+    ASSERT_EQ(res.status, 403);
+    auto err = json::parse(res.body).value("error", "");
+    EXPECT_NE(err.find("identity provider"), std::string::npos) << "unclear error: " << err;
+    // And no password was set behind the scenes.
+    EXPECT_EQ(*f.store->get_password_hash(oidc_user), "");
+    EXPECT_TRUE(f.store->get_user_by_token("oidc-token").has_value());
+}
+
+TEST(PasswordChange, LogoutDevicesFalseKeepsOtherSessions) {
+    Fixture f;
+    f.config.password_hash_cost = 12;
+    auto alice = f.add_user("alice");
+    f.store->store_access_token("alice-laptop", alice, "LAPTOP");
+
+    AuthHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &AuthHandler::handle_password_change, kPasswordPath, "token-alice",
+                    password_change_body("password", "brand-new-password", false).dump());
+    ASSERT_TRUE(IsOk(res));
+    EXPECT_TRUE(f.store->get_user_by_token("alice-laptop").has_value());
+    EXPECT_TRUE(verify_password("brand-new-password", *f.store->get_password_hash(alice)));
+}
+
+// A token must not be usable to re-authenticate as a different account.
+TEST(PasswordChange, IdentifierMustMatchTheAuthenticatedUser) {
+    Fixture f;
+    f.config.password_hash_cost = 12;
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+
+    json body = password_change_body("password", "brand-new-password");
+    body["auth"]["identifier"] = {{"type", "m.id.user"}, {"user", "bob"}};
+
+    AuthHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &AuthHandler::handle_password_change, kPasswordPath, "token-alice",
+                    body.dump());
+    EXPECT_EQ(res.status, 403);
+    EXPECT_TRUE(verify_password("password", *f.store->get_password_hash(bob)));
+}
+
+// Tokens used to be stored in the clear, so a database dump was a live session
+// for every logged-in user.
+TEST(AccessTokens, AreNeverStoredInTheClear) {
+    auto path = temp_db_path("tokenhash");
+    std::filesystem::remove(path);
+    {
+        SqliteStore store(path);
+        store.initialize();
+        store.create_user("@alice:test", hash_password("password", 10));
+        store.store_access_token("super-secret-token", "@alice:test", "DEV");
+        EXPECT_TRUE(store.get_user_by_token("super-secret-token").has_value());
+    }
+
+    // The plaintext appears nowhere in the table...
+    auto leaked = raw_query_text(path,
+        "SELECT token_hash FROM access_tokens WHERE token_hash = 'super-secret-token'");
+    EXPECT_FALSE(leaked.has_value()) << "access token is still readable at rest";
+    // ...but the digest is there, and it is the digest we expect.
+    auto stored = raw_query_text(path, "SELECT token_hash FROM access_tokens");
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(*stored, hash_access_token("super-secret-token"));
+    EXPECT_NE(*stored, "super-secret-token");
+
+    std::filesystem::remove(path);
+}
+
+// Tokens never expired: a leaked one was permanent.
+TEST(AccessTokens, ExpiredTokenIsRejectedAndReaped) {
+    Fixture f;
+    f.store->create_user("@alice:test", hash_password("password", 10));
+    // 1ms lifetime, i.e. expired by the time we look it up.
+    f.store->store_access_token("short-lived", "@alice:test", "DEV", 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    EXPECT_FALSE(f.store->get_user_by_token("short-lived").has_value());
+    // Both the direct store lookup and the middleware used by every handler
+    // must refuse it.
+    EXPECT_FALSE(authenticate(*f.store, "Bearer short-lived").has_value());
+    EXPECT_FALSE(f.store->get_token_expiry("short-lived").has_value())
+        << "expired row was not reaped";
+
+    // A token issued with the normal lifetime still works.
+    f.store->store_access_token("fresh", "@alice:test", "DEV");
+    EXPECT_TRUE(f.store->get_user_by_token("fresh").has_value());
+}
+
+// The desktop client holds one token and polls /sync; a finite lifetime must
+// not log an active user out mid-session.
+TEST(AccessTokens, ActiveSessionSlidesItsExpiryForward) {
+    Fixture f;
+    f.store->create_user("@alice:test", hash_password("password", 10));
+    f.store->store_access_token("sliding", "@alice:test", "DEV", 400);
+
+    auto first = f.store->get_token_expiry("sliding");
+    ASSERT_TRUE(first.has_value());
+
+    // Past the halfway point: the next authentication renews.
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    ASSERT_TRUE(f.store->get_user_by_token("sliding").has_value());
+    auto renewed = f.store->get_token_expiry("sliding");
+    ASSERT_TRUE(renewed.has_value());
+    EXPECT_GT(*renewed, *first);
+
+    // Past the ORIGINAL expiry, but still valid because it was in use.
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    EXPECT_TRUE(f.store->get_user_by_token("sliding").has_value())
+        << "an actively-used session was logged out";
+}
+
+TEST(AccessTokens, LogoutAllRevokesEverySession) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    f.store->store_access_token("alice-phone", alice, "PHONE");
+    auto bob = f.add_user("bob");
+
+    AuthHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &AuthHandler::handle_logout_all,
+                    "/_matrix/client/v3/logout/all", "token-alice");
+    ASSERT_TRUE(IsOk(res));
+
+    EXPECT_FALSE(f.store->get_user_by_token("token-alice").has_value());
+    EXPECT_FALSE(f.store->get_user_by_token("alice-phone").has_value());
+    // Another user's sessions are untouched.
+    EXPECT_TRUE(f.store->get_user_by_token("token-bob").has_value());
+}
+
+TEST(AccessTokens, LogoutRevokesOnlyTheCallingSession) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    f.store->store_access_token("alice-phone", alice, "PHONE");
+
+    AuthHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &AuthHandler::handle_logout, "/_matrix/client/v3/logout",
+                    "token-alice");
+    ASSERT_TRUE(IsOk(res));
+    EXPECT_FALSE(f.store->get_user_by_token("token-alice").has_value());
+    EXPECT_TRUE(f.store->get_user_by_token("alice-phone").has_value());
+}
+
+TEST(AccessTokens, RefreshRotatesBothSecrets) {
+    Fixture f;
+    f.config.password_hash_cost = 10;
+    f.store->create_user("@alice:test", hash_password("password", 10));
+
+    AuthHandler handler(*f.store, *f.sync, f.config);
+
+    // Log in asking for a refresh token.
+    httplib::Request login_req;
+    login_req.body = json{
+        {"type", "m.login.password"},
+        {"identifier", {{"type", "m.id.user"}, {"user", "alice"}}},
+        {"password", "password"},
+        {"refresh_token", true},
+    }.dump();
+    httplib::Response login_res;
+    handler.handle_login(login_req, login_res);
+    ASSERT_TRUE(IsOk(login_res));
+    auto login_body = json::parse(login_res.body);
+    ASSERT_TRUE(login_body.contains("refresh_token"));
+    EXPECT_GT(login_body.value("expires_in_ms", int64_t{0}), 0);
+    const auto old_access = login_body.value("access_token", "");
+    const auto old_refresh = login_body.value("refresh_token", "");
+    ASSERT_TRUE(f.store->get_user_by_token(old_access).has_value());
+
+    auto res = call(handler, &AuthHandler::handle_refresh, "/_matrix/client/v3/refresh", "",
+                    json{{"refresh_token", old_refresh}}.dump());
+    ASSERT_TRUE(IsOk(res));
+    auto body = json::parse(res.body);
+    const auto new_access = body.value("access_token", "");
+    const auto new_refresh = body.value("refresh_token", "");
+    EXPECT_NE(new_access, old_access);
+    EXPECT_NE(new_refresh, old_refresh);
+
+    EXPECT_TRUE(f.store->get_user_by_token(new_access).has_value());
+    // Rotation: the old pair dies with the refresh.
+    EXPECT_FALSE(f.store->get_user_by_token(old_access).has_value());
+    auto reused = call(handler, &AuthHandler::handle_refresh, "/_matrix/client/v3/refresh", "",
+                       json{{"refresh_token", old_refresh}}.dump());
+    EXPECT_EQ(reused.status, 401);
+}
+
+TEST(AccessTokens, LoginWithoutAskingForRefreshGetsNoRefreshToken) {
+    Fixture f;
+    f.config.password_hash_cost = 10;
+    f.store->create_user("@alice:test", hash_password("password", 10));
+
+    AuthHandler handler(*f.store, *f.sync, f.config);
+    httplib::Request req;
+    req.body = json{
+        {"type", "m.login.password"},
+        {"identifier", {{"type", "m.id.user"}, {"user", "alice"}}},
+        {"password", "password"},
+    }.dump();
+    httplib::Response res;
+    handler.handle_login(req, res);
+    ASSERT_TRUE(IsOk(res));
+    auto body = json::parse(res.body);
+    // Pre-refresh clients must keep working unchanged.
+    EXPECT_FALSE(body.contains("refresh_token"));
+    EXPECT_TRUE(f.store->get_user_by_token(body.value("access_token", "")).has_value());
+}
+
+// ── Message edits are reconciled server-side, not left to client goodwill ──
+
+namespace {
+
+struct EditFixture : Fixture {
+    std::string alice;
+    std::string room;
+    std::unique_ptr<EventHandler> events;
+
+    EditFixture() {
+        alice = add_user("alice");
+        room = generate_room_id("test");
+        store->create_room(room, alice);
+        store->set_membership(room, alice, "join");
+        events = std::make_unique<EventHandler>(*store, *sync, config);
+    }
+
+    std::string send(const std::string& body, const std::string& txn) {
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.room.message/" + txn,
+                                "token-alice",
+                                json{{"msgtype", "m.text"}, {"body", body}}.dump());
+        events->handle_send_event(req, res);
+        EXPECT_TRUE(IsOk(res)) << res.body;
+        return json::parse(res.body).value("event_id", "");
+    }
+
+    // Exactly the payload the desktop client sends (MatrixClient::editMessage):
+    // "* " fallback body plus the authoritative m.new_content.
+    httplib::Response edit(const std::string& target, const std::string& new_body,
+                           const std::string& txn, const std::string& token = "token-alice") {
+        json content = {
+            {"msgtype", "m.text"},
+            {"body", "* " + new_body},
+            {"m.new_content", {{"msgtype", "m.text"}, {"body", new_body}}},
+            {"m.relates_to", {{"rel_type", "m.replace"}, {"event_id", target}}},
+        };
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.room.message/" + txn,
+                                token, content.dump());
+        events->handle_send_event(req, res);
+        return res;
+    }
+
+    std::optional<RoomEvent> from_messages(const std::string& event_id) {
+        auto [chunk, _] = store->get_room_events_paginated(room, 100, "b");
+        for (const auto& ev : chunk) {
+            if (ev.event_id == event_id) return ev;
+        }
+        return std::nullopt;
+    }
+};
+
+} // namespace
+
+// The server validated authorship, stored the edit as a sibling event, and then
+// never reconciled: /messages kept returning the pre-edit text forever, so edits
+// were real only for clients that chose to apply them.
+TEST(MessageEdits, MessagesReturnsTheEditedContent) {
+    EditFixture f;
+    auto original = f.send("first draft", "t1");
+    auto res = f.edit(original, "corrected text", "t2");
+    ASSERT_TRUE(IsOk(res)) << res.body;
+    auto replacement = json::parse(res.body).value("event_id", "");
+
+    auto seen = f.from_messages(original);
+    ASSERT_TRUE(seen.has_value());
+    EXPECT_EQ(seen->content.data.value("body", ""), "corrected text")
+        << "/messages still serves the pre-edit text";
+    // The original keeps its identity: same event id, same sender, same type.
+    EXPECT_EQ(seen->event_id, original);
+    EXPECT_EQ(seen->sender, f.alice);
+
+    // The replacement stays discoverable, spec-shaped, and the pristine text is
+    // still available for rendering edit history.
+    ASSERT_TRUE(seen->unsigned_data.has_value());
+    const auto& u = seen->unsigned_data->data;
+    ASSERT_TRUE(u.contains("m.relations"));
+    EXPECT_EQ(u["m.relations"]["m.replace"].value("event_id", ""), replacement);
+    EXPECT_EQ(u["m.relations"]["m.replace"].value("sender", ""), f.alice);
+    EXPECT_EQ(u["bsfchat.original_content"].value("body", ""), "first draft");
+
+    // And it is also still an ordinary timeline event.
+    EXPECT_TRUE(f.from_messages(replacement).has_value());
+    // Direct single-event reads agree with the paginated ones.
+    auto by_id = f.store->get_event_by_id(original);
+    ASSERT_TRUE(by_id.has_value());
+    EXPECT_EQ(by_id->content.data.value("body", ""), "corrected text");
+}
+
+TEST(MessageEdits, LatestEditWinsAndPaginationStaysConsistent) {
+    EditFixture f;
+    auto original = f.send("v1", "t1");
+    ASSERT_TRUE(IsOk(f.edit(original, "v2", "t2")));
+    ASSERT_TRUE(IsOk(f.edit(original, "v3", "t3")));
+
+    auto seen = f.from_messages(original);
+    ASSERT_TRUE(seen.has_value());
+    EXPECT_EQ(seen->content.data.value("body", ""), "v3");
+    EXPECT_EQ(seen->unsigned_data->data["bsfchat.original_content"].value("body", ""), "v1");
+
+    // Reconciliation must not depend on which page the event lands on: walk the
+    // room one event per page and check every page agrees.
+    std::optional<std::string> from;
+    bool found = false;
+    for (int page = 0; page < 10; ++page) {
+        auto [chunk, next] = f.store->get_room_events_paginated(f.room, 1, "b", from);
+        for (const auto& ev : chunk) {
+            if (ev.event_id != original) continue;
+            found = true;
+            EXPECT_EQ(ev.content.data.value("body", ""), "v3") << "page " << page;
+        }
+        if (!next) break;
+        from = "s" + std::to_string(*next);
+    }
+    EXPECT_TRUE(found);
+}
+
+// An edit aimed at a previous edit must still land on the original, or the
+// second edit would be invisible.
+TEST(MessageEdits, EditOfAnEditResolvesToTheOriginal) {
+    EditFixture f;
+    auto original = f.send("v1", "t1");
+    auto first_res = f.edit(original, "v2", "t2");
+    ASSERT_TRUE(IsOk(first_res));
+    auto first_edit = json::parse(first_res.body).value("event_id", "");
+
+    ASSERT_TRUE(IsOk(f.edit(first_edit, "v3", "t3")));
+
+    auto seen = f.from_messages(original);
+    ASSERT_TRUE(seen.has_value());
+    EXPECT_EQ(seen->content.data.value("body", ""), "v3");
+}
+
+TEST(MessageEdits, SyncDeliversEditedContentForAnOldMessage) {
+    EditFixture f;
+    auto original = f.send("original wording", "t1");
+
+    // A client that has been offline: its position predates nothing relevant,
+    // it just does an initial sync.
+    int64_t before_edit = f.store->get_current_stream_position();
+    ASSERT_TRUE(IsOk(f.edit(original, "edited wording", "t2")));
+
+    auto initial = f.sync->handle_sync(f.alice, "", 0);
+    ASSERT_TRUE(initial.rooms.join.count(f.room));
+    bool saw_original = false;
+    for (const auto& ev : initial.rooms.join[f.room].timeline.events) {
+        if (ev.event_id != original) continue;
+        saw_original = true;
+        EXPECT_EQ(ev.content.data.value("body", ""), "edited wording")
+            << "/sync served the pre-edit text";
+        EXPECT_TRUE(ev.unsigned_data.has_value());
+    }
+    EXPECT_TRUE(saw_original);
+
+    // An incremental sync from before the edit delivers the replacement event,
+    // which is what lets a connected client update a message it already holds.
+    auto incremental = f.sync->handle_sync(f.alice, "s" + std::to_string(before_edit), 0);
+    ASSERT_TRUE(incremental.rooms.join.count(f.room));
+    bool saw_replacement = false;
+    for (const auto& ev : incremental.rooms.join[f.room].timeline.events) {
+        const auto& rel = ev.content.data.value("m.relates_to", json::object());
+        if (rel.value("rel_type", "") == "m.replace" &&
+            rel.value("event_id", "") == original) {
+            saw_replacement = true;
+            EXPECT_EQ(ev.content.data["m.new_content"].value("body", ""), "edited wording");
+        }
+    }
+    EXPECT_TRUE(saw_replacement);
+}
+
+// An edit is an ordinary send, so the txnId idempotency added earlier applies:
+// a retry must not produce a second replacement.
+TEST(MessageEdits, RetriedEditIsIdempotent) {
+    EditFixture f;
+    auto original = f.send("v1", "t1");
+    auto first = f.edit(original, "v2", "edit-txn");
+    ASSERT_TRUE(IsOk(first));
+    auto retry = f.edit(original, "v2", "edit-txn");
+    ASSERT_TRUE(IsOk(retry));
+    EXPECT_EQ(json::parse(first.body).at("event_id"), json::parse(retry.body).at("event_id"));
+
+    auto [chunk, _] = f.store->get_room_events_paginated(f.room, 100, "b");
+    int replacements = 0;
+    for (const auto& ev : chunk) {
+        const auto& rel = ev.content.data.value("m.relates_to", json::object());
+        if (rel.value("rel_type", "") == "m.replace") ++replacements;
+    }
+    EXPECT_EQ(replacements, 1);
+    EXPECT_EQ(f.from_messages(original)->content.data.value("body", ""), "v2");
+}
+
+TEST(MessageEdits, OnlyTheAuthorCanEdit) {
+    EditFixture f;
+    f.add_user("bob");
+    f.store->set_membership(f.room, "@bob:test", "join");
+    auto original = f.send("mine", "t1");
+
+    auto res = f.edit(original, "hijacked", "t2", "token-bob");
+    EXPECT_EQ(res.status, 403);
+    EXPECT_EQ(f.from_messages(original)->content.data.value("body", ""), "mine");
+}
+
+// Consistency with the redaction fix: deleting a message must not leave an edit
+// behind that resolves the content back into view.
+TEST(MessageEdits, RedactedMessageStaysRedactedAndCannotBeEdited) {
+    EditFixture f;
+    auto original = f.send("secret", "t1");
+    ASSERT_TRUE(IsOk(f.edit(original, "still secret", "t2")));
+
+    httplib::Response redact_res;
+    auto redact_req = make_request(
+        "/_matrix/client/v3/rooms/" + f.room + "/redact/" + original + "/rtxn", "token-alice", "{}");
+    f.events->handle_redact(redact_req, redact_res);
+    ASSERT_TRUE(IsOk(redact_res));
+
+    auto seen = f.from_messages(original);
+    ASSERT_TRUE(seen.has_value());
+    EXPECT_EQ(seen->content.data.value("body", ""), "")
+        << "an edit resurrected redacted content";
+    EXPECT_FALSE(f.store->get_edit_pointer(original).has_value());
+
+    // And a new edit cannot bring it back either.
+    auto res = f.edit(original, "resurrected", "t3");
+    EXPECT_EQ(res.status, 404);
+    EXPECT_EQ(f.from_messages(original)->content.data.value("body", ""), "");
+}
+
+// Redacting the edit itself rolls the message back to the newest surviving
+// version rather than leaving a dangling pointer.
+TEST(MessageEdits, RedactingAnEditRollsBackToThePreviousVersion) {
+    EditFixture f;
+    auto original = f.send("v1", "t1");
+    auto e2 = json::parse(f.edit(original, "v2", "t2").body).value("event_id", "");
+    auto e3 = json::parse(f.edit(original, "v3", "t3").body).value("event_id", "");
+    ASSERT_EQ(f.from_messages(original)->content.data.value("body", ""), "v3");
+
+    httplib::Response res3;
+    auto req3 = make_request(
+        "/_matrix/client/v3/rooms/" + f.room + "/redact/" + e3 + "/r1", "token-alice", "{}");
+    f.events->handle_redact(req3, res3);
+    ASSERT_TRUE(IsOk(res3));
+    EXPECT_EQ(f.from_messages(original)->content.data.value("body", ""), "v2");
+
+    httplib::Response res2;
+    auto req2 = make_request(
+        "/_matrix/client/v3/rooms/" + f.room + "/redact/" + e2 + "/r2", "token-alice", "{}");
+    f.events->handle_redact(req2, res2);
+    ASSERT_TRUE(IsOk(res2));
+    auto rolled_back = f.from_messages(original);
+    EXPECT_EQ(rolled_back->content.data.value("body", ""), "v1");
+    EXPECT_FALSE(rolled_back->unsigned_data.has_value());
+}
+
+// An edited reply must not lose what it was replying to: m.new_content carries
+// no relation of its own, so the original's has to survive reconciliation.
+TEST(MessageEdits, EditingAReplyKeepsTheReplyPointer) {
+    EditFixture f;
+    auto parent = f.send("question", "t1");
+
+    json reply = {
+        {"msgtype", "m.text"},
+        {"body", "answer"},
+        {"m.relates_to", {{"m.in_reply_to", {{"event_id", parent}}}}},
+    };
+    httplib::Response send_res;
+    auto send_req = make_request(
+        "/_matrix/client/v3/rooms/" + f.room + "/send/m.room.message/t2", "token-alice",
+        reply.dump());
+    f.events->handle_send_event(send_req, send_res);
+    ASSERT_TRUE(IsOk(send_res));
+    auto reply_id = json::parse(send_res.body).value("event_id", "");
+
+    ASSERT_TRUE(IsOk(f.edit(reply_id, "better answer", "t3")));
+
+    auto seen = f.from_messages(reply_id);
+    ASSERT_TRUE(seen.has_value());
+    EXPECT_EQ(seen->content.data.value("body", ""), "better answer");
+    ASSERT_TRUE(seen->content.data.contains("m.relates_to"));
+    EXPECT_EQ(seen->content.data["m.relates_to"]["m.in_reply_to"].value("event_id", ""), parent);
+}
+
+// ── Migrating a PRE-EXISTING database (v6 -> v8) ───────────────────────────
+
+namespace {
+
+// A database at schema v6 — i.e. one written by yesterday's build: plaintext
+// access tokens with no expiry, and an m.replace edit that the server accepted
+// but never reconciled.
+void create_v6_database(const std::string& path) {
+    sqlite3* db = nullptr;
+    ASSERT_EQ(sqlite3_open(path.c_str(), &db), SQLITE_OK);
+    const char* schema = R"(
+        CREATE TABLE users (user_id TEXT PRIMARY KEY, password_hash TEXT NOT NULL,
+            display_name TEXT, avatar_url TEXT,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000));
+        CREATE TABLE access_tokens (token TEXT PRIMARY KEY, user_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000));
+        CREATE TABLE rooms (room_id TEXT PRIMARY KEY, creator TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+            is_direct INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE room_members (room_id TEXT NOT NULL, user_id TEXT NOT NULL,
+            membership TEXT NOT NULL DEFAULT 'join',
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+            PRIMARY KEY (room_id, user_id));
+        CREATE TABLE events (event_id TEXT PRIMARY KEY, room_id TEXT NOT NULL,
+            sender TEXT NOT NULL, event_type TEXT NOT NULL, state_key TEXT,
+            content TEXT NOT NULL, origin_server_ts INTEGER NOT NULL,
+            stream_position INTEGER NOT NULL UNIQUE, redacted_by TEXT);
+        CREATE TABLE read_markers (user_id TEXT NOT NULL, room_id TEXT NOT NULL,
+            last_read_pos INTEGER NOT NULL, PRIMARY KEY (user_id, room_id));
+        CREATE TABLE media (media_id TEXT PRIMARY KEY, uploader TEXT NOT NULL,
+            content_type TEXT NOT NULL, filename TEXT, file_size INTEGER NOT NULL,
+            file_path TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000));
+        CREATE TABLE server_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE server_state (event_type TEXT NOT NULL, state_key TEXT NOT NULL,
+            sender TEXT NOT NULL, content TEXT NOT NULL,
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+            PRIMARY KEY (event_type, state_key));
+        CREATE TABLE event_transactions (user_id TEXT NOT NULL, txn_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+            PRIMARY KEY (user_id, txn_id));
+        PRAGMA user_version = 6;
+
+        INSERT INTO users (user_id, password_hash) VALUES
+            ('@alice:test','$pbkdf2$12$aa$bb'), ('@bob:test','');
+
+        -- Two live sessions, plus one belonging to a user that no longer exists.
+        INSERT INTO access_tokens (token, user_id, device_id) VALUES
+            ('alice-plaintext-token','@alice:test','PHONE'),
+            ('bob-plaintext-token','@bob:test','LAPTOP'),
+            ('orphan-token','@ghost:test','GONE');
+
+        INSERT INTO rooms (room_id, creator) VALUES ('!chan:test','@alice:test');
+        INSERT INTO room_members (room_id,user_id,membership) VALUES
+            ('!chan:test','@alice:test','join'),
+            ('!chan:test','@bob:test','join');
+        INSERT INTO events VALUES
+            ('$name','!chan:test','@alice:test','m.room.name','',
+             '{"name":"general"}',1,1,NULL),
+            ('$orig','!chan:test','@alice:test','m.room.message',NULL,
+             '{"msgtype":"m.text","body":"typo heer"}',2,2,NULL),
+            ('$edit1','!chan:test','@alice:test','m.room.message',NULL,
+             '{"msgtype":"m.text","body":"* typo here","m.new_content":{"msgtype":"m.text","body":"typo here"},"m.relates_to":{"rel_type":"m.replace","event_id":"$orig"}}',3,3,NULL),
+            ('$edit2','!chan:test','@alice:test','m.room.message',NULL,
+             '{"msgtype":"m.text","body":"* no typo now","m.new_content":{"msgtype":"m.text","body":"no typo now"},"m.relates_to":{"rel_type":"m.replace","event_id":"$orig"}}',4,4,NULL),
+            ('$plain','!chan:test','@bob:test','m.room.message',NULL,
+             '{"msgtype":"m.text","body":"never edited"}',5,5,NULL);
+        INSERT INTO server_meta (key,value) VALUES ('next_stream_position','6');
+    )";
+    char* err = nullptr;
+    ASSERT_EQ(sqlite3_exec(db, schema, nullptr, nullptr, &err), SQLITE_OK)
+        << (err ? err : "unknown");
+    sqlite3_close(db);
+}
+
+} // namespace
+
+// Hashing tokens at rest must not log the whole instance out: we still hold the
+// plaintext at migration time, so each existing session is hashed in place.
+TEST(V6Upgrade, PlaintextTokensAreHashedWithoutLoggingAnyoneOut) {
+    auto path = temp_db_path("v6tokens");
+    std::filesystem::remove(path);
+    create_v6_database(path);
+    ASSERT_EQ(get_schema_version_for_test(path), 6);
+
+    {
+        SqliteStore store(path);
+        store.initialize();
+        EXPECT_EQ(get_schema_version_for_test(path), kTargetSchemaVersion);
+
+        // Sessions that existed before the upgrade still authenticate.
+        auto alice = store.get_user_by_token("alice-plaintext-token");
+        ASSERT_TRUE(alice.has_value()) << "existing session was invalidated by the migration";
+        EXPECT_EQ(*alice, "@alice:test");
+        EXPECT_TRUE(store.get_user_by_token("bob-plaintext-token").has_value());
+        // A token whose user is gone is dropped rather than aborting the run.
+        EXPECT_FALSE(store.get_user_by_token("orphan-token").has_value());
+
+        // They now have an expiry, and they are no longer readable at rest.
+        auto expiry = store.get_token_expiry("alice-plaintext-token");
+        ASSERT_TRUE(expiry.has_value());
+        EXPECT_GT(*expiry, now_ms());
+
+        // Everything else survived.
+        EXPECT_TRUE(store.is_room_member("!chan:test", "@bob:test"));
+        EXPECT_EQ(*store.get_password_hash("@alice:test"), "$pbkdf2$12$aa$bb");
+        EXPECT_TRUE(store.get_event_by_id("$plain").has_value());
+    }
+
+    EXPECT_FALSE(raw_query_text(path,
+        "SELECT token_hash FROM access_tokens WHERE token_hash = 'alice-plaintext-token'")
+            .has_value())
+        << "plaintext token survived the migration";
+    EXPECT_TRUE(raw_query_text(path,
+        "SELECT user_id FROM access_tokens WHERE token_hash = '" +
+        hash_access_token("alice-plaintext-token") + "'").has_value());
+
+    // Reopening must not re-run anything.
+    {
+        SqliteStore store(path);
+        store.initialize();
+        EXPECT_TRUE(store.get_user_by_token("alice-plaintext-token").has_value());
+        EXPECT_EQ(get_schema_version_for_test(path), kTargetSchemaVersion);
+    }
+
+    std::filesystem::remove(path);
+}
+
+// Edits accepted before this release were advisory only. The migration
+// backfills them, newest winning, so history stops lying.
+TEST(V6Upgrade, PreExistingEditsBecomeEffective) {
+    auto path = temp_db_path("v6edits");
+    std::filesystem::remove(path);
+    create_v6_database(path);
+
+    {
+        SqliteStore store(path);
+        store.initialize();
+
+        auto edited = store.get_event_by_id("$orig");
+        ASSERT_TRUE(edited.has_value());
+        EXPECT_EQ(edited->content.data.value("body", ""), "no typo now")
+            << "historical edit is still invisible through the API";
+        ASSERT_TRUE(edited->unsigned_data.has_value());
+        EXPECT_EQ(edited->unsigned_data->data["m.relations"]["m.replace"].value("event_id", ""),
+                  "$edit2");
+        EXPECT_EQ(edited->unsigned_data->data["bsfchat.original_content"].value("body", ""),
+                  "typo heer");
+
+        // An unedited message is untouched and carries no bundle.
+        auto plain = store.get_event_by_id("$plain");
+        ASSERT_TRUE(plain.has_value());
+        EXPECT_EQ(plain->content.data.value("body", ""), "never edited");
+        EXPECT_FALSE(plain->unsigned_data.has_value());
+
+        // The replacements themselves are still first-class events.
+        EXPECT_TRUE(store.get_event_by_id("$edit1").has_value());
+        EXPECT_TRUE(store.get_event_by_id("$edit2").has_value());
+    }
+
+    std::filesystem::remove(path);
+}
+
+// Now that tokens expire and can be revoked, a client has to be able to tell
+// "you sent no token" from "your token is dead" — the latter is the only one it
+// can fix by re-authenticating. Every handler used to answer M_MISSING_TOKEN
+// for both.
+TEST(AccessTokens, MissingAndInvalidTokensAreDistinguishable) {
+    Fixture f;
+    f.add_user("alice");
+    AuthHandler handler(*f.store, *f.sync, f.config);
+
+    httplib::Request no_header;
+    httplib::Response no_header_res;
+    handler.handle_whoami(no_header, no_header_res);
+    EXPECT_EQ(no_header_res.status, 401);
+    EXPECT_EQ(json::parse(no_header_res.body).value("errcode", ""), "M_MISSING_TOKEN");
+
+    auto dead = call(handler, &AuthHandler::handle_whoami, "/_matrix/client/v3/account/whoami",
+                     "revoked-or-expired");
+    EXPECT_EQ(dead.status, 401);
+    EXPECT_EQ(json::parse(dead.body).value("errcode", ""), "M_UNKNOWN_TOKEN");
+
+    EXPECT_EQ(auth_error("").errcode, "M_MISSING_TOKEN");
+    EXPECT_EQ(auth_error("Bearer something").errcode, "M_UNKNOWN_TOKEN");
+}

@@ -13,6 +13,46 @@ env:
 
 jobs:
   build:
+    name: build (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      # One configuration failing should not hide the results of the others.
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            build_type: Release
+            # -Wall -Wextra only. Deliberately NOT -Werror: several people
+            # work in this tree at once and a warning introduced in one
+            # branch must not block everyone else's builds. Warnings show up
+            # as GitHub annotations on the diff, which is the point.
+            cxx_flags: "-Wall -Wextra"
+          - name: debug
+            build_type: Debug
+            cxx_flags: "-Wall -Wextra"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libssl-dev libsqlite3-dev
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}"
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: asan+ubsan
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -23,13 +63,48 @@ jobs:
           sudo apt-get install -y cmake g++ libssl-dev libsqlite3-dev
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        # -fno-omit-frame-pointer keeps the stack traces readable; -O1 keeps
+        # the sanitized test run from taking all afternoon.
+        run: |
+          cmake -B build-asan \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize-recover=undefined" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
 
       - name: Build
-        run: cmake --build build -j$(nproc)
+        run: cmake --build build-asan -j$(nproc)
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        env:
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: ctest --test-dir build-asan --output-on-failure
+
+  analyze:
+    name: cppcheck
+    runs-on: ubuntu-24.04
+    # Advisory only for now — this is a new check against an existing
+    # codebase, so it reports rather than gates. Tighten once the backlog it
+    # surfaces has been worked through.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cppcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cppcheck
+
+      - name: Run cppcheck
+        run: |
+          cppcheck --enable=warning,performance,portability \
+                   --inline-suppr \
+                   --suppress=missingInclude \
+                   --suppress=missingIncludeSystem \
+                   --std=c++20 \
+                   --error-exitcode=1 \
+                   -I src \
+                   src/
 
   docker:
     needs: build

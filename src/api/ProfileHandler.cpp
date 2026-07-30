@@ -90,7 +90,7 @@ void ProfileHandler::handle_put_displayname(const httplib::Request& req, httplib
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
         res.status = 401;
-        res.set_content(MatrixError::missing_token().to_json().dump(), "application/json");
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
         return;
     }
 
@@ -160,7 +160,7 @@ void ProfileHandler::handle_put_avatar_url(const httplib::Request& req, httplib:
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
         res.status = 401;
-        res.set_content(MatrixError::missing_token().to_json().dump(), "application/json");
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
         return;
     }
 

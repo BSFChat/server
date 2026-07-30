@@ -4,6 +4,7 @@
 #include "core/Logger.h"
 #include "http/Middleware.h"
 #include "http/Router.h"
+#include "push/PushService.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
 
@@ -14,6 +15,7 @@
 #include <bsfchat/Permissions.h>
 
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <chrono>
 #include <regex>
 
@@ -45,15 +47,121 @@ void send_error(httplib::Response& res, int status, const MatrixError& err) {
     res.set_content(err.to_json().dump(), "application/json");
 }
 
+// ── @mentions (MSC3952 `m.mentions`) ──────────────────────────────────────
+//
+// The shape on the wire is
+//     "m.mentions": { "user_ids": ["@alice:host", ...], "room": true }
+// and it is the ONLY source of mentions. Deliberately not scraped out of the
+// body: the body is display text, so a body scrape would have to guess how a
+// display name maps back to a user id, and would fire on any literal "@foo"
+// somebody typed inside a code block.
+//
+// Non-forgeability rests on three things, all enforced below:
+//   1. The recorded mention is always "the AUTHENTICATED sender mentioned X".
+//      Nothing in the request body names the mentioner, so a client cannot make
+//      a badge claim that some third party mentioned somebody.
+//   2. A target is only recorded if it is a joined member of the room WITH
+//      VIEW_CHANNEL, so a mention cannot be used to poke somebody who has no
+//      business being reachable in that channel, nor to probe membership.
+//   3. `room` is gated on MENTION_EVERYONE, so a room-wide ping is a permission,
+//      not a client-side choice.
+struct MentionSet {
+    std::vector<std::string> user_ids; // validated, deduped, sender removed
+    bool room_wide = false;
+
+    [[nodiscard]] bool empty() const { return user_ids.empty() && !room_wide; }
+
+    // Flattened for storage: room-wide becomes the sentinel row.
+    [[nodiscard]] std::vector<std::string> to_rows() const {
+        auto rows = user_ids;
+        if (room_wide) rows.emplace_back(kRoomMentionSentinel);
+        return rows;
+    }
+};
+
+// Result of validating the `m.mentions` block. `error` set => reject the send.
+struct MentionParse {
+    MentionSet mentions;
+    std::optional<std::pair<int, MatrixError>> error;
+};
+
+MentionParse parse_mentions(const json& content, const std::string& sender,
+                            const std::string& room_id, permission::Flags user_perms,
+                            SqliteStore& store, PermissionsEngine& perms) {
+    MentionParse out;
+
+    auto it = content.find("m.mentions");
+    if (it == content.end() || !it->is_object()) return out;
+    const auto& m = *it;
+
+    // Room-wide ping. Gated even when the send is an edit (which records no
+    // mentions at all), so the permission is never bypassable and a client
+    // without it is told rather than silently ignored.
+    auto room_it = m.find("room");
+    if (room_it != m.end() && !room_it->is_null()) {
+        if (!room_it->is_boolean()) {
+            out.error = {400, MatrixError::invalid_param("m.mentions.room must be a boolean")};
+            return out;
+        }
+        if (room_it->get<bool>()) {
+            if (!permission::has(user_perms, permission::kMentionEveryone)) {
+                out.error = {403, MatrixError::forbidden(
+                    "You don't have permission to mention everyone")};
+                return out;
+            }
+            out.mentions.room_wide = true;
+        }
+    }
+
+    auto users_it = m.find("user_ids");
+    if (users_it == m.end() || users_it->is_null()) return out;
+    if (!users_it->is_array()) {
+        out.error = {400, MatrixError::invalid_param("m.mentions.user_ids must be an array")};
+        return out;
+    }
+    if (users_it->size() > limits::kMaxMentionsPerEvent) {
+        out.error = {400, MatrixError::invalid_param(
+            "m.mentions.user_ids exceeds " + std::to_string(limits::kMaxMentionsPerEvent) +
+            " entries")};
+        return out;
+    }
+
+    // Entries that fail the membership/visibility checks are DROPPED rather than
+    // rejected: a client working from a slightly stale member list mentioning
+    // somebody who just left is ordinary, and failing the whole send over it
+    // would lose the message. The content itself is left exactly as the client
+    // sent it — the server decides who gets badged, not what the message says.
+    std::vector<std::string> seen;
+    for (const auto& entry : *users_it) {
+        if (!entry.is_string()) continue;
+        auto target = entry.get<std::string>();
+        if (target.empty()) continue;
+        // Blocks a client from claiming a room-wide mention by "mentioning" a
+        // user literally named "@room" — belt and braces on top of the sentinel
+        // being unspellable as a real Matrix id.
+        if (target == kRoomMentionSentinel) continue;
+        if (!UserId::is_valid(target)) continue;
+        // Self-mentions must not badge your own room.
+        if (target == sender) continue;
+        if (std::find(seen.begin(), seen.end(), target) != seen.end()) continue;
+        if (!store.is_room_member(room_id, target)) continue;
+        if (!perms.can(target, room_id, permission::kViewChannel)) continue;
+        seen.push_back(std::move(target));
+    }
+    out.mentions.user_ids = std::move(seen);
+    return out;
+}
+
 } // namespace
 
-EventHandler::EventHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config)
-    : store_(store), sync_engine_(sync_engine), config_(config) {}
+EventHandler::EventHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config,
+                           PushService* push)
+    : store_(store), sync_engine_(sync_engine), config_(config), push_(push) {}
 
 void EventHandler::handle_send_event(const httplib::Request& req, httplib::Response& res) {
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
-        return send_error(res, 401, MatrixError::missing_token());
+        return send_error(res, 401, auth_error(req.get_header_value("Authorization")));
     }
 
     // Match: PUT /rooms/{roomId}/send/{eventType}/{txnId}
@@ -64,9 +172,20 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
 
     auto& room_id = match.params["roomId"];
     auto& evt_type = match.params["eventType"];
+    auto& txn_id = match.params["txnId"];
 
     if (!store_.is_room_member(room_id, *user_id)) {
         return send_error(res, 403, MatrixError::forbidden("Not a member of this room"));
+    }
+
+    // Transaction-id idempotency. txnId was parsed out of the path and then
+    // never used, so any client retry — a flaky connection, a resend after a
+    // timeout — silently duplicated the message.
+    if (!txn_id.empty()) {
+        if (auto existing = store_.get_transaction_event(*user_id, txn_id)) {
+            res.set_content(json{{"event_id", *existing}}.dump(), "application/json");
+            return;
+        }
     }
 
     PermissionsEngine perms(store_, config_);
@@ -83,6 +202,14 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
     } catch (...) {
         return send_error(res, 400, MatrixError::bad_json());
     }
+
+    // Set when this send is an m.replace edit, to the id of the event the
+    // replacement should be reconciled onto once it has been stored.
+    std::optional<std::string> edit_target;
+
+    // Validated mention set, recorded after the event is stored. Stays empty for
+    // an edit — see the comment at the record_mentions() call below.
+    MentionSet mentions;
 
     // Additional per-event-type gates. We focus on m.room.message because
     // non-message timeline events (call signaling, etc.) use separate
@@ -108,6 +235,14 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
             return send_error(res, 403, MatrixError::forbidden("You don't have permission to mention everyone"));
         }
 
+        // Structured mentions. Validated before the edit handling below so the
+        // MENTION_EVERYONE gate applies to every message send, edit included.
+        auto parsed = parse_mentions(content, *user_id, room_id, user_perms, store_, perms);
+        if (parsed.error) {
+            return send_error(res, parsed.error->first, parsed.error->second);
+        }
+        mentions = std::move(parsed.mentions);
+
         // Edits: m.relates_to { rel_type: "m.replace", event_id: "$..." }.
         // Only the original sender can edit their own message. MANAGE_MESSAGES
         // is for deletion (redaction), not rewriting — matches Discord: mods
@@ -125,6 +260,26 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
                     return send_error(res, 404, MatrixError::not_found(
                         "Target message not found"));
                 }
+
+                // An edit aimed at a previous edit resolves to the original.
+                // Matrix says clients must always target the original, but a
+                // client that chains them would otherwise pin the replacement
+                // pointer to an event nothing resolves through, making the
+                // second edit invisible. Bounded so a malformed cycle can't
+                // spin here.
+                for (int hops = 0; hops < 10; ++hops) {
+                    if (!target->content.data.is_object()) break;
+                    auto it = target->content.data.find("m.relates_to");
+                    if (it == target->content.data.end() || !it->is_object()) break;
+                    if (it->value("rel_type", "") != "m.replace") break;
+                    auto parent_id = it->value("event_id", "");
+                    if (parent_id.empty() || parent_id == target->event_id) break;
+                    auto parent = store_.get_event_by_id(parent_id);
+                    if (!parent) break;
+                    target = std::move(parent);
+                    target_id = target->event_id;
+                }
+
                 if (target->room_id != room_id) {
                     return send_error(res, 400, MatrixError::bad_json(
                         "Edit target is in a different room"));
@@ -137,6 +292,12 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
                     return send_error(res, 400, MatrixError::bad_json(
                         "Can only edit message events"));
                 }
+                // A deleted message must not be editable back into existence.
+                if (store_.is_event_redacted(target_id)) {
+                    return send_error(res, 404, MatrixError::not_found(
+                        "Target message has been deleted"));
+                }
+                edit_target = target_id;
             }
         }
 
@@ -157,7 +318,66 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
     }
 
     auto event_id = generate_event_id(config_.server_name);
-    store_.insert_event(event_id, room_id, *user_id, evt_type, std::nullopt, content.dump(), now_ms());
+    int64_t stream_pos = store_.insert_event(event_id, room_id, *user_id, evt_type,
+                                             std::nullopt, content.dump(), now_ms());
+
+    // Record mentions — but NEVER for an edit.
+    //
+    // This is the anti-forgery rule that matters most in practice. A replacement
+    // is an ordinary m.room.message in the timeline, so extracting its mentions
+    // like any other message would give it mention rows at a BRAND NEW stream
+    // position, i.e. past everyone's read marker: editing "hi" into "hi @alice"
+    // would fire a fresh mention badge for Alice on a message she had already
+    // read. Worse, it would let somebody edit an old, long-since-read message to
+    // ping people out of nowhere with no visible new message to explain it.
+    //
+    // So the mention set is fixed at the moment of the original send and an edit
+    // can neither add to it nor move it. Removal-on-edit is intentionally NOT
+    // implemented either: the shipped client strips `m.mentions` from its edit
+    // payload entirely (client/src/net/MatrixClient.cpp editMessage), so
+    // "absent" cannot be told apart from "deliberately cleared", and treating it
+    // as cleared would make mention badges vanish whenever a sender fixed a
+    // typo. See the report for the client-side follow-up that would let us
+    // support narrowing safely.
+    if (!edit_target && !mentions.empty()) {
+        store_.record_mentions(event_id, room_id, *user_id, stream_pos, mentions.to_rows());
+    }
+
+    // Reconcile the edit server-side. The replacement was previously stored as
+    // a sibling event and nothing more, so /messages and /sync kept returning
+    // the pre-edit text and the edit was only "real" for clients that chose to
+    // apply it. The original keeps its identity; this just records which
+    // replacement wins. Idempotent with the txnId short-circuit above: a retry
+    // returns the first event id and never reaches here.
+    if (edit_target && !store_.apply_edit(*edit_target, event_id)) {
+        get_logger()->warn("Edit {} could not be applied to {} (redacted or missing)",
+                           event_id, *edit_target);
+    }
+
+    // Push evaluation. Enqueue-only: this writes push_queue rows and returns, so
+    // the response below is never waiting on a push gateway. Skipped for edits
+    // for the same reason mentions are — a replacement must not fire a second
+    // notification for a message that already generated one.
+    if (push_ && !edit_target && evt_type == std::string(event_type::kRoomMessage)) {
+        PushService::MessageNotification notification;
+        notification.event_id = event_id;
+        notification.room_id = room_id;
+        notification.sender = *user_id;
+        notification.event_type = evt_type;
+        notification.mentioned = mentions.user_ids;
+        notification.room_wide_mention = mentions.room_wide;
+        notification.content = content;
+        try {
+            push_->evaluate_message(notification, perms);
+        } catch (const std::exception& e) {
+            // A message must still be delivered if push bookkeeping fails.
+            get_logger()->error("Push evaluation failed for {}: {}", event_id, e.what());
+        }
+    }
+
+    if (!txn_id.empty()) {
+        store_.record_transaction(*user_id, txn_id, event_id);
+    }
     sync_engine_.notify_new_event();
 
     res.set_content(json{{"event_id", event_id}}.dump(), "application/json");
@@ -166,7 +386,7 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
 void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Response& res) {
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
-        return send_error(res, 401, MatrixError::missing_token());
+        return send_error(res, 401, auth_error(req.get_header_value("Authorization")));
     }
 
     auto match = match_route("/_matrix/client/v3/rooms/{roomId}/messages", req.path);
@@ -190,7 +410,13 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
 
     int limit = limits::kDefaultMessagesLimit;
     if (req.has_param("limit")) {
-        limit = std::min(std::stoi(req.get_param_value("limit")), limits::kMaxMessagesLimit);
+        // Unguarded std::stoi threw out of the handler on a malformed param.
+        try {
+            limit = std::stoi(req.get_param_value("limit"));
+        } catch (const std::exception&) {
+            limit = limits::kDefaultMessagesLimit;
+        }
+        limit = std::clamp(limit, 1, limits::kMaxMessagesLimit);
     }
 
     std::optional<std::string> from;
@@ -217,7 +443,7 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
 void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Response& res) {
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
-        return send_error(res, 401, MatrixError::missing_token());
+        return send_error(res, 401, auth_error(req.get_header_value("Authorization")));
     }
 
     auto match = match_route("/_matrix/client/v3/rooms/{roomId}/read_marker", req.path);
@@ -255,7 +481,7 @@ void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Resp
 void EventHandler::handle_redact(const httplib::Request& req, httplib::Response& res) {
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
-        return send_error(res, 401, MatrixError::missing_token());
+        return send_error(res, 401, auth_error(req.get_header_value("Authorization")));
     }
 
     auto match = match_route("/_matrix/client/v3/rooms/{roomId}/redact/{eventId}/{txnId}", req.path);
@@ -277,10 +503,6 @@ void EventHandler::handle_redact(const httplib::Request& req, httplib::Response&
     }
 
     // Self-redact always allowed; redacting others requires MANAGE_MESSAGES.
-    // Look up the target event's sender.
-    auto events = store_.get_room_events(room_id, 1, "b", std::nullopt);
-    // Use get_state_event-style lookup by event id — fall back to scanning.
-    // The store doesn't expose get_event_by_id, so we query sqlite directly.
     auto target = store_.get_event_by_id(target_event_id);
     if (!target || target->room_id != room_id) {
         return send_error(res, 404, MatrixError::not_found("Target event not found in this room"));
@@ -301,6 +523,15 @@ void EventHandler::handle_redact(const httplib::Request& req, httplib::Response&
     content["redacts"] = target_event_id;
     if (body.contains("reason") && body["reason"].is_string()) {
         content["reason"] = body["reason"];
+    }
+
+    // Actually strip the target's content. Previously redaction only appended
+    // an m.room.redaction event and left the original untouched, so a
+    // "deleted" message was still fully retrievable from
+    // /rooms/{id}/messages — enforcement relied entirely on the client
+    // choosing to hide it.
+    if (!store_.redact_event(target_event_id, *user_id)) {
+        return send_error(res, 404, MatrixError::not_found("Target event not found in this room"));
     }
 
     auto event_id = generate_event_id(config_.server_name);

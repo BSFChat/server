@@ -1,5 +1,6 @@
 #include "auth/LocalAuth.h"
 
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
@@ -55,26 +56,60 @@ std::string hash_password(const std::string& password, int cost) {
     return "$pbkdf2$" + std::to_string(cost) + "$" + salt_hex + "$" + hash_hex;
 }
 
+std::optional<int> password_hash_cost(const std::string& stored_hash) {
+    if (stored_hash.size() < 8 || stored_hash.compare(0, 8, "$pbkdf2$") != 0) return std::nullopt;
+    size_t pos2 = stored_hash.find('$', 8);
+    if (pos2 == std::string::npos) return std::nullopt;
+    try {
+        return std::stoi(stored_hash.substr(8, pos2 - 8));
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
 bool verify_password(const std::string& password, const std::string& stored_hash) {
     // Parse: $pbkdf2$cost$salt_hex$hash_hex
-    if (stored_hash.substr(0, 8) != "$pbkdf2$") return false;
+    if (stored_hash.size() < 8 || stored_hash.compare(0, 8, "$pbkdf2$") != 0) return false;
 
     size_t pos1 = 8;
     size_t pos2 = stored_hash.find('$', pos1);
     if (pos2 == std::string::npos) return false;
 
-    int cost = std::stoi(stored_hash.substr(pos1, pos2 - pos1));
+    int cost = 0;
+    try {
+        cost = std::stoi(stored_hash.substr(pos1, pos2 - pos1));
+    } catch (const std::exception&) {
+        return false;
+    }
+    // Guard against a hostile or corrupt stored value turning verification
+    // into an unbounded amount of work (or into UB via a shift overflow).
+    if (cost < 1 || cost > 24) return false;
+
     size_t pos3 = stored_hash.find('$', pos2 + 1);
     if (pos3 == std::string::npos) return false;
 
     std::string salt_hex = stored_hash.substr(pos2 + 1, pos3 - pos2 - 1);
     std::string expected_hash = stored_hash.substr(pos3 + 1);
+    if (salt_hex.empty() || salt_hex.size() % 2 != 0) return false;
 
     auto salt_bytes = hex_to_bytes(salt_hex);
     int iterations = 1 << cost;
     std::string computed_hash = pbkdf2_hash(password, salt_bytes.data(), salt_bytes.size(), iterations);
 
-    return computed_hash == expected_hash;
+    // Constant-time: std::string::operator== short-circuits on the first
+    // differing byte, which leaks how much of the hash a guess got right.
+    if (computed_hash.size() != expected_hash.size()) return false;
+    return CRYPTO_memcmp(computed_hash.data(), expected_hash.data(),
+                         computed_hash.size()) == 0;
+}
+
+std::string hash_access_token(const std::string& token) {
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    if (EVP_Digest(token.data(), token.size(), md, &len, EVP_sha256(), nullptr) != 1) {
+        throw std::runtime_error("SHA-256 of access token failed");
+    }
+    return bytes_to_hex(md, len);
 }
 
 } // namespace bsfchat

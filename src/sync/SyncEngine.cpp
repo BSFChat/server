@@ -28,7 +28,22 @@ SyncEngine::SyncEngine(SqliteStore& store, const Config& config)
 }
 
 void SyncEngine::notify_new_event() {
-    current_position_ = store_.get_current_stream_position();
+    auto pos = store_.get_current_stream_position();
+    {
+        // Must be held while publishing the new position: a waiter evaluates
+        // its predicate under this same lock, and a notify slipping in between
+        // that evaluation and the wait would otherwise be lost entirely.
+        std::lock_guard lock(wait_mutex_);
+        current_position_ = pos;
+    }
+    new_event_cv_.notify_all();
+}
+
+void SyncEngine::notify_ephemeral() {
+    {
+        std::lock_guard lock(wait_mutex_);
+        ++ephemeral_seq_;
+    }
     new_event_cv_.notify_all();
 }
 
@@ -41,8 +56,20 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
 
     int64_t since_pos = 0;
     if (since_token.size() > 1 && since_token[0] == 's') {
-        since_pos = std::stoll(since_token.substr(1));
+        // A malformed token used to throw std::invalid_argument /
+        // std::out_of_range straight out of the handler.
+        try {
+            since_pos = std::stoll(since_token.substr(1));
+        } catch (const std::exception&) {
+            since_pos = 0;
+        }
+        if (since_pos < 0) since_pos = 0;
     }
+
+    // Snapshot the ephemeral counter BEFORE building, so typing/presence
+    // changes that land while we're querying still count as "something
+    // happened" and don't get swallowed by the wait.
+    const uint64_t edu_at_entry = ephemeral_seq_.load();
 
     auto response = build_incremental_sync(user_id, since_pos);
     if (!response.rooms.join.empty()) {
@@ -53,8 +80,10 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
         timeout_ms = std::min(timeout_ms, limits::kMaxSyncTimeoutMs);
         std::unique_lock lock(wait_mutex_);
         new_event_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
-            return current_position_.load() > since_pos;
+            return current_position_.load() > since_pos ||
+                   ephemeral_seq_.load() != edu_at_entry;
         });
+        lock.unlock();
 
         response = build_incremental_sync(user_id, since_pos);
     }
@@ -96,8 +125,14 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
         response.rooms.join[room_id] = std::move(joined);
     }
 
+    // One grouped query for mentions across every room, rather than one per
+    // room inside the loop — each store call serialises behind the store's
+    // single global mutex, and an initial sync visits every joined channel.
+    auto mentions = store_.get_unread_mention_counts(user_id);
     for (auto& [room_id, joined] : response.rooms.join) {
         joined.unread_count = store_.count_unread(user_id, room_id);
+        auto it = mentions.find(room_id);
+        joined.highlight_count = it == mentions.end() ? 0 : it->second;
     }
 
     response.next_batch = "s" + std::to_string(store_.get_current_stream_position());
@@ -108,7 +143,13 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
     SyncResponse response;
     PermissionsEngine perms(store_, config_);
 
-    auto events = store_.get_events_since(user_id, since_pos);
+    // `delivered_max` is the highest stream position actually scanned. It is
+    // what next_batch must be built from: the old code fetched at most `limit`
+    // events and then set next_batch to the GLOBAL stream head, so anything
+    // past the limit — or anything inserted between the fetch and the head
+    // read — was skipped permanently.
+    int64_t delivered_max = since_pos;
+    auto events = store_.get_events_since(user_id, since_pos, delivered_max);
 
     std::set<std::string> newly_joined_rooms;
     // Cache VIEW_CHANNEL decisions so we don't recompute for every event in
@@ -149,15 +190,14 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
         joined.state.events = std::move(state);
     }
 
+    auto mentions = store_.get_unread_mention_counts(user_id);
     for (auto& [room_id, joined] : response.rooms.join) {
         joined.unread_count = store_.count_unread(user_id, room_id);
+        auto it = mentions.find(room_id);
+        joined.highlight_count = it == mentions.end() ? 0 : it->second;
     }
 
-    int64_t max_pos = since_pos;
-    if (!events.empty()) {
-        max_pos = store_.get_current_stream_position();
-    }
-    response.next_batch = "s" + std::to_string(max_pos);
+    response.next_batch = "s" + std::to_string(delivered_max);
     return response;
 }
 

@@ -1,9 +1,13 @@
 #include "store/SqliteStore.h"
+#include "auth/LocalAuth.h"
 #include "core/Logger.h"
+#include "store/Migrations.h"
 
 #include <bsfchat/Constants.h>
 
 #include <nlohmann/json.hpp>
+#include <algorithm>
+#include <chrono>
 #include <stdexcept>
 
 namespace bsfchat {
@@ -23,6 +27,115 @@ StmtPtr prepare(sqlite3* db, const std::string& sql) {
         throw std::runtime_error(std::string("SQL prepare error: ") + sqlite3_errmsg(db) + " [" + sql + "]");
     }
     return StmtPtr(stmt);
+}
+
+// ── Timeline reads and edit reconciliation ────────────────────────────────
+//
+// Every timeline read selects the same columns in the same order and goes
+// through read_event_row(), so no read path can quietly skip edit resolution
+// the way they all used to: the server stored an m.replace as a sibling event
+// and then returned the PRE-EDIT content forever.
+//
+// Column order: 0 event_id, 1 room_id, 2 sender, 3 event_type, 4 state_key,
+// 5 content, 6 origin_server_ts, then the winning replacement (if any):
+// 7 rep.event_id, 8 rep.sender, 9 rep.origin_server_ts, 10 rep.content.
+// Queries that also need the stream position append it as column 11.
+constexpr const char* kEventColumns =
+    "e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content, "
+    "e.origin_server_ts, rep.event_id, rep.sender, rep.origin_server_ts, rep.content";
+
+// A replacement that has itself been redacted must not win, hence the
+// redacted_by guard; redact_event() additionally re-points the target at the
+// newest surviving replacement.
+constexpr const char* kEditJoin =
+    " LEFT JOIN events rep ON rep.event_id = e.edited_by AND rep.redacted_by IS NULL ";
+
+const char* column_text_or_empty(sqlite3_stmt* stmt, int col) {
+    auto* p = sqlite3_column_text(stmt, col);
+    return p ? reinterpret_cast<const char*>(p) : "";
+}
+
+// Wall clock in milliseconds, for the one table that timestamps its rows in C++
+// rather than with a SQL default (audit_log, whose caller may supply the exact
+// timestamp of the action being recorded).
+int64_t audit_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// The content a replacement event contributes. Matrix puts the authoritative
+// version in `m.new_content`; the top-level body is only a "* edited text"
+// fallback for clients that predate edits, so it is used only if
+// `m.new_content` is absent, with the conventional prefix stripped.
+nlohmann::json replacement_content(const nlohmann::json& rep_content) {
+    if (!rep_content.is_object()) return nlohmann::json();
+    auto it = rep_content.find("m.new_content");
+    if (it != rep_content.end() && it->is_object()) return *it;
+
+    nlohmann::json fallback = rep_content;
+    fallback.erase("m.relates_to");
+    if (fallback.contains("body") && fallback["body"].is_string()) {
+        auto body = fallback["body"].get<std::string>();
+        if (body.rfind("* ", 0) == 0) fallback["body"] = body.substr(2);
+    }
+    return fallback;
+}
+
+// The event id an m.replace replacement targets, or nullopt for anything else.
+// Parsed in C++ rather than with json_extract() for the same reason the
+// migration does: the path would be `$."m.relates_to".event_id`, and quoted
+// JSON path labels only parse on recent SQLite builds.
+std::optional<std::string> replacement_target(const std::string& content_json) {
+    auto j = nlohmann::json::parse(content_json, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return std::nullopt;
+    auto it = j.find("m.relates_to");
+    if (it == j.end() || !it->is_object()) return std::nullopt;
+    if (it->value("rel_type", "") != "m.replace") return std::nullopt;
+    auto target = it->value("event_id", "");
+    if (target.empty()) return std::nullopt;
+    return target;
+}
+
+RoomEvent read_event_row(sqlite3_stmt* stmt) {
+    RoomEvent ev;
+    ev.event_id = column_text_or_empty(stmt, 0);
+    ev.room_id = column_text_or_empty(stmt, 1);
+    ev.sender = column_text_or_empty(stmt, 2);
+    ev.type = column_text_or_empty(stmt, 3);
+    if (sqlite3_column_type(stmt, 4) != SQLITE_NULL) {
+        ev.state_key = column_text_or_empty(stmt, 4);
+    }
+    ev.content.data = nlohmann::json::parse(column_text_or_empty(stmt, 5), nullptr, false);
+    if (ev.content.data.is_discarded()) ev.content.data = nlohmann::json::object();
+    ev.origin_server_ts = sqlite3_column_int64(stmt, 6);
+
+    if (sqlite3_column_type(stmt, 7) == SQLITE_NULL) return ev; // not edited
+    auto rep_content = nlohmann::json::parse(column_text_or_empty(stmt, 10), nullptr, false);
+    auto new_content = replacement_content(rep_content);
+    if (!new_content.is_object() || new_content.empty()) return ev;
+
+    // An edited reply must keep pointing at what it replied to. m.new_content
+    // carries no relation of its own, so the original's survives.
+    if (!new_content.contains("m.relates_to") && ev.content.data.is_object()) {
+        auto rel = ev.content.data.find("m.relates_to");
+        if (rel != ev.content.data.end()) new_content["m.relates_to"] = *rel;
+    }
+
+    // Spec-shaped bundled aggregation: the original keeps its identity and the
+    // replacement stays discoverable (it is also still an ordinary event in the
+    // timeline). `bsfchat.original_content` is our own addition — it lets a
+    // client render edit history faithfully without having to have been
+    // connected when the edit happened.
+    nlohmann::json unsigned_data = nlohmann::json::object();
+    unsigned_data["m.relations"]["m.replace"] = {
+        {"event_id", column_text_or_empty(stmt, 7)},
+        {"sender", column_text_or_empty(stmt, 8)},
+        {"origin_server_ts", sqlite3_column_int64(stmt, 9)},
+    };
+    unsigned_data["bsfchat.original_content"] = ev.content.data;
+    ev.unsigned_data = EventContent{.data = std::move(unsigned_data)};
+    ev.content.data = std::move(new_content);
+    return ev;
 }
 
 } // namespace
@@ -52,6 +165,17 @@ void SqliteStore::exec(const std::string& sql) {
 void SqliteStore::initialize() {
     std::lock_guard lock(mutex_);
 
+    // Detect "brand new database" BEFORE creating anything, so migrations can
+    // skip the one-time data repairs that only apply to legacy deployments.
+    bool fresh_database = true;
+    {
+        auto stmt = prepare(db_,
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'users'");
+        if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+            fresh_database = sqlite3_column_int(stmt.get(), 0) == 0;
+        }
+    }
+
     exec(R"(
         CREATE TABLE IF NOT EXISTS users (
             user_id         TEXT PRIMARY KEY,
@@ -62,6 +186,12 @@ void SqliteStore::initialize() {
         )
     )");
 
+    // NOTE: this is the ORIGINAL access_tokens shape and is deliberately left
+    // as-is. Migration v7 replaces it with the hashed/expiring table — a fresh
+    // database gets this one and then immediately has it rebuilt, and an
+    // already-migrated database ignores this statement because a table of that
+    // name exists. Do not "fix" it to match the current schema: that is exactly
+    // the trap the migration runner exists to avoid.
     exec(R"(
         CREATE TABLE IF NOT EXISTS access_tokens (
             token       TEXT PRIMARY KEY,
@@ -126,6 +256,36 @@ void SqliteStore::initialize() {
             created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000)
         )
     )");
+
+    // Versioned migrations for everything added after the original schema.
+    // Anything new belongs in Migrations.cpp, NOT above — `CREATE TABLE IF NOT
+    // EXISTS` silently does nothing on an existing deployment, so a column
+    // added to a block above would never appear there.
+    run_migrations(db_, fresh_database);
+
+    // Load the monotonic stream counter, never letting it go backwards past
+    // what the events table already contains (covers a database last written
+    // by a build that derived positions from MAX(stream_position) + 1).
+    {
+        int64_t from_meta = 0;
+        auto stmt = prepare(db_,
+            "SELECT CAST(value AS INTEGER) FROM server_meta WHERE key = 'next_stream_position'");
+        if (sqlite3_step(stmt.get()) == SQLITE_ROW) from_meta = sqlite3_column_int64(stmt.get(), 0);
+
+        auto max_stmt = prepare(db_, "SELECT COALESCE(MAX(stream_position), 0) + 1 FROM events");
+        sqlite3_step(max_stmt.get());
+        int64_t from_events = sqlite3_column_int64(max_stmt.get(), 0);
+
+        next_stream_position_ = std::max<int64_t>({1, from_meta, from_events});
+    }
+    {
+        auto stmt = prepare(db_,
+            "INSERT INTO server_meta (key, value) VALUES ('next_stream_position', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+        auto v = std::to_string(next_stream_position_);
+        sqlite3_bind_text(stmt.get(), 1, v.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(stmt.get());
+    }
 }
 
 // Users
@@ -136,6 +296,14 @@ bool SqliteStore::create_user(const std::string& user_id, const std::string& pas
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, password_hash.c_str(), -1, SQLITE_TRANSIENT);
     return sqlite3_step(stmt.get()) == SQLITE_DONE && sqlite3_changes(db_) > 0;
+}
+
+void SqliteStore::update_password_hash(const std::string& user_id, const std::string& password_hash) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "UPDATE users SET password_hash = ? WHERE user_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, password_hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
 }
 
 std::optional<std::string> SqliteStore::get_password_hash(const std::string& user_id) {
@@ -163,30 +331,106 @@ bool SqliteStore::username_exists(const std::string& localpart) {
 }
 
 // Access tokens
+//
+// Only SHA-256 digests of tokens ever reach the database; see
+// hash_access_token() in auth/LocalAuth.h for why a fast hash is the right
+// choice for a 256-bit random bearer secret that must be looked up by index on
+// every request.
 
-void SqliteStore::store_access_token(const std::string& token, const std::string& user_id, const std::string& device_id) {
+void SqliteStore::store_access_token(const std::string& token, const std::string& user_id,
+                                      const std::string& device_id, int64_t lifetime_ms,
+                                      const std::optional<std::string>& refresh_token) {
+    if (lifetime_ms <= 0) lifetime_ms = kDefaultAccessTokenLifetimeMs;
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "INSERT INTO access_tokens (token, user_id, device_id) VALUES (?, ?, ?)");
-    sqlite3_bind_text(stmt.get(), 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    // Timestamps come from the C++ clock, not strftime('%s','now') * 1000: the
+    // latter is only second-granular, so expiry maths would be up to a second
+    // out of step with the millisecond `now` that get_user_by_token compares
+    // against.
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    auto stmt = prepare(db_,
+        "INSERT INTO access_tokens "
+        "  (token_hash, user_id, device_id, created_at, expires_at, last_used_at, "
+        "   lifetime_ms, refresh_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+    auto token_hash = hash_access_token(token);
+    sqlite3_bind_text(stmt.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 3, device_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt.get());
+    sqlite3_bind_int64(stmt.get(), 4, now);
+    sqlite3_bind_int64(stmt.get(), 5, now + lifetime_ms);
+    sqlite3_bind_int64(stmt.get(), 6, now);
+    sqlite3_bind_int64(stmt.get(), 7, lifetime_ms);
+    std::string refresh_hash;
+    if (refresh_token && !refresh_token->empty()) {
+        refresh_hash = hash_access_token(*refresh_token);
+        sqlite3_bind_text(stmt.get(), 8, refresh_hash.c_str(), -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt.get(), 8);
+    }
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        throw std::runtime_error(std::string("Failed to store access token: ") + sqlite3_errmsg(db_));
+    }
 }
 
 std::optional<std::string> SqliteStore::get_user_by_token(const std::string& token) {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "SELECT user_id FROM access_tokens WHERE token = ?");
-    sqlite3_bind_text(stmt.get(), 1, token.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-        return reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+    auto token_hash = hash_access_token(token);
+
+    std::string user_id;
+    int64_t expires_at = 0;
+    int64_t lifetime_ms = kDefaultAccessTokenLifetimeMs;
+    {
+        auto stmt = prepare(db_,
+            "SELECT user_id, expires_at, lifetime_ms FROM access_tokens WHERE token_hash = ?");
+        sqlite3_bind_text(stmt.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+        user_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        expires_at = sqlite3_column_int64(stmt.get(), 1);
+        lifetime_ms = sqlite3_column_int64(stmt.get(), 2);
     }
-    return std::nullopt;
+
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    if (expires_at <= now) {
+        // Reap it rather than leaving a dead row to be re-checked forever.
+        auto del = prepare(db_, "DELETE FROM access_tokens WHERE token_hash = ?");
+        sqlite3_bind_text(del.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(del.get());
+        return std::nullopt;
+    }
+
+    // Sliding renewal. Only written once the session is past the halfway point
+    // of its lifetime, so an ordinary request burst costs no writes: a client
+    // polling /sync stays logged in indefinitely, while a token nobody uses
+    // still dies at its expiry.
+    if (lifetime_ms > 0 && (expires_at - now) < lifetime_ms / 2) {
+        auto upd = prepare(db_,
+            "UPDATE access_tokens SET expires_at = ?, last_used_at = ? WHERE token_hash = ?");
+        sqlite3_bind_int64(upd.get(), 1, now + lifetime_ms);
+        sqlite3_bind_int64(upd.get(), 2, now);
+        sqlite3_bind_text(upd.get(), 3, token_hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(upd.get());
+    }
+
+    return user_id;
+}
+
+std::optional<int64_t> SqliteStore::get_token_expiry(const std::string& token) {
+    std::lock_guard lock(mutex_);
+    auto token_hash = hash_access_token(token);
+    auto stmt = prepare(db_, "SELECT expires_at FROM access_tokens WHERE token_hash = ?");
+    sqlite3_bind_text(stmt.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    return sqlite3_column_int64(stmt.get(), 0);
 }
 
 void SqliteStore::delete_access_token(const std::string& token) {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "DELETE FROM access_tokens WHERE token = ?");
-    sqlite3_bind_text(stmt.get(), 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    auto token_hash = hash_access_token(token);
+    auto stmt = prepare(db_, "DELETE FROM access_tokens WHERE token_hash = ?");
+    sqlite3_bind_text(stmt.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt.get());
 }
 
@@ -197,17 +441,76 @@ void SqliteStore::delete_all_tokens_for_user(const std::string& user_id) {
     sqlite3_step(stmt.get());
 }
 
+int SqliteStore::delete_other_tokens_for_user(const std::string& user_id,
+                                              const std::string& keep_token) {
+    std::lock_guard lock(mutex_);
+    auto keep_hash = hash_access_token(keep_token);
+    auto stmt = prepare(db_,
+        "DELETE FROM access_tokens WHERE user_id = ? AND token_hash != ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, keep_hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+    return sqlite3_changes(db_);
+}
+
+std::optional<SqliteStore::TokenSession>
+SqliteStore::get_session_by_token(const std::string& token) {
+    if (token.empty()) return std::nullopt;
+    std::lock_guard lock(mutex_);
+    auto token_hash = hash_access_token(token);
+    auto stmt = prepare(db_,
+        "SELECT user_id, device_id FROM access_tokens WHERE token_hash = ?");
+    sqlite3_bind_text(stmt.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    TokenSession session;
+    session.user_id = column_text_or_empty(stmt.get(), 0);
+    session.device_id = column_text_or_empty(stmt.get(), 1);
+    return session;
+}
+
+std::optional<SqliteStore::TokenSession>
+SqliteStore::consume_refresh_token(const std::string& refresh_token) {
+    if (refresh_token.empty()) return std::nullopt;
+    std::lock_guard lock(mutex_);
+    auto refresh_hash = hash_access_token(refresh_token);
+
+    TokenSession session;
+    {
+        auto stmt = prepare(db_,
+            "SELECT user_id, device_id FROM access_tokens WHERE refresh_hash = ?");
+        sqlite3_bind_text(stmt.get(), 1, refresh_hash.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+        session.user_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        session.device_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
+    }
+    // Rotate: the old access token dies with the refresh token that minted it.
+    auto del = prepare(db_, "DELETE FROM access_tokens WHERE refresh_hash = ?");
+    sqlite3_bind_text(del.get(), 1, refresh_hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(del.get());
+    return session;
+}
+
 // Rooms
 
-std::string SqliteStore::create_room(const std::string& room_id, const std::string& creator) {
+std::string SqliteStore::create_room(const std::string& room_id, const std::string& creator,
+                                      bool is_direct) {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "INSERT INTO rooms (room_id, creator) VALUES (?, ?)");
+    auto stmt = prepare(db_, "INSERT INTO rooms (room_id, creator, is_direct) VALUES (?, ?, ?)");
     sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, creator.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt.get(), 3, is_direct ? 1 : 0);
     if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
         throw std::runtime_error(std::string("Failed to create room: ") + sqlite3_errmsg(db_));
     }
     return room_id;
+}
+
+bool SqliteStore::is_direct_room(const std::string& room_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT is_direct FROM rooms WHERE room_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return false;
+    return sqlite3_column_int(stmt.get(), 0) != 0;
 }
 
 void SqliteStore::delete_room(const std::string& room_id) {
@@ -223,6 +526,25 @@ void SqliteStore::delete_room(const std::string& room_id) {
             sqlite3_step(s.get());
         };
         run("DELETE FROM read_markers WHERE room_id = ?");
+        // event_mentions also cascades off events(event_id), but deleting by
+        // room_id explicitly means a deployment that somehow has foreign_keys
+        // off still can't leave mention badges pointing at a deleted channel.
+        run("DELETE FROM event_mentions WHERE room_id = ?");
+        // Search index: external-content FTS5 needs each document's own text to
+        // forget it, so this goes row by row through the one reindex helper
+        // rather than as a bulk DELETE that would leave the index still matching
+        // a deleted channel's messages.
+        {
+            std::vector<std::string> stale;
+            auto sel = prepare(db_, "SELECT event_id FROM event_search WHERE room_id = ?");
+            sqlite3_bind_text(sel.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+            while (sqlite3_step(sel.get()) == SQLITE_ROW) {
+                stale.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(sel.get(), 0)));
+            }
+            for (const auto& id : stale) {
+                reindex_search_locked(id, room_id, "", 0, std::nullopt);
+            }
+        }
         run("DELETE FROM events WHERE room_id = ?");
         run("DELETE FROM room_members WHERE room_id = ?");
         run("DELETE FROM rooms WHERE room_id = ?");
@@ -264,9 +586,13 @@ std::vector<std::string> SqliteStore::list_all_users() {
 
 std::vector<std::string> SqliteStore::list_all_non_category_rooms() {
     std::lock_guard lock(mutex_);
+    // Direct rooms are excluded: a DM is not a category, so without this
+    // filter every server-wide sweep over "all non-category rooms" would
+    // treat private conversations as ordinary channels.
     const char* sql = R"(
         SELECT r.room_id FROM rooms r
-        WHERE COALESCE((
+        WHERE r.is_direct = 0
+          AND COALESCE((
             SELECT json_extract(content, '$.type')
             FROM events
             WHERE room_id = r.room_id
@@ -283,13 +609,42 @@ std::vector<std::string> SqliteStore::list_all_non_category_rooms() {
     return rooms;
 }
 
+std::vector<std::string> SqliteStore::list_legacy_untyped_rooms() {
+    std::lock_guard lock(mutex_);
+    // handle_create_room has always emitted bsfchat.room.type since the
+    // Discord-like channel model landed. A room without one therefore predates
+    // that model and is the only kind the historical publicize migration is
+    // allowed to touch — a room created private by the CURRENT code was made
+    // private deliberately and must stay that way.
+    const char* sql = R"(
+        SELECT r.room_id FROM rooms r
+        WHERE r.is_direct = 0
+          AND NOT EXISTS (
+            SELECT 1 FROM events
+            WHERE room_id = r.room_id
+              AND event_type = 'bsfchat.room.type'
+              AND state_key = ''
+        )
+    )";
+    auto stmt = prepare(db_, sql);
+    std::vector<std::string> rooms;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        rooms.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)));
+    }
+    return rooms;
+}
+
 std::vector<std::string> SqliteStore::list_public_rooms() {
     std::lock_guard lock(mutex_);
     // Return rooms where the latest m.room.join_rules state event has join_rule == "public"
-    // AND the latest bsfchat.room.type (if any) is NOT "category".
+    // AND the latest bsfchat.room.type (if any) is NOT "category"
+    // AND the room is not a DM. The is_direct guard is what stops a direct
+    // conversation from ever being treated as a room everyone should join,
+    // even if some historical join_rules event on it still says "public".
     const char* sql = R"(
         SELECT r.room_id FROM rooms r
-        WHERE (
+        WHERE r.is_direct = 0
+        AND (
             SELECT json_extract(content, '$.join_rule')
             FROM events
             WHERE room_id = r.room_id
@@ -363,20 +718,42 @@ std::vector<std::pair<std::string, std::string>> SqliteStore::get_room_members(c
 
 // Events
 
+int64_t SqliteStore::claim_stream_position_locked() {
+    int64_t pos = next_stream_position_++;
+    // Persist the new head so a restart never hands out a position twice,
+    // even if the events table has since had its newest rows deleted.
+    auto stmt = prepare(db_,
+        "INSERT INTO server_meta (key, value) VALUES ('next_stream_position', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+    auto v = std::to_string(next_stream_position_);
+    sqlite3_bind_text(stmt.get(), 1, v.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+    return pos;
+}
+
 int64_t SqliteStore::insert_event(const std::string& event_id, const std::string& room_id,
                                    const std::string& sender, const std::string& event_type,
                                    const std::optional<std::string>& state_key,
                                    const std::string& content_json, int64_t origin_server_ts) {
     std::lock_guard lock(mutex_);
 
-    // Get next stream position
-    auto pos_stmt = prepare(db_, "SELECT COALESCE(MAX(stream_position), 0) + 1 FROM events");
-    sqlite3_step(pos_stmt.get());
-    int64_t stream_pos = sqlite3_column_int64(pos_stmt.get(), 0);
+    // Monotonic — deriving this from MAX(stream_position) + 1 meant that
+    // deleting a room's newest events made positions get reused, and clients
+    // holding a sync token at or above a reused position silently stopped
+    // receiving anything.
+    int64_t stream_pos = claim_stream_position_locked();
+
+    // `replaces` is derived here rather than passed in, so no caller can forget
+    // to set it and quietly reintroduce "an edit counts as a new message". It is
+    // an immutable property of the event's own content.
+    std::optional<std::string> replaces;
+    if (event_type == std::string(event_type::kRoomMessage)) {
+        replaces = replacement_target(content_json);
+    }
 
     auto stmt = prepare(db_,
-        "INSERT INTO events (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, stream_position) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+        "INSERT INTO events (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, stream_position, replaces) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
     sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 3, sender.c_str(), -1, SQLITE_TRANSIENT);
@@ -389,9 +766,30 @@ int64_t SqliteStore::insert_event(const std::string& event_id, const std::string
     sqlite3_bind_text(stmt.get(), 6, content_json.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt.get(), 7, origin_server_ts);
     sqlite3_bind_int64(stmt.get(), 8, stream_pos);
+    if (replaces) {
+        sqlite3_bind_text(stmt.get(), 9, replaces->c_str(), -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt.get(), 9);
+    }
 
     if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
         throw std::runtime_error(std::string("Failed to insert event: ") + sqlite3_errmsg(db_));
+    }
+
+    // Search index. Derived here rather than by the caller for the same reason
+    // `replaces` is: insert_event is the one place every event passes through, so
+    // an index maintained here cannot be bypassed by a new call site.
+    //
+    // A replacement is deliberately NOT indexed as itself — apply_edit folds its
+    // text onto the event it replaces, so an edited message stays a single search
+    // hit whose text is current.
+    if (event_type == std::string(event_type::kRoomMessage) && !replaces) {
+        auto content = nlohmann::json::parse(content_json, nullptr, false);
+        std::string body;
+        if (!content.is_discarded() && content.is_object()) body = content.value("body", "");
+        if (!body.empty()) {
+            reindex_search_locked(event_id, room_id, sender, stream_pos, body);
+        }
     }
 
     return stream_pos;
@@ -409,25 +807,33 @@ SqliteStore::get_room_events_paginated(const std::string& room_id, int limit,
     // history exists in the scanned direction — if the fetch size equals
     // `limit+1`, there's at least one more page; otherwise we've reached
     // the end and return nullopt as the token.
-    std::string sql = "SELECT event_id, room_id, sender, event_type, state_key, content, origin_server_ts, stream_position "
-                      "FROM events WHERE room_id = ?";
+    // A client-supplied token like "sabc" or "s99999999999999999999" used to
+    // throw std::invalid_argument / std::out_of_range straight out of the
+    // handler; treat anything unparseable as "no token".
+    auto parse_token = [](const std::optional<std::string>& tok) -> int64_t {
+        if (!tok || tok->size() < 2 || (*tok)[0] != 's') return 0;
+        try {
+            int64_t v = std::stoll(tok->substr(1));
+            return v < 0 ? 0 : v;
+        } catch (const std::exception&) {
+            return 0;
+        }
+    };
+
+    std::string sql = std::string("SELECT ") + kEventColumns + ", e.stream_position "
+                      "FROM events e" + kEditJoin + "WHERE e.room_id = ?";
 
     if (from) {
-        // from is a stream position token like "s42"
-        int64_t pos = 0;
-        if (from->size() > 1 && (*from)[0] == 's') {
-            pos = std::stoll(from->substr(1));
-        }
         if (direction == "b") {
-            sql += " AND stream_position < ? ORDER BY stream_position DESC";
+            sql += " AND e.stream_position < ? ORDER BY e.stream_position DESC";
         } else {
-            sql += " AND stream_position > ? ORDER BY stream_position ASC";
+            sql += " AND e.stream_position > ? ORDER BY e.stream_position ASC";
         }
     } else {
         if (direction == "b") {
-            sql += " ORDER BY stream_position DESC";
+            sql += " ORDER BY e.stream_position DESC";
         } else {
-            sql += " ORDER BY stream_position ASC";
+            sql += " ORDER BY e.stream_position ASC";
         }
     }
     sql += " LIMIT ?";
@@ -436,30 +842,15 @@ SqliteStore::get_room_events_paginated(const std::string& room_id, int limit,
     int idx = 1;
     sqlite3_bind_text(stmt.get(), idx++, room_id.c_str(), -1, SQLITE_TRANSIENT);
     if (from) {
-        int64_t pos = 0;
-        if (from->size() > 1 && (*from)[0] == 's') {
-            pos = std::stoll(from->substr(1));
-        }
-        sqlite3_bind_int64(stmt.get(), idx++, pos);
+        sqlite3_bind_int64(stmt.get(), idx++, parse_token(from));
     }
     sqlite3_bind_int(stmt.get(), idx, limit + 1);
 
     std::vector<RoomEvent> events;
     std::vector<int64_t> positions;
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-        RoomEvent ev;
-        ev.event_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
-        ev.room_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
-        ev.sender = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 2));
-        ev.type = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 3));
-        if (sqlite3_column_type(stmt.get(), 4) != SQLITE_NULL) {
-            ev.state_key = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 4));
-        }
-        ev.content.data = nlohmann::json::parse(
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 5)));
-        ev.origin_server_ts = sqlite3_column_int64(stmt.get(), 6);
-        events.push_back(std::move(ev));
-        positions.push_back(sqlite3_column_int64(stmt.get(), 7));
+        events.push_back(read_event_row(stmt.get()));
+        positions.push_back(sqlite3_column_int64(stmt.get(), 11));
     }
 
     // If we fetched the probe row, there's more history in this direction.
@@ -517,23 +908,238 @@ std::vector<RoomEvent> SqliteStore::get_state_events(const std::string& room_id)
 std::optional<RoomEvent> SqliteStore::get_event_by_id(const std::string& event_id) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
-        "SELECT event_id, room_id, sender, event_type, state_key, content, origin_server_ts "
-        "FROM events WHERE event_id = ? LIMIT 1");
+        std::string("SELECT ") + kEventColumns + " FROM events e" + kEditJoin +
+        "WHERE e.event_id = ? LIMIT 1");
     sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    return read_event_row(stmt.get());
+}
 
-    RoomEvent ev;
-    ev.event_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
-    ev.room_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
-    ev.sender = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 2));
-    ev.type = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 3));
-    if (sqlite3_column_type(stmt.get(), 4) != SQLITE_NULL) {
-        ev.state_key = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 4));
+bool SqliteStore::apply_edit(const std::string& target_event_id,
+                             const std::string& replacement_event_id) {
+    std::lock_guard lock(mutex_);
+    // Refuses on a redacted target: an edit must never resurrect content that
+    // was deleted.
+    auto stmt = prepare(db_,
+        "UPDATE events SET edited_by = ? WHERE event_id = ? AND redacted_by IS NULL");
+    sqlite3_bind_text(stmt.get(), 1, replacement_event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, target_event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+    const bool applied = sqlite3_changes(db_) > 0;
+    // Search must match what the timeline now shows. Re-derived from stored state
+    // rather than from the replacement passed in, so this is correct however the
+    // edit pointer got where it is.
+    if (applied) refresh_search_for_event_locked(target_event_id);
+    return applied;
+}
+
+std::optional<std::string> SqliteStore::get_edit_pointer(const std::string& event_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT edited_by FROM events WHERE event_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    if (sqlite3_column_type(stmt.get(), 0) == SQLITE_NULL) return std::nullopt;
+    return reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+}
+
+bool SqliteStore::is_event_redacted(const std::string& event_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT redacted_by FROM events WHERE event_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return false;
+    return sqlite3_column_type(stmt.get(), 0) != SQLITE_NULL;
+}
+
+void SqliteStore::reresolve_edit_locked(const std::string& room_id,
+                                        const std::string& target_event_id) {
+    // Find the newest surviving replacement of `target_event_id`. The candidate
+    // set is narrowed with a LIKE on the target's event id — event ids are
+    // random and unique, so this is highly selective — and then confirmed by
+    // parsing the relation in C++. Deliberately NOT json_extract(): the path
+    // would be `$."m.relates_to".rel_type`, and quoted JSON path labels are
+    // only supported by recent SQLite builds.
+    std::optional<std::string> winner;
+    {
+        auto sel = prepare(db_,
+            "SELECT event_id, content FROM events "
+            "WHERE room_id = ? AND event_type = 'm.room.message' AND redacted_by IS NULL "
+            "  AND content LIKE '%' || ? || '%' "
+            "ORDER BY stream_position DESC");
+        sqlite3_bind_text(sel.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(sel.get(), 2, target_event_id.c_str(), -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(sel.get()) == SQLITE_ROW) {
+            auto content = nlohmann::json::parse(column_text_or_empty(sel.get(), 1), nullptr, false);
+            if (content.is_discarded() || !content.is_object()) continue;
+            auto rel = content.find("m.relates_to");
+            if (rel == content.end() || !rel->is_object()) continue;
+            if (rel->value("rel_type", "") != "m.replace") continue;
+            if (rel->value("event_id", "") != target_event_id) continue;
+            winner = column_text_or_empty(sel.get(), 0);
+            break;
+        }
     }
-    ev.content.data = nlohmann::json::parse(
-        reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 5)));
-    ev.origin_server_ts = sqlite3_column_int64(stmt.get(), 6);
-    return ev;
+
+    auto upd = prepare(db_, "UPDATE events SET edited_by = ? WHERE event_id = ?");
+    if (winner) {
+        sqlite3_bind_text(upd.get(), 1, winner->c_str(), -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(upd.get(), 1);
+    }
+    sqlite3_bind_text(upd.get(), 2, target_event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(upd.get());
+}
+
+bool SqliteStore::redact_event(const std::string& event_id, const std::string& redacted_by) {
+    std::lock_guard lock(mutex_);
+
+    // Capture the relation before the content is stripped: if this event is
+    // itself a replacement, its target has to be re-resolved afterwards.
+    std::string room_id;
+    std::optional<std::string> replaced_target;
+    {
+        auto sel = prepare(db_, "SELECT room_id, content FROM events WHERE event_id = ?");
+        sqlite3_bind_text(sel.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(sel.get()) != SQLITE_ROW) return false;
+        room_id = column_text_or_empty(sel.get(), 0);
+        auto content = nlohmann::json::parse(column_text_or_empty(sel.get(), 1), nullptr, false);
+        if (!content.is_discarded() && content.is_object()) {
+            auto rel = content.find("m.relates_to");
+            if (rel != content.end() && rel->is_object() &&
+                rel->value("rel_type", "") == "m.replace") {
+                auto target = rel->value("event_id", "");
+                if (!target.empty()) replaced_target = target;
+            }
+        }
+    }
+
+    // Matrix redaction: the event row survives as a tombstone (same id, type,
+    // sender and timestamp) but its content is stripped. Previously the server
+    // only appended an m.room.redaction event and left the original intact, so
+    // "deleted" messages were still fully readable from /rooms/{id}/messages.
+    //
+    // edited_by is cleared in the same statement: deleting a message that had
+    // been edited must not leave the edit behind to be resolved back into view.
+    auto stmt = prepare(db_,
+        "UPDATE events SET content = '{}', edited_by = NULL, redacted_by = ? "
+        "WHERE event_id = ? AND redacted_by IS NULL");
+    sqlite3_bind_text(stmt.get(), 1, redacted_by.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+    const bool newly_redacted = sqlite3_changes(db_) > 0;
+
+    // A redacted message must stop badging anybody: its content is gone, so a
+    // mention inside it can no longer be read and must not keep a highlight lit.
+    // Inlined rather than calling delete_mentions_for_event() — mutex_ is
+    // already held here.
+    if (newly_redacted) {
+        auto del = prepare(db_, "DELETE FROM event_mentions WHERE event_id = ?");
+        sqlite3_bind_text(del.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(del.get());
+    }
+
+    // Deleting an edit rolls its target back to the newest edit that survives,
+    // or to the pristine original when none does.
+    if (newly_redacted && replaced_target) {
+        reresolve_edit_locked(room_id, *replaced_target);
+        // ...and search follows it back, so a deleted edit's words stop matching
+        // and the surviving text starts matching again.
+        refresh_search_for_event_locked(*replaced_target);
+    }
+    // Redacted content must not be searchable. refresh_ recomputes to "nothing"
+    // because the row now has redacted_by set.
+    if (newly_redacted) refresh_search_for_event_locked(event_id);
+    return true; // the row exists; already-redacted counts as success
+}
+
+std::optional<std::string> SqliteStore::get_transaction_event(const std::string& user_id,
+                                                               const std::string& txn_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT event_id FROM event_transactions WHERE user_id = ? AND txn_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, txn_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        return reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+    }
+    return std::nullopt;
+}
+
+void SqliteStore::record_transaction(const std::string& user_id, const std::string& txn_id,
+                                      const std::string& event_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "INSERT OR IGNORE INTO event_transactions (user_id, txn_id, event_id) VALUES (?, ?, ?)");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, txn_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+}
+
+std::optional<std::string> SqliteStore::set_server_state(const std::string& event_type,
+                                                          const std::string& state_key,
+                                                          const std::string& sender,
+                                                          const std::string& content_json) {
+    std::lock_guard lock(mutex_);
+
+    // The content about to be replaced, read under the same lock as the write so
+    // the caller's audit record cannot attribute a "before" that another writer
+    // already overwrote. Inlined rather than calling get_server_state(), which
+    // would deadlock on the same non-recursive mutex.
+    std::optional<std::string> previous;
+    {
+        auto sel = prepare(db_,
+            "SELECT content FROM server_state WHERE event_type = ? AND state_key = ?");
+        sqlite3_bind_text(sel.get(), 1, event_type.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(sel.get(), 2, state_key.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(sel.get()) == SQLITE_ROW) {
+            previous = reinterpret_cast<const char*>(sqlite3_column_text(sel.get(), 0));
+        }
+    }
+
+    auto stmt = prepare(db_,
+        "INSERT INTO server_state (event_type, state_key, sender, content, updated_at) "
+        "VALUES (?, ?, ?, ?, strftime('%s','now') * 1000) "
+        "ON CONFLICT(event_type, state_key) DO UPDATE SET "
+        "  sender = excluded.sender, content = excluded.content, updated_at = excluded.updated_at");
+    sqlite3_bind_text(stmt.get(), 1, event_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, state_key.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, sender.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, content_json.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+    return previous;
+}
+
+std::optional<std::string> SqliteStore::get_server_state(const std::string& event_type,
+                                                          const std::string& state_key) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT content FROM server_state WHERE event_type = ? AND state_key = ?");
+    sqlite3_bind_text(stmt.get(), 1, event_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, state_key.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        return reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> SqliteStore::get_meta(const std::string& key) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT value FROM server_meta WHERE key = ?");
+    sqlite3_bind_text(stmt.get(), 1, key.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        return reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+    }
+    return std::nullopt;
+}
+
+void SqliteStore::set_meta(const std::string& key, const std::string& value) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "INSERT INTO server_meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+    sqlite3_bind_text(stmt.get(), 1, key.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, value.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
 }
 
 std::optional<RoomEvent> SqliteStore::get_state_event(const std::string& room_id,
@@ -567,13 +1173,17 @@ std::optional<RoomEvent> SqliteStore::get_state_event(const std::string& room_id
 
 // Sync
 
-std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id, int64_t since_position, int limit) {
+std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id, int64_t since_position,
+                                                     int64_t& out_max_position, int limit) {
     std::lock_guard lock(mutex_);
 
+    out_max_position = since_position;
+
     auto stmt = prepare(db_,
-        "SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content, e.origin_server_ts "
+        std::string("SELECT ") + kEventColumns + ", e.stream_position "
         "FROM events e "
-        "INNER JOIN room_members rm ON e.room_id = rm.room_id AND rm.user_id = ? AND rm.membership = 'join' "
+        "INNER JOIN room_members rm ON e.room_id = rm.room_id AND rm.user_id = ? AND rm.membership = 'join' " +
+        kEditJoin +
         "WHERE e.stream_position > ? "
         "ORDER BY e.stream_position ASC "
         "LIMIT ?");
@@ -583,27 +1193,24 @@ std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id,
 
     std::vector<RoomEvent> events;
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-        RoomEvent ev;
-        ev.event_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
-        ev.room_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
-        ev.sender = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 2));
-        ev.type = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 3));
-        if (sqlite3_column_type(stmt.get(), 4) != SQLITE_NULL) {
-            ev.state_key = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 4));
-        }
-        ev.content.data = nlohmann::json::parse(
-            reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 5)));
-        ev.origin_server_ts = sqlite3_column_int64(stmt.get(), 6);
-        events.push_back(std::move(ev));
+        out_max_position = std::max(out_max_position, sqlite3_column_int64(stmt.get(), 11));
+        events.push_back(read_event_row(stmt.get()));
     }
     return events;
 }
 
+std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id, int64_t since_position,
+                                                     int limit) {
+    int64_t ignored = since_position;
+    return get_events_since(user_id, since_position, ignored, limit);
+}
+
 int64_t SqliteStore::get_current_stream_position() {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "SELECT COALESCE(MAX(stream_position), 0) FROM events");
-    sqlite3_step(stmt.get());
-    return sqlite3_column_int64(stmt.get(), 0);
+    // The highest position ever issued, NOT MAX(stream_position) — deleting a
+    // room must not rewind the stream head under clients that already hold a
+    // token past it.
+    return next_stream_position_ - 1;
 }
 
 int64_t SqliteStore::get_room_max_stream_position(const std::string& room_id) {
@@ -645,10 +1252,20 @@ int64_t SqliteStore::get_read_marker(const std::string& user_id, const std::stri
 
 int SqliteStore::count_unread(const std::string& user_id, const std::string& room_id) {
     std::lock_guard lock(mutex_);
+    // `replaces IS NULL` — an m.replace replacement is a rewrite of a message
+    // the reader has already been told about, not a new message. Without this,
+    // anyone editing their own text bumped the unread badge for every other
+    // member of the room.
+    //
+    // `redacted_by IS NULL` — the same bug in the other direction: a deleted
+    // message kept its badge lit forever, inviting the reader to open a room to
+    // find content that no longer exists.
     auto stmt = prepare(db_,
         "SELECT COUNT(*) FROM events "
         "WHERE room_id = ? AND event_type = 'm.room.message' "
         "AND sender != ? "
+        "AND replaces IS NULL "
+        "AND redacted_by IS NULL "
         "AND stream_position > COALESCE("
         "  (SELECT last_read_pos FROM read_markers WHERE user_id = ? AND room_id = ?), 0)");
     sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -661,20 +1278,118 @@ int SqliteStore::count_unread(const std::string& user_id, const std::string& roo
     return 0;
 }
 
+// Mentions
+//
+// Every write here originates from the send path, which has already established
+// that (a) `sender` is the authenticated user and (b) each mentioned user is a
+// joined member of the room with VIEW_CHANNEL. There is no handler that lets a
+// client name the `sender` of a mention, which is what makes the badge
+// unforgeable.
+
+void SqliteStore::record_mentions(const std::string& event_id, const std::string& room_id,
+                                  const std::string& sender, int64_t stream_position,
+                                  const std::vector<std::string>& mentioned_user_ids) {
+    if (mentioned_user_ids.empty()) return;
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "INSERT OR IGNORE INTO event_mentions "
+        "  (event_id, room_id, user_id, sender, stream_position) VALUES (?, ?, ?, ?, ?)");
+    for (const auto& target : mentioned_user_ids) {
+        if (target.empty()) continue;
+        // Mentioning yourself must never badge your own room. Enforced here as
+        // well as at extraction time so the invariant holds for every caller.
+        if (target == sender) continue;
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+        sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 3, target.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 4, sender.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt.get(), 5, stream_position);
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            throw std::runtime_error(std::string("Failed to record mention: ") +
+                                     sqlite3_errmsg(db_));
+        }
+    }
+}
+
+std::vector<std::string> SqliteStore::get_event_mentions(const std::string& event_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT user_id FROM event_mentions WHERE event_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    std::vector<std::string> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        out.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)));
+    }
+    return out;
+}
+
+void SqliteStore::delete_mentions_for_event(const std::string& event_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "DELETE FROM event_mentions WHERE event_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+}
+
+int SqliteStore::count_unread_mentions(const std::string& user_id, const std::string& room_id) {
+    std::lock_guard lock(mutex_);
+    // Pure index range scan on idx_event_mentions_target — no join back to
+    // events, because stream_position is denormalised onto the mention row.
+    // `user_id IN (?, '@room')` picks up both a direct mention and a room-wide
+    // one; `sender != ?` drops mentions the reader made themselves.
+    auto stmt = prepare(db_,
+        "SELECT COUNT(*) FROM event_mentions "
+        "WHERE room_id = ? AND user_id IN (?, ?) AND sender != ? "
+        "AND stream_position > COALESCE("
+        "  (SELECT last_read_pos FROM read_markers WHERE user_id = ? AND room_id = ?), 0)");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, kRoomMentionSentinel, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt.get(), 4, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 5, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 6, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        return sqlite3_column_int(stmt.get(), 0);
+    }
+    return 0;
+}
+
+std::map<std::string, int> SqliteStore::get_unread_mention_counts(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    // One grouped query for every room, rather than count_unread_mentions() in a
+    // loop: /sync asks about every joined room on every poll, and each of those
+    // calls would serialise behind this store's single global mutex.
+    auto stmt = prepare(db_,
+        "SELECT m.room_id, COUNT(*) FROM event_mentions m "
+        "WHERE m.user_id IN (?, ?) AND m.sender != ? "
+        "AND m.stream_position > COALESCE("
+        "  (SELECT last_read_pos FROM read_markers r "
+        "   WHERE r.user_id = ? AND r.room_id = m.room_id), 0) "
+        "GROUP BY m.room_id");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, kRoomMentionSentinel, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt.get(), 3, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, user_id.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::map<std::string, int> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        out.emplace(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)),
+                    sqlite3_column_int(stmt.get(), 1));
+    }
+    return out;
+}
+
 // Permissions / roles
 
 std::vector<ServerRole> SqliteStore::get_server_roles() {
-    std::lock_guard lock(mutex_);
-    // Latest bsfchat.server.roles event globally (regardless of room).
-    std::string type(event_type::kServerRoles);
-    auto stmt = prepare(db_,
-        "SELECT content FROM events "
-        "WHERE event_type = ? AND state_key = '' "
-        "ORDER BY stream_position DESC LIMIT 1");
-    sqlite3_bind_text(stmt.get(), 1, type.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return {};
-    auto json = nlohmann::json::parse(
-        reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)), nullptr, false);
+    // Reads server_state (primary-key lookup), not events. The old query
+    // filtered events on (event_type, state_key) with no room_id, which the
+    // only usable index — (room_id, event_type, state_key) — could not serve,
+    // so every permission check full-scanned and sorted the entire events
+    // table under the store's single global mutex.
+    auto content_json = get_server_state(std::string(event_type::kServerRoles), "");
+    if (!content_json) return {};
+    auto json = nlohmann::json::parse(*content_json, nullptr, false);
     if (json.is_discarded()) return {};
     ServerRolesContent content;
     from_json(json, content);
@@ -682,17 +1397,9 @@ std::vector<ServerRole> SqliteStore::get_server_roles() {
 }
 
 std::vector<std::string> SqliteStore::get_member_role_ids(const std::string& user_id) {
-    std::lock_guard lock(mutex_);
-    std::string type(event_type::kMemberRoles);
-    auto stmt = prepare(db_,
-        "SELECT content FROM events "
-        "WHERE event_type = ? AND state_key = ? "
-        "ORDER BY stream_position DESC LIMIT 1");
-    sqlite3_bind_text(stmt.get(), 1, type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return {};
-    auto json = nlohmann::json::parse(
-        reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)), nullptr, false);
+    auto content_json = get_server_state(std::string(event_type::kMemberRoles), user_id);
+    if (!content_json) return {};
+    auto json = nlohmann::json::parse(*content_json, nullptr, false);
     if (json.is_discarded()) return {};
     MemberRolesContent content;
     from_json(json, content);
@@ -770,6 +1477,598 @@ std::vector<std::pair<std::string, int64_t>> SqliteStore::list_users_with_create
             sqlite3_column_int64(stmt.get(), 1));
     }
     return out;
+}
+
+// ── Message search (FTS5, external content over event_search) ─────────────
+
+bool SqliteStore::fts5_available_locked() {
+    if (fts5_available_ < 0) {
+        auto stmt = prepare(db_,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'event_search_fts'");
+        fts5_available_ = (sqlite3_step(stmt.get()) == SQLITE_ROW &&
+                           sqlite3_column_int(stmt.get(), 0) > 0) ? 1 : 0;
+    }
+    return fts5_available_ == 1;
+}
+
+bool SqliteStore::search_index_available() {
+    std::lock_guard lock(mutex_);
+    return fts5_available_locked();
+}
+
+void SqliteStore::reindex_search_locked(const std::string& event_id, const std::string& room_id,
+                                        const std::string& sender, int64_t stream_position,
+                                        const std::optional<std::string>& body) {
+    const bool fts5 = fts5_available_locked();
+
+    // Existing shadow row, if any. Its rowid and OLD body are both required: an
+    // external-content FTS5 index is told to forget a document by replaying the
+    // exact text it was indexed with.
+    std::optional<int64_t> existing_rowid;
+    std::string old_body;
+    {
+        auto sel = prepare(db_, "SELECT rowid, body FROM event_search WHERE event_id = ?");
+        sqlite3_bind_text(sel.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(sel.get()) == SQLITE_ROW) {
+            existing_rowid = sqlite3_column_int64(sel.get(), 0);
+            old_body = column_text_or_empty(sel.get(), 1);
+        }
+    }
+
+    auto forget = [&](int64_t rowid, const std::string& text) {
+        if (!fts5) return;
+        auto del = prepare(db_,
+            "INSERT INTO event_search_fts (event_search_fts, rowid, body) "
+            "VALUES ('delete', ?, ?)");
+        sqlite3_bind_int64(del.get(), 1, rowid);
+        sqlite3_bind_text(del.get(), 2, text.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(del.get());
+    };
+    auto remember = [&](int64_t rowid, const std::string& text) {
+        if (!fts5) return;
+        auto ins = prepare(db_, "INSERT INTO event_search_fts (rowid, body) VALUES (?, ?)");
+        sqlite3_bind_int64(ins.get(), 1, rowid);
+        sqlite3_bind_text(ins.get(), 2, text.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(ins.get());
+    };
+
+    const bool want_indexed = body.has_value() && !body->empty();
+
+    if (existing_rowid && !want_indexed) {
+        // Removal: redacted, or edited down to nothing.
+        forget(*existing_rowid, old_body);
+        auto del = prepare(db_, "DELETE FROM event_search WHERE rowid = ?");
+        sqlite3_bind_int64(del.get(), 1, *existing_rowid);
+        sqlite3_step(del.get());
+        return;
+    }
+    if (!want_indexed) return;
+
+    if (existing_rowid) {
+        if (old_body == *body) return; // nothing changed
+        forget(*existing_rowid, old_body);
+        auto upd = prepare(db_,
+            "UPDATE event_search SET room_id = ?, sender = ?, stream_position = ?, body = ? "
+            "WHERE rowid = ?");
+        sqlite3_bind_text(upd.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(upd.get(), 2, sender.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(upd.get(), 3, stream_position);
+        sqlite3_bind_text(upd.get(), 4, body->c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(upd.get(), 5, *existing_rowid);
+        sqlite3_step(upd.get());
+        remember(*existing_rowid, *body);
+        return;
+    }
+
+    auto ins = prepare(db_,
+        "INSERT INTO event_search (event_id, room_id, sender, stream_position, body) "
+        "VALUES (?, ?, ?, ?, ?)");
+    sqlite3_bind_text(ins.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins.get(), 3, sender.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(ins.get(), 4, stream_position);
+    sqlite3_bind_text(ins.get(), 5, body->c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+        throw std::runtime_error(std::string("Failed to index message for search: ") +
+                                 sqlite3_errmsg(db_));
+    }
+    remember(sqlite3_last_insert_rowid(db_), *body);
+}
+
+void SqliteStore::refresh_search_for_event_locked(const std::string& event_id) {
+    // Read the event's current state and derive what should be searchable:
+    // nothing if it is redacted or is itself a replacement, otherwise the
+    // resolved (post-edit) body.
+    std::string room_id;
+    std::string sender;
+    int64_t stream_position = 0;
+    std::string own_content;
+    bool redacted = false;
+    bool is_replacement = false;
+    std::string edited_by;
+    {
+        auto sel = prepare(db_,
+            "SELECT room_id, sender, stream_position, content, redacted_by, replaces, edited_by "
+            "FROM events WHERE event_id = ?");
+        sqlite3_bind_text(sel.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(sel.get()) != SQLITE_ROW) {
+            reindex_search_locked(event_id, "", "", 0, std::nullopt);
+            return;
+        }
+        room_id = column_text_or_empty(sel.get(), 0);
+        sender = column_text_or_empty(sel.get(), 1);
+        stream_position = sqlite3_column_int64(sel.get(), 2);
+        own_content = column_text_or_empty(sel.get(), 3);
+        redacted = sqlite3_column_type(sel.get(), 4) != SQLITE_NULL;
+        is_replacement = sqlite3_column_type(sel.get(), 5) != SQLITE_NULL;
+        if (sqlite3_column_type(sel.get(), 6) != SQLITE_NULL) {
+            edited_by = column_text_or_empty(sel.get(), 6);
+        }
+    }
+
+    // A replacement is not its own search result — it would be a duplicate hit
+    // for a message that already has one.
+    if (redacted || is_replacement) {
+        reindex_search_locked(event_id, room_id, sender, stream_position, std::nullopt);
+        return;
+    }
+
+    std::string body;
+    if (!edited_by.empty()) {
+        // Resolve through the winning replacement so search matches what the
+        // timeline currently shows, not the pristine original.
+        auto sel = prepare(db_,
+            "SELECT content FROM events WHERE event_id = ? AND redacted_by IS NULL");
+        sqlite3_bind_text(sel.get(), 1, edited_by.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(sel.get()) == SQLITE_ROW) {
+            auto rep = nlohmann::json::parse(column_text_or_empty(sel.get(), 0), nullptr, false);
+            auto resolved = replacement_content(rep);
+            if (resolved.is_object()) body = resolved.value("body", "");
+        }
+    }
+    if (body.empty()) {
+        auto content = nlohmann::json::parse(own_content, nullptr, false);
+        if (!content.is_discarded() && content.is_object()) body = content.value("body", "");
+    }
+    reindex_search_locked(event_id, room_id, sender, stream_position,
+                          body.empty() ? std::nullopt : std::optional<std::string>(body));
+}
+
+SqliteStore::SearchResult
+SqliteStore::search_messages(const std::vector<std::string>& room_ids,
+                             const std::vector<std::string>& terms,
+                             const std::vector<std::string>& senders,
+                             int limit, int offset, bool order_recent) {
+    SearchResult result;
+    // Fail closed. An empty permitted-room set must return nothing, never
+    // degenerate into an unrestricted search.
+    if (room_ids.empty() || terms.empty()) return result;
+    if (limit < 1) limit = 1;
+    if (offset < 0) offset = 0;
+
+    std::lock_guard lock(mutex_);
+    if (!fts5_available_locked()) return result;
+
+    // Build the MATCH expression from bare terms, each wrapped as a quoted FTS5
+    // phrase. Quoting is what makes this safe: inside double quotes FTS5 treats
+    // the contents as literal text, so no term can become an operator. Embedded
+    // quotes are escaped by doubling, per FTS5's string literal rules.
+    std::string match;
+    for (const auto& term : terms) {
+        if (!match.empty()) match += " AND ";
+        match += '"';
+        for (char c : term) {
+            if (c == '"') match += "\"\"";
+            else match += c;
+        }
+        match += '"';
+    }
+
+    auto placeholders = [](size_t n) {
+        std::string s;
+        for (size_t i = 0; i < n; ++i) s += (i ? ",?" : "?");
+        return s;
+    };
+
+    std::string where =
+        " FROM event_search_fts f "
+        "INNER JOIN event_search s ON s.rowid = f.rowid "
+        "WHERE f.event_search_fts MATCH ? "
+        "  AND s.room_id IN (" + placeholders(room_ids.size()) + ")";
+    if (!senders.empty()) {
+        where += " AND s.sender IN (" + placeholders(senders.size()) + ")";
+    }
+
+    auto bind_common = [&](sqlite3_stmt* stmt) {
+        int i = 1;
+        sqlite3_bind_text(stmt, i++, match.c_str(), -1, SQLITE_TRANSIENT);
+        for (const auto& r : room_ids) {
+            sqlite3_bind_text(stmt, i++, r.c_str(), -1, SQLITE_TRANSIENT);
+        }
+        for (const auto& s : senders) {
+            sqlite3_bind_text(stmt, i++, s.c_str(), -1, SQLITE_TRANSIENT);
+        }
+        return i;
+    };
+
+    // FTS5 reports a bad MATCH expression at STEP time, not at prepare time. A
+    // plain `while (step() == SQLITE_ROW)` therefore turns any such error into a
+    // silent empty result set — indistinguishable from "nothing matched", which
+    // would have hidden a broken query behind a plausible-looking answer. Check
+    // explicitly and throw so the handler can answer honestly.
+    auto step_checked = [&](sqlite3_stmt* stmt) {
+        int rc = sqlite3_step(stmt);
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+            throw std::runtime_error(std::string("search query failed: ") + sqlite3_errmsg(db_));
+        }
+        return rc == SQLITE_ROW;
+    };
+
+    {
+        auto stmt = prepare(db_, "SELECT COUNT(*)" + where);
+        bind_common(stmt.get());
+        if (step_checked(stmt.get())) {
+            result.total = sqlite3_column_int(stmt.get(), 0);
+        }
+    }
+
+    // bm25() is ascending-better (more negative = stronger match), so "rank"
+    // order is plain ASC. Ties broken by recency so paging is stable.
+    const std::string order = order_recent
+        ? " ORDER BY s.stream_position DESC "
+        : " ORDER BY bm25(f.event_search_fts) ASC, s.stream_position DESC ";
+
+    auto stmt = prepare(db_,
+        "SELECT s.event_id, s.room_id, s.stream_position, bm25(f.event_search_fts)" + where +
+        order + "LIMIT ? OFFSET ?");
+    int i = bind_common(stmt.get());
+    sqlite3_bind_int(stmt.get(), i++, limit);
+    sqlite3_bind_int(stmt.get(), i, offset);
+
+    while (step_checked(stmt.get())) {
+        SearchHit hit;
+        hit.event_id = column_text_or_empty(stmt.get(), 0);
+        hit.room_id = column_text_or_empty(stmt.get(), 1);
+        hit.stream_position = sqlite3_column_int64(stmt.get(), 2);
+        hit.rank = sqlite3_column_double(stmt.get(), 3);
+        result.hits.push_back(std::move(hit));
+    }
+    result.more = offset + static_cast<int>(result.hits.size()) < result.total;
+    return result;
+}
+
+int SqliteStore::count_search_index_rows() {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT COUNT(*) FROM event_search");
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) return sqlite3_column_int(stmt.get(), 0);
+    return 0;
+}
+
+// ── Push notifications ────────────────────────────────────────────────────
+
+namespace {
+
+SqliteStore::Pusher read_pusher_row(sqlite3_stmt* stmt) {
+    SqliteStore::Pusher p;
+    p.user_id = column_text_or_empty(stmt, 0);
+    p.app_id = column_text_or_empty(stmt, 1);
+    p.pushkey = column_text_or_empty(stmt, 2);
+    p.device_id = column_text_or_empty(stmt, 3);
+    p.kind = column_text_or_empty(stmt, 4);
+    p.app_display_name = column_text_or_empty(stmt, 5);
+    p.device_display_name = column_text_or_empty(stmt, 6);
+    p.profile_tag = column_text_or_empty(stmt, 7);
+    p.lang = column_text_or_empty(stmt, 8);
+    p.url = column_text_or_empty(stmt, 9);
+    p.format = column_text_or_empty(stmt, 10);
+    p.data_json = column_text_or_empty(stmt, 11);
+    return p;
+}
+
+constexpr const char* kPusherColumns =
+    "user_id, app_id, pushkey, device_id, kind, app_display_name, "
+    "device_display_name, profile_tag, lang, url, format, data";
+
+} // namespace
+
+void SqliteStore::upsert_pusher(const Pusher& p) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "INSERT INTO pushers (user_id, app_id, pushkey, device_id, kind, app_display_name, "
+        "  device_display_name, profile_tag, lang, url, format, data) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(user_id, app_id, pushkey) DO UPDATE SET "
+        "  device_id = excluded.device_id, kind = excluded.kind, "
+        "  app_display_name = excluded.app_display_name, "
+        "  device_display_name = excluded.device_display_name, "
+        "  profile_tag = excluded.profile_tag, lang = excluded.lang, "
+        "  url = excluded.url, format = excluded.format, data = excluded.data");
+    int i = 1;
+    for (const auto* v : {&p.user_id, &p.app_id, &p.pushkey, &p.device_id, &p.kind,
+                          &p.app_display_name, &p.device_display_name, &p.profile_tag,
+                          &p.lang, &p.url, &p.format, &p.data_json}) {
+        sqlite3_bind_text(stmt.get(), i++, v->c_str(), -1, SQLITE_TRANSIENT);
+    }
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        throw std::runtime_error(std::string("Failed to store pusher: ") + sqlite3_errmsg(db_));
+    }
+}
+
+std::vector<SqliteStore::Pusher> SqliteStore::get_pushers(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, std::string("SELECT ") + kPusherColumns +
+                             " FROM pushers WHERE user_id = ? ORDER BY created_at ASC");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    std::vector<Pusher> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) out.push_back(read_pusher_row(stmt.get()));
+    return out;
+}
+
+void SqliteStore::delete_pusher(const std::string& user_id, const std::string& app_id,
+                                const std::string& pushkey) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "DELETE FROM pushers WHERE user_id = ? AND app_id = ? AND pushkey = ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, app_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, pushkey.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+}
+
+int SqliteStore::delete_pushers_by_pushkey_except(const std::string& pushkey,
+                                                 const std::string& keep_user_id,
+                                                 const std::string& keep_app_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "DELETE FROM pushers WHERE pushkey = ? AND NOT (user_id = ? AND app_id = ?)");
+    sqlite3_bind_text(stmt.get(), 1, pushkey.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, keep_user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, keep_app_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+    return sqlite3_changes(db_);
+}
+
+int SqliteStore::delete_pushers_by_pushkey(const std::string& pushkey) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "DELETE FROM pushers WHERE pushkey = ?");
+    sqlite3_bind_text(stmt.get(), 1, pushkey.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+    return sqlite3_changes(db_);
+}
+
+std::vector<SqliteStore::Pusher>
+SqliteStore::list_room_pusher_candidates(const std::string& room_id,
+                                         const std::string& exclude_user) {
+    std::lock_guard lock(mutex_);
+    // Joining against room_members means the result is bounded by "members who
+    // registered a pusher", not by room size — a 5000-member channel where three
+    // people use mobile push costs three rows. `kind = 'http'` and a non-empty
+    // url filter out pushers that have nowhere to deliver to.
+    auto stmt = prepare(db_,
+        "SELECT p.user_id, p.app_id, p.pushkey, p.device_id, p.kind, p.app_display_name, "
+        "       p.device_display_name, p.profile_tag, p.lang, p.url, p.format, p.data "
+        "FROM pushers p "
+        "INNER JOIN room_members rm ON rm.user_id = p.user_id "
+        "WHERE rm.room_id = ? AND rm.membership = 'join' "
+        "  AND p.user_id != ? AND p.kind = 'http' AND p.url != ''");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, exclude_user.c_str(), -1, SQLITE_TRANSIENT);
+    std::vector<Pusher> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) out.push_back(read_pusher_row(stmt.get()));
+    return out;
+}
+
+std::map<std::string, std::string>
+SqliteStore::get_room_notify_levels(const std::string& room_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT user_id, level FROM room_notify_settings WHERE room_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    std::map<std::string, std::string> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        out.emplace(column_text_or_empty(stmt.get(), 0), column_text_or_empty(stmt.get(), 1));
+    }
+    return out;
+}
+
+std::optional<std::string> SqliteStore::get_room_notify_level(const std::string& user_id,
+                                                              const std::string& room_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT level FROM room_notify_settings WHERE user_id = ? AND room_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    return column_text_or_empty(stmt.get(), 0);
+}
+
+void SqliteStore::set_room_notify_level(const std::string& user_id, const std::string& room_id,
+                                        const std::string& level) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "INSERT INTO room_notify_settings (user_id, room_id, level, updated_at) "
+        "VALUES (?, ?, ?, strftime('%s','now') * 1000) "
+        "ON CONFLICT(user_id, room_id) DO UPDATE SET "
+        "  level = excluded.level, updated_at = excluded.updated_at");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, level.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+}
+
+void SqliteStore::enqueue_pushes(const std::vector<QueuedPush>& pushes) {
+    if (pushes.empty()) return;
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "INSERT INTO push_queue (user_id, app_id, pushkey, url, payload, next_attempt_at) "
+        "VALUES (?, ?, ?, ?, ?, 0)");
+    for (const auto& p : pushes) {
+        sqlite3_reset(stmt.get());
+        sqlite3_clear_bindings(stmt.get());
+        sqlite3_bind_text(stmt.get(), 1, p.user_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 2, p.app_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 3, p.pushkey.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 4, p.url.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 5, p.payload.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            throw std::runtime_error(std::string("Failed to enqueue push: ") +
+                                     sqlite3_errmsg(db_));
+        }
+    }
+}
+
+std::vector<SqliteStore::QueuedPush>
+SqliteStore::claim_due_pushes(int64_t now_ms, int limit, int64_t lease_ms) {
+    std::lock_guard lock(mutex_);
+
+    std::vector<QueuedPush> out;
+    {
+        auto stmt = prepare(db_,
+            "SELECT id, user_id, app_id, pushkey, url, payload, attempts FROM push_queue "
+            "WHERE next_attempt_at <= ? ORDER BY id ASC LIMIT ?");
+        sqlite3_bind_int64(stmt.get(), 1, now_ms);
+        sqlite3_bind_int(stmt.get(), 2, limit);
+        while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+            QueuedPush q;
+            q.id = sqlite3_column_int64(stmt.get(), 0);
+            q.user_id = column_text_or_empty(stmt.get(), 1);
+            q.app_id = column_text_or_empty(stmt.get(), 2);
+            q.pushkey = column_text_or_empty(stmt.get(), 3);
+            q.url = column_text_or_empty(stmt.get(), 4);
+            q.payload = column_text_or_empty(stmt.get(), 5);
+            q.attempts = sqlite3_column_int(stmt.get(), 6);
+            out.push_back(std::move(q));
+        }
+    }
+    if (out.empty()) return out;
+
+    // Lease the claimed rows. Without this a crash (or simply a slow gateway
+    // alongside a second worker) could hand the same row out twice; with it the
+    // row becomes invisible until the lease lapses and is then retried.
+    auto upd = prepare(db_, "UPDATE push_queue SET next_attempt_at = ? WHERE id = ?");
+    for (const auto& q : out) {
+        sqlite3_reset(upd.get());
+        sqlite3_bind_int64(upd.get(), 1, now_ms + lease_ms);
+        sqlite3_bind_int64(upd.get(), 2, q.id);
+        sqlite3_step(upd.get());
+    }
+    return out;
+}
+
+void SqliteStore::delete_queued_push(int64_t id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "DELETE FROM push_queue WHERE id = ?");
+    sqlite3_bind_int64(stmt.get(), 1, id);
+    sqlite3_step(stmt.get());
+}
+
+bool SqliteStore::reschedule_queued_push(int64_t id, int max_attempts, int64_t next_attempt_at) {
+    std::lock_guard lock(mutex_);
+    {
+        auto upd = prepare(db_,
+            "UPDATE push_queue SET attempts = attempts + 1, next_attempt_at = ? WHERE id = ?");
+        sqlite3_bind_int64(upd.get(), 1, next_attempt_at);
+        sqlite3_bind_int64(upd.get(), 2, id);
+        sqlite3_step(upd.get());
+    }
+    auto del = prepare(db_, "DELETE FROM push_queue WHERE id = ? AND attempts >= ?");
+    sqlite3_bind_int64(del.get(), 1, id);
+    sqlite3_bind_int(del.get(), 2, max_attempts);
+    sqlite3_step(del.get());
+    return sqlite3_changes(db_) == 0; // still queued?
+}
+
+int SqliteStore::count_queued_pushes() {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT COUNT(*) FROM push_queue");
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) return sqlite3_column_int(stmt.get(), 0);
+    return 0;
+}
+
+// ── Moderation audit log ──────────────────────────────────────────────────
+//
+// One INSERT and one SELECT, and that is the complete surface: no UPDATE, no
+// DELETE, no "fix up a record" helper. See the header for why retention is
+// unbounded, and migration v13 for the triggers that make append-only a property
+// of the database rather than of this file.
+
+int64_t SqliteStore::append_audit_record(const AuditRecord& record) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "INSERT INTO audit_log "
+        "  (created_at, actor, action, target_user, target_room, target_key, reason, "
+        "   before_json, after_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    const int64_t created_at = record.created_at != 0 ? record.created_at : audit_now_ms();
+    sqlite3_bind_int64(stmt.get(), 1, created_at);
+    sqlite3_bind_text(stmt.get(), 2, record.actor.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, record.action.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, record.target_user.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 5, record.target_room.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 6, record.target_key.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 7, record.reason.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 8, record.before_json.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 9, record.after_json.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        // Deliberately fatal to the request rather than swallowed. An audited
+        // action whose record could not be written must not quietly succeed as if
+        // it had been logged.
+        throw std::runtime_error(std::string("Failed to append audit record: ") +
+                                 sqlite3_errmsg(db_));
+    }
+    return sqlite3_last_insert_rowid(db_);
+}
+
+SqliteStore::AuditPage SqliteStore::list_audit_records(int limit,
+                                                       std::optional<int64_t> before_id) {
+    std::lock_guard lock(mutex_);
+    if (limit < 1) limit = 1;
+
+    AuditPage page;
+
+    // Over-fetch one row to learn whether a further page exists without a second
+    // query — the same trick get_room_events_paginated uses.
+    std::string sql =
+        "SELECT id, created_at, actor, action, target_user, target_room, target_key, "
+        "       reason, before_json, after_json FROM audit_log ";
+    if (before_id) sql += "WHERE id < ? ";
+    sql += "ORDER BY id DESC LIMIT ?";
+
+    auto stmt = prepare(db_, sql);
+    int bind_index = 1;
+    if (before_id) sqlite3_bind_int64(stmt.get(), bind_index++, *before_id);
+    sqlite3_bind_int(stmt.get(), bind_index, limit + 1);
+
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        AuditRecord r;
+        r.id = sqlite3_column_int64(stmt.get(), 0);
+        r.created_at = sqlite3_column_int64(stmt.get(), 1);
+        r.actor = column_text_or_empty(stmt.get(), 2);
+        r.action = column_text_or_empty(stmt.get(), 3);
+        r.target_user = column_text_or_empty(stmt.get(), 4);
+        r.target_room = column_text_or_empty(stmt.get(), 5);
+        r.target_key = column_text_or_empty(stmt.get(), 6);
+        r.reason = column_text_or_empty(stmt.get(), 7);
+        r.before_json = column_text_or_empty(stmt.get(), 8);
+        r.after_json = column_text_or_empty(stmt.get(), 9);
+        page.records.push_back(std::move(r));
+    }
+
+    if (page.records.size() > static_cast<size_t>(limit)) {
+        page.records.pop_back();
+        // Exclusive cursor: the next page is everything strictly older than the
+        // last row we are returning, so no record can be served twice or skipped.
+        page.next_from = page.records.back().id;
+    }
+
+    // Growth visibility. Unbounded retention is a decision, not an oversight, so
+    // the number an operator would need in order to revisit it is in every
+    // response rather than only in the database.
+    auto count = prepare(db_, "SELECT COUNT(*) FROM audit_log");
+    if (sqlite3_step(count.get()) == SQLITE_ROW) {
+        page.total = sqlite3_column_int64(count.get(), 0);
+    }
+    return page;
 }
 
 // Profile

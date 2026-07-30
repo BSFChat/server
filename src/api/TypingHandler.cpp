@@ -26,7 +26,7 @@ void TypingHandler::handle_typing(const httplib::Request& req, httplib::Response
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
         res.status = 401;
-        res.set_content(MatrixError::missing_token().to_json().dump(), "application/json");
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
         return;
     }
 
@@ -94,8 +94,11 @@ void TypingHandler::handle_typing(const httplib::Request& req, httplib::Response
         }
     }
 
-    // Wake sync waiters so they pick up the typing change
-    sync_engine_.notify_new_event();
+    // Wake sync waiters so they pick up the typing change. This must be the
+    // ephemeral notifier: no event was inserted, so notify_new_event() would
+    // re-read an unchanged stream position and the waiter's predicate would
+    // stay false — typing stayed invisible until the 30s poll expired.
+    sync_engine_.notify_ephemeral();
 
     res.status = 200;
     res.set_content("{}", "application/json");

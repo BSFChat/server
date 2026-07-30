@@ -1,4 +1,27 @@
+# Build directories (CMake out-of-tree). `build-*/` covers the throwaway
+# trees people actually use — build-fix/, build-sec/, build-asan/ — which
+# were showing up as hundreds of megabytes of untracked noise in git status.
 build/
+build-*/
+
+# Local runtime state: sqlite databases, uploaded media, and dev keys.
+# Never commit — data/keys/ holds real private keys.
 data/
+
+# CMake incremental / tooling artefacts
 .cache/
+CMakeFiles/
+CMakeCache.txt
 compile_commands.json
+CMakeUserPresets.json
+
+# Local config with real secrets. Only config/*.example.toml is tracked.
+*.local.toml
+
+# Logs and editor noise
+*.log
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/

@@ -1,5 +1,6 @@
 #include "auth/RoleBootstrap.h"
 
+#include "audit/AuditLog.h"
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "store/SqliteStore.h"
@@ -25,16 +26,17 @@ std::string server_actor(const Config& config) {
     return "@server:" + config.server_name;
 }
 
-// Pick the room we write server-wide state into. Prefer a category room,
-// fall back to any room. Returns empty if no rooms exist yet.
-std::string pick_canonical_room(SqliteStore& store) {
+// Room to MIRROR server-wide state into so clients pick it up on sync.
+//
+// This used to be where server-wide state actually LIVED, chosen as
+// list_all_non_category_rooms().front() — an unordered SQLite result. Since
+// delete_room hard-deletes every event in a room, deleting whichever channel
+// happened to come back first destroyed every role definition and assignment
+// server-wide. Authority now lives in the server_state table
+// (SqliteStore::set_server_state); this mirror is presentation only, and it
+// being absent or deleted costs nothing.
+std::string pick_mirror_room(SqliteStore& store) {
     auto non_cat = store.list_all_non_category_rooms();
-    // The difference between the full room list and non_cat gives us categories.
-    // But we don't have a direct "list categories" helper; use sqlite directly
-    // via a simpler path: get_joined_rooms across any user won't work either.
-    // Easiest: just pick the first non-category if categories are absent.
-    // For now, prefer the lowest-stream-position room (oldest).
-    // Actually we don't have that helper either — just return first non-cat.
     if (!non_cat.empty()) return non_cat.front();
     return {};
 }
@@ -78,38 +80,67 @@ ServerRolesContent default_roles() {
     return c;
 }
 
-void write_server_roles(SqliteStore& store, SyncEngine& sync_engine,
-                        const Config& config, const std::string& room_id) {
+void write_server_roles(SqliteStore& store, const Config& config,
+                        const std::string& mirror_room) {
     nlohmann::json j;
     to_json(j, default_roles());
-    auto event_id = generate_event_id(config.server_name);
-    store.insert_event(event_id, room_id, server_actor(config),
-                       std::string(event_type::kServerRoles),
-                       std::string(""), j.dump(), now_ms());
-    get_logger()->info("Seeded default server roles in room {}", room_id);
+    write_server_scoped_state(store, config, std::string(event_type::kServerRoles),
+                              std::string(""), j.dump(), mirror_room);
+    get_logger()->info("Seeded default server roles");
 }
 
 void write_member_roles(SqliteStore& store, const Config& config,
-                        const std::string& room_id, const std::string& user_id,
+                        const std::string& mirror_room, const std::string& user_id,
                         const std::vector<std::string>& role_ids) {
     MemberRolesContent c;
     c.role_ids = role_ids;
     nlohmann::json j;
     to_json(j, c);
-    auto event_id = generate_event_id(config.server_name);
-    store.insert_event(event_id, room_id, server_actor(config),
-                       std::string(event_type::kMemberRoles),
-                       user_id, j.dump(), now_ms());
+    write_server_scoped_state(store, config, std::string(event_type::kMemberRoles),
+                              user_id, j.dump(), mirror_room);
 }
 
 } // namespace
 
-void bootstrap_roles(SqliteStore& store, SyncEngine& sync_engine, const Config& config) {
-    auto canonical = pick_canonical_room(store);
-    if (canonical.empty()) {
-        get_logger()->info("bootstrap_roles: no rooms yet, skipping");
-        return;
+void write_server_scoped_state(SqliteStore& store, const Config& config,
+                                const std::string& evt_type, const std::string& state_key,
+                                const std::string& content_json,
+                                const std::string& mirror_room,
+                                const std::string& sender) {
+    const std::string actor = sender.empty() ? server_actor(config) : sender;
+
+    // Authoritative write — survives deletion of every room on the server. The
+    // content it replaced comes back from the same locked write, so the audit
+    // record below cannot name a "before" that a concurrent role edit had already
+    // overwritten.
+    auto previous = store.set_server_state(evt_type, state_key, actor, content_json);
+
+    // Audited HERE rather than in the handler, because this is the one choke point
+    // every role definition and role assignment write passes through — the
+    // permission handler, the startup bootstrap, and anything added later. A new
+    // call site cannot introduce an unaudited role change by forgetting to log.
+    // Bootstrap writes are recorded too, under the synthetic @server actor: "the
+    // server granted the first account Admin at bootstrap" is exactly the kind of
+    // thing an owner asking "how did they get admin?" needs to be able to see.
+    audit_server_scoped_change(store, actor, evt_type, state_key, previous, content_json);
+
+    // Best-effort mirror so clients, which learn about roles from sync state
+    // events, still see the change. Purely a delivery mechanism: no read path
+    // consults these events any more.
+    if (!mirror_room.empty() && store.room_exists(mirror_room)) {
+        auto event_id = generate_event_id(config.server_name);
+        store.insert_event(event_id, mirror_room, actor,
+                           evt_type, state_key, content_json, now_ms());
     }
+}
+
+void bootstrap_roles(SqliteStore& store, SyncEngine& sync_engine, const Config& config) {
+    // Note: no longer bails out when the server has no rooms. Role bootstrap
+    // used to require a room to write into, which deadlocked a fresh
+    // deployment now that channel creation itself requires MANAGE_CHANNELS —
+    // no rooms meant no roles, no roles meant nobody could create the first
+    // room. Server-wide state has its own home now, so this always works.
+    auto canonical = pick_mirror_room(store);
 
     // 1. Seed default server roles if missing OR if the existing event is
     // legacy-shape (pre-permissions, i.e. name/level/color only). Detect the
@@ -129,7 +160,7 @@ void bootstrap_roles(SqliteStore& store, SyncEngine& sync_engine, const Config& 
         }
     }
     if (needs_seed) {
-        write_server_roles(store, sync_engine, config, canonical);
+        write_server_roles(store, config, canonical);
     }
 
     // 2. Ensure every user has a member.roles event. First-registered user

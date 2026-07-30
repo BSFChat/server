@@ -28,6 +28,10 @@ int main(int argc, char* argv[]) {
         }
     } else {
         config = bsfchat::Config::defaults();
+        // Run the same validation/warning pass the file path gets, so a
+        // default-configured server still reports unusable combinations
+        // (e.g. voice enabled with no STUN/TURN) instead of failing silently.
+        bsfchat::Config::validate(config);
         log->info("Using default configuration");
     }
 

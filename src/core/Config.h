@@ -11,6 +11,11 @@ struct IdentityConfig {
     std::string provider_url;
     bool required = false;
     bool allow_local_accounts = true;
+    // Expected `aud` claim on identity tokens. Without an audience check, an
+    // ID token minted for ANY other OAuth client registered with the same
+    // identity provider is accepted as a chat login. Defaults to the id the
+    // shipped desktop client registers under.
+    std::string client_id = "bsfchat-desktop";
 };
 
 struct StorageS3Config {
@@ -40,7 +45,54 @@ struct VoiceConfig {
     std::string turn_secret;
     int64_t turn_ttl = 3600; // Ephemeral credential lifetime, seconds
     std::string stun_uri; // No default — admin should configure their own STUN/TURN
-    bool allow_peer_to_peer = false; // Default: TURN-only for IP privacy
+    // Was `false` ("TURN-only for IP privacy") while turn_uris/stun_uri
+    // defaulted to EMPTY and voice.enabled defaulted true — relay-only with
+    // zero relays, i.e. 100% voice failure on a fresh install. For a
+    // self-hosted product the sane default is working voice; an admin who
+    // deploys TURN and wants every call relayed sets this back to false.
+    // Config::load additionally warns loudly (and falls back to P2P) if this
+    // is false with no relay configured.
+    bool allow_peer_to_peer = true;
+};
+
+// Push notifications.
+//
+// Deployment note: this server is deliberately provider-agnostic. It speaks only
+// the Matrix push-gateway "notify" shape and POSTs it to whatever URL a client
+// registered on its pusher. A deployment that wants mobile push must run a push
+// gateway (sygnal or equivalent) holding the FCM/APNs credentials; none of those
+// credentials belong in this config, and none are read here.
+struct PushConfig {
+    bool enabled = true;
+    // How long the delivery worker sleeps when the queue is empty. It is also
+    // woken immediately whenever something is enqueued, so this is only the
+    // ceiling on picking up a retry that has come due.
+    int worker_poll_ms = 1000;
+    // Per-attempt HTTP timeouts against the gateway, seconds.
+    int connect_timeout_s = 5;
+    int request_timeout_s = 10;
+    // Attempts before a notification is dropped. Exponential backoff between
+    // them, capped at max_backoff_ms.
+    int max_attempts = 6;
+    int64_t base_backoff_ms = 5000;
+    int64_t max_backoff_ms = 60LL * 60 * 1000;
+    // Rows claimed per wakeup.
+    int batch_size = 20;
+    // How long a claimed row stays invisible to the worker. Must comfortably
+    // exceed request_timeout_s or a slow gateway would get duplicate deliveries.
+    int64_t lease_ms = 60LL * 1000;
+
+    // URL prefixes a client is allowed to register as a push gateway.
+    //
+    // This matters more than it looks. /pushers/set lets any authenticated user
+    // name a URL that the SERVER will then POST to, which is a server-side
+    // request forgery primitive: without a restriction, a user can aim it at
+    // cloud metadata endpoints or at services that are only reachable from
+    // inside the deployment's network, and use notification timing as the oracle.
+    // Empty means "any absolute http(s) URL", which Config::validate warns about
+    // loudly — appropriate for a single-admin self-hosted instance, not for one
+    // with untrusted accounts.
+    std::vector<std::string> allowed_gateway_prefixes;
 };
 
 struct Config {
@@ -56,15 +108,39 @@ struct Config {
     // Media
     std::string media_path = "./data/media/";
     size_t max_upload_size_mb = 50;
+    // Require an access token (header or ?access_token=) on media downloads.
+    // On by default. Without it a media id is a bare capability URL: no
+    // revocation, no per-room ACL. The desktop client appends ?access_token=
+    // (see util/MediaUrl.h) because QML Image.source cannot set headers.
+    // Set to false only for a deployment still running pre-token clients.
+    bool require_media_auth = true;
 
     // Storage
     StorageConfig storage;
 
     // Auth
     bool registration_enabled = true;
-    int password_hash_cost = 12;
+    // PBKDF2-HMAC-SHA256 work factor, as a power of two: iterations = 2^cost.
+    // 19 => 524,288 iterations, in line with current OWASP guidance (~600k).
+    // The old default of 12 gave 4,096. Each stored hash records the cost it
+    // was created with, so existing hashes still verify; AuthHandler
+    // transparently re-hashes on the next successful login.
+    int password_hash_cost = 19;
+    // Access-token validity, in days. Long on purpose: the desktop client
+    // stores one access token and has no background refresh, so a short
+    // lifetime would log people out mid-session. Every authenticated request
+    // slides the expiry forward once the session is past half its lifetime, so
+    // an active client never lapses while an unused (or leaked-and-idle) token
+    // dies on schedule. Clients that opt in with `refresh_token: true` also get
+    // a refresh token for POST /_matrix/client/v3/refresh.
+    // Keep the default in sync with kDefaultAccessTokenLifetimeMs.
+    int access_token_lifetime_days = 90;
 
-    // TLS
+    // TLS. NOTE: not implemented — HttpServer has no SSLServer path. Kept in
+    // the schema so an existing config with a [tls] block still parses, but
+    // Server::start() refuses to start when tls_enabled is true rather than
+    // silently serving plaintext on a port the admin believes is HTTPS.
+    // Terminate TLS at a reverse proxy.
     bool tls_enabled = false;
     std::string tls_cert_file;
     std::string tls_key_file;
@@ -75,8 +151,16 @@ struct Config {
     // Voice
     VoiceConfig voice;
 
+    // Push notifications
+    PushConfig push;
+
     static Config load(const std::string& path);
     static Config defaults();
+
+    // Clamps unsafe values and warns about combinations that cannot work
+    // (voice enabled with relay-only and no relay, unset identity audience,
+    // absurd password cost). Applied by load(); exposed for tests.
+    static void validate(Config& cfg);
 };
 
 } // namespace bsfchat

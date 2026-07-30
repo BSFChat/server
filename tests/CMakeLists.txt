@@ -18,6 +18,12 @@ add_executable(server_tests
     test_media.cpp
     test_voice.cpp
     test_typing.cpp
+    test_regressions.cpp
+    test_mentions.cpp
+    test_push.cpp
+    test_migration_v11.cpp
+    test_search.cpp
+    test_audit.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -48,6 +54,19 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/api/AuthHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/TypingHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/VoiceHandler.cpp
+    # The permission-gated request surface was structurally untestable: none
+    # of these handlers were compiled into the test binary at all.
+    ${CMAKE_SOURCE_DIR}/src/api/RoomHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/EventHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/SyncHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/PresenceHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/MediaHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/ProfileHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/PushHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/SearchHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/AuditHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/audit/AuditLog.cpp
+    ${CMAKE_SOURCE_DIR}/src/push/PushService.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/AutoJoin.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/OidcAuth.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/RoleBootstrap.cpp

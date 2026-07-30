@@ -2,6 +2,7 @@
 #include "auth/AutoJoin.h"
 #include "auth/LocalAuth.h"
 #include "auth/OidcAuth.h"
+#include "auth/RoleBootstrap.h"
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
@@ -20,9 +21,48 @@ namespace bsfchat {
 
 using json = nlohmann::json;
 
+namespace {
+
+// Map an arbitrary OIDC subject onto the Matrix localpart grammar
+// (lowercase alphanumerics plus . _ = - /) using the spec's recommended
+// reversible escaping: uppercase X becomes "_x", anything else invalid
+// becomes "=hh". Literal '_' is escaped so it can't collide with the
+// uppercase form. Blindly concatenating the raw subject is what produced the
+// "@@josh:" double-@ user ids.
+std::string sanitize_localpart(const std::string& input) {
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(input.size());
+    for (unsigned char c : input) {
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '.' || c == '-' || c == '/') {
+            out += static_cast<char>(c);
+        } else if (c >= 'A' && c <= 'Z') {
+            out += '_';
+            out += static_cast<char>(c - 'A' + 'a');
+        } else {
+            out += '=';
+            out += kHex[(c >> 4) & 0x0F];
+            out += kHex[c & 0x0F];
+        }
+    }
+    return out;
+}
+
+void send_error(httplib::Response& res, int status, const MatrixError& err) {
+    res.status = status;
+    res.set_content(err.to_json().dump(), "application/json");
+}
+
+} // namespace
+
 AuthHandler::AuthHandler(SqliteStore& store, SyncEngine& sync_engine,
                          const Config& config, OidcAuth* oidc_auth)
     : store_(store), sync_engine_(sync_engine), config_(config), oidc_auth_(oidc_auth) {}
+
+int64_t AuthHandler::token_lifetime_ms() const {
+    return static_cast<int64_t>(config_.access_token_lifetime_days) * 24 * 60 * 60 * 1000;
+}
 
 void AuthHandler::handle_versions(const httplib::Request&, httplib::Response& res) {
     json resp = {
@@ -85,15 +125,36 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
             return;
         }
 
+        // Transparently upgrade a hash that was created with a weaker work
+        // factor. The cost is recorded in the stored hash, so old hashes keep
+        // verifying; this is the only moment we hold the plaintext and can
+        // re-derive at the current cost.
+        auto stored_cost = password_hash_cost(*hash);
+        if (stored_cost && *stored_cost < config_.password_hash_cost) {
+            try {
+                store_.update_password_hash(
+                    user_id, hash_password(login_req.password, config_.password_hash_cost));
+                get_logger()->info("Upgraded password hash cost {} -> {} for {}",
+                                   *stored_cost, config_.password_hash_cost, user_id);
+            } catch (const std::exception& e) {
+                get_logger()->warn("Password hash upgrade failed for {}: {}", user_id, e.what());
+            }
+        }
+
         auto access_token = generate_access_token();
         auto device_id = login_req.device_id.value_or(generate_device_id());
-        store_.store_access_token(access_token, user_id, device_id);
+        std::optional<std::string> refresh_token;
+        if (login_req.refresh_token) refresh_token = generate_access_token();
+        store_.store_access_token(access_token, user_id, device_id, token_lifetime_ms(),
+                                  refresh_token);
 
         LoginResponse login_resp{
             .user_id = user_id,
             .access_token = access_token,
             .device_id = device_id,
         };
+        login_resp.refresh_token = refresh_token;
+        login_resp.expires_in_ms = token_lifetime_ms();
 
         json resp;
         to_json(resp, login_resp);
@@ -108,15 +169,30 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
             return;
         }
 
-        auto claims = oidc_auth_->validate_token(login_req.token);
+        const std::string expected_audience =
+            config_.identity ? config_.identity->client_id : std::string();
+        auto claims = oidc_auth_->validate_token(login_req.token, expected_audience);
         if (!claims) {
             res.status = 403;
             res.set_content(MatrixError::forbidden("Invalid identity token").to_json().dump(), "application/json");
             return;
         }
 
-        // Build user_id from OIDC subject
-        std::string user_id = "@oidc_" + claims->sub + ":" + config_.server_name;
+        // Build user_id from the OIDC subject. The subject is provider-chosen
+        // and can contain anything — concatenating it unchecked is how the
+        // "@@josh:" double-@ incident happened. Sanitise to the Matrix
+        // localpart grammar, then validate the assembled id before it reaches
+        // the database.
+        std::string localpart = "oidc_" + sanitize_localpart(claims->sub);
+        std::string user_id = "@" + localpart + ":" + config_.server_name;
+        if (localpart == "oidc_" || !UserId::is_valid(user_id)) {
+            get_logger()->warn("Rejected identity token: subject '{}' does not map to a valid user id",
+                               claims->sub);
+            res.status = 403;
+            res.set_content(MatrixError::forbidden("Identity token subject is not usable as a user id")
+                                .to_json().dump(), "application/json");
+            return;
+        }
 
         // Create user if they don't exist (OIDC-only user with empty password hash)
         bool newly_created = !store_.user_exists(user_id);
@@ -131,7 +207,10 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
 
         auto access_token = generate_access_token();
         auto device_id = login_req.device_id.value_or(generate_device_id());
-        store_.store_access_token(access_token, user_id, device_id);
+        std::optional<std::string> refresh_token;
+        if (login_req.refresh_token) refresh_token = generate_access_token();
+        store_.store_access_token(access_token, user_id, device_id, token_lifetime_ms(),
+                                  refresh_token);
 
         if (newly_created) {
             auto_join_public_rooms(store_, sync_engine_, config_, user_id);
@@ -142,6 +221,8 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
             .access_token = access_token,
             .device_id = device_id,
         };
+        login_resp.refresh_token = refresh_token;
+        login_resp.expires_in_ms = token_lifetime_ms();
 
         json resp;
         to_json(resp, login_resp);
@@ -196,6 +277,17 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
         return;
     }
 
+    // "server" is the synthetic actor PermissionsEngine grants ADMINISTRATOR
+    // to unconditionally (@server:<server_name>), so registering it would hand
+    // that account god mode. "oidc_*" is the namespace identity logins map
+    // into, so a local account must not be able to squat an identity user.
+    if (username == "server" || username.rfind("oidc_", 0) == 0) {
+        res.status = 400;
+        res.set_content(MatrixError::invalid_username("That username is reserved").to_json().dump(),
+                        "application/json");
+        return;
+    }
+
     if (reg_req.password.size() < limits::kMinPasswordLength) {
         res.status = 400;
         res.set_content(MatrixError::invalid_param("Password must be at least 8 characters").to_json().dump(), "application/json");
@@ -219,16 +311,27 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
 
     auto access_token = generate_access_token();
     auto device_id = reg_req.device_id.value_or(generate_device_id());
-    store_.store_access_token(access_token, user_id, device_id);
+    std::optional<std::string> refresh_token;
+    if (reg_req.refresh_token) refresh_token = generate_access_token();
+    store_.store_access_token(access_token, user_id, device_id, token_lifetime_ms(),
+                              refresh_token);
 
     // Auto-join all existing public channels so new users immediately see the server's content
     auto_join_public_rooms(store_, sync_engine_, config_, user_id);
+
+    // Give the new account its role assignment now rather than at the next
+    // restart. On a brand-new deployment this is also what makes the very
+    // first registered user an admin — without it nobody would hold
+    // MANAGE_CHANNELS and the first channel could never be created.
+    bootstrap_roles(store_, sync_engine_, config_);
 
     LoginResponse login_resp{
         .user_id = user_id,
         .access_token = access_token,
         .device_id = device_id,
     };
+    login_resp.refresh_token = refresh_token;
+    login_resp.expires_in_ms = token_lifetime_ms();
 
     json resp;
     to_json(resp, login_resp);
@@ -242,7 +345,7 @@ void AuthHandler::handle_logout(const httplib::Request& req, httplib::Response& 
     auto token = extract_access_token(req.get_header_value("Authorization"));
     if (!token) {
         res.status = 401;
-        res.set_content(MatrixError::missing_token().to_json().dump(), "application/json");
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
         return;
     }
 
@@ -250,11 +353,178 @@ void AuthHandler::handle_logout(const httplib::Request& req, httplib::Response& 
     res.set_content("{}", "application/json");
 }
 
+void AuthHandler::handle_logout_all(const httplib::Request& req, httplib::Response& res) {
+    auto token = extract_access_token(req.get_header_value("Authorization"));
+    if (!token) {
+        return send_error(res, 401, auth_error(req.get_header_value("Authorization")));
+    }
+    auto user_id = store_.get_user_by_token(*token);
+    if (!user_id) {
+        return send_error(res, 401, MatrixError::unknown_token());
+    }
+
+    // Panic button: revokes every session for the account, this one included.
+    // Before tokens had any invalidation path at all, a user who believed their
+    // token had leaked had no remedy short of an admin editing the database.
+    store_.delete_all_tokens_for_user(*user_id);
+    get_logger()->info("All sessions revoked for {}", *user_id);
+    res.set_content("{}", "application/json");
+}
+
+void AuthHandler::handle_password_change(const httplib::Request& req, httplib::Response& res) {
+    auto token = extract_access_token(req.get_header_value("Authorization"));
+    if (!token) {
+        return send_error(res, 401, auth_error(req.get_header_value("Authorization")));
+    }
+    auto user_id = store_.get_user_by_token(*token);
+    if (!user_id) {
+        return send_error(res, 401, MatrixError::unknown_token());
+    }
+
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (...) {
+        return send_error(res, 400, MatrixError::bad_json());
+    }
+    if (!body.is_object()) {
+        return send_error(res, 400, MatrixError::bad_json());
+    }
+
+    // Re-authentication is mandatory. A valid access token proves "this client
+    // holds a token", not "the account owner is present" — without the current
+    // password, anyone who got hold of a token could lock the real owner out by
+    // changing their password. This is the m.login.password stage of Matrix's
+    // user-interactive auth, supplied inline in the `auth` object.
+    if (!body.contains("auth") || !body["auth"].is_object()) {
+        res.status = 401;
+        res.set_content(json{
+            {"flows", json::array({json{{"stages", json::array({"m.login.password"})}}})},
+            {"params", json::object()},
+            {"completed", json::array()},
+            {"session", generate_device_id()},
+        }.dump(), "application/json");
+        return;
+    }
+
+    const auto& auth = body["auth"];
+    if (auth.value("type", "") != "m.login.password") {
+        return send_error(res, 400, MatrixError::unknown("Unsupported auth type"));
+    }
+    // If the client names a user, it must be the authenticated one — a token
+    // must never be usable to re-authenticate as somebody else.
+    if (auth.contains("identifier") && auth["identifier"].is_object()) {
+        auto named = auth["identifier"].value("user", "");
+        if (!named.empty()) {
+            if (named[0] != '@') named = "@" + named + ":" + config_.server_name;
+            if (named != *user_id) {
+                return send_error(res, 403, MatrixError::forbidden(
+                    "Authentication identifier does not match the access token"));
+            }
+        }
+    }
+    const std::string current_password = auth.value("password", "");
+
+    std::string new_password;
+    if (body.contains("new_password") && body["new_password"].is_string()) {
+        new_password = body["new_password"].get<std::string>();
+    }
+    if (new_password.empty()) {
+        return send_error(res, 400, MatrixError::invalid_param("Missing new_password"));
+    }
+    if (new_password.size() < limits::kMinPasswordLength) {
+        return send_error(res, 400,
+            MatrixError::invalid_param("Password must be at least 8 characters"));
+    }
+
+    auto stored = store_.get_password_hash(*user_id);
+    if (!stored) {
+        // The token resolved to a user, so this should be unreachable.
+        return send_error(res, 404, MatrixError::not_found("Account not found"));
+    }
+    // OIDC-backed accounts are created with an empty hash precisely so password
+    // login can never work for them. Say so plainly instead of failing
+    // verification and looking like a wrong-password error.
+    if (stored->empty()) {
+        return send_error(res, 403, MatrixError::forbidden(
+            "This account signs in through the identity provider; change your password there."));
+    }
+    if (config_.identity && config_.identity->required && !config_.identity->allow_local_accounts) {
+        return send_error(res, 403, MatrixError::forbidden(
+            "Local password login is disabled on this server"));
+    }
+
+    // verify_password reads the cost out of the stored hash, so an account
+    // still on the old cost-12 hash re-authenticates fine here...
+    if (current_password.empty() || !verify_password(current_password, *stored)) {
+        return send_error(res, 403, MatrixError::forbidden("Invalid password"));
+    }
+
+    // ...and the replacement is always written at the CURRENT configured cost,
+    // which makes a password change a second upgrade path alongside
+    // migrate-on-login.
+    try {
+        store_.update_password_hash(*user_id,
+                                    hash_password(new_password, config_.password_hash_cost));
+    } catch (const std::exception& e) {
+        get_logger()->error("Password change failed for {}: {}", *user_id, e.what());
+        return send_error(res, 500, MatrixError::unknown("Failed to update password"));
+    }
+
+    // Matrix default: revoke the account's other sessions. This is the point of
+    // a password change — if the reason for changing it is a suspected leak,
+    // leaving the leaked token alive defeats the exercise. The session that
+    // just re-authenticated is kept so the user isn't kicked out of the client
+    // they made the change from.
+    const bool logout_devices = body.value("logout_devices", true);
+    int revoked = 0;
+    if (logout_devices) {
+        revoked = store_.delete_other_tokens_for_user(*user_id, *token);
+    }
+
+    get_logger()->info("Password changed for {} ({} other session(s) revoked)", *user_id, revoked);
+    res.set_content("{}", "application/json");
+}
+
+void AuthHandler::handle_refresh(const httplib::Request& req, httplib::Response& res) {
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (...) {
+        return send_error(res, 400, MatrixError::bad_json());
+    }
+    std::string refresh_token;
+    if (body.is_object() && body.contains("refresh_token") && body["refresh_token"].is_string()) {
+        refresh_token = body["refresh_token"].get<std::string>();
+    }
+    if (refresh_token.empty()) {
+        return send_error(res, 400, MatrixError::invalid_param("Missing refresh_token"));
+    }
+
+    // Redemption is single-use and rotates both secrets, so a stolen refresh
+    // token stops working the moment the legitimate client refreshes.
+    auto session = store_.consume_refresh_token(refresh_token);
+    if (!session) {
+        return send_error(res, 401, MatrixError::unknown_token("Invalid refresh token"));
+    }
+
+    auto access_token = generate_access_token();
+    auto new_refresh = generate_access_token();
+    store_.store_access_token(access_token, session->user_id, session->device_id,
+                              token_lifetime_ms(), new_refresh);
+
+    res.set_content(json{
+        {"access_token", access_token},
+        {"refresh_token", new_refresh},
+        {"expires_in_ms", token_lifetime_ms()},
+    }.dump(), "application/json");
+}
+
 void AuthHandler::handle_whoami(const httplib::Request& req, httplib::Response& res) {
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
         res.status = 401;
-        res.set_content(MatrixError::missing_token().to_json().dump(), "application/json");
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
         return;
     }
 

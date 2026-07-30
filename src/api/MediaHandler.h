@@ -2,6 +2,8 @@
 
 #include <httplib.h>
 #include <memory>
+#include <optional>
+#include <string>
 
 namespace bsfchat {
 
@@ -19,6 +21,9 @@ public:
 
 private:
     std::string generate_media_id() const;
+    // Resolves the caller from either the Authorization header or an
+    // ?access_token= query param (image/video widgets can't set headers).
+    std::optional<std::string> authenticate_media(const httplib::Request& req);
 
     SqliteStore& store_;
     const Config& config_;

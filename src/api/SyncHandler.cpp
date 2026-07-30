@@ -5,6 +5,7 @@
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
 
+#include <algorithm>
 #include <set>
 
 #include <bsfchat/Constants.h>
@@ -24,7 +25,7 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
         res.status = 401;
-        res.set_content(MatrixError::missing_token().to_json().dump(), "application/json");
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
         return;
     }
 
@@ -33,10 +34,24 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
 
     int timeout = limits::kDefaultSyncTimeoutMs;
     if (req.has_param("timeout")) {
-        timeout = std::stoi(req.get_param_value("timeout"));
+        // Unguarded std::stoi threw straight out of the handler on any
+        // malformed query param (`?timeout=abc`, `?timeout=99999999999999`).
+        try {
+            timeout = std::stoi(req.get_param_value("timeout"));
+        } catch (const std::exception&) {
+            timeout = limits::kDefaultSyncTimeoutMs;
+        }
+        timeout = std::clamp(timeout, 0, limits::kMaxSyncTimeoutMs);
     }
 
     auto response = sync_engine_.handle_sync(*user_id, since, timeout);
+
+    // Joined-room list is fetched once and shared by the typing and presence
+    // passes below — this used to be queried twice per poll.
+    std::vector<std::string> joined_rooms;
+    if (typing_handler_ || presence_handler_) {
+        joined_rooms = store_.get_joined_rooms(*user_id);
+    }
 
     // Inject typing indicators into joined rooms
     if (typing_handler_) {
@@ -53,7 +68,6 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
         }
 
         // Also add rooms where someone is typing but no timeline events occurred
-        auto joined_rooms = store_.get_joined_rooms(*user_id);
         for (const auto& room_id : joined_rooms) {
             if (response.rooms.join.count(room_id)) continue; // already handled
             auto typing_users = typing_handler_->get_typing_users(room_id);
@@ -75,8 +89,12 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
     // map, so we collect distinct user-ids across all joined rooms
     // and emit one m.presence event per known peer.
     if (presence_handler_) {
+        // Drop entries nobody has refreshed in a long time; entries_ is an
+        // in-memory map that otherwise grew without bound and kept anyone who
+        // ever went "online" online forever, until the process restarted.
+        presence_handler_->sweep_expired();
+
         std::set<std::string> seen;
-        auto joined_rooms = store_.get_joined_rooms(*user_id);
         for (const auto& room_id : joined_rooms) {
             auto members = store_.get_room_members(room_id);
             for (const auto& [m_uid, _state] : members) {

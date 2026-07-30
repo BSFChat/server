@@ -36,12 +36,16 @@ Config Config::load(const std::string& path) {
             if (auto v = media->get("max_upload_size_mb"))
                 cfg.max_upload_size_mb = static_cast<size_t>(
                     v->value_or(static_cast<int64_t>(cfg.max_upload_size_mb)));
+            if (auto v = media->get("require_auth"))
+                cfg.require_media_auth = v->value_or(cfg.require_media_auth);
         }
 
         // [auth]
         if (auto auth = tbl["auth"].as_table()) {
             if (auto v = auth->get("registration_enabled")) cfg.registration_enabled = v->value_or(cfg.registration_enabled);
             if (auto v = auth->get("password_hash_cost")) cfg.password_hash_cost = v->value_or(cfg.password_hash_cost);
+            if (auto v = auth->get("access_token_lifetime_days"))
+                cfg.access_token_lifetime_days = v->value_or(cfg.access_token_lifetime_days);
         }
 
         // [tls]
@@ -86,12 +90,38 @@ Config Config::load(const std::string& path) {
             if (auto v = voice->get("allow_peer_to_peer")) cfg.voice.allow_peer_to_peer = v->value_or(cfg.voice.allow_peer_to_peer);
         }
 
+        // [push]. No provider credentials here on purpose — see PushConfig.
+        if (auto push = tbl["push"].as_table()) {
+            if (auto v = push->get("enabled")) cfg.push.enabled = v->value_or(cfg.push.enabled);
+            if (auto v = push->get("worker_poll_ms")) cfg.push.worker_poll_ms = v->value_or(cfg.push.worker_poll_ms);
+            if (auto v = push->get("connect_timeout_s")) cfg.push.connect_timeout_s = v->value_or(cfg.push.connect_timeout_s);
+            if (auto v = push->get("request_timeout_s")) cfg.push.request_timeout_s = v->value_or(cfg.push.request_timeout_s);
+            if (auto v = push->get("max_attempts")) cfg.push.max_attempts = v->value_or(cfg.push.max_attempts);
+            if (auto v = push->get("base_backoff_ms")) cfg.push.base_backoff_ms = v->value_or(cfg.push.base_backoff_ms);
+            if (auto v = push->get("max_backoff_ms")) cfg.push.max_backoff_ms = v->value_or(cfg.push.max_backoff_ms);
+            if (auto v = push->get("batch_size")) cfg.push.batch_size = v->value_or(cfg.push.batch_size);
+            if (auto v = push->get("lease_ms")) cfg.push.lease_ms = v->value_or(cfg.push.lease_ms);
+            // Accepts a single string or an array, same as voice.turn_uri.
+            if (auto v = push->get("allowed_gateway_prefixes")) {
+                if (auto arr = v->as_array()) {
+                    for (auto&& el : *arr) {
+                        if (auto s = el.value<std::string>()) {
+                            cfg.push.allowed_gateway_prefixes.push_back(*s);
+                        }
+                    }
+                } else if (auto s = v->value<std::string>()) {
+                    cfg.push.allowed_gateway_prefixes.push_back(*s);
+                }
+            }
+        }
+
         // [identity]
         if (auto id = tbl["identity"].as_table()) {
             IdentityConfig id_cfg;
             if (auto v = id->get("provider_url")) id_cfg.provider_url = v->value_or(std::string{});
             if (auto v = id->get("required")) id_cfg.required = v->value_or(false);
             if (auto v = id->get("allow_local_accounts")) id_cfg.allow_local_accounts = v->value_or(true);
+            if (auto v = id->get("client_id")) id_cfg.client_id = v->value_or(id_cfg.client_id);
             if (!id_cfg.provider_url.empty()) {
                 cfg.identity = id_cfg;
             }
@@ -101,7 +131,95 @@ Config Config::load(const std::string& path) {
         throw std::runtime_error(std::string("Failed to parse config: ") + e.what());
     }
 
+    validate(cfg);
     return cfg;
+}
+
+void Config::validate(Config& cfg) {
+    auto log = get_logger();
+
+    if (cfg.voice.enabled) {
+        const bool has_relay = !cfg.voice.turn_uris.empty();
+        const bool has_stun = !cfg.voice.stun_uri.empty();
+        if (!cfg.voice.allow_peer_to_peer && !has_relay) {
+            // Relay-only with zero relays configured means every call fails.
+            // Fall back to peer-to-peer and say so loudly rather than shipping
+            // a voice feature that is enabled but cannot ever connect.
+            log->warn("voice.allow_peer_to_peer is false but no voice.turn_uri is configured — "
+                      "that combination can never establish a call. Falling back to "
+                      "peer-to-peer. Configure voice.turn_uri (and turn_secret or "
+                      "turn_username/turn_password) to force relayed calls.");
+            cfg.voice.allow_peer_to_peer = true;
+        }
+        if (!has_relay && !has_stun) {
+            log->warn("voice.enabled is true but neither voice.stun_uri nor voice.turn_uri is "
+                      "set — calls will only connect between clients on the same local network. "
+                      "Set voice.stun_uri for NAT traversal.");
+        }
+    }
+
+    if (cfg.password_hash_cost < 12) {
+        log->warn("auth.password_hash_cost = {} is dangerously low ({} PBKDF2 iterations). "
+                  "Raising to 12; 19 or higher is recommended.",
+                  cfg.password_hash_cost, 1u << cfg.password_hash_cost);
+        cfg.password_hash_cost = 12;
+    }
+    if (cfg.password_hash_cost > 24) {
+        // 2^24 iterations would take seconds per login.
+        cfg.password_hash_cost = 24;
+    }
+
+    if (cfg.access_token_lifetime_days < 1) {
+        // A sub-day lifetime with no refresh flow in the shipped client means
+        // users get logged out while they are still using the app.
+        log->warn("auth.access_token_lifetime_days = {} is too short to be usable; raising to 1.",
+                  cfg.access_token_lifetime_days);
+        cfg.access_token_lifetime_days = 1;
+    }
+    if (cfg.access_token_lifetime_days > 3650) {
+        log->warn("auth.access_token_lifetime_days = {} is effectively 'never expires'; "
+                  "clamping to 3650.", cfg.access_token_lifetime_days);
+        cfg.access_token_lifetime_days = 3650;
+    }
+
+    if (cfg.identity && cfg.identity->client_id.empty()) {
+        log->warn("identity.client_id is empty — identity tokens will be accepted regardless of "
+                  "their audience, so a token minted for any other OAuth client registered with "
+                  "the same provider will be accepted as a chat login.");
+    }
+
+    if (cfg.push.worker_poll_ms < 50) cfg.push.worker_poll_ms = 50;
+    if (cfg.push.batch_size < 1) cfg.push.batch_size = 1;
+    if (cfg.push.max_attempts < 1) cfg.push.max_attempts = 1;
+    if (cfg.push.base_backoff_ms < 100) cfg.push.base_backoff_ms = 100;
+    if (cfg.push.max_backoff_ms < cfg.push.base_backoff_ms) {
+        cfg.push.max_backoff_ms = cfg.push.base_backoff_ms;
+    }
+    if (cfg.push.connect_timeout_s < 1) cfg.push.connect_timeout_s = 1;
+    if (cfg.push.request_timeout_s < 1) cfg.push.request_timeout_s = 1;
+    {
+        // A lease shorter than the request timeout would hand a still-in-flight
+        // notification to the next wakeup, duplicating it on every slow gateway
+        // response.
+        const int64_t min_lease =
+            static_cast<int64_t>(cfg.push.connect_timeout_s + cfg.push.request_timeout_s) * 1000 * 2;
+        if (cfg.push.lease_ms < min_lease) {
+            log->warn("push.lease_ms = {} is shorter than twice the configured HTTP timeouts; "
+                      "raising to {} so a slow gateway cannot cause duplicate notifications.",
+                      cfg.push.lease_ms, min_lease);
+            cfg.push.lease_ms = min_lease;
+        }
+    }
+
+    if (cfg.push.enabled && cfg.push.allowed_gateway_prefixes.empty()) {
+        log->warn("push.allowed_gateway_prefixes is empty — any authenticated user can register "
+                  "an arbitrary push gateway URL that this server will then POST to, which is a "
+                  "server-side request forgery primitive against anything reachable from this "
+                  "host. Set it to the URL prefix(es) of your push gateway if this instance has "
+                  "accounts you do not fully trust.");
+    }
+
+    if (cfg.workers < 1) cfg.workers = 1;
 }
 
 Config Config::defaults() {

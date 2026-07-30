@@ -3,7 +3,10 @@
 #include <bsfchat/MatrixTypes.h>
 #include <bsfchat/Permissions.h>
 
+#include <optional>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace bsfchat {
 
@@ -38,8 +41,18 @@ public:
     bool outranks(const std::string& actor_id, const std::string& target_id);
 
 private:
+    // Role data is identical for every room in a single request, but compute()
+    // is called once per room — an initial sync across 50 channels re-read it
+    // 100 times, all serialised behind the store's global mutex. Memoise for
+    // the lifetime of this engine, which is a single request.
+    const std::vector<ServerRole>& server_roles();
+    const std::vector<std::string>& member_role_ids(const std::string& user_id);
+
     SqliteStore& store_;
     const Config& config_;
+
+    std::optional<std::vector<ServerRole>> server_roles_cache_;
+    std::unordered_map<std::string, std::vector<std::string>> member_roles_cache_;
 };
 
 } // namespace bsfchat

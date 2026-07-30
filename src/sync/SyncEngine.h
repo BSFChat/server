@@ -19,6 +19,12 @@ public:
     // Notify that a new event was inserted. Wakes all waiting sync requests.
     void notify_new_event();
 
+    // Notify that ephemeral (EDU) state changed — typing, presence. These
+    // insert no event, so the stream position is unchanged and a waiter
+    // blocked on it would never wake; the sync predicate watches a separate
+    // counter that this bumps.
+    void notify_ephemeral();
+
     // Handle a /sync request. Blocks up to timeout_ms if no new events.
     // since_token: "s{stream_position}" or empty for initial sync.
     SyncResponse handle_sync(const std::string& user_id,
@@ -33,7 +39,11 @@ private:
     const Config& config_;
     std::mutex wait_mutex_;
     std::condition_variable new_event_cv_;
+    // Both are written only while holding wait_mutex_. Mutating them outside
+    // the lock loses a notification that lands between a waiter's predicate
+    // check and its block, costing that client up to a full poll timeout.
     std::atomic<int64_t> current_position_{0};
+    std::atomic<uint64_t> ephemeral_seq_{0};
 };
 
 } // namespace bsfchat
