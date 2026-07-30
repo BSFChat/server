@@ -71,7 +71,16 @@ public:
     // so a client that keeps syncing is never logged out.
     std::optional<std::string> get_user_by_token(const std::string& token);
     void delete_access_token(const std::string& token);
-    void delete_all_tokens_for_user(const std::string& user_id);
+    // Revokes every session for the account: /logout/all, and a server-wide ban.
+    //
+    // This deletes ROWS, and a refresh token is the `refresh_hash` column of the
+    // row its access token lives on — so both die together and there is no way to
+    // revoke one and leave the other alive. That is the reason a ban reuses this
+    // rather than growing a revocation path of its own: a ban that killed the
+    // access token but left a refresh token able to mint a replacement would be
+    // theatre. Returns the number of sessions revoked; 0 is an ordinary result
+    // (an account that never logged in, or is already logged out).
+    int delete_all_tokens_for_user(const std::string& user_id);
     // "Log out everywhere but here": used by the password-change flow so the
     // caller isn't logged out of the session they just re-authenticated in.
     // Returns the number of sessions revoked.

@@ -279,13 +279,36 @@ RoomHandler::ModerationResult RoomHandler::apply_membership_moderation(
     ok.status = 200;
 
     if (intent.places_server_ban) {
-        // The ban list first, then the projection. Order matters: the list is the
-        // authoritative record and the membership rows are its projection, so a
-        // crash between the two leaves a ban that is enforced at /join, auto-join
-        // and /sync — fail-closed — rather than membership rows nobody can explain.
+        // The ban list first, then the sessions, then the projection. Both
+        // orderings are load-bearing.
+        //
+        // Ban row before revocation: revoking first would leave a window in which
+        // the target holds no token, is not yet banned, and can simply log in
+        // again — handing them a fresh 90-day session created moments before the
+        // ban lands. Writing the ban first means anything they re-authenticate
+        // into is already refused.
+        //
+        // Ban row before projection: the list is the authoritative record and the
+        // membership rows are its projection, so a crash between them leaves a ban
+        // that /join, auto-join and /sync all still enforce — fail-closed — rather
+        // than membership rows nobody can explain.
         store_.set_server_ban(target_user, actor, reason, now_ms());
+
+        // Revoke every session. Reuses the /logout/all primitive rather than
+        // adding a second revocation path: refresh tokens are a column on the
+        // access-token row, so this is the only operation that cannot leave one of
+        // the pair alive. A ban is not "you may stay signed in but see nothing" —
+        // and without this, enforcement depended on every future read path
+        // remembering to consult the ban list.
+        //
+        // Revoking zero sessions is an ordinary outcome (an account that never
+        // logged in, or is already logged out), not an error.
+        const int revoked = store_.delete_all_tokens_for_user(target_user);
+
         ok.event_id = project_membership_everywhere(actor, room_id, target_user,
                                                     std::string(membership::kBan), reason, "");
+        get_logger()->info("Server ban on {} by {} revoked {} session(s)", target_user, actor,
+                           revoked);
     } else if (intent.lifts_server_ban) {
         store_.clear_server_ban(target_user);
         // "leave", not "join": lifting a ban restores the user's ability to come

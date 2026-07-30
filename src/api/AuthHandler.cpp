@@ -125,6 +125,25 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
             return;
         }
 
+        // A banned identity cannot start a new session.
+        //
+        // This is what makes revoking sessions on ban worth doing. Revocation
+        // alone would be theatre: the target's client would be logged out, it
+        // would immediately re-authenticate with the password it still has, and
+        // receive a fresh 90-day token. The ban would hold only because /sync and
+        // /join happen to consult the ban list.
+        //
+        // Checked AFTER the password verification on purpose. Refusing earlier
+        // would turn /login into an oracle that reports whether an arbitrary
+        // username is banned, to anyone who asks and without credentials.
+        if (store_.is_server_banned(user_id)) {
+            get_logger()->info("Refused login for banned user {}", user_id);
+            res.status = 403;
+            res.set_content(MatrixError::forbidden("You are banned from this server")
+                                .to_json().dump(), "application/json");
+            return;
+        }
+
         // Transparently upgrade a hash that was created with a weaker work
         // factor. The cost is recorded in the stored hash, so old hashes keep
         // verifying; this is the only moment we hold the plaintext and can
@@ -190,6 +209,18 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
                                claims->sub);
             res.status = 403;
             res.set_content(MatrixError::forbidden("Identity token subject is not usable as a user id")
+                                .to_json().dump(), "application/json");
+            return;
+        }
+
+        // Same gate on the identity path. Checked after the identity token has
+        // been validated, for the same oracle reason as the password path — and
+        // before create_user, so a banned OIDC identity is not silently recreated
+        // as a fresh account by the very request that should be refused.
+        if (store_.is_server_banned(user_id)) {
+            get_logger()->info("Refused identity login for banned user {}", user_id);
+            res.status = 403;
+            res.set_content(MatrixError::forbidden("You are banned from this server")
                                 .to_json().dump(), "application/json");
             return;
         }

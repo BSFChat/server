@@ -434,11 +434,12 @@ void SqliteStore::delete_access_token(const std::string& token) {
     sqlite3_step(stmt.get());
 }
 
-void SqliteStore::delete_all_tokens_for_user(const std::string& user_id) {
+int SqliteStore::delete_all_tokens_for_user(const std::string& user_id) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_, "DELETE FROM access_tokens WHERE user_id = ?");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt.get());
+    return sqlite3_changes(db_);
 }
 
 int SqliteStore::delete_other_tokens_for_user(const std::string& user_id,

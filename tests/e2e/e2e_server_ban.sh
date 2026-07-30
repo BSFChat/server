@@ -182,15 +182,26 @@ check_body "carol starts joined to secret-plans"      "$SECRET"
 BODY_C='{"user_id":"'"$C"'","reason":"e2e"}'
 check "alice bans carol via general"          200 "$(req POST "/rooms/$GENERAL/ban" "$T_ALICE" "$BODY_C")"
 
-req GET "/joined_rooms" "$T_CAROL" > /dev/null
-check_no_body "carol is no longer joined to offtopic"  "$OFFTOPIC"
-check_no_body "carol is no longer joined to secret"    "$SECRET"
+# Asserted from ALICE's session, not carol's. A ban now revokes carol's tokens, so
+# every request of hers answers 401 — and a check that merely looked for the room
+# id to be absent from her response body would pass on the error page, whatever
+# the membership rows actually say. Reading the state event from an authorised
+# account is what proves the projection really happened.
+req GET "/rooms/$OFFTOPIC/state/m.room.member/$C" "$T_ALICE" > /dev/null
+check_body "carol's membership in offtopic is ban"    '"membership":"ban"'
+req GET "/rooms/$SECRET/state/m.room.member/$C" "$T_ALICE" > /dev/null
+check_body "...and in the channel never named"        '"membership":"ban"'
 
-check "banned carol cannot join a public channel" 403 "$(req POST "/rooms/$OFFTOPIC/join" "$T_CAROL")"
+# The session revocation itself.
+OLD_T_CAROL="$T_CAROL"
+check "the ban revoked carol's live session"   401 "$(req GET "/joined_rooms" "$OLD_T_CAROL")"
+check "...her sync is refused outright"        401 "$(req GET "/sync?timeout=0" "$OLD_T_CAROL")"
+
+# ...and she cannot simply log back in, which is what would have made the
+# revocation theatre: she still knows her password.
+LOGIN_CAROL='{"type":"m.login.password","identifier":{"type":"m.id.user","user":"carol"},"password":"pw-carol-12345"}'
+check "a banned user cannot log in again"      403 "$(req POST "/login" "" "$LOGIN_CAROL")"
 check_body "...and is told why"                       "banned from this server"
-
-req GET "/sync?timeout=0" "$T_CAROL" > /dev/null
-check_no_body "banned carol's sync carries no channels" "$OFFTOPIC"
 
 echo
 echo "── T2: auto-join cannot re-admit a banned user ──────────────────────"
@@ -199,8 +210,8 @@ echo "── T2: auto-join cannot re-admit a banned user ───────�
 # silently undid the client-side ban loop.
 FRESH=$(create_room "$T_ALICE" after-the-ban)
 [[ -n "$FRESH" ]] || die "could not create the post-ban channel"
-req GET "/joined_rooms" "$T_CAROL" > /dev/null
-check_no_body "a channel made AFTER the ban does not re-admit" "$FRESH"
+req GET "/rooms/$FRESH/members" "$T_ALICE" > /dev/null
+check_no_body "a channel made AFTER the ban does not re-admit" "$C"
 
 INVITE_C='{"user_id":"'"$C"'"}'
 check "banned carol cannot be invited back"   403 "$(req POST "/rooms/$FRESH/invite" "$T_ALICE" "$INVITE_C")"
@@ -213,7 +224,7 @@ echo
 echo "── T3: the ban survives deletion of the channel it came from ────────"
 
 check "alice deletes the channel she banned from" 200 "$(req DELETE "/rooms/$GENERAL" "$T_ALICE")"
-check "the ban still holds after that deletion"   403 "$(req POST "/rooms/$OFFTOPIC/join" "$T_CAROL")"
+check "the ban still holds after that deletion"   403 "$(req POST "/login" "" "$LOGIN_CAROL")"
 check_body "...still for the ban reason"              "banned from this server"
 
 echo
@@ -221,6 +232,14 @@ echo "── T4: unban restores access, server-wide ─────────�
 
 UNBAN_C='{"user_id":"'"$C"'"}'
 check "alice unbans carol via offtopic"       200 "$(req POST "/rooms/$OFFTOPIC/unban" "$T_ALICE" "$UNBAN_C")"
+
+# The unban does NOT resurrect the session the ban revoked — those rows are gone.
+# The way back in is the ordinary login, which is now permitted again.
+check "the revoked session stays revoked"     401 "$(req GET "/joined_rooms" "$OLD_T_CAROL")"
+check "carol can log in fresh after the unban" 200 "$(req POST "/login" "" "$LOGIN_CAROL")"
+T_CAROL=$(jfield access_token)
+[[ -n "$T_CAROL" ]] || die "carol got no token after unban"
+
 check "carol can rejoin offtopic"             200 "$(req POST "/rooms/$OFFTOPIC/join" "$T_CAROL")"
 # secret-plans was never named in either the ban or the unban request.
 check "carol can rejoin secret-plans too"     200 "$(req POST "/rooms/$SECRET/join" "$T_CAROL")"
@@ -236,14 +255,23 @@ check_body "bob starts joined to offtopic"            "$OFFTOPIC"
 BAN_STATE='{"membership":"ban"}'
 check "alice bans bob through the state route" 200 "$(req PUT "/rooms/$OFFTOPIC/state/m.room.member/$B" "$T_ALICE" "$BAN_STATE")"
 
-req GET "/joined_rooms" "$T_BOB" > /dev/null
-check_no_body "bob's membership row is really gone"   "$OFFTOPIC"
-check_no_body "...in secret-plans as well"            "$SECRET"
-check "bob cannot rejoin"                      403 "$(req POST "/rooms/$OFFTOPIC/join" "$T_BOB")"
+# Read from alice's session: bob's own is revoked, so his responses would be 401
+# error bodies that trivially "do not contain" the room id.
+req GET "/rooms/$OFFTOPIC/state/m.room.member/$B" "$T_ALICE" > /dev/null
+check_body "bob's membership row really says ban"     '"membership":"ban"'
+req GET "/rooms/$SECRET/state/m.room.member/$B" "$T_ALICE" > /dev/null
+check_body "...in secret-plans as well"               '"membership":"ban"'
+
+LOGIN_BOB='{"type":"m.login.password","identifier":{"type":"m.id.user","user":"bob"},"password":"pw-bob-12345"}'
+check "a state-PUT ban revoked bob's session"  401 "$(req GET "/joined_rooms" "$T_BOB")"
+check "...and he cannot log back in"           403 "$(req POST "/login" "" "$LOGIN_BOB")"
 check_body "...because he is server-banned"           "banned from this server"
 
 UNBAN_B='{"user_id":"'"$B"'"}'
 check "and it is liftable through /unban"      200 "$(req POST "/rooms/$OFFTOPIC/unban" "$T_ALICE" "$UNBAN_B")"
+check "bob can log in again"                   200 "$(req POST "/login" "" "$LOGIN_BOB")"
+T_BOB=$(jfield access_token)
+[[ -n "$T_BOB" ]] || die "bob got no token after unban"
 check "bob can come back"                      200 "$(req POST "/rooms/$OFFTOPIC/join" "$T_BOB")"
 
 echo
@@ -256,6 +284,16 @@ check "a plain member cannot ban via state-PUT" 403 "$(req PUT "/rooms/$OFFTOPIC
 check_body "...same refusal from either route"        "Insufficient permissions to ban"
 check "bob's failed attempts left carol joined" 200 "$(req GET "/rooms/$OFFTOPIC/state/m.room.member/$C" "$T_ALICE")"
 check_body "...genuinely still joined"                "join"
+
+echo
+echo "── T6b: a kick does not sign the user out of the server ─────────────"
+
+KICK_C='{"user_id":"'"$C"'"}'
+check "alice kicks carol from offtopic"        200 "$(req POST "/rooms/$OFFTOPIC/kick" "$T_ALICE" "$KICK_C")"
+# A kick is per-channel. Carol keeps her session and the rest of the server.
+check "carol's session still works after a kick" 200 "$(req GET "/joined_rooms" "$T_CAROL")"
+check_body "...and she is still in secret-plans"     "$SECRET"
+check "carol can rejoin the channel she was kicked from" 200 "$(req POST "/rooms/$OFFTOPIC/join" "$T_CAROL")"
 
 echo
 echo "── T7: the audit trail survived the rewrite ─────────────────────────"

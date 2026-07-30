@@ -499,3 +499,28 @@ test fail, revert):
 - A client-supplied `device_id` cannot forge another user's identity.
 - Token issuance counts as a liveness heartbeat, with a control test proving
   the same stale heartbeat *is* reaped without it.
+
+## Decision: mic metering under PlatformAudio (2026-07-30)
+
+`PlatformAudio`/`PlatformAudioSource` expose **no level API**. `audio_level`
+exists only in `AudioSourceStats` via `Room::getStats()` — an async FFI
+round-trip, unusable for a 20-50ms meter. `onActiveSpeakersChanged` carries
+only `std::vector<Participant*>`, i.e. binary speaking/not-speaking with no
+magnitude.
+
+**Decision: keep a Qt `QAudioSource` open purely for local mic metering,
+alongside PlatformAudio's capture.** This preserves the continuous mic meter
+and the existing audio settings UI, which `micLevelChanged(float)` /
+`peerLevelChanged(userId, float)` are bound to in QML.
+
+Implement in phase 3, when the LiveKit transport is actually wired.
+
+Open risk to validate then: two audio input devices open simultaneously.
+Plausible on macOS; **needs explicit validation on Windows**, where exclusive
+-mode capture drivers are more common. If it proves unworkable there, the
+fallback is binary speaking indicators from `onActiveSpeakersChanged` — a
+visible downgrade, so exhaust the Qt option first.
+
+Remote participant levels have no equivalent workaround: a Qt source can only
+meter the local mic. Speaking rings for remote peers will be binary under
+LiveKit regardless.

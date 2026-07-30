@@ -197,6 +197,19 @@ struct Fixture {
     std::vector<SqliteStore::AuditRecord> records() {
         return store->list_audit_records(limits::kMaxAuditLimit, std::nullopt).records;
     }
+
+    // A session minted straight into the store, bypassing /login.
+    //
+    // Needed because a ban now revokes every session AND /login refuses a banned
+    // identity, so after a ban there is no legitimate way to obtain a token for
+    // that user — which would leave the /join and /sync ban guards unreachable
+    // from a test, and therefore untested. This stands in for the state those
+    // guards exist to catch: a token that outlived the revocation it should have
+    // died in.
+    std::string mint_token(const std::string& user_id, const std::string& name) {
+        store->store_access_token(name, user_id, "dev");
+        return name;
+    }
 };
 
 const std::string kRoomsPrefix = "/_matrix/client/v3/rooms/";
@@ -232,10 +245,17 @@ TEST(ServerBan, BanPreventsJoining) {
                           target_body(victim, "spam"))));
     ASSERT_TRUE(f.store->is_server_banned(victim));
 
-    // The channel is public, so before the ban list existed this join succeeded:
-    // handle_join checked only the join_rules event.
+    // The ban revoked the victim's session, so their old token is simply gone.
+    EXPECT_EQ(call(handler, &RoomHandler::handle_join, join_path(room), "token-victim").status,
+              401);
+
+    // ...and the join guard refuses independently of that, for a token that
+    // somehow survived. Both halves matter: without the second, deleting the
+    // /join guard would leave this test green, because the 401 above would still
+    // fire. (Mutation testing on the sync guard caught exactly that shape.)
+    auto survivor = f.mint_token(victim, "token-victim-survivor");
     EXPECT_TRUE(IsForbiddenBecause(call(handler, &RoomHandler::handle_join, join_path(room),
-                                        "token-victim"),
+                                        survivor),
                                    "You are banned from this server"));
     EXPECT_FALSE(f.store->is_room_member(room, victim));
 }
@@ -389,8 +409,9 @@ TEST(ServerBan, BanSurvivesDeletionOfTheChannelItWasPlacedFrom) {
     EXPECT_EQ(ban->reason, "the reason");
 
     // And it still bites: the surviving channel is still closed to them.
+    auto survivor = f.mint_token(victim, "token-victim-survivor");
     EXPECT_TRUE(IsForbiddenBecause(call(handler, &RoomHandler::handle_join, join_path(other),
-                                        "token-victim"),
+                                        survivor),
                                    "You are banned from this server"));
 }
 
@@ -422,8 +443,14 @@ TEST(ServerBan, UnbanRestoresAccessEverywhere) {
     EXPECT_EQ(f.store->get_membership(general, victim), membership::kLeave);
     EXPECT_EQ(f.store->get_membership(other, victim), membership::kLeave);
 
-    // And they can actually come back.
-    EXPECT_TRUE(IsOk(call(handler, &RoomHandler::handle_join, join_path(other), "token-victim")));
+    // Unban does NOT resurrect the sessions the ban revoked — those rows are
+    // gone, and nothing recreates them. The user comes back by logging in again.
+    EXPECT_EQ(call(handler, &RoomHandler::handle_join, join_path(other), "token-victim").status,
+              401);
+
+    // And once they have re-authenticated, they can actually come back.
+    auto fresh = f.mint_token(victim, "token-victim-relogin");
+    EXPECT_TRUE(IsOk(call(handler, &RoomHandler::handle_join, join_path(other), fresh)));
     EXPECT_TRUE(f.store->is_room_member(other, victim));
 }
 
@@ -597,6 +624,171 @@ TEST(ServerBan, ABannedIdentityCannotReRegister) {
     auto res = call(auth, &AuthHandler::handle_register, "/_matrix/client/v3/register", "",
                     json{{"username", "victim"}, {"password", "hunter2hunter2"}}.dump());
     EXPECT_TRUE(IsForbiddenBecause(res, "banned"));
+}
+
+// ══ 6b. A ban revokes every session ═══════════════════════════════════════
+//
+// Without this a ban was "you may stay signed in, but everything you ask for is
+// refused" — enforcement resting on every present and future read path
+// remembering to consult the ban list. Revocation makes the ban act at the
+// identity, not at each endpoint.
+
+TEST(ServerBanSessions, BanRevokesThePreviouslyValidAccessToken) {
+    Fixture f("revoke-access");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel(mod, "general");
+    f.join(room, victim);
+
+    // The token works first, so its death below is caused by the ban and not by a
+    // fixture that never issued a usable session.
+    ASSERT_TRUE(f.store->get_user_by_token("token-victim").has_value());
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(room), "token-mod",
+                          target_body(victim))));
+
+    EXPECT_FALSE(f.store->get_user_by_token("token-victim").has_value());
+    // The moderator's own session is untouched — a ban revokes the target's
+    // sessions, not everybody's.
+    EXPECT_TRUE(f.store->get_user_by_token("token-mod").has_value());
+}
+
+TEST(ServerBanSessions, BanRevokesTheRefreshTokenToo) {
+    Fixture f("revoke-refresh");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel(mod, "general");
+    f.join(room, victim);
+
+    // A session WITH a refresh token, which is the interesting case: revoking the
+    // access token alone would be pointless, because the refresh token mints a
+    // replacement without needing the password.
+    f.store->store_access_token("victim-access", victim, "dev",
+                                kDefaultAccessTokenLifetimeMs, std::string("victim-refresh"));
+    ASSERT_TRUE(f.store->get_user_by_token("victim-access").has_value());
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(room), "token-mod",
+                          target_body(victim))));
+
+    // The REFRESH token is asserted first, and the order is load-bearing.
+    //
+    // get_user_by_token reaps a row it finds expired. So if this test checked the
+    // access token first, a hypothetical revocation that merely EXPIRED the row
+    // instead of deleting it would have the reaping delete the row as a side
+    // effect — and the refresh check below would then pass against a row that the
+    // assertion above had just removed, rather than against revocation doing its
+    // job. Mutation testing found exactly that: replacing the DELETE with an
+    // expiry UPDATE left this test green until these two lines were swapped.
+    EXPECT_FALSE(f.store->consume_refresh_token("victim-refresh").has_value());
+    EXPECT_FALSE(f.store->get_user_by_token("victim-access").has_value());
+}
+
+TEST(ServerBanSessions, KickDoesNotRevokeSessions) {
+    Fixture f("kick-keeps-session");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel(mod, "general");
+    f.join(room, victim);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_kick, kick_path(room), "token-mod",
+                          target_body(victim))));
+
+    // A kick is per-channel: the user is removed from one room and remains a
+    // member of the server, so signing them out everywhere would be wrong.
+    EXPECT_TRUE(f.store->get_user_by_token("token-victim").has_value());
+    EXPECT_FALSE(f.store->is_server_banned(victim));
+    EXPECT_EQ(f.store->get_membership(room, victim), membership::kLeave);
+}
+
+TEST(ServerBanSessions, BanningAUserWithNoSessionDoesNotFault) {
+    Fixture f("no-session");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel(mod, "general");
+    f.join(room, victim);
+
+    // Revoking zero sessions is an ordinary outcome, not an error: an account that
+    // never logged in, or is already logged out, must ban exactly like any other.
+    f.store->delete_all_tokens_for_user(victim);
+    ASSERT_FALSE(f.store->get_user_by_token("token-victim").has_value());
+    EXPECT_EQ(f.store->delete_all_tokens_for_user(victim), 0);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    EXPECT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(room), "token-mod",
+                          target_body(victim))));
+    EXPECT_TRUE(f.store->is_server_banned(victim));
+    EXPECT_EQ(f.store->get_membership(room, victim), membership::kBan);
+    // Still exactly one audit record: revocation is a side effect of the decision,
+    // not a second decision.
+    EXPECT_EQ(f.records().size(), 1u);
+}
+
+TEST(ServerBanSessions, ABannedUserCannotLogInAgain) {
+    Fixture f("login-refused");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel(mod, "general");
+    f.join(room, victim);
+
+    // add_user stores a bcrypt hash of "password", so this is a real credential.
+    const std::string creds =
+        json{{"type", "m.login.password"},
+             {"identifier", {{"type", "m.id.user"}, {"user", "victim"}}},
+             {"password", "password"}}.dump();
+
+    AuthHandler auth(*f.store, *f.sync, f.config);
+    // Logging in works BEFORE the ban, so the refusal below is the ban and not a
+    // malformed request or a wrong password.
+    ASSERT_TRUE(IsOk(call(auth, &AuthHandler::handle_login, "/_matrix/client/v3/login", "",
+                          creds)));
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(room), "token-mod",
+                          target_body(victim))));
+
+    // Revocation without this would be theatre: the client would be logged out and
+    // would immediately log back in with the password it still has.
+    EXPECT_TRUE(IsForbiddenBecause(call(auth, &AuthHandler::handle_login,
+                                        "/_matrix/client/v3/login", "", creds),
+                                   "You are banned from this server"));
+}
+
+TEST(ServerBanSessions, UnbanLetsTheUserLogInFresh) {
+    Fixture f("login-after-unban");
+    f.seed_roles();
+    auto mod = f.add_user("mod", {std::string(permission::role_id::kModerator)});
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel(mod, "general");
+    f.join(room, victim);
+
+    const std::string creds =
+        json{{"type", "m.login.password"},
+             {"identifier", {{"type", "m.id.user"}, {"user", "victim"}}},
+             {"password", "password"}}.dump();
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_ban, ban_path(room), "token-mod",
+                          target_body(victim))));
+    // Unban must not error just because the target has no sessions left to restore.
+    ASSERT_TRUE(IsOk(call(handler, &RoomHandler::handle_unban, unban_path(room), "token-mod",
+                          target_body(victim))));
+
+    // The account and its password survived the ban untouched, so the ordinary
+    // login path is the way back in — no session was resurrected for them.
+    AuthHandler auth(*f.store, *f.sync, f.config);
+    auto res = call(auth, &AuthHandler::handle_login, "/_matrix/client/v3/login", "", creds);
+    EXPECT_TRUE(IsOk(res));
+    auto token = json::parse(res.body).value("access_token", "");
+    EXPECT_FALSE(token.empty());
+    EXPECT_EQ(f.store->get_user_by_token(token).value_or(""), victim);
 }
 
 // ══ 7. Audit records are preserved ════════════════════════════════════════
