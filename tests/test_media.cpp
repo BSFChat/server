@@ -12,11 +12,11 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
-#else
-#include <unistd.h>
 #endif
+#include <unistd.h>   // getpid(), for the per-process temp dirs below
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -28,12 +28,32 @@
 
 using namespace bsfchat;
 
+namespace {
+
+// `gtest_discover_tests` registers every test as its own ctest test, so
+// `ctest -j4` runs several processes over this binary concurrently. A
+// fixture with a hard-coded temp directory then has one process calling
+// remove_all() on the directory another process is reading — which is what
+// made LocalStorageTest.* and MediaHttpTest.* fail under -j4 and pass
+// serially. Every directory below is unique per process and per call.
+std::filesystem::path unique_temp_dir(const std::string& prefix) {
+    static std::atomic<unsigned> counter{0};
+    auto path = std::filesystem::temp_directory_path()
+              / (prefix + "-" + std::to_string(static_cast<long>(::getpid()))
+                 + "-" + std::to_string(counter.fetch_add(1)));
+    std::error_code ec;
+    std::filesystem::remove_all(path, ec);
+    return path;
+}
+
+} // namespace
+
 // --- Local Storage Tests ---
 
 class LocalStorageTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        test_dir = std::filesystem::temp_directory_path() / "bsfchat_test_media";
+        test_dir = unique_temp_dir("bsfchat_test_media");
         std::filesystem::create_directories(test_dir);
         storage = std::make_unique<LocalStorage>(test_dir.string());
     }
@@ -782,8 +802,7 @@ namespace {
 class MediaHttpTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        dir_ = std::filesystem::temp_directory_path() / "bsfchat_media_http_test";
-        std::filesystem::remove_all(dir_);
+        dir_ = unique_temp_dir("bsfchat_media_http_test");
         std::filesystem::create_directories(dir_);
 
         storage_ = std::make_shared<LocalStorage>(dir_.string());
