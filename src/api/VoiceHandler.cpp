@@ -18,6 +18,7 @@
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/kdf.h>
+#include <openssl/rand.h>
 #include <algorithm>
 #include <chrono>
 #include <exception>
@@ -40,6 +41,30 @@ std::string base64_encode(const unsigned char* data, size_t len) {
     std::string out((len + 2) / 3 * 4, '\0');
     int written = EVP_EncodeBlock(reinterpret_cast<unsigned char*>(out.data()), data, static_cast<int>(len));
     out.resize(written > 0 ? static_cast<size_t>(written) : 0);
+    return out;
+}
+
+// Opaque per-join token. 128 bits of CSPRNG output, hex encoded.
+//
+// It is not a secret and not a capability: every leave/state request is still
+// authenticated as the user, and the token is published in the m.call.member
+// content so a client can recognise its own session in a sync. Its only job is
+// to let the server tell one join of a user from the next one, which a
+// millisecond timestamp cannot do reliably when a client leaves and rejoins
+// inside the same tick (V-H1).
+std::string generate_session_id() {
+    unsigned char buf[16];
+    if (RAND_bytes(buf, sizeof(buf)) != 1) {
+        // Falling back to a timestamp would silently reintroduce the
+        // same-millisecond collision the token exists to rule out.
+        throw std::runtime_error("RAND_bytes failed generating a voice session id");
+    }
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out(sizeof(buf) * 2, '\0');
+    for (size_t i = 0; i < sizeof(buf); ++i) {
+        out[i * 2] = kHex[buf[i] >> 4];
+        out[i * 2 + 1] = kHex[buf[i] & 0x0f];
+    }
     return out;
 }
 
@@ -81,6 +106,33 @@ size_t VoiceHandler::reap_stale_members(std::chrono::steady_clock::time_point no
             if (!ev.content.data.value("active", false)) continue;
 
             const auto& member_id = *ev.state_key;
+            // Identity of the row this sweep decided to look at. Re-checked
+            // under the lock below; if it has moved on, a join landed in the
+            // meantime and this sweep must not touch it.
+            const auto snapshot_session = ev.content.data.value("session_id", std::string{});
+            const auto snapshot_joined_at = ev.content.data.value("joined_at", int64_t(0));
+
+            // The scan above is unsynchronised (it walks whole rooms and must
+            // not hold a lock while doing so), so everything from here to the
+            // emit runs under the same mutex handle_voice_join takes. Without
+            // this a join that lands between the scan and the emit is reaped
+            // by a sweep that never saw it: the member ends up active=false
+            // with a live client, which is exactly the ghost the reaper is
+            // supposed to prevent. Lock order is voice_state_mutex_ then
+            // heartbeat_mutex_ everywhere.
+            std::lock_guard<std::mutex> state_lock(voice_state_mutex_);
+
+            auto current = store_.get_state_event(room_id, std::string(event_type::kCallMember), member_id);
+            if (!current || !current->content.data.value("active", false)) continue;
+            if (current->content.data.value("session_id", std::string{}) != snapshot_session ||
+                current->content.data.value("joined_at", int64_t(0)) != snapshot_joined_at) {
+                // A newer join replaced the row this sweep sampled. Its
+                // heartbeat is fresh by construction (handle_voice_join
+                // records it inside this same critical section), so leaving
+                // it alone is correct and it will be considered next tick.
+                continue;
+            }
+
             bool stale = false;
             {
                 std::lock_guard<std::mutex> lock(heartbeat_mutex_);
@@ -103,6 +155,11 @@ size_t VoiceHandler::reap_stale_members(std::chrono::steady_clock::time_point no
 
             json member_json;
             to_json(member_json, member);
+            // Echo the session being retracted so a client can tell "the
+            // session I am running was reaped" from "an older session of mine
+            // was cleaned up", which is what the client-side self-row
+            // authority fix (V-H2) keys off.
+            member_json["session_id"] = snapshot_session;
             emit_state_event(store_, sync_engine_, config_.server_name,
                              room_id, member_id, std::string(event_type::kCallMember), member_id, member_json);
             get_logger()->info("Voice reaper: expired ghost participant {} in room {}", member_id, room_id);
@@ -190,10 +247,16 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
         } catch (...) {}
     }
 
+    std::string session_id;
+    int64_t joined_at = 0;
     {
         // Serialize the participant-count check and the state emit so two
-        // workers can't both pass the check and overfill the channel.
+        // workers can't both pass the check and overfill the channel. The
+        // reaper takes the same mutex around its check-and-emit.
         std::lock_guard<std::mutex> lock(voice_state_mutex_);
+
+        auto existing = store_.get_state_event(room_id, std::string(event_type::kCallMember), *user_id);
+        const bool was_active = existing && existing->content.data.value("active", false);
 
         // Check max participants if set
         if (voice_channel.max_participants > 0) {
@@ -201,7 +264,12 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
             auto state_events = store_.get_state_events(room_id);
             int active_count = 0;
             for (const auto& ev : state_events) {
-                if (ev.type == std::string(event_type::kCallMember)) {
+                if (ev.type == std::string(event_type::kCallMember) && ev.state_key) {
+                    // The caller's own stale row is about to be replaced, not
+                    // added to, so it must not count against the cap.
+                    // Otherwise rejoining after a crash into a full channel
+                    // is refused because of the ghost the rejoin replaces.
+                    if (*ev.state_key == *user_id) continue;
                     if (ev.content.data.value("active", false)) {
                         active_count++;
                     }
@@ -214,21 +282,46 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
             }
         }
 
+        // V-M6: joining over a row that is still active (second device, a
+        // rejoin after a crash, a leave that never arrived) used to overwrite
+        // it silently. Sitting mesh peers key their peer connection on the
+        // active transition, so they never saw a reason to tear the old one
+        // down and re-offer, and the rejoiner got silence. Retract the old
+        // row explicitly first, then publish the new one.
+        if (was_active) {
+            VoiceMemberContent reset;
+            reset.active = false;
+            json reset_json;
+            to_json(reset_json, reset);
+            reset_json["session_id"] = existing->content.data.value("session_id", std::string{});
+            emit_state_event(store_, sync_engine_, config_.server_name,
+                             room_id, *user_id, std::string(event_type::kCallMember), *user_id, reset_json);
+            get_logger()->info("User {} rejoined voice in room {} over a still-active session; "
+                               "emitted a reset first", *user_id, room_id);
+        }
+
         // Set the user's m.call.member state to active
+        session_id = generate_session_id();
+        joined_at = now_ms();
+
         VoiceMemberContent member;
         member.active = true;
         member.muted = false;
         member.deafened = false;
         member.device_id = device_id;
-        member.joined_at = now_ms();
+        member.joined_at = joined_at;
 
         json member_json;
         to_json(member_json, member);
+        member_json["session_id"] = session_id;
         emit_state_event(store_, sync_engine_, config_.server_name,
                          room_id, *user_id, std::string(event_type::kCallMember), *user_id, member_json);
-    }
 
-    record_heartbeat(room_id, *user_id);
+        // Inside the critical section on purpose: a reaper sweep must never be
+        // able to observe the new active row without its heartbeat, which is
+        // the "join in the same tick as the sweep" race.
+        record_heartbeat(room_id, *user_id);
+    }
 
     // Gather list of other active voice members
     auto state_events = store_.get_state_events(room_id);
@@ -243,12 +336,21 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
                     {"screen_sharing", ev.content.data.value("screen_sharing", false)},
                     {"camera_on", ev.content.data.value("camera_on", false)},
                     {"device_id", ev.content.data.value("device_id", "")},
+                    {"joined_at", ev.content.data.value("joined_at", int64_t(0))},
+                    {"session_id", ev.content.data.value("session_id", "")},
                 });
             }
         }
     }
 
-    res.set_content(json{{"members", members_arr}}.dump(), "application/json");
+    // session_id is the token a client echoes back on leave/state so an
+    // out-of-order request from a previous session cannot clobber this one
+    // (V-H1). Clients that ignore it keep the pre-existing behaviour.
+    res.set_content(json{
+        {"members", members_arr},
+        {"session_id", session_id},
+        {"joined_at", joined_at},
+    }.dump(), "application/json");
     get_logger()->info("User {} joined voice in room {}", *user_id, room_id);
 }
 
@@ -274,17 +376,81 @@ void VoiceHandler::handle_voice_leave(const httplib::Request& req, httplib::Resp
         return;
     }
 
-    // Set the user's m.call.member state to inactive
-    VoiceMemberContent member;
-    member.active = false;
+    // Optional session echo. A client that got a session_id from voice/join
+    // should send it back here; joined_at is accepted as a weaker fallback for
+    // clients that only kept the timestamp. Both are optional so clients
+    // predating this change keep working.
+    std::string claimed_session;
+    int64_t claimed_joined_at = 0;
+    bool has_claimed_joined_at = false;
+    if (!req.body.empty()) {
+        try {
+            auto body = json::parse(req.body);
+            if (body.is_object()) {
+                if (body.contains("session_id") && body["session_id"].is_string()) {
+                    claimed_session = body["session_id"].get<std::string>();
+                }
+                if (body.contains("joined_at") && body["joined_at"].is_number_integer()) {
+                    claimed_joined_at = body["joined_at"].get<int64_t>();
+                    has_claimed_joined_at = true;
+                }
+            }
+        } catch (...) {}
+    }
 
-    json member_json;
-    to_json(member_json, member);
-    emit_state_event(store_, sync_engine_, config_.server_name,
-                     room_id, *user_id, std::string(event_type::kCallMember), *user_id, member_json);
-    clear_heartbeat(room_id, *user_id);
+    std::string reason;
+    {
+        // Same mutex as join and the reaper: the decision below is a
+        // check-then-emit and must not interleave with either.
+        std::lock_guard<std::mutex> lock(voice_state_mutex_);
 
-    res.set_content("{}", "application/json");
+        auto current = store_.get_state_event(room_id, std::string(event_type::kCallMember), *user_id);
+        const bool active = current && current->content.data.value("active", false);
+        const auto stored_session =
+            current ? current->content.data.value("session_id", std::string{}) : std::string{};
+        const auto stored_joined_at =
+            current ? current->content.data.value("joined_at", int64_t(0)) : int64_t(0);
+
+        if (!active) {
+            // Already inactive: a duplicate leave, a leave racing the reaper,
+            // or a leave after a moderator action. Answering 200 with an
+            // explicit no-op rather than 4xx keeps leave idempotent, which is
+            // what a client tearing down on quit or on an error path needs;
+            // re-emitting active=false would spam every peer's sync with a
+            // state change that changes nothing.
+            reason = "not_active";
+        } else if (!claimed_session.empty() && !stored_session.empty() &&
+                   claimed_session != stored_session) {
+            // V-H1 server half: the leave belongs to a session that has
+            // already been replaced by a newer join. Honouring it would mark
+            // a live client inactive — the ghost participant that is audible,
+            // unlisted and never heartbeats.
+            reason = "stale_session";
+        } else if (has_claimed_joined_at && stored_joined_at > claimed_joined_at) {
+            // Same situation, detected from the weaker timestamp evidence.
+            reason = "stale_session";
+        }
+
+        if (reason.empty()) {
+            VoiceMemberContent member;
+            member.active = false;
+
+            json member_json;
+            to_json(member_json, member);
+            member_json["session_id"] = stored_session;
+            emit_state_event(store_, sync_engine_, config_.server_name,
+                             room_id, *user_id, std::string(event_type::kCallMember), *user_id, member_json);
+            clear_heartbeat(room_id, *user_id);
+        }
+    }
+
+    if (!reason.empty()) {
+        get_logger()->info("Voice leave from {} in room {} ignored ({})", *user_id, room_id, reason);
+        res.set_content(json{{"changed", false}, {"reason", reason}}.dump(), "application/json");
+        return;
+    }
+
+    res.set_content(json{{"changed", true}}.dump(), "application/json");
     get_logger()->info("User {} left voice in room {}", *user_id, room_id);
 }
 
@@ -325,6 +491,7 @@ void VoiceHandler::handle_voice_members(const httplib::Request& req, httplib::Re
                     {"camera_on", ev.content.data.value("camera_on", false)},
                     {"device_id", ev.content.data.value("device_id", "")},
                     {"joined_at", ev.content.data.value("joined_at", int64_t(0))},
+                    {"session_id", ev.content.data.value("session_id", "")},
                 });
             }
         }
@@ -373,9 +540,31 @@ void VoiceHandler::handle_voice_state(const httplib::Request& req, httplib::Resp
         // Get current member state
         auto current = store_.get_state_event(room_id, std::string(event_type::kCallMember), *user_id);
         if (!current || !current->content.data.value("active", false)) {
+            // Deliberate: a state PUT never re-activates a member, including
+            // one the reaper has just expired. Re-activating would make the
+            // reaper unenforceable (any client that keeps PUTting mute every
+            // few seconds would resurrect itself forever, which is precisely
+            // the ghost participant the reaper exists to remove) and it would
+            // let a state PUT stand in for a join, skipping the capacity
+            // check and the join reset. A reaped client must re-POST
+            // voice/join, which is what the client-side V-H2 fix does.
             res.status = 403;
             res.set_content(MatrixError::forbidden("Not in voice channel").to_json().dump(), "application/json");
             return;
+        }
+
+        // Reject a state PUT carrying a superseded session token for the same
+        // reason leave rejects one: a mute/screen-share announcement queued by
+        // a session that has already been replaced must not overwrite the
+        // flags of the session running now.
+        if (body.is_object() && body.contains("session_id") && body["session_id"].is_string()) {
+            const auto stored_session = current->content.data.value("session_id", std::string{});
+            if (!stored_session.empty() && body["session_id"].get<std::string>() != stored_session) {
+                res.status = 403;
+                res.set_content(MatrixError::forbidden("Voice session superseded").to_json().dump(),
+                                "application/json");
+                return;
+            }
         }
 
         // Update muted/deafened/screen_sharing/camera_on from request body,

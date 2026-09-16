@@ -80,3 +80,34 @@ target_sources(server_tests PRIVATE
 
 include(GoogleTest)
 gtest_discover_tests(server_tests)
+
+# --- end-to-end scripts ------------------------------------------------------
+#
+# These start the real bsfchat-server binary on a real socket, so they cover
+# what the unit tests structurally cannot: routing, auth middleware, JSON on
+# the wire, and what /sync actually shows the other participant. They are
+# labelled `e2e` and separated from the unit tests:
+#
+#   ctest --test-dir build -L  e2e     # the e2e scripts only
+#   ctest --test-dir build -LE e2e     # the unit tests only
+#   cmake --build build --target e2e   # shorthand for the first
+#
+# BSFCHAT_SERVER_BIN is handed to the script as a generator expression rather
+# than a guessed path, so the script always exercises the binary from THIS
+# build tree and never a stale scratch tree lying around the repo.
+add_test(NAME e2e_voice
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/e2e/e2e_voice.sh)
+set_tests_properties(e2e_voice PROPERTIES
+    LABELS e2e
+    ENVIRONMENT "BSFCHAT_SERVER_BIN=$<TARGET_FILE:bsfchat-server>"
+    # Generous: it registers two users (bcrypt) and makes ~40 HTTP round trips.
+    TIMEOUT 300
+    # It binds a socket and starts a server process; two copies at once would
+    # be fine (the port is ephemeral) but there is nothing to gain from it.
+    RUN_SERIAL TRUE)
+
+add_custom_target(e2e
+    COMMAND ${CMAKE_CTEST_COMMAND} --test-dir ${CMAKE_BINARY_DIR} -L e2e --output-on-failure
+    DEPENDS bsfchat-server
+    USES_TERMINAL
+    COMMENT "Running the end-to-end scripts against the real server binary")

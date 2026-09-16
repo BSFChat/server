@@ -3,6 +3,11 @@
 Status: **feasibility confirmed, phase 0 (server-side token issuance) implemented.**
 No client code has been changed.
 
+Updated 2026-09-16: §6 revised for the voice roster lifecycle work
+(PLAN-2026-09 V-M6 / V-H1 server half). m.call.member now carries a
+`session_id`, and the reaper's check-and-emit is synchronised against joins.
+The LiveKit analysis below is unchanged and still **UNVERIFIED** where marked.
+
 Written 2026-07-30. Every external fact in this document was verified against a
 primary source (upstream repository, release metadata, or upstream source code)
 on that date; the "Verified facts" section lists what and where. Anything not
@@ -237,17 +242,39 @@ Rules for the flag:
 Today there are two overlapping sources of truth:
 
 - `m.call.member` state events, written **only by the server**
-  (`VoiceHandler.cpp:207-215` join, `:268-276` leave, `:92-99` reaper) with
-  content `{active, muted, deafened, screen_sharing, camera_on, device_id,
-  joined_at}`.
+  (`VoiceHandler.cpp:317` join, `:441` leave, `:163` reaper) with content
+  `{active, muted, deafened, screen_sharing, camera_on, device_id, joined_at,
+  session_id}`.
+
+  `session_id` is an opaque per-join token minted by `voice/join`, returned in
+  its response alongside `joined_at`, and echoed back by `voice/leave` and
+  `voice/state`. The server refuses to act on a token the stored row has moved
+  past, so a leave the client sent before a rejoin — but that the server
+  processed after it — can no longer mark a live participant inactive. Both
+  fields are optional on the way in; clients that ignore them keep the older
+  behaviour. The retraction events emitted by leave, by a rejoin and by the
+  reaper all name the session they retract, which is what lets a client tell
+  "the session I am running was expired" from "an older session of mine was
+  cleaned up".
+
+  A join over a row that is still `active` now emits `active: false` and then
+  the new `active: true`, in that order. A mesh peer keys its peer connection
+  on the active transition; overwriting one active row with another gave it no
+  edge to react to, so it held a dead connection instead of re-offering.
 - The client's `m_voiceMembers` (`ServerConnection.h:754`), refreshed by a 5 s
   poll of `GET .../voice/members` (`ServerConnection.cpp:324-331`) and
   immediately on any `m.call.member` sync event (`:2044`, `:2129`). The same
   poll also drives mesh reconciliation (`:546-560`).
-- The **ghost reaper** (`VoiceHandler.cpp:66-134`, `kHeartbeatTtl = 30s`,
+- The **ghost reaper** (`VoiceHandler.cpp:100-170`, `kHeartbeatTtl = 30s`,
   `kReapInterval = 10s`) exists because in a mesh nobody authoritatively knows
   who is still connected. It infers liveness from HTTP heartbeats and flips
   `active: false` when one goes stale.
+
+  Its per-member check-and-emit runs under the same mutex `handle_voice_join`
+  records its heartbeat under, and it re-reads the row it sampled before
+  emitting: a join landing between a sweep's staleness check and its emit used
+  to be expired with a live client on the other end. It is still O(rooms ×
+  state events) per tick (PLAN-2026-09 V-L5), which is untouched.
 
 With an SFU, **LiveKit becomes the authority on liveness.** The recommended end
 state:
@@ -271,6 +298,11 @@ state:
   already records a heartbeat (`handle_livekit_token` → `record_heartbeat`), so
   a token-renewing SFU client is not reaped in the interim — that is
   deliberate, and it is what keeps phase 1 safe before webhooks land.
+- Whichever option wins, the session token stays useful: it is what tells the
+  server that a `participant_left` (or a client's own leave) refers to the
+  join it was issued for and not to the one that replaced it. LiveKit's own
+  identity collision rule — one identity, one participant, older connection
+  disconnected — is the same problem at the SFU layer.
 - The 5 s member poll can drop to a slow reconciliation safety net (30-60 s)
   for SFU channels, since LiveKit pushes participant events to the client
   directly. Keep it for mesh.

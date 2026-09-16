@@ -10,6 +10,9 @@
 
 #include <chrono>
 #include <filesystem>
+#include <atomic>
+#include <thread>
+#include <vector>
 #include <fstream>
 
 #include <bsfchat/Constants.h>
@@ -469,6 +472,44 @@ protected:
         return res.status == -1 ? 200 : res.status;
     }
 
+    // Drives the real join handler rather than inserting a row, so the
+    // session token, the reset-on-rejoin and the heartbeat all happen.
+    json real_join(const std::string& room_id, const std::string& token,
+                   const std::string& body = "") {
+        httplib::Response res;
+        auto req = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/join", token, body);
+        handler->handle_voice_join(req, res);
+        EXPECT_EQ(status_of(res), 200) << res.body;
+        return json::parse(res.body);
+    }
+
+    json real_leave(const std::string& room_id, const std::string& token,
+                    const std::string& body = "") {
+        httplib::Response res;
+        auto req = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/leave", token, body);
+        handler->handle_voice_leave(req, res);
+        EXPECT_EQ(status_of(res), 200) << res.body;
+        return json::parse(res.body);
+    }
+
+    // Every m.call.member event ever emitted for `user_id`, oldest first.
+    // The roster is a state event, so the current row alone cannot show that
+    // a rejoin emitted an inactive transition before the active one.
+    std::vector<json> member_event_history(const std::string& room_id, const std::string& user_id) {
+        std::vector<json> out;
+        for (const auto& ev : store->get_room_events(room_id, 1000, "f")) {
+            if (ev.type != std::string(event_type::kCallMember)) continue;
+            if (!ev.state_key || *ev.state_key != user_id) continue;
+            out.push_back(ev.content.data);
+        }
+        return out;
+    }
+
+    std::string stored_session(const std::string& room_id, const std::string& user_id) {
+        auto ev = store->get_state_event(room_id, std::string(event_type::kCallMember), user_id);
+        return ev ? ev->content.data.value("session_id", std::string{}) : std::string{};
+    }
+
     static httplib::Request make_request(const std::string& method, const std::string& path,
                                          const std::string& token, const std::string& body = "") {
         httplib::Request req;
@@ -669,6 +710,341 @@ TEST_F(VoiceHandlerTest, LeaveRequiresRoomMembership) {
     auto req2 = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/leave", "alice-token");
     handler->handle_voice_leave(req2, res2);
     EXPECT_EQ(status_of(res2), 200);
+}
+
+// --- V-M6 / V-H1: join and leave state checks ---
+//
+// Every test below drives the real handlers. The bug class they cover is
+// "the server took an instruction at face value without asking what state
+// the row was actually in", which only shows up when requests arrive out of
+// the order the client sent them in.
+
+TEST_F(VoiceHandlerTest, JoinMintsASessionTokenAndPublishesIt) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    auto joined = real_join(room_id, "alice-token");
+
+    ASSERT_TRUE(joined.contains("session_id"));
+    ASSERT_TRUE(joined.contains("joined_at"));
+    EXPECT_EQ(joined["session_id"].get<std::string>().size(), 32u); // 128 bits, hex
+    EXPECT_GT(joined["joined_at"].get<int64_t>(), 0);
+    EXPECT_EQ(stored_session(room_id, "@alice:test"), joined["session_id"].get<std::string>());
+    EXPECT_TRUE(is_active(room_id, "@alice:test"));
+}
+
+TEST_F(VoiceHandlerTest, TwoJoinsMintDifferentSessionTokens) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    auto first = real_join(room_id, "alice-token")["session_id"].get<std::string>();
+    auto second = real_join(room_id, "alice-token")["session_id"].get<std::string>();
+    EXPECT_NE(first, second);
+    EXPECT_EQ(stored_session(room_id, "@alice:test"), second);
+}
+
+TEST_F(VoiceHandlerTest, LeaveWithTheCurrentSessionDeactivates) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    auto session = real_join(room_id, "alice-token")["session_id"].get<std::string>();
+    auto left = real_leave(room_id, "alice-token", json{{"session_id", session}}.dump());
+
+    EXPECT_TRUE(left.value("changed", false));
+    EXPECT_FALSE(is_active(room_id, "@alice:test"));
+}
+
+TEST_F(VoiceHandlerTest, LeaveFromAnOlderSessionCannotFlipAFreshJoin) {
+    // V-H1. The client sent leave then join on two connections; the server
+    // saw the join first. Before the session token the late leave marked a
+    // live client inactive: audible, unlisted, never heartbeating.
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    auto old_session = real_join(room_id, "alice-token")["session_id"].get<std::string>();
+    auto fresh = real_join(room_id, "alice-token");
+    auto fresh_session = fresh["session_id"].get<std::string>();
+
+    auto ignored = real_leave(room_id, "alice-token", json{{"session_id", old_session}}.dump());
+
+    EXPECT_FALSE(ignored.value("changed", true));
+    EXPECT_EQ(ignored.value("reason", ""), "stale_session");
+    EXPECT_TRUE(is_active(room_id, "@alice:test"));
+    EXPECT_EQ(stored_session(room_id, "@alice:test"), fresh_session);
+
+    // And the fresh session's own leave still works.
+    EXPECT_TRUE(real_leave(room_id, "alice-token",
+                           json{{"session_id", fresh_session}}.dump()).value("changed", false));
+    EXPECT_FALSE(is_active(room_id, "@alice:test"));
+}
+
+TEST_F(VoiceHandlerTest, LeaveWithAnOlderJoinedAtIsIgnored) {
+    // Fallback evidence for a client that kept only the timestamp.
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    auto first = real_join(room_id, "alice-token");
+    auto old_joined_at = first["joined_at"].get<int64_t>();
+
+    // Force the replacement row to carry a strictly newer joined_at; two
+    // joins inside one millisecond would otherwise make this ambiguous, which
+    // is exactly why the session token exists as the primary check.
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    real_join(room_id, "alice-token");
+
+    auto ignored = real_leave(room_id, "alice-token", json{{"joined_at", old_joined_at}}.dump());
+    EXPECT_FALSE(ignored.value("changed", true));
+    EXPECT_EQ(ignored.value("reason", ""), "stale_session");
+    EXPECT_TRUE(is_active(room_id, "@alice:test"));
+}
+
+TEST_F(VoiceHandlerTest, LeaveWithoutASessionTokenStillWorks) {
+    // Backwards compatibility: clients predating the token send an empty body.
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    real_join(room_id, "alice-token");
+    EXPECT_TRUE(real_leave(room_id, "alice-token").value("changed", false));
+    EXPECT_FALSE(is_active(room_id, "@alice:test"));
+}
+
+TEST_F(VoiceHandlerTest, LeaveWhenAlreadyInactiveIsANoOpNotAnEvent) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    real_join(room_id, "alice-token");
+    real_leave(room_id, "alice-token");
+    auto after_first_leave = member_event_history(room_id, "@alice:test").size();
+
+    auto second = real_leave(room_id, "alice-token");
+    EXPECT_FALSE(second.value("changed", true));
+    EXPECT_EQ(second.value("reason", ""), "not_active");
+    EXPECT_FALSE(is_active(room_id, "@alice:test"));
+    // The point of the no-op: no second active=false in everyone's /sync.
+    EXPECT_EQ(member_event_history(room_id, "@alice:test").size(), after_first_leave);
+}
+
+TEST_F(VoiceHandlerTest, LeaveBeforeEverJoiningIsANoOp) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    auto res = real_leave(room_id, "alice-token");
+    EXPECT_FALSE(res.value("changed", true));
+    EXPECT_EQ(res.value("reason", ""), "not_active");
+    EXPECT_TRUE(member_event_history(room_id, "@alice:test").empty());
+}
+
+TEST_F(VoiceHandlerTest, JoinOverAnActiveRowEmitsInactiveThenActive) {
+    // V-M6. Sitting mesh peers key their peer connection on the active
+    // transition. Overwriting one active row with another gave them no edge
+    // to react to, so they held a dead connection and the rejoiner got
+    // silence until a watchdog fired.
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    auto first = real_join(room_id, "alice-token");
+    auto second = real_join(room_id, "alice-token");
+
+    auto history = member_event_history(room_id, "@alice:test");
+    ASSERT_EQ(history.size(), 3u) << "expected active, then inactive, then active";
+    EXPECT_TRUE(history[0].value("active", false));
+    EXPECT_EQ(history[0].value("session_id", ""), first["session_id"].get<std::string>());
+
+    EXPECT_FALSE(history[1].value("active", true));
+    EXPECT_EQ(history[1].value("session_id", ""), first["session_id"].get<std::string>())
+        << "the reset must name the session it retracts, not the new one";
+
+    EXPECT_TRUE(history[2].value("active", false));
+    EXPECT_EQ(history[2].value("session_id", ""), second["session_id"].get<std::string>());
+    EXPECT_TRUE(is_active(room_id, "@alice:test"));
+}
+
+TEST_F(VoiceHandlerTest, JoinOverAnInactiveRowEmitsOnlyTheActiveEvent) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    real_join(room_id, "alice-token");
+    real_leave(room_id, "alice-token");
+    auto before = member_event_history(room_id, "@alice:test").size();
+    real_join(room_id, "alice-token");
+
+    // No spurious reset when there was nothing live to reset.
+    EXPECT_EQ(member_event_history(room_id, "@alice:test").size(), before + 1);
+}
+
+TEST_F(VoiceHandlerTest, RejoinIsNotRefusedByAFullChannel) {
+    // The caller's own ghost row is replaced, not added to, so it must not
+    // count against max_participants — otherwise a crash-and-rejoin into a
+    // full channel is refused because of the ghost the rejoin would clear.
+    auto room_id = generate_room_id("test");
+    store->create_room(room_id, "@alice:test");
+    store->set_membership(room_id, "@alice:test", "join");
+    store->set_membership(room_id, "@bob:test", "join");
+    store->insert_event(generate_event_id("test"), room_id, "@alice:test",
+                        std::string(event_type::kRoomVoice), "",
+                        json{{"enabled", true}, {"max_participants", 2}}.dump(), 1000);
+
+    real_join(room_id, "alice-token");
+    real_join(room_id, "bob-token");
+
+    // Channel is at capacity with alice and bob. Alice rejoining is fine.
+    auto rejoin = real_join(room_id, "alice-token");
+    EXPECT_TRUE(is_active(room_id, "@alice:test"));
+    EXPECT_TRUE(is_active(room_id, "@bob:test"));
+
+    // Carol, a genuine third party, is still refused.
+    store->create_user("@carol:test", hash_password("pass", 10));
+    store->store_access_token("carol-token", "@carol:test", "DEV3");
+    store->set_membership(room_id, "@carol:test", "join");
+    httplib::Response res;
+    auto req = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/join", "carol-token");
+    handler->handle_voice_join(req, res);
+    EXPECT_EQ(status_of(res), 403);
+    EXPECT_NE(res.body.find("full"), std::string::npos);
+}
+
+TEST_F(VoiceHandlerTest, VoiceStateOnAReapedMemberIsRefusedAndDoesNotReactivate) {
+    // Documented decision: a state PUT never re-activates a row. Allowing it
+    // would make the reaper unenforceable (a client PUTting mute every few
+    // seconds would resurrect itself indefinitely) and would let a state PUT
+    // substitute for a join, skipping the capacity check and the reset.
+    // A reaped client must re-POST voice/join.
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    auto joined = real_join(room_id, "alice-token");
+    auto t0 = std::chrono::steady_clock::now();
+    handler->record_heartbeat(room_id, "@alice:test", t0 - std::chrono::seconds(60));
+    ASSERT_EQ(handler->reap_stale_members(t0), 1u);
+    ASSERT_FALSE(is_active(room_id, "@alice:test"));
+    auto after_reap = member_event_history(room_id, "@alice:test").size();
+
+    httplib::Response res;
+    auto req = make_request("PUT", "/_matrix/client/v3/rooms/" + room_id + "/voice/state", "alice-token",
+                            json{{"muted", true}, {"session_id", joined["session_id"]}}.dump());
+    handler->handle_voice_state(req, res);
+
+    EXPECT_EQ(status_of(res), 403);
+    EXPECT_NE(res.body.find("M_FORBIDDEN"), std::string::npos);
+    EXPECT_FALSE(is_active(room_id, "@alice:test"));
+    EXPECT_EQ(member_event_history(room_id, "@alice:test").size(), after_reap);
+
+    // The prescribed recovery path works and mints a new session.
+    auto rejoined = real_join(room_id, "alice-token");
+    EXPECT_TRUE(is_active(room_id, "@alice:test"));
+    EXPECT_NE(rejoined["session_id"], joined["session_id"]);
+}
+
+TEST_F(VoiceHandlerTest, ReapedRowNamesTheSessionItRetracted) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    auto joined = real_join(room_id, "alice-token");
+    auto t0 = std::chrono::steady_clock::now();
+    handler->record_heartbeat(room_id, "@alice:test", t0 - std::chrono::seconds(60));
+    ASSERT_EQ(handler->reap_stale_members(t0), 1u);
+
+    auto history = member_event_history(room_id, "@alice:test");
+    ASSERT_FALSE(history.empty());
+    EXPECT_FALSE(history.back().value("active", true));
+    EXPECT_EQ(history.back().value("session_id", ""), joined["session_id"].get<std::string>());
+}
+
+TEST_F(VoiceHandlerTest, VoiceStateFromASupersededSessionIsRefused) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    auto old_session = real_join(room_id, "alice-token")["session_id"].get<std::string>();
+    real_join(room_id, "alice-token");
+
+    httplib::Response res;
+    auto req = make_request("PUT", "/_matrix/client/v3/rooms/" + room_id + "/voice/state", "alice-token",
+                            json{{"muted", true}, {"session_id", old_session}}.dump());
+    handler->handle_voice_state(req, res);
+
+    EXPECT_EQ(status_of(res), 403);
+    auto ev = store->get_state_event(room_id, std::string(event_type::kCallMember), "@alice:test");
+    ASSERT_TRUE(ev.has_value());
+    EXPECT_FALSE(ev->content.data.value("muted", true)) << "a stale session must not mute the live one";
+}
+
+TEST_F(VoiceHandlerTest, VoiceStateWithTheCurrentSessionIsAccepted) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    auto session = real_join(room_id, "alice-token")["session_id"].get<std::string>();
+    httplib::Response res;
+    auto req = make_request("PUT", "/_matrix/client/v3/rooms/" + room_id + "/voice/state", "alice-token",
+                            json{{"muted", true}, {"session_id", session}}.dump());
+    handler->handle_voice_state(req, res);
+
+    EXPECT_EQ(status_of(res), 200);
+    auto ev = store->get_state_event(room_id, std::string(event_type::kCallMember), "@alice:test");
+    ASSERT_TRUE(ev.has_value());
+    EXPECT_TRUE(ev->content.data.value("muted", false));
+    // The token survives a state update; it identifies the join, not the PUT.
+    EXPECT_EQ(ev->content.data.value("session_id", ""), session);
+}
+
+TEST_F(VoiceHandlerTest, JoinInTheSameTickAsASweepIsNotReaped) {
+    // The join's heartbeat is recorded inside the same critical section that
+    // publishes the active row, so a sweep cannot observe one without the
+    // other. Before that, a join landing between the reaper's scan and its
+    // emit was marked inactive with a live client on the other end.
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    real_join(room_id, "alice-token");
+    auto t0 = std::chrono::steady_clock::now();
+
+    // Heartbeat is long stale: this member is due to be reaped.
+    handler->record_heartbeat(room_id, "@alice:test", t0 - std::chrono::seconds(60));
+
+    // ...but a fresh join lands first. It replaces the row AND the heartbeat.
+    auto fresh = real_join(room_id, "alice-token");
+
+    EXPECT_EQ(handler->reap_stale_members(t0), 0u);
+    EXPECT_TRUE(is_active(room_id, "@alice:test"));
+    EXPECT_EQ(stored_session(room_id, "@alice:test"), fresh["session_id"].get<std::string>());
+}
+
+TEST_F(VoiceHandlerTest, AJoinRacingASweepIsNeverLeftInactive) {
+    // The deterministic test above cannot reach the interleaving that
+    // actually bit: the sweep has already read the stale heartbeat and
+    // decided to reap when the join lands, so it emits active=false over a
+    // row that a live client just created. This runs the two against each
+    // other with the reaper on a real clock, so every reap it performs is
+    // one it was entitled to perform, and the only way the assertion can
+    // fail is the check-then-emit window.
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    real_join(room_id, "alice-token");
+
+    std::atomic<bool> stop{false};
+    std::thread sweeper([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            handler->reap_stale_members(std::chrono::steady_clock::now());
+            std::this_thread::yield();
+        }
+    });
+
+    for (int i = 0; i < 300; ++i) {
+        // Age the heartbeat so the sweep running alongside wants to reap,
+        // then join. The join publishes the active row and records a fresh
+        // heartbeat in one critical section, so once it has returned no sweep
+        // on this clock has grounds to expire it.
+        handler->record_heartbeat(room_id, "@alice:test",
+                                  std::chrono::steady_clock::now() - std::chrono::seconds(60));
+        real_join(room_id, "alice-token");
+
+        auto ev = store->get_state_event(room_id, std::string(event_type::kCallMember), "@alice:test");
+        ASSERT_TRUE(ev.has_value());
+        ASSERT_TRUE(ev->content.data.value("active", false))
+            << "a sweep expired a join it raced with, iteration " << i;
+    }
+
+    stop.store(true, std::memory_order_relaxed);
+    sweeper.join();
 }
 
 TEST_F(VoiceHandlerTest, EphemeralTurnCredentials) {

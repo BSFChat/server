@@ -2,15 +2,16 @@
 # End-to-end authorization check against the REAL bsfchat-server binary over HTTP.
 #
 # Safety: everything lives under a throwaway directory. The real dev database at
-# /Users/josh/dev/gamechat/data is checksummed before and after and the script
+# the live dev data directory is checksummed before and after and the script
 # HARD-FAILS if a single byte changed, and hard-fails if the server did not
 # actually create its database at the configured path (which is how a misparsed
 # TOML would show up).
 set -uo pipefail
 
-BIN=/Users/josh/dev/gamechat/server/build-perm/bsfchat-server
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+BIN=$(e2e_require_server_bin) || exit 1
 WORK=$(mktemp -d /tmp/bsfchat-perm-e2e-XXXXXX)
-REALDATA=/Users/josh/dev/gamechat/data
+REALDATA=$(e2e_real_data_dir || echo /nonexistent)
 PORT=8899
 BASE="http://127.0.0.1:${PORT}/_matrix/client/v3"
 FAILURES=0

@@ -3,7 +3,8 @@
 # the real bsfchat-server binary, exercising the HTTP routing that unit tests
 # bypass.
 #
-# SAFETY: the owner's live dev database lives at /Users/josh/dev/gamechat/data/.
+# SAFETY: the owner's live dev database lives in the data/ directory beside
+# this checkout (override with BSFCHAT_REAL_DATA).
 # An earlier agent misparsed the TOML (it uses [server]/[database] TABLES, not
 # flat keys), silently fell back to ./data/bsfchat.db, and migrated the real
 # database. Three independent guards below; any one failing aborts:
@@ -12,8 +13,9 @@
 #   3. the run aborts unless the throwaway DB file actually appears.
 set -uo pipefail
 
-REAL_DB=/Users/josh/dev/gamechat/data/bsfchat.db
-BIN=/Users/josh/dev/gamechat/server/build-fix/bsfchat-server
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+REAL_DB="$(e2e_real_data_dir || echo /nonexistent)/bsfchat.db"
+BIN=$(e2e_require_server_bin) || exit 1
 PORT=18456
 WORK=$(mktemp -d /tmp/bsfchat-e2e.XXXXXX)
 ROOT="http://127.0.0.1:$PORT"

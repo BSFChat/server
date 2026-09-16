@@ -9,11 +9,9 @@
 # database path is not the one the server actually creates.
 set -uo pipefail
 
-SRV=/Users/josh/dev/gamechat/server
-# build-fix is the build directory this repo's test runs use; build-media was a
-# scratch tree from the streaming work and is not guaranteed to exist.
-BIN=${BSFCHAT_SERVER_BIN:-$SRV/build-fix/bsfchat-server}
-[ -x "$BIN" ] || { echo "server binary not found at $BIN (build it first)" >&2; exit 1; }
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+SRV=$(e2e_server_root)
+BIN=$(e2e_require_server_bin) || exit 1
 ROOT=$(mktemp -d /tmp/bsfchat-media-e2e.XXXXXX)
 PORT=18${RANDOM:0:3}
 [ "$PORT" -lt 1024 ] && PORT=18449
@@ -65,7 +63,7 @@ EOF
 echo "== root: $ROOT  port: $PORT =="
 
 # Snapshot the real dev database so we can prove we never touched it.
-REAL_DB=/Users/josh/dev/gamechat/data/bsfchat.db
+REAL_DB="$(e2e_real_data_dir || echo /nonexistent)/bsfchat.db"
 REAL_BEFORE=$(shasum "$REAL_DB" 2>/dev/null | cut -d' ' -f1)
 
 "$BIN" --config "$ROOT/server.toml" > "$ROOT/server.log" 2>&1 &
