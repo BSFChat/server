@@ -22,6 +22,30 @@ public:
     VoiceHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config);
     ~VoiceHandler();
 
+    // Voice roster lifecycle. All four endpoints write or read the one
+    // authoritative record, the m.call.member state event keyed on user id.
+    //
+    // Session tokens (V-H1/V-M6). join mints an opaque `session_id`, returns
+    // it alongside `joined_at`, and stores it in the m.call.member content.
+    // leave and state accept it back in their body and refuse to act on a
+    // token that no longer matches the stored row, so a request queued by a
+    // previous session cannot clobber a fresh join. Both fields are optional
+    // on the way in: a client that sends neither gets the pre-token
+    // behaviour, minus the already-inactive no-op, which always applies.
+    //
+    // State transitions:
+    //   join over an inactive/absent row -> one active=true event.
+    //   join over an ACTIVE row          -> active=false then active=true, in
+    //                                       that order, so mesh peers drop the
+    //                                       dead peer connection and re-offer
+    //                                       instead of holding a stale one.
+    //   leave with a matching (or absent) token on an active row
+    //                                    -> active=false, heartbeat cleared.
+    //   leave on an already-inactive row -> 200, no event, {"changed": false}.
+    //   leave with a superseded token    -> 200, no event, {"changed": false}.
+    //   state on an inactive row         -> 403. A state PUT never
+    //                                       re-activates; see the comment at
+    //                                       the check for why.
     void handle_voice_join(const httplib::Request& req, httplib::Response& res);
     void handle_voice_leave(const httplib::Request& req, httplib::Response& res);
     void handle_voice_members(const httplib::Request& req, httplib::Response& res);
@@ -104,6 +128,11 @@ public:
     // whose last heartbeat is older than kHeartbeatTtl. Active members never
     // seen before (e.g. after a server restart) are seeded with a fresh
     // heartbeat instead of being reaped. Returns the number of members reaped.
+    //
+    // A row whose session_id/joined_at changed between the scan and the emit
+    // is skipped: a join landed mid-sweep and reaping it would mark a live
+    // client inactive. The check-and-emit runs under voice_state_mutex_,
+    // which is the same mutex handle_voice_join records its heartbeat under.
     size_t reap_stale_members(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
 
     static constexpr std::chrono::seconds kHeartbeatTtl{30};
@@ -116,9 +145,14 @@ private:
     SyncEngine& sync_engine_;
     const Config& config_;
 
-    // Serializes check-then-emit sections across HTTP worker threads:
-    // the max_participants check in handle_voice_join and the
-    // read-modify-write in handle_voice_state.
+    // Serializes check-then-emit sections across HTTP worker threads and the
+    // reaper: the max_participants check and reset-then-join emit in
+    // handle_voice_join, the staleness decision in handle_voice_leave, the
+    // read-modify-write in handle_voice_state, and the per-member
+    // re-read-and-emit in reap_stale_members.
+    //
+    // Lock order where both are held: voice_state_mutex_ then
+    // heartbeat_mutex_. Never the other way round.
     std::mutex voice_state_mutex_;
 
     // (room_id, user_id) -> last heartbeat. Guarded by heartbeat_mutex_.
