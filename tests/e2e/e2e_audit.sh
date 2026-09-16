@@ -9,9 +9,9 @@
 # below exists because of that.
 set -u
 
-REPO=/Users/josh/dev/gamechat
-BIN="$REPO/server/build-fix/bsfchat-server"
-REAL_DATA="$REPO/data"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+BIN=$(e2e_require_server_bin) || exit 1
+REAL_DATA=$(e2e_real_data_dir || true)
 
 WORK=$(mktemp -d /tmp/bsfchat-e2e-audit.XXXXXX)
 DB="$WORK/e2e.db"

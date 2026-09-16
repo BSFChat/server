@@ -18,6 +18,11 @@ CMakeUserPresets.json
 # Local config with real secrets. Only config/*.example.toml is tracked.
 *.local.toml
 
+# e2e run artefacts: tests/e2e/*.sh regenerate this directory (config, db,
+# media, logs) on every run. server.toml in here was tracked by accident and
+# carried one machine's absolute paths.
+tests/e2e/e2e-run/
+
 # Logs and editor noise
 *.log
 *.swp

@@ -4,7 +4,9 @@
 # proves the routes are actually registered and reachable.
 set -u
 SCRATCH="$(cd "$(dirname "$0")" && pwd)"
-SRV=/Users/josh/dev/gamechat/server
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+SRV=$(e2e_server_root)
+BIN=$(e2e_require_server_bin) || exit 1
 RUN="$SCRATCH/e2e-run"
 PORT=18449
 BASE="http://127.0.0.1:$PORT"
@@ -51,7 +53,7 @@ HTTPServer(('127.0.0.1',port),H).serve_forever()
 PYEOF
 GW_PID=$!
 
-( cd "$RUN" && exec "$SRV/build-fix/bsfchat-server" --config "$RUN/server.toml" ) > "$RUN/server.log" 2>&1 &
+( cd "$RUN" && exec "$BIN" --config "$RUN/server.toml" ) > "$RUN/server.log" 2>&1 &
 SV_PID=$!
 cleanup(){ kill $SV_PID $GW_PID 2>/dev/null; wait 2>/dev/null; }
 trap cleanup EXIT

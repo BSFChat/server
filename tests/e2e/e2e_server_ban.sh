@@ -7,18 +7,16 @@
 # through the actual wire.
 #
 # Safety: everything lives under a throwaway directory. The real dev database at
-# /Users/josh/dev/gamechat/data is checksummed before and after and the script
+# the live dev data directory is checksummed before and after and the script
 # HARD-FAILS if a single byte changed, and hard-fails if the server did not
 # actually create its database at the configured path (which is how a misparsed
 # TOML would show up).
 set -uo pipefail
 
-# build-fix is the build directory this repo's test runs use; build-ban was a
-# scratch tree from the ban work and is not guaranteed to exist or to be current.
-BIN=${BSFCHAT_SERVER_BIN:-/Users/josh/dev/gamechat/server/build-fix/bsfchat-server}
-[[ -x "$BIN" ]] || { echo "server binary not found at $BIN (build it first)" >&2; exit 1; }
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+BIN=$(e2e_require_server_bin) || exit 1
 WORK=$(mktemp -d /tmp/bsfchat-ban-e2e-XXXXXX)
-REALDATA=/Users/josh/dev/gamechat/data
+REALDATA=$(e2e_real_data_dir || echo /nonexistent)
 PORT=8901
 BASE="http://127.0.0.1:${PORT}/_matrix/client/v3"
 FAILURES=0
