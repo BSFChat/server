@@ -132,7 +132,7 @@ stop_server
 # and @everyone to the rest — the real ownership path, not a fixture poke.
 start_server second
 T_ALICE=$(login alice); T_BOB=$(login bob); T_CAROL=$(login carol)
-[[ -n "$T_ALICE" && -n "$T_BOB" ]] || die "login failed after restart"
+[[ -n "$T_ALICE" && -n "$T_BOB" && -n "$T_CAROL" ]] || die "login failed after restart"
 
 A="@alice:e2e"; B="@bob:e2e"; C="@carol:e2e"
 
@@ -158,7 +158,16 @@ check "channel override does NOT confer unban"  403 "$(req POST "/rooms/$ROOM/un
 check "state-PUT membership bypass is closed"   403 "$(req PUT "/rooms/$ROOM/state/m.room.member/$C" "$T_BOB" '{"membership":"ban"}')"
 
 check "admin CAN ban (server-wide role)"        200 "$(req POST "/rooms/$ROOM/ban" "$T_ALICE" "{\"user_id\":\"$C\"}")"
+
+# A ban revokes the target's sessions and refuses login until it is lifted.
+# Carol's token from before the ban is dead from here on, so every later check
+# that acts as carol must use a token minted AFTER the unban below.
+check "ban revoked carol's existing session"    401 "$(req GET "/account/whoami" "$T_CAROL")"
+check "banned identity cannot log in"           403 "$(req POST "/login" "" '{"type":"m.login.password","identifier":{"type":"m.id.user","user":"carol"},"password":"pw-carol-12345"}')"
+
 check "admin CAN unban"                         200 "$(req POST "/rooms/$ROOM/unban" "$T_ALICE" "{\"user_id\":\"$C\"}")"
+T_CAROL=$(login carol)
+[[ -n "$T_CAROL" ]] || { cat "$WORK/last-body.json"; die "carol could not log back in after the unban"; }
 
 echo
 echo "── T2: nickname permissions ─────────────────────────────────────────"
