@@ -48,8 +48,12 @@ jobs:
       - name: Build
         run: cmake --build build -j$(nproc)
 
+      # -j: gtest_discover_tests registers every case as its own ctest
+      # test, so this is also the check that fixtures stay parallel-safe
+      # (unique temp dirs, ephemeral ports). Serial would hide a
+      # regression back to shared paths.
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure -j$(nproc)
 
   sanitizers:
     name: asan+ubsan
@@ -78,7 +82,7 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-        run: ctest --test-dir build-asan --output-on-failure
+        run: ctest --test-dir build-asan --output-on-failure -j$(nproc)
 
   analyze:
     name: cppcheck
