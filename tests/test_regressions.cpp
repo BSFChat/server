@@ -479,6 +479,83 @@ TEST(RoomHandlerCreate, DirectRoomIsPersistedPrivateAndPeerJoined) {
     EXPECT_FALSE(f.store->is_room_member(room_id, "@carol:test"));
 }
 
+// ── DMs: one room per pair, and both sides can tell it is a DM ─────────────
+
+// /sync used to carry nothing that marked a room as direct. The creator's
+// client knew because it made the room; the invited side filed it under
+// channels and then opened a SECOND DM with the same person.
+TEST(DirectRooms, SyncReportsMDirectToBothSidesAndNobodyElse) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+
+    // Bob is already syncing when alice opens the DM.
+    auto bob_since = f.sync->handle_sync(bob, "", 0).next_batch;
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request("/_matrix/client/v3/createRoom", "token-alice",
+                            json{{"is_direct", true}, {"invite", json::array({bob})}}.dump());
+    handler.handle_create_room(req, res);
+    ASSERT_TRUE(IsOk(res));
+    auto room_id = json::parse(res.body).at("room_id").get<std::string>();
+
+    // Incremental: the sync that delivers the room also says what it is.
+    auto bob_inc = f.sync->handle_sync(bob, bob_since, 0);
+    ASSERT_EQ(bob_inc.rooms.join.count(room_id), 1u);
+    ASSERT_TRUE(bob_inc.direct_rooms.has_value());
+    EXPECT_EQ(bob_inc.direct_rooms->at(alice), std::vector<std::string>{room_id});
+
+    // Initial: a fresh login on either side sees it too.
+    auto bob_init = f.sync->handle_sync(bob, "", 0);
+    ASSERT_TRUE(bob_init.direct_rooms.has_value());
+    EXPECT_EQ(bob_init.direct_rooms->at(alice), std::vector<std::string>{room_id});
+    auto alice_init = f.sync->handle_sync(alice, "", 0);
+    ASSERT_TRUE(alice_init.direct_rooms.has_value());
+    EXPECT_EQ(alice_init.direct_rooms->at(bob), std::vector<std::string>{room_id});
+
+    EXPECT_FALSE(f.sync->handle_sync(carol, "", 0).direct_rooms.has_value());
+
+    // An ordinary incremental sync does not restate it.
+    f.store->insert_event(generate_event_id("test"), room_id, alice,
+                          std::string(event_type::kRoomMessage), std::nullopt,
+                          json{{"msgtype", "m.text"}, {"body", "hi"}}.dump(), now_ms());
+    auto bob_quiet = f.sync->handle_sync(bob, bob_inc.next_batch, 0);
+    EXPECT_EQ(bob_quiet.rooms.join.count(room_id), 1u);
+    EXPECT_FALSE(bob_quiet.direct_rooms.has_value());
+}
+
+// A client can only de-duplicate against what it has synced. A second device,
+// a double click, or both people opening the DM at once all get past that.
+TEST(DirectRooms, CreatingADmThatAlreadyExistsReturnsTheExistingRoom) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+    RoomHandler handler(*f.store, *f.sync, f.config);
+
+    auto open_dm = [&](const std::string& token, const std::string& peer) {
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/createRoom", token,
+                                json{{"is_direct", true}, {"invite", json::array({peer})}}.dump());
+        handler.handle_create_room(req, res);
+        EXPECT_TRUE(IsOk(res));
+        return json::parse(res.body).at("room_id").get<std::string>();
+    };
+
+    auto first = open_dm("token-alice", bob);
+    EXPECT_EQ(open_dm("token-alice", bob), first);
+    // From the other side too — bob must not mint a twin.
+    EXPECT_EQ(open_dm("token-bob", alice), first);
+    // A different peer is a different room.
+    EXPECT_NE(open_dm("token-alice", carol), first);
+
+    // Once a side has left, the old room is no longer a usable answer.
+    f.store->set_membership(first, alice, "leave");
+    EXPECT_NE(open_dm("token-alice", bob), first);
+}
+
 // ── S2: room creation authorization ───────────────────────────────────────
 
 TEST(RoomHandlerCreate, PlainUserCannotCreateChannels) {

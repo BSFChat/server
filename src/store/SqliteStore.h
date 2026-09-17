@@ -116,6 +116,15 @@ public:
                             bool is_direct = false);
     bool room_exists(const std::string& room_id);
     bool is_direct_room(const std::string& room_id);
+    // Every direct room `user_id` is joined to, as (room_id, peer) pairs. The
+    // peer is reported whatever their own membership is: a DM the other side
+    // has left is still that person's conversation. This is what /sync turns
+    // into m.direct.
+    std::vector<std::pair<std::string, std::string>> get_direct_rooms(const std::string& user_id);
+    // The direct room both users are currently joined to, if any — oldest
+    // first, so the answer is stable when legacy duplicates exist.
+    std::optional<std::string> find_direct_room(const std::string& user_a,
+                                                const std::string& user_b);
     // Remove a room and everything that references it (events, members,
     // read markers). Destructive; intended for admin-driven channel deletion.
     void delete_room(const std::string& room_id);

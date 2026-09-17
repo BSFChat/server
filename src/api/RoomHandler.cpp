@@ -384,6 +384,24 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
         }
     }
 
+    // One DM per pair. A client can only de-duplicate against what it has
+    // already synced, which loses to a second device, to a double click that
+    // beats the first reply, and to both people opening the DM at the same
+    // moment. The store is the one place that sees all of those, so an
+    // existing direct room with the same single peer is handed back instead of
+    // minting a twin. Both sides must still be joined: returning a room the
+    // caller has left would drop them into a conversation they cannot read.
+    if (is_direct && room_req.invite.size() == 1 && room_req.invite.front() != *user_id) {
+        if (auto existing = store_.find_direct_room(*user_id, room_req.invite.front())) {
+            CreateRoomResponse existing_resp;
+            existing_resp.room_id = *existing;
+            json existing_json;
+            to_json(existing_json, existing_resp);
+            res.set_content(existing_json.dump(), "application/json");
+            return;
+        }
+    }
+
     auto room_id = generate_room_id(config_.server_name);
     store_.create_room(room_id, *user_id, is_direct);
 
