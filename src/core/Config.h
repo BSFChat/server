@@ -160,6 +160,61 @@ struct PushConfig {
     std::vector<std::string> allowed_gateway_prefixes;
 };
 
+// Rate limiting and lockout for /login, /register, /refresh and
+// /account/password. Flat keys under [auth]; grouped here so AuthHandler can
+// take the lot.
+//
+// Until this existed nothing limited any of them: unlimited password guesses,
+// unlimited account creation, and — because every attempt runs PBKDF2 on an
+// HTTP worker — an unauthenticated CPU-exhaustion lever.
+struct AuthLimitsConfig {
+    // Master switch. Off means every limit below is ignored.
+    bool enabled = true;
+
+    // Addresses (or CIDR networks) of reverse proxies whose X-Forwarded-For is
+    // believed. Behind a proxy the socket peer is the proxy for EVERY request;
+    // without this list the per-address limits below would put the whole
+    // internet in one bucket and the first attacker to trip it would lock out
+    // everyone. See http/ClientAddress.h for how the client is derived.
+    //
+    // Loopback by default: only a process on this host can connect from it,
+    // and the worst it can do by forging the header is dodge a rate limit. A
+    // proxy anywhere else — including the Docker bridge gateway, which is what
+    // a containerised server sees when nginx runs on the host — must be listed.
+    std::vector<std::string> trusted_proxies = {"127.0.0.0/8", "::1"};
+
+    // Attempts per client address per window, counted separately for each of
+    // /login, /register, /refresh and /account/password. Successful attempts
+    // count too: this bounds the PBKDF2 work one address can demand.
+    int rate_limit = 30;
+    int rate_window_seconds = 60;
+
+    // Failed password attempts before a lockout, tracked independently per
+    // client address (stops one host spraying many accounts) and per target
+    // username (stops many hosts grinding one account). Lockout length doubles
+    // as the memory of the counter: failures older than this are forgotten.
+    //
+    // The per-username lockout is a deliberate trade: it lets anyone who knows
+    // a username hold that account's NEW logins off for lockout_seconds at a
+    // time. Existing sessions are untouched, which is why the price is
+    // acceptable, and it is the reason the lockout is minutes rather than
+    // hours.
+    int max_failures = 10;
+    int lockout_seconds = 300;
+
+    // Accounts one client address may create per window.
+    int register_limit = 10;
+    int register_window_seconds = 3600;
+
+    // Accounts the WHOLE SERVER will create per window, regardless of source.
+    // The per-address limit alone is cheap to sidestep with many addresses,
+    // and every signup costs a password hash plus role bootstrap across all
+    // existing users. This one is a global switch by design — but it only
+    // closes new signups, never sign-in, and only for the rest of the window.
+    // 0 disables it.
+    int register_global_limit = 200;
+};
+
 struct Config {
     // Server
     std::string server_name = "localhost";
@@ -228,6 +283,10 @@ struct Config {
     // a refresh token for POST /_matrix/client/v3/refresh.
     // Keep the default in sync with kDefaultAccessTokenLifetimeMs.
     int access_token_lifetime_days = 90;
+
+    // Request limits on the unauthenticated credential endpoints. See
+    // AuthLimitsConfig. TOML keys live flat under [auth].
+    AuthLimitsConfig auth_limits;
 
     // TLS. NOTE: not implemented — HttpServer has no SSLServer path. Kept in
     // the schema so an existing config with a [tls] block still parses, but

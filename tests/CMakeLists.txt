@@ -54,6 +54,8 @@ target_link_libraries(server_tests PRIVATE
 target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/core/Logger.cpp
     ${CMAKE_SOURCE_DIR}/src/core/Config.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/RateLimiter.cpp
+    ${CMAKE_SOURCE_DIR}/src/http/ClientAddress.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/LocalAuth.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/Permissions.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/PowerLevels.cpp

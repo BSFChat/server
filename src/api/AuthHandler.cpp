@@ -17,6 +17,8 @@
 
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <chrono>
+#include <limits>
 
 namespace bsfchat {
 
@@ -55,11 +57,93 @@ void send_error(httplib::Response& res, int status, const MatrixError& err) {
     res.set_content(err.to_json().dump(), "application/json");
 }
 
+// 429 + M_LIMIT_EXCEEDED, with the wait in both places a client might look:
+// the Matrix body field (milliseconds) and the HTTP header (whole seconds,
+// rounded UP — telling a client to come back a fraction early just earns it a
+// second 429).
+void send_rate_limited(httplib::Response& res, int64_t retry_ms, const std::string& message) {
+    retry_ms = std::clamp<int64_t>(retry_ms, 1, std::numeric_limits<int>::max());
+    res.set_header("Retry-After", std::to_string((retry_ms + 999) / 1000));
+    send_error(res, 429, MatrixError::limit_exceeded(message, static_cast<int>(retry_ms)));
+}
+
+// Failure-tracker key for a login target. Keyed on what was SUBMITTED, whether
+// or not such an account exists, so a lockout says nothing about existence.
+// Truncated because the string is attacker-supplied and lives in a map; no
+// real user id is anywhere near this long.
+std::string user_failure_key(const std::string& user_id) {
+    return "user:" + user_id.substr(0, 255);
+}
+
 } // namespace
 
 AuthHandler::AuthHandler(SqliteStore& store, SyncEngine& sync_engine,
-                         const Config& config, OidcAuth* oidc_auth)
-    : store_(store), sync_engine_(sync_engine), config_(config), oidc_auth_(oidc_auth) {}
+                         const Config& config, OidcAuth* oidc_auth, LimiterClock clock)
+    : store_(store), sync_engine_(sync_engine), config_(config), oidc_auth_(oidc_auth)
+    , client_address_(config.auth_limits.trusted_proxies)
+    , attempt_limiter_(config.auth_limits.rate_limit,
+                       std::chrono::seconds(config.auth_limits.rate_window_seconds), clock)
+    , register_limiter_(config.auth_limits.register_limit,
+                        std::chrono::seconds(config.auth_limits.register_window_seconds), clock)
+    , register_global_limiter_(config.auth_limits.register_global_limit,
+                               std::chrono::seconds(config.auth_limits.register_window_seconds), clock)
+    , failures_(config.auth_limits.max_failures,
+                std::chrono::seconds(config.auth_limits.lockout_seconds), clock) {}
+
+std::string AuthHandler::client_key(const httplib::Request& req) {
+    if (!config_.auth_limits.enabled) return {};
+
+    if (client_address_.looks_like_untrusted_proxy(req)) {
+        // Every client of this deployment is sharing one bucket. Say so, with
+        // the fix, but not once per request.
+        const auto now = limiter_steady_now_ms();
+        auto last = last_proxy_warning_ms_.load();
+        if ((last == 0 || now - last > 60'000) &&
+            last_proxy_warning_ms_.compare_exchange_strong(last, now)) {
+            get_logger()->warn(
+                "Request from {} carries X-Forwarded-For, but that address is not in "
+                "auth.trusted_proxies, so the header is ignored and every client behind it is "
+                "rate-limited as ONE address — one abusive client can lock all of them out of "
+                "/login. If {} is your reverse proxy, add it to auth.trusted_proxies.",
+                req.remote_addr, req.remote_addr);
+        }
+    }
+
+    auto addr = client_address_.resolve(req);
+    return addr ? "ip:" + *addr : std::string{};
+}
+
+bool AuthHandler::over_attempt_limit(const char* endpoint, const std::string& client,
+                                     httplib::Response& res) {
+    if (client.empty()) return false;
+    const auto wait = attempt_limiter_.acquire(std::string(endpoint) + "|" + client);
+    if (wait == 0) return false;
+    send_rate_limited(res, wait, "Too many requests. Try again later.");
+    return true;
+}
+
+bool AuthHandler::locked_out(const std::string& key_a, const std::string& key_b,
+                             httplib::Response& res) {
+    if (!config_.auth_limits.enabled) return false;
+    int64_t wait = 0;
+    if (!key_a.empty()) wait = std::max(wait, failures_.locked_for(key_a));
+    if (!key_b.empty()) wait = std::max(wait, failures_.locked_for(key_b));
+    if (wait == 0) return false;
+    // One message for both causes: distinguishing "your address" from "this
+    // account" would tell a sprayer which usernames other people are attacking.
+    send_rate_limited(res, wait, "Too many failed attempts. Try again later.");
+    return true;
+}
+
+void AuthHandler::record_failure(const std::string& key_a, const std::string& key_b) {
+    if (!config_.auth_limits.enabled) return;
+    if (!key_a.empty() && failures_.record_failure(key_a)) {
+        get_logger()->warn("Auth lockout engaged for {}", key_a);
+    }
+    if (!key_b.empty() && failures_.record_failure(key_b)) {
+        get_logger()->warn("Auth lockout engaged for {}", key_b);
+    }
+}
 
 int64_t AuthHandler::token_lifetime_ms() const {
     return static_cast<int64_t>(config_.access_token_lifetime_days) * 24 * 60 * 60 * 1000;
@@ -114,6 +198,11 @@ void AuthHandler::handle_login_flows(const httplib::Request&, httplib::Response&
 }
 
 void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& res) {
+    // Before anything else, including the JSON parse: the point is to bound the
+    // work an address can demand, and a refused request should cost nothing.
+    const auto client = client_key(req);
+    if (over_attempt_limit("login", client, res)) return;
+
     json body;
     try {
         body = json::parse(req.body);
@@ -139,8 +228,14 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
             user_id = "@" + user_id + ":" + config_.server_name;
         }
 
+        // Must come before verify_password: PBKDF2 is the expensive part, and
+        // a locked-out guesser should not get to make us run it.
+        const auto user_key = config_.auth_limits.enabled ? user_failure_key(user_id) : std::string{};
+        if (locked_out(client, user_key, res)) return;
+
         auto hash = store_.get_password_hash(user_id);
         if (!hash || !verify_password(login_req.password, *hash)) {
+            record_failure(client, user_key);
             res.status = 403;
             res.set_content(MatrixError::forbidden("Invalid username or password").to_json().dump(), "application/json");
             return;
@@ -157,6 +252,12 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
         // Checked AFTER the password verification on purpose. Refusing earlier
         // would turn /login into an oracle that reports whether an arbitrary
         // username is banned, to anyone who asks and without credentials.
+        // The password was right, so the account's failure count resets. The
+        // ADDRESS's count deliberately does not: if it did, anyone with one
+        // valid account could log into it between guesses and spray other
+        // accounts from the same address forever. It simply ages out.
+        if (!user_key.empty()) failures_.clear(user_key);
+
         if (store_.is_server_banned(user_id)) {
             get_logger()->info("Refused login for banned user {}", user_id);
             res.status = 403;
@@ -209,10 +310,13 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
             return;
         }
 
+        if (locked_out(client, {}, res)) return;
+
         const std::string expected_audience =
             config_.identity ? config_.identity->client_id : std::string();
         auto claims = oidc_auth_->validate_token(login_req.token, expected_audience);
         if (!claims) {
+            record_failure(client, {});
             res.status = 403;
             res.set_content(MatrixError::forbidden("Invalid identity token").to_json().dump(), "application/json");
             return;
@@ -323,6 +427,15 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
         return;
     }
 
+    // Two layers. This one counts every attempt, so the "is this username
+    // taken" answer below cannot be used to enumerate accounts at line rate.
+    // The (much tighter) creation limit further down only spends a slot on a
+    // request that is actually about to create an account — someone working
+    // through taken usernames or a rejected password is not burning their
+    // allowance for the hour.
+    const auto client = client_key(req);
+    if (over_attempt_limit("register", client, res)) return;
+
     json body;
     try {
         body = json::parse(req.body);
@@ -404,6 +517,26 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
         return;
     }
 
+    // Everything past this point is the expensive part: a password hash, then
+    // auto-join and a role bootstrap that walks every existing user under the
+    // store's global lock. Per-address first, so an address that is already
+    // over its own limit cannot also drain the server-wide allowance.
+    if (config_.auth_limits.enabled) {
+        if (!client.empty()) {
+            if (auto wait = register_limiter_.acquire(client)) {
+                return send_rate_limited(res, wait,
+                    "Too many accounts created from your address. Try again later.");
+            }
+        }
+        if (auto wait = register_global_limiter_.acquire("*")) {
+            get_logger()->warn("Server-wide registration limit reached "
+                               "(auth.register_global_limit = {}); refusing signups for {}s",
+                               config_.auth_limits.register_global_limit, (wait + 999) / 1000);
+            return send_rate_limited(res, wait,
+                "This server is not accepting new registrations right now. Try again later.");
+        }
+    }
+
     auto password_hash = hash_password(reg_req.password, config_.password_hash_cost);
     if (!store_.create_user(user_id, password_hash)) {
         res.status = 500;
@@ -474,6 +607,9 @@ void AuthHandler::handle_logout_all(const httplib::Request& req, httplib::Respon
 }
 
 void AuthHandler::handle_password_change(const httplib::Request& req, httplib::Response& res) {
+    const auto client = client_key(req);
+    if (over_attempt_limit("password", client, res)) return;
+
     auto token = extract_access_token(req.get_header_value("Authorization"));
     if (!token) {
         return send_error(res, 401, auth_error(req.get_header_value("Authorization")));
@@ -558,9 +694,18 @@ void AuthHandler::handle_password_change(const httplib::Request& req, httplib::R
 
     // verify_password reads the cost out of the stored hash, so an account
     // still on the old cost-12 hash re-authenticates fine here...
+    //
+    // This endpoint is a password oracle for whoever holds a token, so it gets
+    // the same lockout as /login — under its own key. Sharing /login's would
+    // let a stolen token lock the owner out of signing in.
+    const auto change_key = config_.auth_limits.enabled
+        ? "pwchange:" + *user_id : std::string{};
+    if (locked_out(client, change_key, res)) return;
     if (current_password.empty() || !verify_password(current_password, *stored)) {
+        record_failure(client, change_key);
         return send_error(res, 403, MatrixError::forbidden("Invalid password"));
     }
+    if (!change_key.empty()) failures_.clear(change_key);
 
     // ...and the replacement is always written at the CURRENT configured cost,
     // which makes a password change a second upgrade path alongside
@@ -589,6 +734,12 @@ void AuthHandler::handle_password_change(const httplib::Request& req, httplib::R
 }
 
 void AuthHandler::handle_refresh(const httplib::Request& req, httplib::Response& res) {
+    // Attempt limit only, no failure lockout: refresh tokens are 256-bit
+    // random, so guessing is not the threat — unmetered database work is.
+    // And a client looping on a stale token must not be able to lock the
+    // other people behind its NAT out of /login.
+    if (over_attempt_limit("refresh", client_key(req), res)) return;
+
     json body;
     try {
         body = json::parse(req.body);
