@@ -93,12 +93,52 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
 
     if (timeout_ms > 0) {
         timeout_ms = std::min(timeout_ms, limits::kMaxSyncTimeoutMs);
-        std::unique_lock lock(wait_mutex_);
-        new_event_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] {
-            return current_position_.load() > since_pos ||
-                   ephemeral_seq_.load() != edu_at_entry;
-        });
-        lock.unlock();
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+
+        // The condition variable is global: notify_new_event() wakes every
+        // waiter on the server, whatever room the event landed in. Returning
+        // straight after the first wake therefore ended a client's poll because
+        // somebody else posted in a channel it cannot even see.
+        //
+        // That is not just wasted work. Such a reply carries no timeline events
+        // AND no advance in next_batch, and the desktop client reads a fast
+        // reply that did not move next_batch as a broken endpoint: it answers
+        // with SyncBackoff's escalating no-progress delay, 1s then 2s, 4s, 8s,
+        // up to a minute. So a busy unrelated channel could walk an idle
+        // client's poll interval out to 60s, and the next message genuinely
+        // addressed to it then waited that long with no request even in flight.
+        //
+        // Re-check instead, and go back to sleep on a wake that turned out to
+        // hold nothing for this user. `checked_pos` is what makes that
+        // terminate: the raw predicate stays true forever once the global head
+        // has passed since_pos, so it has to advance to the head we have
+        // already looked at.
+        int64_t checked_pos = since_pos;
+        for (;;) {
+            bool signalled = false;
+            {
+                std::unique_lock lock(wait_mutex_);
+                // Read under the lock: current_position_ is only published
+                // under it, so sampling it here cannot miss a notification
+                // that lands between this and the wait.
+                checked_pos = std::max(checked_pos, current_position_.load());
+                signalled = new_event_cv_.wait_until(lock, deadline, [&] {
+                    return current_position_.load() > checked_pos ||
+                           ephemeral_seq_.load() != edu_at_entry;
+                });
+            }
+            if (!signalled) break; // deadline passed with nothing for us
+
+            response = build_incremental_sync(user_id, since_pos);
+            // Real events, or an ephemeral change the caller injects typing and
+            // presence from — either is worth returning immediately.
+            if (!response.rooms.join.empty() ||
+                ephemeral_seq_.load() != edu_at_entry) {
+                return response;
+            }
+            // Woken for an event this user cannot see. Keep the poll parked.
+        }
 
         response = build_incremental_sync(user_id, since_pos);
     }
@@ -164,7 +204,23 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
     // past the limit — or anything inserted between the fetch and the head
     // read — was skipped permanently.
     int64_t delivered_max = since_pos;
-    auto events = store_.get_events_since(user_id, since_pos, delivered_max);
+    constexpr int kScanLimit = 1000;
+    auto events = store_.get_events_since(user_id, since_pos, delivered_max, kScanLimit);
+
+    // When the scan was not cut short by the limit, this user has been offered
+    // everything on the stream, so their token can jump to the global head even
+    // though most of those rows were other people's rooms. Leaving it pinned to
+    // the highest VISIBLE row meant a client in a quiet channel re-scanned the
+    // same widening range on every poll, and — worse — came back from any
+    // spurious wake with next_batch unchanged, which the desktop client treats
+    // as a no-progress reply and punishes with an escalating backoff.
+    //
+    // Only safe when the scan was complete: if it hit the limit there are
+    // certainly rows past `delivered_max` this user still needs, and skipping
+    // to the head would drop them permanently.
+    if (static_cast<int>(events.size()) < kScanLimit) {
+        delivered_max = std::max(delivered_max, store_.get_current_stream_position());
+    }
 
     std::set<std::string> newly_joined_rooms;
     // Cache VIEW_CHANNEL decisions so we don't recompute for every event in

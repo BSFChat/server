@@ -120,6 +120,34 @@ TEST_F(SyncLatencyTest, PendingSyncWakesWithinBudgetOfASend) {
         << "ms to see a send; it should be woken by notify_new_event(), not by its timeout";
 }
 
+// An event in a room the user is not in must not cut their poll short. This
+// is the flip side of the test above and it guards a real client-side cost:
+// a woken sync that carries nothing leaves next_batch unmoved, which the
+// desktop client reads as a no-progress reply and answers with an escalating
+// backoff (SyncBackoff::delayForFailure).
+TEST_F(SyncLatencyTest, UnrelatedRoomDoesNotWakeAPoll) {
+    const std::string since = sync->handle_sync("@bob:test", "", 0).next_batch;
+
+    auto other = generate_room_id("test");
+    store->create_room(other, "@alice:test");
+    store->set_membership(other, "@alice:test", "join");
+
+    auto t0 = clk::now();
+    std::thread bob([&] { sync->handle_sync("@bob:test", since, 400); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    store->insert_event(generate_event_id("test"), other, "@alice:test",
+                        "m.room.message", std::nullopt,
+                        json{{"msgtype", "m.text"}, {"body", "not for bob"}}.dump(), 2000);
+    sync->notify_new_event();
+    bob.join();
+
+    // It should have ridden out the full 400ms timeout rather than returning
+    // empty the instant someone else's room moved.
+    EXPECT_GE(ms_since(t0), 350)
+        << "Bob's poll returned early for an event in a room he is not in";
+}
+
 // The regression test for the pool itself.
 //
 // Parks more simultaneous connections than two desktop clients would hold and
