@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "auth/LocalAuth.h"
+#include "auth/OidcAuth.h"
 #include "store/SqliteStore.h"
 
 #include <bsfchat/Identifiers.h>
@@ -181,4 +182,54 @@ TEST_F(AuthHandlerTest, RegisterAcceptsValidLocalpart) {
 
     auto body = nlohmann::json::parse(res.body);
     EXPECT_EQ(body["user_id"], "@new.user_1-ok:test");
+}
+
+
+// OIDC key-refresh backoff.
+//
+// validate_token() used to call refresh_keys() unconditionally — twice, in
+// fact: once because "never refreshed" reads as infinitely stale, and again
+// on the unknown-kid path. Each call is a discovery fetch plus a JWKS fetch
+// with a 10 s connect and a 10 s read timeout, performed inline on an httplib
+// worker thread. With the default four workers, four requests carrying any
+// Authorization header were enough to make an identity-backed server
+// unresponsive for ~40 s at a time, for as long as the identity service was
+// down, from anyone who can reach the port. The schedule below is what bounds
+// that, and what paces the startup retry when the identity container is
+// simply slower to come up than we are.
+TEST(OidcBackoff, DoublesFromOneSecond) {
+    using bsfchat::oidc_detail::next_backoff_seconds;
+    EXPECT_EQ(next_backoff_seconds(1), 2);
+    EXPECT_EQ(next_backoff_seconds(2), 4);
+    EXPECT_EQ(next_backoff_seconds(4), 8);
+    EXPECT_EQ(next_backoff_seconds(8), 16);
+}
+
+TEST(OidcBackoff, ClampsAtFiveMinutes) {
+    using bsfchat::oidc_detail::next_backoff_seconds;
+    // Must saturate rather than grow without bound: a provider that comes
+    // back after an hour has to be noticed within five minutes, and the
+    // multiplication must never overflow.
+    EXPECT_EQ(next_backoff_seconds(256), 300);
+    EXPECT_EQ(next_backoff_seconds(300), 300);
+    EXPECT_EQ(next_backoff_seconds(4096), 300);
+    EXPECT_EQ(next_backoff_seconds(1LL << 40), 300);
+}
+
+TEST(OidcBackoff, NeverReturnsZeroOrNegative) {
+    using bsfchat::oidc_detail::next_backoff_seconds;
+    // A zero would put the retry loop into a hot spin against the provider,
+    // which is the failure this whole change exists to prevent.
+    EXPECT_EQ(next_backoff_seconds(0), 1);
+    EXPECT_EQ(next_backoff_seconds(-1), 1);
+    EXPECT_EQ(next_backoff_seconds(-1000000), 1);
+}
+
+// Destroying an OidcAuth whose background retry never succeeded must not
+// hang or crash — the provider being permanently unreachable is exactly when
+// a shutdown gets attempted.
+TEST(OidcBackoff, BackgroundRefreshIsJoinedOnDestruction) {
+    bsfchat::OidcAuth auth("http://127.0.0.1:1/");  // nothing listens here
+    auth.start_background_refresh();
+    EXPECT_FALSE(auth.has_keys());
 }

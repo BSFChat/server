@@ -59,7 +59,16 @@ Server::Server(Config config)
         if (oidc_auth_->refresh_keys()) {
             get_logger()->info("OIDC keys loaded from {}", config_.identity->provider_url);
         } else {
-            get_logger()->warn("Failed to fetch OIDC keys; identity login will not work until keys are available");
+            // Not an error, and not the end of the attempt. In a compose
+            // deployment the server almost always finishes starting before
+            // the identity container is answering, and a single try here
+            // used to leave every later token validation to re-fetch the
+            // JWKS inline on an httplib worker thread.
+            get_logger()->info("OIDC keys not available from {} yet; retrying in "
+                               "the background. Identity login starts working as "
+                               "soon as the provider answers.",
+                               config_.identity->provider_url);
+            oidc_auth_->start_background_refresh();
         }
     }
 
