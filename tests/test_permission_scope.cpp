@@ -1056,3 +1056,196 @@ TEST(NicknameAudit, RefusedAndNoOpRenamesRecordNothing) {
                           "token-nickmod", nickname_body("Same"))));
     EXPECT_EQ(f.records().size(), 1u);
 }
+
+// ── Role hierarchy ────────────────────────────────────────────────────────
+//
+// MANAGE_ROLES is the permission an owner hands to a trusted-but-not-admin
+// "builder". It used to be the WHOLE gate on both role state events, with no
+// rank check anywhere on the path — so one request turned it into full
+// ADMINISTRATOR:
+//
+//   PUT /rooms/{any}/state/bsfchat.member.roles/@self  {"role_ids":["admin"]}
+//
+// and rewriting bsfchat.server.roles to put ADMINISTRATOR on @everyone was the
+// same escalation from the other side. Permissions.h already named role
+// assignment as something outranks() gates; it was the one case that did not
+// use it.
+
+namespace {
+
+// A builder: MANAGE_ROLES, ranked below admin. Position 30 sits above the
+// fixture's helper/moderator/nickmod and well below admin at 100.
+std::string add_builder(Fixture& f) {
+    auto roles = f.store->get_server_roles();
+    roles.push_back(role("builder", 30,
+                         permission::kEveryoneDefault | permission::kManageRoles));
+    ServerRolesContent content;
+    content.roles = roles;
+    json j;
+    to_json(j, content);
+    f.store->set_server_state(std::string(event_type::kServerRoles), "", "@server:test",
+                              j.dump());
+    return f.add_user("builder", {"builder"});
+}
+
+std::string member_roles_path(const std::string& room, const std::string& target) {
+    return kRoomsPrefix + room + "/state/" + std::string(event_type::kMemberRoles) + "/" + target;
+}
+std::string server_roles_path(const std::string& room) {
+    return kRoomsPrefix + room + "/state/" + std::string(event_type::kServerRoles) + "/";
+}
+std::string assignment_body(const std::vector<std::string>& ids) {
+    MemberRolesContent c;
+    c.role_ids = ids;
+    json j;
+    to_json(j, c);
+    return j.dump();
+}
+std::string roles_body(const std::vector<ServerRole>& roles) {
+    ServerRolesContent c;
+    c.roles = roles;
+    json j;
+    to_json(j, c);
+    return j.dump();
+}
+
+bool holds_admin(Fixture& f, const std::string& user) {
+    PermissionsEngine perms(*f.store, f.config);
+    return perms.can(user, std::string(), permission::kAdministrator);
+}
+
+} // namespace
+
+TEST(RoleHierarchy, ManageRolesCannotMakeYouAnAdministrator) {
+    Fixture f("role-self-promote");
+    f.seed_roles();
+    auto builder = add_builder(f);
+    auto room = f.add_channel("@server:test", "general");
+    f.join(room, builder);
+    ASSERT_FALSE(holds_admin(f, builder));
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &RoomHandler::handle_set_state,
+                    member_roles_path(room, builder), "token-builder",
+                    assignment_body({std::string(permission::role_id::kEveryone), "builder",
+                                     std::string(permission::role_id::kAdmin)}));
+    EXPECT_EQ(res.status, 403) << res.body;
+    EXPECT_FALSE(holds_admin(f, builder)) << "MANAGE_ROLES became ADMINISTRATOR";
+}
+
+TEST(RoleHierarchy, ManageRolesCannotGrantAdministratorToEveryone) {
+    Fixture f("role-everyone-admin");
+    f.seed_roles();
+    auto builder = add_builder(f);
+    auto victim = f.add_user("victim");
+    auto room = f.add_channel("@server:test", "general");
+    f.join(room, builder);
+
+    auto roles = f.store->get_server_roles();
+    for (auto& r : roles) {
+        if (r.id == permission::role_id::kEveryone) r.permissions = permission::kAllFlags;
+    }
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &RoomHandler::handle_set_state, server_roles_path(room),
+                    "token-builder", roles_body(roles));
+    EXPECT_EQ(res.status, 403) << res.body;
+    EXPECT_FALSE(holds_admin(f, victim)) << "every user on the server became an admin";
+}
+
+TEST(RoleHierarchy, ManageRolesCannotRaiseItsOwnRoleAboveTheOwner) {
+    Fixture f("role-reposition");
+    f.seed_roles();
+    auto builder = add_builder(f);
+    auto room = f.add_channel("@server:test", "general");
+    f.join(room, builder);
+
+    auto roles = f.store->get_server_roles();
+    for (auto& r : roles) {
+        if (r.id == "builder") r.position = 200;   // above admin at 100
+    }
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &RoomHandler::handle_set_state, server_roles_path(room),
+                    "token-builder", roles_body(roles));
+    EXPECT_EQ(res.status, 403) << res.body;
+
+    PermissionsEngine perms(*f.store, f.config);
+    EXPECT_LT(perms.highest_role_position(builder), 100);
+}
+
+TEST(RoleHierarchy, ManageRolesCannotDeleteTheAdminRole) {
+    Fixture f("role-delete-admin");
+    f.seed_roles();
+    auto builder = add_builder(f);
+    auto owner = f.add_user("owner", {std::string(permission::role_id::kAdmin)});
+    auto room = f.add_channel("@server:test", "general");
+    f.join(room, builder);
+
+    auto roles = f.store->get_server_roles();
+    roles.erase(std::remove_if(roles.begin(), roles.end(),
+                               [](const ServerRole& r) {
+                                   return r.id == permission::role_id::kAdmin;
+                               }),
+                roles.end());
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &RoomHandler::handle_set_state, server_roles_path(room),
+                    "token-builder", roles_body(roles));
+    EXPECT_EQ(res.status, 403) << res.body;
+    EXPECT_TRUE(holds_admin(f, owner)) << "the owner was demoted";
+}
+
+TEST(RoleHierarchy, ManageRolesCannotStripAHigherRankedUsersRoles) {
+    Fixture f("role-strip-owner");
+    f.seed_roles();
+    auto builder = add_builder(f);
+    auto owner = f.add_user("owner", {std::string(permission::role_id::kAdmin)});
+    auto room = f.add_channel("@server:test", "general");
+    f.join(room, builder);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &RoomHandler::handle_set_state,
+                    member_roles_path(room, owner), "token-builder",
+                    assignment_body({std::string(permission::role_id::kEveryone)}));
+    EXPECT_EQ(res.status, 403) << res.body;
+    EXPECT_TRUE(holds_admin(f, owner)) << "a builder demoted the owner";
+}
+
+// The permission has to keep doing its job: a builder manages roles BELOW
+// their own rank. A guard that simply refused everything would pass every
+// test above and break the feature.
+TEST(RoleHierarchy, ManageRolesStillManagesLowerRoles) {
+    Fixture f("role-legit");
+    f.seed_roles();
+    auto builder = add_builder(f);
+    auto member = f.add_user("member");
+    auto room = f.add_channel("@server:test", "general");
+    f.join(room, builder);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &RoomHandler::handle_set_state,
+                    member_roles_path(room, member), "token-builder",
+                    assignment_body({std::string(permission::role_id::kEveryone), "helper"}));
+    ASSERT_TRUE(IsOk(res)) << res.status << " " << res.body;
+
+    auto ids = f.store->get_member_role_ids(member);
+    EXPECT_NE(std::find(ids.begin(), ids.end(), "helper"), ids.end());
+}
+
+TEST(RoleHierarchy, AnAdministratorIsStillUnrestricted) {
+    Fixture f("role-admin-ok");
+    f.seed_roles();
+    auto owner = f.add_user("owner", {std::string(permission::role_id::kAdmin)});
+    auto member = f.add_user("member");
+    auto room = f.add_channel("@server:test", "general");
+    f.join(room, owner);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    auto res = call(handler, &RoomHandler::handle_set_state,
+                    member_roles_path(room, member), "token-owner",
+                    assignment_body({std::string(permission::role_id::kEveryone),
+                                     std::string(permission::role_id::kAdmin)}));
+    ASSERT_TRUE(IsOk(res)) << res.status << " " << res.body;
+    EXPECT_TRUE(holds_admin(f, member));
+}

@@ -1300,6 +1300,49 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     }
 
     if (is_server_scoped) {
+        // MANAGE_ROLES says you may edit roles; it does not say WHICH. Without
+        // a rank check on this path, one request — PUT .../bsfchat.member.roles/
+        // @self with {"role_ids":["admin"]} — turned the "builder" role an owner
+        // hands to a trusted non-admin into full ADMINISTRATOR. Rewriting
+        // bsfchat.server.roles to put ADMINISTRATOR on @everyone was the same
+        // trick from the other side. Administrators are exempt, as everywhere.
+        PermissionsEngine::RoleChangeVerdict verdict;
+        if (evt_type == std::string(event_type::kMemberRoles)) {
+            if (state_key.empty()) {
+                res.status = 400;
+                res.set_content(MatrixError::bad_json("Missing user id in state key")
+                                    .to_json().dump(), "application/json");
+                return;
+            }
+            MemberRolesContent assignment;
+            try {
+                from_json(content, assignment);
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(MatrixError::bad_json("Malformed role assignment")
+                                    .to_json().dump(), "application/json");
+                return;
+            }
+            verdict = perms.may_assign_roles(*user_id, state_key, assignment.role_ids);
+        } else {
+            ServerRolesContent definitions;
+            try {
+                from_json(content, definitions);
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(MatrixError::bad_json("Malformed role list")
+                                    .to_json().dump(), "application/json");
+                return;
+            }
+            verdict = perms.may_edit_role_definitions(*user_id, definitions.roles);
+        }
+        if (!verdict.allowed) {
+            res.status = 403;
+            res.set_content(MatrixError::forbidden(verdict.reason).to_json().dump(),
+                            "application/json");
+            return;
+        }
+
         // Authoritative write lands in server_state; the room event is only a
         // mirror so clients still learn about it through /sync. Role definition and
         // role assignment changes are audited inside write_server_scoped_state,

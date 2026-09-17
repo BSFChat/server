@@ -4,6 +4,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
 
@@ -40,8 +41,68 @@ std::string token_kid(const std::string& token) {
 
 } // namespace
 
+namespace oidc_detail {
+
+int64_t next_backoff_seconds(int64_t current_seconds)
+{
+    if (current_seconds < 1) return 1;
+    if (current_seconds >= 300) return 300;
+    return std::min<int64_t>(current_seconds * 2, 300);
+}
+
+} // namespace oidc_detail
+
 OidcAuth::OidcAuth(const std::string& provider_url)
     : provider_url_(provider_url) {
+}
+
+OidcAuth::~OidcAuth() {
+    {
+        std::lock_guard lock(wake_mutex_);
+        stopping_ = true;
+    }
+    wake_.notify_all();
+    if (refresher_.joinable()) refresher_.join();
+}
+
+bool OidcAuth::has_keys() const {
+    std::lock_guard lock(mutex_);
+    return !keys_by_kid_.empty();
+}
+
+void OidcAuth::start_background_refresh() {
+    if (refresher_.joinable()) return;
+    refresher_ = std::thread([this] { background_refresh_loop(); });
+}
+
+void OidcAuth::background_refresh_loop() {
+    auto log = get_logger();
+    int64_t wait_s = 1;
+    int attempts = 0;
+
+    while (true) {
+        if (refresh_keys()) {
+            if (attempts > 0) {
+                // Info, not warn: the identity container simply started after
+                // us, which is the normal case in a compose deployment and
+                // not something an operator needs to act on.
+                log->info("OIDC: identity provider became available after {} "
+                          "retr{}; identity login is live", attempts,
+                          attempts == 1 ? "y" : "ies");
+            }
+            return;
+        }
+        ++attempts;
+
+        std::unique_lock lock(wake_mutex_);
+        if (stopping_) return;
+        wake_.wait_for(lock, std::chrono::seconds(wait_s),
+                       [this] { return stopping_; });
+        if (stopping_) return;
+        lock.unlock();
+
+        wait_s = oidc_detail::next_backoff_seconds(wait_s);
+    }
 }
 
 int64_t OidcAuth::seconds_since_refresh() const {
@@ -65,16 +126,18 @@ std::string OidcAuth::key_for_kid(const std::string& kid) const {
 std::optional<JwtClaims> OidcAuth::validate_token(const std::string& id_token,
                                                    const std::string& expected_audience) {
     if (seconds_since_refresh() > kKeyRefreshIntervalSeconds) {
-        refresh_keys();
+        refresh_keys_throttled();
     }
 
     const std::string kid = token_kid(id_token);
     std::string pem = key_for_kid(kid);
 
     // A kid we've never seen usually means the provider rotated its keys since
-    // our last refresh — pull the JWKS again once before giving up.
+    // our last refresh — pull the JWKS again once before giving up. Throttled,
+    // because when the provider is unreachable this path is otherwise a free
+    // 20 s block of an httplib worker thread per request.
     if (pem.empty()) {
-        if (refresh_keys()) pem = key_for_kid(kid);
+        if (refresh_keys_throttled()) pem = key_for_kid(kid);
     }
     if (pem.empty()) {
         get_logger()->warn("OIDC: no public key available for kid '{}', cannot validate token",
@@ -91,6 +154,30 @@ std::optional<JwtClaims> OidcAuth::validate_token(const std::string& id_token,
     return jwt_verify(id_token, pem, issuer, expected_audience);
 }
 
+bool OidcAuth::refresh_keys_throttled() {
+    const int64_t now = now_seconds();
+    {
+        std::lock_guard lock(mutex_);
+        if (now < next_on_demand_refresh_) return false;
+        // Claim the slot before releasing the lock so concurrent worker
+        // threads cannot all decide to fetch at once.
+        next_on_demand_refresh_ = now + on_demand_backoff_;
+    }
+
+    const bool ok = refresh_keys();
+
+    {
+        std::lock_guard lock(mutex_);
+        if (ok) {
+            on_demand_backoff_ = kMinBackoffSeconds;
+            next_on_demand_refresh_ = 0;
+        } else {
+            on_demand_backoff_ = oidc_detail::next_backoff_seconds(on_demand_backoff_);
+        }
+    }
+    return ok;
+}
+
 bool OidcAuth::refresh_keys() {
     auto log = get_logger();
 
@@ -102,7 +189,8 @@ bool OidcAuth::refresh_keys() {
 
         auto discovery_res = discovery_client.Get("/.well-known/openid-configuration");
         if (!discovery_res || discovery_res->status != 200) {
-            log->error("OIDC: Failed to fetch discovery document from {}", provider_url_);
+            log->warn("OIDC: could not fetch the discovery document from {} "
+                      "(will retry)", provider_url_);
             return false;
         }
 
@@ -142,7 +230,7 @@ bool OidcAuth::refresh_keys() {
 
         auto jwks_res = jwks_client.Get(jwks_path);
         if (!jwks_res || jwks_res->status != 200) {
-            log->error("OIDC: Failed to fetch JWKS from {}", jwks_uri);
+            log->warn("OIDC: could not fetch JWKS from {} (will retry)", jwks_uri);
             return false;
         }
 

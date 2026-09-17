@@ -691,6 +691,18 @@ void SqliteStore::set_membership(const std::string& room_id, const std::string& 
     sqlite3_step(stmt.get());
 }
 
+std::optional<std::string> SqliteStore::find_membership(const std::string& room_id,
+                                                        const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT membership FROM room_members WHERE room_id = ? AND user_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        return std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)));
+    }
+    return std::nullopt;
+}
+
 std::string SqliteStore::get_membership(const std::string& room_id, const std::string& user_id) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_, "SELECT membership FROM room_members WHERE room_id = ? AND user_id = ?");

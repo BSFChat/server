@@ -27,8 +27,19 @@ int64_t now_ms() {
 void join_user_to_room(SqliteStore& store, SyncEngine& sync_engine,
                         const Config& config, const std::string& room_id,
                         const std::string& user_id) {
-    // Skip if already joined
-    if (store.is_room_member(room_id, user_id)) return;
+    // Any membership row at all means a decision about this user and this
+    // room has already been taken: `join` means they are in, `leave` means
+    // they were kicked or chose to go, `ban` and `invite` are equally
+    // deliberate. Only a user with NO row has never been considered, and
+    // those are the ones auto-join exists for.
+    //
+    // This used to test is_room_member(), which is `membership = 'join'`
+    // only — so a `leave` row read as "not joined yet" and got force-joined.
+    // backfill_auto_join runs unconditionally at every boot, so a kick was
+    // silently undone by the next restart or deploy, and a user who
+    // deliberately left a channel was put back into it the same way. The
+    // moderator got no indication either time.
+    if (store.find_membership(room_id, user_id).has_value()) return;
 
     // A server-wide ban wins over every force-join in the server.
     //

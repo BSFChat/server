@@ -376,6 +376,81 @@ TEST(AutoJoinBackfill, PublicChannelStillAutoJoinsEveryone) {
     EXPECT_TRUE(f.store->is_room_member(chan, bob));
 }
 
+// A kick is a moderator decision. backfill_auto_join runs unconditionally at
+// every boot, and it used to test is_room_member() — `membership = 'join'`
+// only — so the `leave` row a kick writes read as "not joined yet" and the
+// user was force-joined straight back in. The moderator's action was undone
+// by the next restart or deploy, silently, with nothing in the log.
+TEST(AutoJoinBackfill, AKickSurvivesARestart) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+
+    auto chan = generate_room_id("test");
+    f.store->create_room(chan, alice);
+    f.store->set_membership(chan, alice, "join");
+    f.store->insert_event(generate_event_id("test"), chan, alice,
+                          std::string(event_type::kRoomJoinRules), std::string(""),
+                          json{{"join_rule", "public"}}.dump(), now_ms());
+
+    backfill_auto_join(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(f.store->is_room_member(chan, bob));
+
+    // Alice kicks bob — this is what handle_kick writes.
+    f.store->set_membership(chan, bob, "leave");
+    ASSERT_FALSE(f.store->is_room_member(chan, bob));
+
+    for (int i = 0; i < 3; ++i) {
+        backfill_auto_join(*f.store, *f.sync, f.config);
+    }
+    EXPECT_FALSE(f.store->is_room_member(chan, bob))
+        << "the kick was undone by a restart";
+}
+
+// Same mechanism, from the user's side: leaving a channel you do not want to
+// be in has to stick.
+TEST(AutoJoinBackfill, LeavingAChannelSticksAcrossRestarts) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+
+    auto chan = generate_room_id("test");
+    f.store->create_room(chan, alice);
+    f.store->set_membership(chan, alice, "join");
+    f.store->insert_event(generate_event_id("test"), chan, alice,
+                          std::string(event_type::kRoomJoinRules), std::string(""),
+                          json{{"join_rule", "public"}}.dump(), now_ms());
+    backfill_auto_join(*f.store, *f.sync, f.config);
+    ASSERT_TRUE(f.store->is_room_member(chan, bob));
+
+    f.store->set_membership(chan, bob, "leave");
+    backfill_auto_join(*f.store, *f.sync, f.config);
+    EXPECT_FALSE(f.store->is_room_member(chan, bob));
+
+    // But a user who has never been considered still gets auto-joined — the
+    // thing backfill is actually for.
+    auto dave = f.add_user("dave");
+    backfill_auto_join(*f.store, *f.sync, f.config);
+    EXPECT_TRUE(f.store->is_room_member(chan, dave));
+}
+
+// find_membership must distinguish "no row" from "leave"; get_membership
+// cannot, which is what made the bug above possible.
+TEST(AutoJoinBackfill, FindMembershipSeparatesNeverJoinedFromLeft) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto chan = generate_room_id("test");
+    f.store->create_room(chan, alice);
+
+    EXPECT_FALSE(f.store->find_membership(chan, bob).has_value());
+    EXPECT_EQ(f.store->get_membership(chan, bob), "leave");
+
+    f.store->set_membership(chan, bob, "leave");
+    ASSERT_TRUE(f.store->find_membership(chan, bob).has_value());
+    EXPECT_EQ(*f.store->find_membership(chan, bob), "leave");
+}
+
 TEST(RoomHandlerCreate, DirectRoomIsPersistedPrivateAndPeerJoined) {
     Fixture f;
     auto alice = f.add_user("alice");
