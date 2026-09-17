@@ -34,7 +34,17 @@ void SyncEngine::notify_new_event() {
         // its predicate under this same lock, and a notify slipping in between
         // that evaluation and the wait would otherwise be lost entirely.
         std::lock_guard lock(wait_mutex_);
-        current_position_ = pos;
+        // Monotonic, never a plain assignment. The head is read after the
+        // insert's transaction has committed and released the store mutex, so
+        // two writers can reach here in the opposite order to their commits:
+        // B commits position 6 and publishes 6, then A — which committed 5 and
+        // sampled the head as 5 before B got there — would drag the published
+        // head back to 5. A waiter that had already examined 6 then parks
+        // against a head that no longer exceeds it and sits out its timeout
+        // holding an event that is committed and visible.
+        if (pos > current_position_.load()) {
+            current_position_ = pos;
+        }
     }
     new_event_cv_.notify_all();
 }
@@ -45,6 +55,10 @@ void SyncEngine::notify_ephemeral() {
         ++ephemeral_seq_;
     }
     new_event_cv_.notify_all();
+}
+
+void SyncEngine::set_post_scan_hook_for_test(std::function<void()> hook) {
+    post_scan_hook_for_test_ = std::move(hook);
 }
 
 SyncResponse SyncEngine::handle_sync(const std::string& user_id,
@@ -86,7 +100,11 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
     // happened" and don't get swallowed by the wait.
     const uint64_t edu_at_entry = ephemeral_seq_.load();
 
-    auto response = build_incremental_sync(user_id, since_pos);
+    // The position this scan covered — NOT the head as it stands now. An event
+    // persisted while the scan was running has a position above this, so the
+    // wait below still treats it as unseen and wakes on it at once.
+    int64_t covered_pos = since_pos;
+    auto response = build_incremental_sync(user_id, since_pos, &covered_pos);
     if (!response.rooms.join.empty()) {
         return response;
     }
@@ -112,17 +130,20 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
         // Re-check instead, and go back to sleep on a wake that turned out to
         // hold nothing for this user. `checked_pos` is what makes that
         // terminate: the raw predicate stays true forever once the global head
-        // has passed since_pos, so it has to advance to the head we have
-        // already looked at.
-        int64_t checked_pos = since_pos;
+        // has passed since_pos, so it has to advance past what we have already
+        // looked at.
+        //
+        // It advances to the position each SCAN COVERED, never to the head as
+        // read afterwards. Sampling the head here instead marked an event that
+        // landed between the scan and this line as already examined: the
+        // predicate was false for it, and the client sat out the whole 30s
+        // timeout — or until some unrelated event happened along — holding a
+        // message that was committed and readable the entire time.
+        int64_t checked_pos = covered_pos;
         for (;;) {
             bool signalled = false;
             {
                 std::unique_lock lock(wait_mutex_);
-                // Read under the lock: current_position_ is only published
-                // under it, so sampling it here cannot miss a notification
-                // that lands between this and the wait.
-                checked_pos = std::max(checked_pos, current_position_.load());
                 signalled = new_event_cv_.wait_until(lock, deadline, [&] {
                     return current_position_.load() > checked_pos ||
                            ephemeral_seq_.load() != edu_at_entry;
@@ -130,17 +151,28 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
             }
             if (!signalled) break; // deadline passed with nothing for us
 
-            response = build_incremental_sync(user_id, since_pos);
+            response = build_incremental_sync(user_id, since_pos, &covered_pos);
             // Real events, or an ephemeral change the caller injects typing and
             // presence from — either is worth returning immediately.
             if (!response.rooms.join.empty() ||
                 ephemeral_seq_.load() != edu_at_entry) {
                 return response;
             }
-            // Woken for an event this user cannot see. Keep the poll parked.
+            // Woken for an event this user cannot see. Keep the poll parked,
+            // now against the position that re-scan reached.
+            if (covered_pos > checked_pos) {
+                checked_pos = covered_pos;
+                continue;
+            }
+            // The re-scan covered no new ground. That means it was cut short by
+            // its limit on rows this user cannot read, so re-scanning returns
+            // the same rows forever and covered_pos will never move. Park
+            // against the current head rather than spinning until the deadline;
+            // next_batch carries the client past those rows on its next poll.
+            checked_pos = std::max(checked_pos, current_position_.load());
         }
 
-        response = build_incremental_sync(user_id, since_pos);
+        response = build_incremental_sync(user_id, since_pos, &covered_pos);
     }
 
     return response;
@@ -170,7 +202,19 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
     SyncResponse response;
     PermissionsEngine perms(store_, config_);
 
+    // Sampled BEFORE a single room is read, and next_batch is built from it
+    // below. Reading it at the end instead skips every event that landed while
+    // this sync was walking the room list: such an event is not in any
+    // timeline here, yet sits at or below the token the client goes on to poll
+    // with, so nothing ever asks for it again. Taken first, the worst case is
+    // that the client is offered an event twice — which it deduplicates by
+    // event_id — instead of never.
+    const int64_t head_before_scan = store_.get_current_stream_position();
+
     auto rooms = store_.get_joined_rooms(user_id);
+
+    // Stands in for an event committing while the walk below is in progress.
+    if (post_scan_hook_for_test_) post_scan_hook_for_test_();
     for (const auto& room_id : rooms) {
         // Categories bypass VIEW_CHANNEL so the sidebar can still show the
         // container node even when individual child channels are hidden.
@@ -212,11 +256,12 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
 
     attach_direct_rooms(store_, user_id, response);
 
-    response.next_batch = "s" + std::to_string(store_.get_current_stream_position());
+    response.next_batch = "s" + std::to_string(head_before_scan);
     return response;
 }
 
-SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int64_t since_pos) {
+SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int64_t since_pos,
+                                                int64_t* out_covered_pos) {
     SyncResponse response;
     PermissionsEngine perms(store_, config_);
 
@@ -227,7 +272,17 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
     // read — was skipped permanently.
     int64_t delivered_max = since_pos;
     constexpr int kScanLimit = 1000;
-    auto events = store_.get_events_since(user_id, since_pos, delivered_max, kScanLimit);
+    // `scan_head` is the stream head as of the scan's own snapshot, taken under
+    // the store lock that serialises writes. Reading the head separately after
+    // the scan — as this did — leaves a window in which an insert commits with
+    // a position at or below the head we then read but above anything the scan
+    // returned. next_batch jumped over it and no later sync ever asked for it:
+    // that event was lost to this client for good.
+    int64_t scan_head = since_pos;
+    auto events =
+        store_.get_events_since(user_id, since_pos, delivered_max, scan_head, kScanLimit);
+
+    if (post_scan_hook_for_test_) post_scan_hook_for_test_();
 
     // When the scan was not cut short by the limit, this user has been offered
     // everything on the stream, so their token can jump to the global head even
@@ -241,7 +296,7 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
     // certainly rows past `delivered_max` this user still needs, and skipping
     // to the head would drop them permanently.
     if (static_cast<int>(events.size()) < kScanLimit) {
-        delivered_max = std::max(delivered_max, store_.get_current_stream_position());
+        delivered_max = std::max(delivered_max, scan_head);
     }
 
     std::set<std::string> newly_joined_rooms;
@@ -296,6 +351,10 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
     }
 
     response.next_batch = "s" + std::to_string(delivered_max);
+    // Same value as next_batch by construction, and that is the point: what the
+    // client is told it has seen and what a wait treats as seen must be the one
+    // number, or one of the two is wrong.
+    if (out_covered_pos) *out_covered_pos = delivered_max;
     return response;
 }
 

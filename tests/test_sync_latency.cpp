@@ -242,4 +242,112 @@ TEST(HttpWorkerPoolTest, ValidateRaisesACeilingBelowTheBase) {
     EXPECT_GE(zero.max_workers, zero.workers);
 }
 
+// ---------------------------------------------------------------------------
+// The two races the scoped-wake change (89c958a) opened, each of which turns
+// on the same mistake: reading the global stream head as a SEPARATE step after
+// the scan, and treating it as though it described what the scan saw.
+//
+// Both use SyncEngine's post-scan hook rather than threads and sleeps. The hook
+// runs on the syncing thread itself, in the exact instant between the scan and
+// everything built from it, so the window is hit every run on every machine
+// instead of being aimed at.
+// ---------------------------------------------------------------------------
+
+// Race 1: an event that lands while the first scan is running was marked as
+// already examined by the wait, because `checked_pos` was bumped to the head as
+// read AFTER that scan. The predicate was then false for an event that was
+// committed, visible, and not in the response — so the client waited for some
+// later event, or for the full timeout, to be told about it.
+TEST_F(SyncLatencyTest, EventDuringTheInitialScanWakesThePollAtOnce) {
+    const std::string since = sync->handle_sync("@bob:test", "", 0).next_batch;
+
+    // Fires once, inside the initial scan, before the wait is entered.
+    bool fired = false;
+    sync->set_post_scan_hook_for_test([&] {
+        if (fired) return;
+        fired = true;
+        insert_message("landed mid-scan");
+        sync->notify_new_event();
+    });
+
+    const auto t0 = clk::now();
+    auto got = sync->handle_sync("@bob:test", since, 4000);
+    const int64_t elapsed = ms_since(t0);
+
+    ASSERT_TRUE(fired);
+    ASSERT_EQ(got.rooms.join.count(room_id), 1u);
+    ASSERT_EQ(got.rooms.join[room_id].timeline.events.size(), 1u);
+    EXPECT_EQ(got.rooms.join[room_id].timeline.events[0].content.data["body"],
+              "landed mid-scan");
+    // The event was already on disk before the wait began, so this must return
+    // immediately. Before the fix it rode out all 4000ms and only picked the
+    // message up in the post-deadline scan.
+    EXPECT_LT(elapsed, 1000)
+        << "a sync took " << elapsed
+        << "ms to return an event that was committed before it ever waited";
+}
+
+// Race 2: next_batch was built from the head read after the scan, so an event
+// committing in between sat at or below the new token without having been in
+// the scan. The client polls with that token, asks only for positions above it,
+// and never learns the event exists.
+TEST_F(SyncLatencyTest, NextBatchNeverJumpsPastAnUnscannedEvent) {
+    const std::string since = sync->handle_sync("@bob:test", "", 0).next_batch;
+
+    bool fired = false;
+    sync->set_post_scan_hook_for_test([&] {
+        if (fired) return;
+        fired = true;
+        insert_message("committed between the scan and the head read");
+    });
+
+    // timeout 0: no waiting, just the scan and the token it hands back.
+    auto first = sync->handle_sync("@bob:test", since, 0);
+    ASSERT_TRUE(fired);
+    EXPECT_TRUE(first.rooms.join.empty())
+        << "the event landed after the scan, so it cannot be in this response";
+
+    // Whatever the token says, the next poll with it must still produce the
+    // event. This is the assertion that fails without the fix: next_batch had
+    // already advanced past a row nobody had read.
+    sync->set_post_scan_hook_for_test(nullptr);
+    auto second = sync->handle_sync("@bob:test", first.next_batch, 0);
+
+    ASSERT_EQ(second.rooms.join.count(room_id), 1u)
+        << "next_batch (" << first.next_batch << ") skipped an event that was "
+           "never scanned; no later sync will ever ask for it";
+    ASSERT_EQ(second.rooms.join[room_id].timeline.events.size(), 1u);
+    EXPECT_EQ(second.rooms.join[room_id].timeline.events[0].content.data["body"],
+              "committed between the scan and the head read");
+}
+
+// The same hazard on the initial-sync path: next_batch there was built from a
+// head read after every room had been walked, so an event landing mid-walk was
+// in no timeline in the response and still below the token the client then
+// polled with. The hook fires inside the walk.
+TEST_F(SyncLatencyTest, InitialSyncTokenDoesNotSkipAnEventLandingDuringIt) {
+    // An earlier event puts the head somewhere non-zero, so a token that has
+    // over-advanced cannot pass by looking like the empty-server case.
+    insert_message("older");
+
+    bool fired = false;
+    sync->set_post_scan_hook_for_test([&] {
+        if (fired) return;
+        fired = true;
+        insert_message("during the walk");
+    });
+
+    auto initial = sync->handle_sync("@bob:test", "", 0);
+    ASSERT_TRUE(fired);
+    sync->set_post_scan_hook_for_test(nullptr);
+
+    auto next = sync->handle_sync("@bob:test", initial.next_batch, 0);
+    ASSERT_EQ(next.rooms.join.count(room_id), 1u)
+        << "the initial-sync token (" << initial.next_batch
+        << ") ran past an event that was not in the initial response";
+    ASSERT_EQ(next.rooms.join[room_id].timeline.events.size(), 1u);
+    EXPECT_EQ(next.rooms.join[room_id].timeline.events[0].content.data["body"],
+              "during the walk");
+}
+
 } // namespace

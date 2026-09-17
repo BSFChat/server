@@ -292,6 +292,21 @@ public:
                                             int64_t& out_max_position, int limit = 1000);
     std::vector<RoomEvent> get_events_since(const std::string& user_id, int64_t since_position,
                                             int limit = 1000);
+    // Same scan, plus `out_stream_head`: the global stream head sampled under
+    // the SAME lock as the scan, so it is the head of the snapshot the scan
+    // actually saw and not a later one.
+    //
+    // Reading the head afterwards (a second, separate lock acquisition) loses
+    // events permanently. An insert landing between the two calls gets a
+    // position at or below the head the caller then reads, so the caller's
+    // next_batch jumps past a row the scan never returned and no later sync
+    // ever asks for it again. Writes are serialised by this same mutex_ and a
+    // position is both claimed and committed while it is held, so a head taken
+    // inside the lock is a genuine watermark: every position at or below it is
+    // committed and was offered to the query.
+    std::vector<RoomEvent> get_events_since(const std::string& user_id, int64_t since_position,
+                                            int64_t& out_max_position, int64_t& out_stream_head,
+                                            int limit);
     int64_t get_current_stream_position();
     int64_t get_room_max_stream_position(const std::string& room_id);
 
