@@ -266,6 +266,20 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
 
         if (newly_created) {
             auto_join_public_rooms(store_, sync_engine_, config_, user_id);
+            // Same reason as in handle_register: without this the new account
+            // holds no bsfchat.member.roles row at all and falls through to
+            // @everyone until the next restart runs bootstrap_roles.
+            //
+            // It matters most on exactly the deployment shape we ship:
+            // identity-only (identity.required, allow_local_accounts = false)
+            // refuses local registration, so m.login.token is the ONLY way an
+            // account is ever created there — and the very first user, who
+            // should be the admin, came out with no admin role and therefore
+            // no MANAGE_CHANNELS. They could not create the first channel,
+            // and the only cure was restarting the server. That is the
+            // deadlock RoleBootstrap was written to prevent, reappearing on
+            // the one path that did not call it.
+            bootstrap_roles(store_, sync_engine_, config_);
         }
 
         LoginResponse login_resp{
