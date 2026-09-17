@@ -295,6 +295,109 @@ TEST(Pushers, GatewayUrlMustBeAbsoluteHttpAndCarryNoCredentials) {
     EXPECT_EQ(attempt("https://gateway.example/notify\r\nX-Injected: 1"), 400);
 }
 
+// With no allowlist configured the handler used to accept any absolute
+// http(s) URL, which made an out-of-the-box deployment a ready-made SSRF
+// primitive: /pushers/set is the one endpoint where an ordinary user names a
+// URL that the SERVER then POSTs to, and the delivery worker runs inside the
+// compose network. The allowlist is still the real control (and the example
+// config ships one); this is the backstop for deployments that never set it.
+TEST(Pushers, InternalTargetsAreRefusedWithNoAllowlist) {
+    PushFixture f;
+    ASSERT_TRUE(f.config.push.allowed_gateway_prefixes.empty());
+    f.add_user("alice");
+
+    auto attempt = [&](const std::string& url) {
+        auto req = make_request("/_matrix/client/v3/pushers/set", "token-alice",
+                                json{{"kind", "http"},
+                                     {"pushkey", "k"},
+                                     {"app_id", "a"},
+                                     {"data", {{"url", url}}}}
+                                    .dump());
+        httplib::Response res;
+        f.pushers->handle_set_pusher(req, res);
+        return res.status;
+    };
+
+    // Cloud metadata — the classic one.
+    EXPECT_EQ(attempt("http://169.254.169.254/latest/meta-data/"), 400);
+    // The server talking to itself, by name and by address, v4 and v6.
+    EXPECT_EQ(attempt("http://localhost:8448/_matrix/client/v3/sync"), 400);
+    EXPECT_EQ(attempt("http://127.0.0.1:8448/"), 400);
+    EXPECT_EQ(attempt("http://[::1]:8448/"), 400);
+    EXPECT_EQ(attempt("http://[::ffff:127.0.0.1]/"), 400);
+    // Private ranges and CGNAT.
+    EXPECT_EQ(attempt("http://10.0.0.5/notify"), 400);
+    EXPECT_EQ(attempt("http://172.16.0.9/notify"), 400);
+    EXPECT_EQ(attempt("http://172.31.255.254/notify"), 400);
+    EXPECT_EQ(attempt("http://192.168.1.1/notify"), 400);
+    EXPECT_EQ(attempt("http://100.64.0.1/notify"), 400);
+    EXPECT_EQ(attempt("http://[fd00::1]/notify"), 400);
+    EXPECT_EQ(attempt("http://[fe80::1]/notify"), 400);
+    // Compose service names and internal search domains.
+    EXPECT_EQ(attempt("http://identity:9000/notify"), 400);
+    EXPECT_EQ(attempt("http://db/notify"), 400);
+    EXPECT_EQ(attempt("http://gateway.internal/notify"), 400);
+    EXPECT_EQ(attempt("http://printer.local/notify"), 400);
+
+    // A genuinely public gateway is still accepted — this must not become a
+    // de-facto allowlist of one.
+    EXPECT_TRUE(IsOk([&] {
+        auto req = make_request("/_matrix/client/v3/pushers/set", "token-alice",
+                                json{{"kind", "http"},
+                                     {"pushkey", "k"},
+                                     {"app_id", "a"},
+                                     {"data", {{"url", "https://push.example.com/_matrix/push/v1/notify"}}}}
+                                    .dump());
+        httplib::Response res;
+        f.pushers->handle_set_pusher(req, res);
+        return res;
+    }()));
+}
+
+// 172.15 and 172.32 are *outside* RFC1918; an off-by-one here would silently
+// block a legitimate gateway.
+TEST(Pushers, AddressesAdjacentToPrivateRangesAreStillAllowed) {
+    PushFixture f;
+    ASSERT_TRUE(f.config.push.allowed_gateway_prefixes.empty());
+    f.add_user("alice");
+
+    auto attempt = [&](const std::string& url) {
+        auto req = make_request("/_matrix/client/v3/pushers/set", "token-alice",
+                                json{{"kind", "http"},
+                                     {"pushkey", "k"},
+                                     {"app_id", "a"},
+                                     {"data", {{"url", url}}}}
+                                    .dump());
+        httplib::Response res;
+        f.pushers->handle_set_pusher(req, res);
+        return res;
+    };
+
+    EXPECT_TRUE(IsOk(attempt("http://172.15.0.1/notify")));
+    EXPECT_TRUE(IsOk(attempt("http://172.32.0.1/notify")));
+    EXPECT_TRUE(IsOk(attempt("http://11.0.0.1/notify")));
+    EXPECT_TRUE(IsOk(attempt("http://8.8.8.8/notify")));
+}
+
+// The allowlist overrides the backstop: a deployment whose gateway really is
+// on localhost (sygnal in the same compose file) says so and keeps working.
+// tests/e2e/e2e.sh depends on exactly this.
+TEST(Pushers, AllowlistOverridesTheInternalHostBackstop) {
+    PushFixture f;
+    f.config.push.allowed_gateway_prefixes = {"http://127.0.0.1:9999/"};
+    f.add_user("alice");
+
+    auto req = make_request("/_matrix/client/v3/pushers/set", "token-alice",
+                            json{{"kind", "http"},
+                                 {"pushkey", "k"},
+                                 {"app_id", "a"},
+                                 {"data", {{"url", "http://127.0.0.1:9999/notify"}}}}
+                                .dump());
+    httplib::Response res;
+    f.pushers->handle_set_pusher(req, res);
+    EXPECT_TRUE(IsOk(res));
+}
+
 TEST(Pushers, GatewayAllowlistIsEnforcedWhenConfigured) {
     PushFixture f;
     f.config.push.allowed_gateway_prefixes = {"https://gateway.example/"};

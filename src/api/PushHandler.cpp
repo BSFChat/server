@@ -12,6 +12,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <string>
 
 namespace bsfchat {
 
@@ -22,6 +25,99 @@ namespace {
 void send_error(httplib::Response& res, int status, const MatrixError& err) {
     res.status = status;
     res.set_content(err.to_json().dump(), "application/json");
+}
+
+// The authority ("host[:port]") of an absolute http(s) URL, lowercased and
+// with any port and IPv6 brackets removed. Empty when there isn't one.
+std::string url_host(const std::string& url) {
+    const auto scheme = url.find("://");
+    if (scheme == std::string::npos) return {};
+    const auto start = scheme + 3;
+    auto end = url.find_first_of("/?#", start);
+    if (end == std::string::npos) end = url.size();
+    std::string authority = url.substr(start, end - start);
+    if (authority.empty()) return {};
+
+    if (authority.front() == '[') {                 // [::1]:8448
+        const auto close = authority.find(']');
+        if (close == std::string::npos) return {};
+        authority = authority.substr(1, close - 1);
+    } else if (const auto colon = authority.rfind(':');
+               colon != std::string::npos
+               && authority.find(':') == colon) {   // host:port, not bare IPv6
+        authority = authority.substr(0, colon);
+    }
+
+    std::transform(authority.begin(), authority.end(), authority.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return authority;
+}
+
+bool parse_ipv4(const std::string& host, unsigned octets[4]) {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    char tail = 0;
+    if (std::sscanf(host.c_str(), "%u.%u.%u.%u%c", &a, &b, &c, &d, &tail) != 4)
+        return false;
+    if (a > 255 || b > 255 || c > 255 || d > 255) return false;
+    octets[0] = a; octets[1] = b; octets[2] = c; octets[3] = d;
+    return true;
+}
+
+bool ends_with(const std::string& s, const char* suffix) {
+    const std::string suf(suffix);
+    return s.size() >= suf.size()
+        && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
+}
+
+// Targets that only make sense as an attack when a user picks them.
+//
+// This is the backstop for a deployment that has NOT set
+// push.allowed_gateway_prefixes. The allowlist is still the real control and
+// is still what the example config ships; this only stops the fully-open
+// configuration from being a ready-made SSRF primitive aimed at the inside of
+// the deployment. A deployment that genuinely needs to notify a gateway on
+// 127.0.0.1 or 10.x names it in the allowlist, which bypasses this entirely.
+bool host_is_internal(const std::string& host) {
+    if (host.empty()) return true;
+
+    if (host == "localhost" || ends_with(host, ".localhost")
+        || ends_with(host, ".local") || ends_with(host, ".internal")
+        || ends_with(host, ".home.arpa"))
+        return true;
+
+    unsigned ip[4];
+    if (parse_ipv4(host, ip)) {
+        if (ip[0] == 127) return true;                             // loopback
+        if (ip[0] == 0) return true;                               // "this host"
+        if (ip[0] == 10) return true;                              // RFC1918
+        if (ip[0] == 172 && ip[1] >= 16 && ip[1] <= 31) return true;
+        if (ip[0] == 192 && ip[1] == 168) return true;
+        if (ip[0] == 169 && ip[1] == 254) return true;             // link-local / metadata
+        if (ip[0] == 100 && ip[1] >= 64 && ip[1] <= 127) return true; // CGNAT
+        if (ip[0] == 192 && ip[1] == 0 && ip[2] == 0) return true;
+        if (ip[0] >= 224) return true;                             // multicast + broadcast
+        return false;
+    }
+
+    if (host.find(':') != std::string::npos) {                     // IPv6 literal
+        if (host == "::1" || host == "::") return true;
+        if (host.rfind("fe8", 0) == 0 || host.rfind("fe9", 0) == 0
+            || host.rfind("fea", 0) == 0 || host.rfind("feb", 0) == 0)
+            return true;                                           // fe80::/10
+        if (host.rfind("fc", 0) == 0 || host.rfind("fd", 0) == 0)
+            return true;                                           // fc00::/7
+        // ::ffff:127.0.0.1 and friends.
+        const auto last = host.rfind(':');
+        unsigned mapped[4];
+        if (last != std::string::npos && parse_ipv4(host.substr(last + 1), mapped))
+            return host_is_internal(host.substr(last + 1));
+        return false;
+    }
+
+    // A bare name with no dot resolves through the deployment's own search
+    // domain — "db", "identity", a compose service name. Never a public
+    // push gateway.
+    return host.find('.') == std::string::npos;
 }
 
 // Validates a client-supplied push gateway URL.
@@ -49,7 +145,20 @@ bool gateway_url_allowed(const std::string& url, const PushConfig& cfg, std::str
         why = "data.url contains invalid characters";
         return false;
     }
-    if (cfg.allowed_gateway_prefixes.empty()) return true;
+    if (cfg.allowed_gateway_prefixes.empty()) {
+        // No allowlist configured: Config::validate already warns about this
+        // loudly. Accepting *anything* on top of that made an unconfigured
+        // deployment a turnkey SSRF primitive against its own compose network
+        // and the cloud metadata endpoint, so the obviously-internal targets
+        // are refused even here.
+        if (host_is_internal(url_host(url))) {
+            why = "data.url must be a public push gateway; this server has no "
+                  "push.allowed_gateway_prefixes configured and will not POST "
+                  "to an internal address";
+            return false;
+        }
+        return true;
+    }
 
     for (const auto& prefix : cfg.allowed_gateway_prefixes) {
         if (!prefix.empty() && url.rfind(prefix, 0) == 0) return true;
