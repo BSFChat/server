@@ -42,7 +42,14 @@ public:
 
 private:
     SyncResponse build_initial_sync(const std::string& user_id);
-    SyncResponse build_incremental_sync(const std::string& user_id, int64_t since_pos);
+    // `out_covered_pos`, when given, receives the stream position this scan is
+    // known to have covered: every event at or below it has been offered to
+    // this user. It is what next_batch is built from, and what a wait must
+    // compare the stream head against — re-reading the head after the scan
+    // instead is how an event that landed during the scan ends up neither
+    // delivered nor waited for.
+    SyncResponse build_incremental_sync(const std::string& user_id, int64_t since_pos,
+                                        int64_t* out_covered_pos = nullptr);
 
     SqliteStore& store_;
     const Config& config_;

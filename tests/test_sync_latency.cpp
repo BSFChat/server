@@ -253,6 +253,40 @@ TEST(HttpWorkerPoolTest, ValidateRaisesACeilingBelowTheBase) {
 // instead of being aimed at.
 // ---------------------------------------------------------------------------
 
+// Race 1: an event that lands while the first scan is running was marked as
+// already examined by the wait, because `checked_pos` was bumped to the head as
+// read AFTER that scan. The predicate was then false for an event that was
+// committed, visible, and not in the response — so the client waited for some
+// later event, or for the full timeout, to be told about it.
+TEST_F(SyncLatencyTest, EventDuringTheInitialScanWakesThePollAtOnce) {
+    const std::string since = sync->handle_sync("@bob:test", "", 0).next_batch;
+
+    // Fires once, inside the initial scan, before the wait is entered.
+    bool fired = false;
+    sync->set_post_scan_hook_for_test([&] {
+        if (fired) return;
+        fired = true;
+        insert_message("landed mid-scan");
+        sync->notify_new_event();
+    });
+
+    const auto t0 = clk::now();
+    auto got = sync->handle_sync("@bob:test", since, 4000);
+    const int64_t elapsed = ms_since(t0);
+
+    ASSERT_TRUE(fired);
+    ASSERT_EQ(got.rooms.join.count(room_id), 1u);
+    ASSERT_EQ(got.rooms.join[room_id].timeline.events.size(), 1u);
+    EXPECT_EQ(got.rooms.join[room_id].timeline.events[0].content.data["body"],
+              "landed mid-scan");
+    // The event was already on disk before the wait began, so this must return
+    // immediately. Before the fix it rode out all 4000ms and only picked the
+    // message up in the post-deadline scan.
+    EXPECT_LT(elapsed, 1000)
+        << "a sync took " << elapsed
+        << "ms to return an event that was committed before it ever waited";
+}
+
 // Race 2: next_batch was built from the head read after the scan, so an event
 // committing in between sat at or below the new token without having been in
 // the scan. The client polls with that token, asks only for positions above it,
