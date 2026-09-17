@@ -24,7 +24,7 @@ namespace bsfchat {
 //   3. Never edit or renumber an existing step — deployments have already run it.
 
 // The schema version this build expects.
-inline constexpr int kTargetSchemaVersion = 16;
+inline constexpr int kTargetSchemaVersion = 17;
 
 // Reads `PRAGMA user_version`.
 int get_schema_version(sqlite3* db);
