@@ -26,9 +26,17 @@ add_executable(server_tests
     test_audit.cpp
     test_permission_scope.cpp
     test_server_ban.cpp
+    test_version.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+
+# Same definitions the server target gets, so test_version.cpp checks the
+# string the shipped binary would actually report rather than the
+# #ifndef fallback inside the header.
+target_compile_definitions(server_tests PRIVATE
+    BSFCHAT_SERVER_VERSION="${BSFCHAT_SERVER_VERSION}"
+    BSFCHAT_SERVER_REVISION="${BSFCHAT_SERVER_REVISION}")
 
 target_link_libraries(server_tests PRIVATE
     bsfchat_protocol
@@ -105,6 +113,25 @@ set_tests_properties(e2e_voice PROPERTIES
     # It binds a socket and starts a server process; two copies at once would
     # be fine (the port is ephemeral) but there is nothing to gain from it.
     RUN_SERIAL TRUE)
+
+# --- release-channel script --------------------------------------------------
+#
+# scripts/channel_tags.py decides which of :latest / :latest-beta a pushed
+# git tag takes. It runs in CI, but it is registered here too so that
+# breaking the semver rule fails the same `ctest` run everyone already
+# does before pushing, instead of only being caught by a release.
+#
+# Not labelled e2e: it is a pure unit test, it needs no network and no
+# server process, and it belongs in the default `ctest -LE e2e` sweep.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME channel_tags
+             COMMAND ${Python3_EXECUTABLE}
+                     ${CMAKE_SOURCE_DIR}/scripts/test_channel_tags.py)
+else()
+    message(STATUS "python3 not found - skipping the channel_tags test "
+                   "(CI always has it; this only affects local ctest runs)")
+endif()
 
 add_custom_target(e2e
     COMMAND ${CMAKE_CTEST_COMMAND} --test-dir ${CMAKE_BINARY_DIR} -L e2e --output-on-failure

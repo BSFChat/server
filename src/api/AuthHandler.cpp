@@ -5,6 +5,7 @@
 #include "auth/RoleBootstrap.h"
 #include "core/Config.h"
 #include "core/Logger.h"
+#include "core/Version.h"
 #include "http/Middleware.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
@@ -68,6 +69,26 @@ void AuthHandler::handle_versions(const httplib::Request&, httplib::Response& re
     json resp = {
         {"versions", {std::string(spec::kVersion)}},
     };
+
+    // Additive only. `versions` keeps exactly the value it had, because a
+    // Matrix client keys its whole feature negotiation off that array and
+    // an extra entry there would be a protocol claim we cannot honour.
+    //
+    // The build identity goes in vendor-namespaced sibling keys instead.
+    // Anything that does not know them ignores them (the spec requires
+    // unknown keys to be tolerated), and `bsfchat.version` is the one an
+    // operator or a support conversation actually wants:
+    //
+    //   curl -s http://host:8448/_matrix/client/versions | jq .
+    //
+    // `unstable_features` is a map of string->BOOLEAN per the spec, so
+    // the version string cannot live there; we advertise the capability
+    // flag there and put the string beside it.
+    resp["unstable_features"] = {{"bsfchat.server", true}};
+    resp["bsfchat.version"] = build::version_string();
+    resp["bsfchat.revision"] = build::revision_string();
+    resp["bsfchat.channel"] = build::channel_of(build::kVersion);
+
     res.set_content(resp.dump(), "application/json");
 }
 

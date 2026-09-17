@@ -1,6 +1,7 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "core/Server.h"
+#include "core/Version.h"
 
 #include <csignal>
 #include <iostream>
@@ -16,6 +17,12 @@ void signal_handler(int) {
 int main(int argc, char* argv[]) {
     bsfchat::init_logger("info");
     auto log = bsfchat::get_logger();
+
+    // First line in the log, before config loading can fail: when someone
+    // pastes a log excerpt asking why their server is misbehaving, the
+    // build that produced it is the first thing worth knowing, and a
+    // config error must not swallow it.
+    log->info("BSFChat server {}", bsfchat::build::describe());
 
     bsfchat::Config config;
     if (argc > 2 && std::string(argv[1]) == "--config") {
