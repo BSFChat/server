@@ -30,3 +30,7 @@ tests/e2e/e2e-run/
 .DS_Store
 .vscode/
 .idea/
+
+# Python bytecode from scripts/ (the release-channel tooling).
+__pycache__/
+*.pyc

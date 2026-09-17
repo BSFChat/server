@@ -1,4 +1,11 @@
+# build/ is not the only build tree in this repo — there are several
+# build-<topic>/ scratch trees, and each is hundreds of MB of object
+# files that would otherwise be copied into the build context and
+# invalidate its cache on every local rebuild.
 build/
+build-*/
 data/
+.git
 .git/
 .cache/
+.DS_Store

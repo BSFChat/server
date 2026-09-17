@@ -110,15 +110,57 @@ jobs:
                    -I src \
                    src/
 
-  docker:
-    needs: build
+  # ---------------------------------------------------------------------------
+  # Release-channel script
+  # ---------------------------------------------------------------------------
+  # scripts/channel_tags.py decides which of :latest / :latest-beta a tag
+  # takes, and getting it wrong silently downgrades every deployment
+  # tracking stable. It runs on PRs too, so the rule is checked before the
+  # tag that would exercise it is ever pushed.
+  channels:
+    name: channel rules
     runs-on: ubuntu-24.04
-    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit-test the channel rules
+        run: python3 scripts/test_channel_tags.py
+
+  # ---------------------------------------------------------------------------
+  # Development image: tip of main
+  # ---------------------------------------------------------------------------
+  # :main is what :latest used to be — whatever landed last, unreviewed.
+  # It is deliberately NOT :latest any more; see docs/release-channels.md.
+  #
+  # Single-arch (linux/amd64). Adding linux/arm64 here means QEMU-emulating
+  # a full C++ build of this tree on every push, which costs roughly an
+  # order of magnitude more runner time than it is worth. The way to do it
+  # properly is a native arm64 runner and a manifest merge, not
+  # `platforms:` on this step.
+  docker:
+    name: image (main)
+    needs: [build, channels]
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Tags and history, so cmake/Version.cmake's `git describe`
+          # fallback resolves to the last release rather than 0.0.0-dev.
+          fetch-depth: 0
+
+      - name: Derive a development version
+        id: version
+        run: |
+          LAST=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
+          LAST="${LAST#v}"
+          # -dev.<sha> sorts BELOW the release it is built on under semver
+          # precedence, which is correct: this is main after that tag, and
+          # it must never read as the tag itself.
+          echo "version=${LAST%%-*}-dev.$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "revision=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Log in to Container Registry
         uses: docker/login-action@v3
@@ -127,27 +169,124 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha
-            # Always add :latest on a push to main. The previous
-            # `{{is_default_branch}}` template evaluated to false on
-            # some runs, so prod was stuck on a stale image until
-            # someone manually retagged. GitHub Actions context is
-            # deterministic here.
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Build and push Docker image
+      - name: Build and push :main
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ steps.version.outputs.revision }}
+          build-args: |
+            BSFCHAT_SERVER_VERSION=${{ steps.version.outputs.version }}
+            BSFCHAT_SERVER_REVISION=${{ steps.version.outputs.revision }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------------
+  # Release: tag push
+  # ---------------------------------------------------------------------------
+  # Builds ONCE and pushes that one image under every tag it earns. The
+  # channel assignment is ours (scripts/channel_tags.py) rather than
+  # metadata-action's `type=semver`, because only ours can see the other
+  # tags in the repository — which is the whole point: :latest follows the
+  # HIGHEST stable version, so a hotfix cut on an older line does not drag
+  # it backwards.
+  release:
+    name: release (${{ github.ref_name }})
+    needs: [build, channels]
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write   # creating the GitHub Release
+      packages: write   # pushing to ghcr.io
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Every v* tag has to be present locally or the comparison is
+          # made against an empty set and every tag looks like the newest.
+          fetch-depth: 0
+
+      - name: Compute channel tags
+        id: channel
+        run: |
+          python3 scripts/channel_tags.py \
+            --tag "${GITHUB_REF_NAME}" \
+            --image "${REGISTRY}/${IMAGE_NAME}"
+
+      - name: Summarise
+        run: |
+          {
+            echo "### \`${GITHUB_REF_NAME}\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| version | \`${{ steps.channel.outputs.version }}\` |"
+            echo "| prerelease | \`${{ steps.channel.outputs.prerelease }}\` |"
+            echo "| takes \`:latest\` | \`${{ steps.channel.outputs.latest }}\` |"
+            echo "| takes \`:latest-beta\` | \`${{ steps.channel.outputs.latest_beta }}\` |"
+            echo
+            echo '```'
+            echo "${{ steps.channel.outputs.tags }}" | tr ',' '\n'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # One build, many tags: build-push-action pushes the same image
+      # digest under each, so :latest and :0.0.44 are literally the same
+      # bytes and cannot drift.
+      - name: Build and push the release image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.channel.outputs.tags }}
+          build-args: |
+            BSFCHAT_SERVER_VERSION=${{ steps.channel.outputs.version }}
+            BSFCHAT_SERVER_REVISION=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.channel.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Mirrors the client's release job: the GitHub Release's `prerelease`
+      # boolean is the authority for what is a beta, never the tag text.
+      # The desktop updater filters on exactly this flag, and GitHub itself
+      # excludes a prerelease from /releases/latest.
+      - name: Create the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ steps.channel.outputs.prerelease == 'true' }}
+          body: |
+            Container image:
+
+            ```
+            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.channel.outputs.version }}
+            ```
+
+            Published tags:
+
+            ```
+            ${{ steps.channel.outputs.tags }}
+            ```
+
+            See [docs/release-channels.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/release-channels.md)
+            for what `:latest` and `:latest-beta` mean.

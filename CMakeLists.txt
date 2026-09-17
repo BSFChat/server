@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
-project(bsfchat-server VERSION 0.1.0 LANGUAGES CXX)
+
+# Version.cmake before project(): project(VERSION ...) needs the strict
+# MAJOR.MINOR.PATCH form, and CI passes -DBSFCHAT_SERVER_VERSION on tag
+# builds so the number in the image matches the tag that produced it.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Version.cmake)
+
+project(bsfchat-server VERSION ${BSFCHAT_SERVER_VERSION_DOTS} LANGUAGES CXX)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Ccache.cmake)
 
@@ -49,6 +55,12 @@ add_executable(bsfchat-server
 )
 
 target_include_directories(bsfchat-server PRIVATE src)
+
+# src/core/Version.h reads these. Defined on the target rather than
+# globally so a stale definition cannot leak in from a parent scope.
+target_compile_definitions(bsfchat-server PRIVATE
+    BSFCHAT_SERVER_VERSION="${BSFCHAT_SERVER_VERSION}"
+    BSFCHAT_SERVER_REVISION="${BSFCHAT_SERVER_REVISION}")
 
 target_link_libraries(bsfchat-server PRIVATE
     bsfchat_protocol
