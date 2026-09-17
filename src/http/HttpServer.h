@@ -23,6 +23,7 @@ private:
     std::string bind_address_;
     int port_;
     int workers_;
+    int max_workers_;
 };
 
 } // namespace bsfchat

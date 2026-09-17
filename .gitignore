@@ -22,6 +22,9 @@ CMakeUserPresets.json
 # media, logs) on every run. server.toml in here was tracked by accident and
 # carried one machine's absolute paths.
 tests/e2e/e2e-run/
+# Scratch trees the e2e scripts build: one per script, each holding a
+# throwaway server.toml, sqlite db and captured responses.
+tests/e2e/e2e-run-*/
 
 # Logs and editor noise
 *.log

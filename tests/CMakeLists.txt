@@ -14,6 +14,7 @@ add_executable(server_tests
     test_auth.cpp
     test_rooms.cpp
     test_sync.cpp
+    test_sync_latency.cpp
     test_permissions.cpp
     test_media.cpp
     test_voice.cpp
@@ -60,6 +61,9 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/store/Migrations.cpp
     ${CMAKE_SOURCE_DIR}/src/sync/SyncEngine.cpp
     ${CMAKE_SOURCE_DIR}/src/http/Router.cpp
+    # For the worker-pool regression test: the defect was in how this
+    # constructs httplib's ThreadPool, so the test must build the real thing.
+    ${CMAKE_SOURCE_DIR}/src/http/HttpServer.cpp
     ${CMAKE_SOURCE_DIR}/src/http/Middleware.cpp
     ${CMAKE_SOURCE_DIR}/src/api/AuthHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/TypingHandler.cpp
@@ -112,6 +116,18 @@ set_tests_properties(e2e_voice PROPERTIES
     TIMEOUT 300
     # It binds a socket and starts a server process; two copies at once would
     # be fine (the port is ephemeral) but there is nothing to gain from it.
+    RUN_SERIAL TRUE)
+
+add_test(NAME e2e_sync_latency
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/e2e/e2e_sync_latency.sh)
+set_tests_properties(e2e_sync_latency PROPERTIES
+    LABELS e2e
+    ENVIRONMENT "BSFCHAT_SERVER_BIN=$<TARGET_FILE:bsfchat-server>"
+    # The unit test covers the pool in isolation; this one proves the number
+    # an owner actually feels — send on one connection, watch a parked /sync
+    # on another come back — over real sockets with the real binary.
+    TIMEOUT 300
+    # Times a latency budget, so it must not share the box with another test.
     RUN_SERIAL TRUE)
 
 # --- release-channel script --------------------------------------------------

@@ -165,7 +165,35 @@ struct Config {
     std::string server_name = "localhost";
     std::string bind_address = "0.0.0.0";
     int port = 8448;
-    int workers = 4;
+    // Base size of the HTTP worker pool. cpp-httplib dispatches one pool task
+    // per CONNECTION and runs that connection's entire keep-alive session on
+    // it, so a worker is held for as long as the socket lives — for a /sync
+    // long poll, that is the full poll timeout. This is therefore a count of
+    // concurrent *connections*, not of concurrent requests, and every signed-in
+    // client holds several.
+    int workers = 64;
+    // Hard ceiling on the pool. Threads beyond `workers` are spawned on demand
+    // when a connection arrives and no worker is idle, and retire themselves
+    // after a few seconds idle.
+    //
+    // Treat this as a safety net, not as the mechanism — `workers` is what
+    // must actually be sized. httplib only grows the pool when it observes
+    // zero idle workers at the instant a connection is enqueued, and a thread
+    // it spawns then takes the OLDEST queued job rather than the arrival that
+    // triggered it. A burst that lands faster than the workers can decrement
+    // the idle counter — every client reconnecting after a restart, say —
+    // therefore leaves a backlog that growth alone never clears.
+    //
+    // This exists because the pool used to be constructed with a base size and
+    // no ceiling argument, which httplib reads as "ceiling == base": a hard cap
+    // with no growth at all. With workers = 4 and two desktop clients — each
+    // parking a 30s /sync plus a second connection for its voice poll — all
+    // four workers were held, and the next request to arrive (a message send)
+    // sat in the job queue with no thread to run it until a long poll timed
+    // out. Measured: 28.4s to deliver a message that takes 81ms on an idle
+    // pool. Growth is what makes the pool degrade gracefully instead of
+    // deadlocking at exactly the size an operator configured.
+    int max_workers = 512;
 
     // Database
     std::string database_path = "./data/bsfchat.db";
