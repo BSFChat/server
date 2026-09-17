@@ -4,6 +4,9 @@
 // For kLiveKitMinTtl/kLiveKitMaxTtl — validate() warns using the same bounds
 // the signer clamps to, so the two can't drift apart.
 #include <bsfchat/JwtUtils.h>
+// For kMaxSyncTimeoutMs — the worker-headroom warning quotes the real
+// long-poll ceiling rather than restating it as a literal.
+#include <bsfchat/Constants.h>
 
 #include <toml++/toml.hpp>
 #include <stdexcept>
@@ -27,6 +30,7 @@ Config Config::load(const std::string& path) {
             if (auto v = server->get("bind_address")) cfg.bind_address = v->value_or(cfg.bind_address);
             if (auto v = server->get("port")) cfg.port = v->value_or(cfg.port);
             if (auto v = server->get("workers")) cfg.workers = v->value_or(cfg.workers);
+            if (auto v = server->get("max_workers")) cfg.max_workers = v->value_or(cfg.max_workers);
         }
 
         // [database]
@@ -267,6 +271,19 @@ void Config::validate(Config& cfg) {
     }
 
     if (cfg.workers < 1) cfg.workers = 1;
+    // httplib throws std::invalid_argument from the ThreadPool constructor if
+    // the ceiling is below the base, which would abort startup on a config
+    // that is merely odd rather than wrong. Raise it to the base instead:
+    // that reproduces the old fixed-size behaviour, which is what an operator
+    // who deliberately sets max_workers = workers is asking for.
+    if (cfg.max_workers < cfg.workers) cfg.max_workers = cfg.workers;
+    if (cfg.max_workers < cfg.workers + 8) {
+        log->warn("server.max_workers ({}) leaves little headroom above server.workers ({}). "
+                  "Each connection holds a worker for its whole lifetime, and a /sync long poll "
+                  "holds one for up to {}s, so a message send can queue behind idle long polls "
+                  "once the ceiling is reached.",
+                  cfg.max_workers, cfg.workers, limits::kMaxSyncTimeoutMs / 1000);
+    }
 }
 
 Config Config::defaults() {

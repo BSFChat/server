@@ -2,10 +2,37 @@
 name = "localhost"
 bind_address = "0.0.0.0"
 port = 8448
-# Size of the HTTP worker thread pool. Every /sync long-poll occupies a
-# worker for up to its timeout, so this is effectively a concurrent-client
-# ceiling — raise it well above your expected simultaneous user count.
-workers = 4
+# SIZING THE WORKER POOL. Read this before lowering either number.
+#
+# cpp-httplib runs an entire CONNECTION on one pool thread, not one request:
+# the thread is held for as long as the socket lives. /sync is a long poll
+# that deliberately holds its socket open for up to its timeout, so `workers`
+# is a ceiling on concurrent *connections*, and each signed-in client holds
+# several of them at once — its /sync, its voice poll, media and identity
+# fetches.
+#
+# Budget roughly 4 connections per simultaneously connected client, then leave
+# generous headroom. 64 comfortably carries a 10-client deployment; a thread
+# that is parked on a long poll costs a stack and nothing else, so over-sizing
+# this is far cheaper than under-sizing it.
+#
+# Under-sizing does not degrade — it stalls. With workers = 4 and two desktop
+# clients, both /sync polls plus their secondary connections held all four
+# threads, and the next request to arrive (someone sending a message) sat in
+# the job queue with NO thread to run it until a long poll timed out. Measured
+# on loopback: 28.4 s to deliver a message that takes 81 ms on an idle pool.
+workers = 64
+
+# Hard ceiling. Threads above `workers` are spawned on demand and retire after
+# a few seconds idle, so the steady-state footprint stays near `workers`.
+#
+# This is a safety net for bursts, not a substitute for sizing `workers`
+# correctly: httplib only grows the pool when it sees zero idle threads at the
+# moment a connection arrives, and the thread it then spawns picks up the
+# OLDEST queued connection rather than the one that triggered it. A burst that
+# lands faster than the pool can react — every client reconnecting at once
+# after a restart — leaves a backlog that growth alone will not clear.
+max_workers = 512
 
 [database]
 path = "./data/bsfchat.db"
