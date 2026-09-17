@@ -125,10 +125,21 @@ std::optional<std::string> ClientAddressResolver::resolve(const httplib::Request
     if (!is_trusted(*peer)) return canonical(*peer);
 
     // The peer is a proxy we trust, so its X-Forwarded-For is worth reading.
-    // A request can carry the header more than once; the lines concatenate in
-    // order, exactly as if they had been one comma-separated value.
+    //
+    // ...provided it arrives as ONE line. HTTP says repeated lines concatenate
+    // in order, but httplib keeps headers in a std::unordered_multimap, which
+    // makes no promise about the relative order of equal keys — libc++ happens
+    // to preserve it, libstdc++ does not (this failed on the Linux CI only).
+    // With the order unknowable, "rightmost" is unknowable too, and guessing
+    // wrong hands the client the choice of its own rate-limit identity: send
+    // your own X-Forwarded-For, and a proxy that ADDS a line rather than
+    // appending puts your invented value where the vouched-for one should be.
+    // So more than one line means we do not know who this is. nginx and every
+    // mainstream proxy fold the header into a single line, so this only bites
+    // a proxy that was already behaving unusually.
     std::vector<std::string> hops;
     const auto lines = req.get_header_value_count("X-Forwarded-For");
+    if (lines > 1) return std::nullopt;
     for (size_t i = 0; i < lines; ++i) {
         const auto line = req.get_header_value("X-Forwarded-For", "", i);
         size_t start = 0;

@@ -524,10 +524,13 @@ TEST(ClientAddress, TrustedPeerYieldsTheRightmostUntrustedHop) {
     // A dual-stack listener reports IPv4 peers in mapped form.
     EXPECT_EQ(r.resolve(request_from("::ffff:127.0.0.1", "203.0.113.9")), "203.0.113.9");
 
-    // The header split across two lines means the same as one joined line.
+    // The header split across two lines: the order of repeated header lines
+    // is not recoverable from httplib (unordered_multimap), so "rightmost" is
+    // unknowable and the resolver must refuse to guess rather than risk
+    // returning the value the client supplied itself.
     auto req = request_from("127.0.0.1", "6.6.6.6");
     req.set_header("X-Forwarded-For", "203.0.113.9");
-    EXPECT_EQ(r.resolve(req), "203.0.113.9");
+    EXPECT_EQ(r.resolve(req), std::nullopt);
 }
 
 TEST(ClientAddress, UnknowableClientIsNulloptNotASharedBucket) {
