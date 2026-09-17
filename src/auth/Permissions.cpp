@@ -123,4 +123,102 @@ bool PermissionsEngine::outranks(const std::string& actor_id, const std::string&
     return highest_role_position(actor_id) > highest_role_position(target_id);
 }
 
+namespace {
+
+const ServerRole* find_role(const std::vector<ServerRole>& roles, const std::string& id) {
+    auto it = std::find_if(roles.begin(), roles.end(),
+        [&](const ServerRole& r) { return r.id == id; });
+    return it == roles.end() ? nullptr : &*it;
+}
+
+bool same_role(const ServerRole& a, const ServerRole& b) {
+    return a.position == b.position && a.permissions == b.permissions;
+}
+
+} // namespace
+
+PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_assign_roles(
+    const std::string& actor_id, const std::string& target_id,
+    const std::vector<std::string>& new_role_ids) {
+    if (is_server_actor(actor_id, config_)) return {};
+    if (can(actor_id, std::string(), permission::kAdministrator)) return {};
+
+    const int actor_pos = highest_role_position(actor_id);
+
+    // You cannot rewrite the roles of someone who ranks at or above you.
+    // Editing your OWN assignment is allowed, but only downward — the role
+    // checks below are what stop it being a promotion.
+    if (actor_id != target_id && !outranks(actor_id, target_id)) {
+        return {false, "You cannot change the roles of a user ranked at or above you"};
+    }
+
+    const auto& all = server_roles();
+
+    // Nothing at or above your own rank may be granted...
+    for (const auto& id : new_role_ids) {
+        if (id == permission::role_id::kEveryone) continue;
+        const ServerRole* role = find_role(all, id);
+        if (!role) return {false, "Unknown role: " + id};
+        if (role->position >= actor_pos) {
+            return {false, "You cannot assign a role ranked at or above your own"};
+        }
+    }
+
+    // ...nor taken away. Otherwise a moderator could strip the owner's admin
+    // role, which is the same escalation wearing a different hat.
+    const auto& current = member_role_ids(target_id);
+    for (const auto& id : current) {
+        if (id == permission::role_id::kEveryone) continue;
+        if (std::find(new_role_ids.begin(), new_role_ids.end(), id) != new_role_ids.end())
+            continue;
+        const ServerRole* role = find_role(all, id);
+        if (role && role->position >= actor_pos) {
+            return {false, "You cannot remove a role ranked at or above your own"};
+        }
+    }
+
+    return {};
+}
+
+PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_edit_role_definitions(
+    const std::string& actor_id, const std::vector<ServerRole>& proposed) {
+    if (is_server_actor(actor_id, config_)) return {};
+    if (can(actor_id, std::string(), permission::kAdministrator)) return {};
+
+    const int actor_pos = highest_role_position(actor_id);
+    const auto& current = server_roles();
+
+    for (const auto& role : proposed) {
+        const ServerRole* existing = find_role(current, role.id);
+
+        // Granting ADMINISTRATOR is granting everything, including the power
+        // to undo this check. Only an administrator may do it.
+        if (permission::has(role.permissions, permission::kAdministrator)
+            && (!existing || !permission::has(existing->permissions, permission::kAdministrator))) {
+            return {false, "Only an administrator may grant the Administrator permission"};
+        }
+
+        // A role at or above your own rank may exist, but you may not touch
+        // it — and you may not mint a new one there either.
+        if (role.position >= actor_pos) {
+            if (!existing) {
+                return {false, "You cannot create a role ranked at or above your own"};
+            }
+            if (!same_role(role, *existing)) {
+                return {false, "You cannot modify a role ranked at or above your own"};
+            }
+        }
+    }
+
+    // Deleting the role above you is as good as modifying it.
+    for (const auto& role : current) {
+        if (role.position < actor_pos) continue;
+        if (!find_role(proposed, role.id)) {
+            return {false, "You cannot delete a role ranked at or above your own"};
+        }
+    }
+
+    return {};
+}
+
 } // namespace bsfchat
