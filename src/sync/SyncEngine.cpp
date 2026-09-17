@@ -230,8 +230,15 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
         // the stream_position of the oldest row in the returned batch; the
         // client passes it back as `from` to /rooms/{id}/messages to fetch
         // events strictly older than this batch.
+        // `user_id` as the viewer: an initial sync is a DELIVERY path, not a
+        // history one. Without it a client that restarts mid-call — or that
+        // reconnects after a network blip — silently loses the invite or
+        // candidate batch addressed to it, and the call never establishes. With
+        // it, this user sees their own signalling and no one else's; /messages
+        // passes no viewer and so shows none of it to anybody. See
+        // store/CallSignalling.h.
         auto [timeline_events, next_pos] = store_.get_room_events_paginated(
-            room_id, limits::kDefaultTimelineLimit, "b");
+            room_id, limits::kDefaultTimelineLimit, "b", std::nullopt, user_id);
         joined.timeline.events = std::move(timeline_events);
         std::reverse(joined.timeline.events.begin(), joined.timeline.events.end());
         // `limited` is true when more history exists beyond this batch; the

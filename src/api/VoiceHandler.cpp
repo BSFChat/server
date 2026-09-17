@@ -186,6 +186,23 @@ void VoiceHandler::start_reaper() {
             } catch (const std::exception& e) {
                 get_logger()->error("Voice reaper error: {}", e.what());
             }
+            // Expiring signalling rides this sweep rather than a thread of its
+            // own: it wants the same cadence (every 10 s, against a 2-minute
+            // TTL), it is the same subsystem, and a second thread waking up to
+            // do nothing on an idle server is pure cost. Failing it must not
+            // stop the ghost reaper — they are independent jobs that happen to
+            // share a tick.
+            try {
+                const int64_t now_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                const int pruned = store_.prune_expired_call_signalling(now_ms);
+                if (pruned > 0) {
+                    get_logger()->debug("Expired {} call-signalling events", pruned);
+                }
+            } catch (const std::exception& e) {
+                get_logger()->error("Call-signalling prune error: {}", e.what());
+            }
             lock.lock();
         }
     });

@@ -1,9 +1,13 @@
 #include "store/Migrations.h"
 #include "auth/LocalAuth.h"
 #include "core/Logger.h"
+#include "store/CallSignalling.h"
+
+#include <bsfchat/Constants.h>
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -948,6 +952,115 @@ void migrate_v16(sqlite3* db, bool /*fresh_database*/) {
              "ON audit_log(target_room) WHERE target_room <> ''");
 }
 
+// v17: call signalling stops being a permanent public record of everyone's IP.
+//
+// See store/CallSignalling.h for what the leak was and why these five event
+// types are singled out. This step does two things, in this order:
+//
+//   1. Adds `signal_to` to `events` and backfills it. It is the ADDRESSEE of an
+//      addressed signalling event and NULL for everything else — every message,
+//      every state event, and any signalling from a client too old to address
+//      it. Every read path keys off "signal_to IS NULL" meaning "ordinary
+//      event, behave exactly as before", so the column has to be NULL-by-
+//      default and the backfill has to be conservative: anything it cannot
+//      confidently parse stays NULL and stays visible, because the failure mode
+//      in that direction is the status quo while the other direction is a call
+//      that silently never connects.
+//
+//   2. Deletes the addressed signalling already on disk that is older than the
+//      TTL. This is the part that matters for a deployment that has been
+//      running: the column alone would stop NEW addresses being published, and
+//      leave the existing archive — 4,518 events back to April on production —
+//      sitting in the timeline for the next person to join and page back
+//      through. A privacy fix that only applies going forward is not one.
+//
+// The delete is safe to do here in bulk. Nothing references events(event_id)
+// except event_mentions (ON DELETE CASCADE, and signalling never carries a
+// mention) and event_search (populated only for m.room.message, so no
+// signalling event has ever had a row in it). Stream positions are not
+// disturbed either: the head lives in server_meta and is never re-derived from
+// MAX(stream_position), so removing rows cannot rewind a client's sync token.
+//
+// Counted and logged, because "it deleted something" is not a claim worth
+// making without a number next to it.
+void migrate_v17(sqlite3* db, bool /*fresh_database*/) {
+    if (!column_exists(db, "events", "signal_to")) {
+        exec(db, "ALTER TABLE events ADD COLUMN signal_to TEXT");
+    }
+
+    // Partial: only addressed signalling is ever in it, which on a normal
+    // deployment is a couple of minutes' worth of rows rather than the whole
+    // events table. It serves the sweep's `WHERE signal_to IS NOT NULL AND
+    // origin_server_ts < ?` directly, and it costs an insert only on the events
+    // that go into it — a chat message pays nothing.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_events_signal_expiry "
+             "ON events(origin_server_ts) WHERE signal_to IS NOT NULL");
+
+    // Backfill. Only the five types can match, so this reads a bounded slice of
+    // the table rather than all of it.
+    std::string type_list;
+    for (auto t : {event_type::kCallInvite, event_type::kCallAnswer,
+                   event_type::kCallCandidates, event_type::kCallHangup,
+                   event_type::kCallNegotiate}) {
+        if (!type_list.empty()) type_list += ", ";
+        type_list += "'" + std::string(t) + "'";
+    }
+
+    std::vector<std::pair<std::string, std::string>> addressed; // event_id -> to
+    {
+        auto sel = prepare(db, "SELECT event_id, event_type, content FROM events "
+                               "WHERE event_type IN (" + type_list + ")");
+        while (sqlite3_step(sel.get()) == SQLITE_ROW) {
+            const std::string id = text_or_empty(sel.get(), 0);
+            const std::string type = text_or_empty(sel.get(), 1);
+            const std::string content = text_or_empty(sel.get(), 2);
+            if (auto to = call_signal_addressee(type, content)) {
+                addressed.emplace_back(id, *to);
+            }
+        }
+    }
+
+    {
+        auto upd = prepare(db, "UPDATE events SET signal_to = ? WHERE event_id = ?");
+        for (const auto& [id, to] : addressed) {
+            sqlite3_reset(upd.get());
+            sqlite3_bind_text(upd.get(), 1, to.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(upd.get(), 2, id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(upd.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("v17 backfill failed: ") +
+                                         sqlite3_errmsg(db));
+            }
+        }
+    }
+
+    // The purge. Everything already on disk is by definition older than a
+    // 2-minute TTL by the time a server that has been down long enough to
+    // upgrade comes back, but the cutoff is computed rather than assumed so
+    // this step cannot delete a live call's signalling on a fast restart.
+    const int64_t now_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    const int64_t cutoff = now_ms - limits::kCallSignallingTtlMs;
+
+    const int before = scalar_int(db, "SELECT COUNT(*) FROM events WHERE signal_to IS NOT NULL");
+    {
+        auto del = prepare(db, "DELETE FROM events "
+                               "WHERE signal_to IS NOT NULL AND origin_server_ts < ?");
+        sqlite3_bind_int64(del.get(), 1, cutoff);
+        if (sqlite3_step(del.get()) != SQLITE_DONE) {
+            throw std::runtime_error(std::string("v17 purge failed: ") + sqlite3_errmsg(db));
+        }
+    }
+    const int purged = before - scalar_int(db,
+        "SELECT COUNT(*) FROM events WHERE signal_to IS NOT NULL");
+
+    get_logger()->info(
+        "Schema v17: purged {} stored call-signalling events older than {}s "
+        "(they carried participants' LAN and public IP addresses); {} retained "
+        "as still within the delivery window",
+        purged, limits::kCallSignallingTtlMs / 1000, before - purged);
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -968,6 +1081,7 @@ const std::vector<Step>& steps() {
         migrate_v14,
         migrate_v15,
         migrate_v16,
+        migrate_v17,
     };
     return kMigrations;
 }

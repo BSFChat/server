@@ -1,4 +1,5 @@
 #include "store/SqliteStore.h"
+#include "store/CallSignalling.h"
 #include "auth/LocalAuth.h"
 #include "core/Logger.h"
 #include "store/Migrations.h"
@@ -956,9 +957,19 @@ int64_t SqliteStore::insert_event(const std::string& event_id, const std::string
             replaces = replacement_target(content_json);
         }
 
+        // Derived here for the same reason `replaces` is, and it matters more:
+        // this column is what stops an event full of IP addresses being handed
+        // to the whole room. Deriving it in the handler instead would mean a
+        // new send path — a future federation ingress, a bulk import, a test
+        // helper — could insert signalling with signal_to NULL and silently
+        // reinstate the leak, with nothing failing to say so. insert_event is
+        // the one door into this table; the rule lives on the door.
+        const std::optional<std::string> signal_to =
+            call_signal_addressee(event_type, content_json);
+
         auto stmt = prepare(db_,
-            "INSERT INTO events (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, stream_position, replaces) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            "INSERT INTO events (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, stream_position, replaces, signal_to) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt.get(), 3, sender.c_str(), -1, SQLITE_TRANSIENT);
@@ -975,6 +986,11 @@ int64_t SqliteStore::insert_event(const std::string& event_id, const std::string
             sqlite3_bind_text(stmt.get(), 9, replaces->c_str(), -1, SQLITE_TRANSIENT);
         } else {
             sqlite3_bind_null(stmt.get(), 9);
+        }
+        if (signal_to) {
+            sqlite3_bind_text(stmt.get(), 10, signal_to->c_str(), -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt.get(), 10);
         }
 
         if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
@@ -1018,7 +1034,8 @@ int64_t SqliteStore::insert_event(const std::string& event_id, const std::string
 std::pair<std::vector<RoomEvent>, std::optional<int64_t>>
 SqliteStore::get_room_events_paginated(const std::string& room_id, int limit,
                                         const std::string& direction,
-                                        const std::optional<std::string>& from) {
+                                        const std::optional<std::string>& from,
+                                        const std::optional<std::string>& viewer) {
     std::lock_guard lock(mutex_);
 
     // Same query shape as get_room_events, but we also pull stream_position
@@ -1043,11 +1060,33 @@ SqliteStore::get_room_events_paginated(const std::string& room_id, int limit,
     std::string sql = std::string("SELECT ") + kEventColumns + ", e.stream_position "
                       "FROM events e" + kEditJoin + "WHERE e.room_id = ?";
 
+    // Addressed call signalling is not room content — see store/CallSignalling.h.
+    //
+    // With no `viewer` this is the HISTORY path (/messages), and history is
+    // exactly the thing that made the leak permanent: a member who joins in
+    // September can page back to April and read the LAN and public address of
+    // everyone who has ever been in a call in this channel. None of it is
+    // excluded from `viewer`'s own sync — this is history, and a client that
+    // needs a signalling event has already had it live or has missed the call
+    // entirely.
+    //
+    // With a `viewer` this is the INITIAL-SYNC timeline, which is a delivery
+    // path and not a history one: a client that has just reconnected must still
+    // receive an invite addressed to it that landed while it was away, so the
+    // sender/addressee pair is admitted and everybody else is not. (Little
+    // survives to be admitted — the sweep keeps only the last two minutes — but
+    // "little" is not "none", and a dropped invite is a call that never starts.)
+    if (viewer) {
+        sql += " AND (e.signal_to IS NULL OR e.signal_to = ?2 OR e.sender = ?2)";
+    } else {
+        sql += " AND e.signal_to IS NULL";
+    }
+
     if (from) {
         if (direction == "b") {
-            sql += " AND e.stream_position < ? ORDER BY e.stream_position DESC";
+            sql += " AND e.stream_position < ?3 ORDER BY e.stream_position DESC";
         } else {
-            sql += " AND e.stream_position > ? ORDER BY e.stream_position ASC";
+            sql += " AND e.stream_position > ?3 ORDER BY e.stream_position ASC";
         }
     } else {
         if (direction == "b") {
@@ -1056,15 +1095,25 @@ SqliteStore::get_room_events_paginated(const std::string& room_id, int limit,
             sql += " ORDER BY e.stream_position ASC";
         }
     }
-    sql += " LIMIT ?";
+    sql += " LIMIT ?4";
 
+    // EVERY placeholder in this statement is numbered explicitly, and that is
+    // not a style choice. `?2` is bound once and read twice, and an unnumbered
+    // `?` takes "one past the highest number used so far" — so the `from` and
+    // `LIMIT` placeholders would land on different indices depending on whether
+    // the viewer clause was appended, and binding them by a running counter
+    // would be right in one branch and wrong in the other. A misbound LIMIT
+    // reads as zero and returns an empty page: a channel that looks empty, not
+    // an error anyone would see.
     auto stmt = prepare(db_, sql);
-    int idx = 1;
-    sqlite3_bind_text(stmt.get(), idx++, room_id.c_str(), -1, SQLITE_TRANSIENT);
-    if (from) {
-        sqlite3_bind_int64(stmt.get(), idx++, parse_token(from));
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (viewer) {
+        sqlite3_bind_text(stmt.get(), 2, viewer->c_str(), -1, SQLITE_TRANSIENT);
     }
-    sqlite3_bind_int(stmt.get(), idx, limit + 1);
+    if (from) {
+        sqlite3_bind_int64(stmt.get(), 3, parse_token(from));
+    }
+    sqlite3_bind_int(stmt.get(), 4, limit + 1);
 
     std::vector<RoomEvent> events;
     std::vector<int64_t> positions;
@@ -1412,14 +1461,34 @@ std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id,
     // now and is therefore offered to the statement we are about to run.
     out_stream_head = next_stream_position_ - 1;
 
+    // The recipient filter. Addressed call signalling reaches exactly two
+    // people: the sender and the addressee named in its content. Room
+    // membership is no longer enough to see one, and that is the whole of
+    // deliverable 1 on the /sync side — see store/CallSignalling.h.
+    //
+    // A NULL `signal_to` is every ordinary event and every unaddressed one, and
+    // passes untouched, so nothing about chat, state or legacy clients changes
+    // here.
+    //
+    // This is a residual test over a range scan on stream_position, not an
+    // index lookup: the scan is already bounded by `since_position` and the
+    // limit, and the column is NULL for all but a two-minute window of rows.
+    //
+    // Filtered rows are NOT a hole in the sync token. Excluding a row makes the
+    // scan return fewer than `limit`, and the caller (SyncEngine) then advances
+    // next_batch to the scan's own head — so a poll woken by somebody else's
+    // candidate batch comes back with a token that has MOVED, and the client's
+    // no-progress backoff never sees it. That interplay is why this filter is
+    // here and not in the loop above SyncEngine's own permission check.
     auto stmt = prepare(db_,
         std::string("SELECT ") + kEventColumns + ", e.stream_position "
         "FROM events e "
-        "INNER JOIN room_members rm ON e.room_id = rm.room_id AND rm.user_id = ? AND rm.membership = 'join' " +
+        "INNER JOIN room_members rm ON e.room_id = rm.room_id AND rm.user_id = ?1 AND rm.membership = 'join' " +
         kEditJoin +
-        "WHERE e.stream_position > ? "
+        "WHERE e.stream_position > ?2 "
+        "AND (e.signal_to IS NULL OR e.signal_to = ?1 OR e.sender = ?1) "
         "ORDER BY e.stream_position ASC "
-        "LIMIT ?");
+        "LIMIT ?3");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt.get(), 2, since_position);
     sqlite3_bind_int(stmt.get(), 3, limit);
@@ -1449,6 +1518,54 @@ int64_t SqliteStore::get_current_stream_position() {
     // room must not rewind the stream head under clients that already hold a
     // token past it.
     return next_stream_position_ - 1;
+}
+
+int SqliteStore::prune_expired_call_signalling(int64_t now_ms) {
+    std::lock_guard lock(mutex_);
+    const int64_t cutoff = now_ms - limits::kCallSignallingTtlMs;
+
+    // Two statements, one transaction. The event rows are the point; the
+    // idempotency rows are bookkeeping that would otherwise accumulate one row
+    // per candidate batch per call, forever, pointing at events that no longer
+    // exist. Nothing else references events(event_id) for these types:
+    // event_mentions is only ever written for messages, and event_search only
+    // indexes m.room.message.
+    exec("BEGIN IMMEDIATE");
+    try {
+        std::vector<std::string> doomed;
+        {
+            auto sel = prepare(db_,
+                "SELECT event_id FROM events "
+                "WHERE signal_to IS NOT NULL AND origin_server_ts < ?");
+            sqlite3_bind_int64(sel.get(), 1, cutoff);
+            while (sqlite3_step(sel.get()) == SQLITE_ROW) {
+                doomed.emplace_back(column_text_or_empty(sel.get(), 0));
+            }
+        }
+        if (!doomed.empty()) {
+            auto del = prepare(db_, "DELETE FROM events WHERE event_id = ?");
+            auto del_txn = prepare(db_, "DELETE FROM event_transactions WHERE event_id = ?");
+            for (const auto& id : doomed) {
+                sqlite3_reset(del.get());
+                sqlite3_bind_text(del.get(), 1, id.c_str(), -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(del.get()) != SQLITE_DONE) {
+                    throw std::runtime_error(std::string("signalling prune failed: ") +
+                                             sqlite3_errmsg(db_));
+                }
+                sqlite3_reset(del_txn.get());
+                sqlite3_bind_text(del_txn.get(), 1, id.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_step(del_txn.get());
+            }
+        }
+        exec("COMMIT");
+        return static_cast<int>(doomed.size());
+    } catch (...) {
+        try {
+            exec("ROLLBACK");
+        } catch (...) {
+        }
+        throw;
+    }
 }
 
 int64_t SqliteStore::get_room_max_stream_position(const std::string& room_id) {

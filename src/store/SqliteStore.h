@@ -233,10 +233,22 @@ public:
     // position of the oldest row in this batch for dir="b" / newest for
     // dir="f"; encode it as "s<pos>" and pass back as `from` on the next
     // page request. nullopt when there are no more rows in that direction.
+    //
+    // `viewer` decides what happens to ADDRESSED call signalling (see
+    // store/CallSignalling.h). Left unset — the history case, /messages — none
+    // of it is returned at all: those events carry participants' LAN and public
+    // IP addresses and have no business being pageable months later. Set to a
+    // user id — the initial-sync case — that user's own signalling (sent by
+    // them, or addressed to them) is included and nobody else's is, so a client
+    // that reconnects still receives an invite that arrived while it was away.
+    //
+    // Unaddressed signalling, from a client too old to name a recipient, is
+    // NULL in the column and returned on both paths exactly as before.
     std::pair<std::vector<RoomEvent>, std::optional<int64_t>>
     get_room_events_paginated(const std::string& room_id, int limit,
                               const std::string& direction = "b",
-                              const std::optional<std::string>& from = std::nullopt);
+                              const std::optional<std::string>& from = std::nullopt,
+                              const std::optional<std::string>& viewer = std::nullopt);
 
     std::vector<RoomEvent> get_room_events(const std::string& room_id, int limit, const std::string& direction = "b",
                                             const std::optional<std::string>& from = std::nullopt);
@@ -307,6 +319,19 @@ public:
     std::vector<RoomEvent> get_events_since(const std::string& user_id, int64_t since_position,
                                             int64_t& out_max_position, int64_t& out_stream_head,
                                             int limit);
+    // Deletes addressed call-signalling events whose origin_server_ts is more
+    // than kCallSignallingTtlMs before `now_ms`, and returns how many went.
+    //
+    // This is the retention half of the fix, and it is the half that has to keep
+    // running: the /sync and /messages filters stop anyone READING another
+    // pair's addresses, but an addressed candidate batch still sits on disk in
+    // plain text until this removes it, where a database copy, a backup or a
+    // future bug can reach it. Two minutes of exposure instead of five months.
+    //
+    // Cheap enough to call on a timer: served by a partial index over just those
+    // rows, and on an idle server it matches nothing.
+    int prune_expired_call_signalling(int64_t now_ms);
+
     int64_t get_current_stream_position();
     int64_t get_room_max_stream_position(const std::string& room_id);
 
