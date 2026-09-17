@@ -133,7 +133,12 @@ public:
 
     // Room membership
     void set_membership(const std::string& room_id, const std::string& user_id, const std::string& membership);
+    // Note: returns "leave" when there is NO row, so it cannot tell "never a
+    // member" from "kicked". Use find_membership when that distinction matters.
     std::string get_membership(const std::string& room_id, const std::string& user_id);
+    // The membership row if one exists, nullopt if the user has never had one.
+    std::optional<std::string> find_membership(const std::string& room_id,
+                                               const std::string& user_id);
     std::vector<std::pair<std::string, std::string>> get_room_members(const std::string& room_id);
     // Every (room_id, membership) row this user has, in any state. This is the
     // list a server-wide ban has to be projected across, and it is deliberately
