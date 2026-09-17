@@ -1,5 +1,6 @@
 #include "core/Config.h"
 #include "core/Logger.h"
+#include "http/ClientAddress.h"
 
 // For kLiveKitMinTtl/kLiveKitMaxTtl — validate() warns using the same bounds
 // the signer clamps to, so the two can't drift apart.
@@ -54,6 +55,32 @@ Config Config::load(const std::string& path) {
             if (auto v = auth->get("password_hash_cost")) cfg.password_hash_cost = v->value_or(cfg.password_hash_cost);
             if (auto v = auth->get("access_token_lifetime_days"))
                 cfg.access_token_lifetime_days = v->value_or(cfg.access_token_lifetime_days);
+
+            auto& lim = cfg.auth_limits;
+            if (auto v = auth->get("rate_limit_enabled")) lim.enabled = v->value_or(lim.enabled);
+            if (auto v = auth->get("rate_limit")) lim.rate_limit = v->value_or(lim.rate_limit);
+            if (auto v = auth->get("rate_window_seconds"))
+                lim.rate_window_seconds = v->value_or(lim.rate_window_seconds);
+            if (auto v = auth->get("max_failures")) lim.max_failures = v->value_or(lim.max_failures);
+            if (auto v = auth->get("lockout_seconds")) lim.lockout_seconds = v->value_or(lim.lockout_seconds);
+            if (auto v = auth->get("register_limit")) lim.register_limit = v->value_or(lim.register_limit);
+            if (auto v = auth->get("register_window_seconds"))
+                lim.register_window_seconds = v->value_or(lim.register_window_seconds);
+            if (auto v = auth->get("register_global_limit"))
+                lim.register_global_limit = v->value_or(lim.register_global_limit);
+            // Single string or array, same as voice.turn_uri. Present-but-empty
+            // is meaningful ("trust nothing, not even loopback"), so the
+            // default is replaced rather than appended to.
+            if (auto v = auth->get("trusted_proxies")) {
+                lim.trusted_proxies.clear();
+                if (auto arr = v->as_array()) {
+                    for (const auto& el : *arr) {
+                        if (auto s = el.value<std::string>()) lim.trusted_proxies.push_back(*s);
+                    }
+                } else if (auto s = v->value<std::string>()) {
+                    lim.trusted_proxies.push_back(*s);
+                }
+            }
         }
 
         // [tls]
@@ -231,6 +258,34 @@ void Config::validate(Config& cfg) {
         log->warn("auth.access_token_lifetime_days = {} is effectively 'never expires'; "
                   "clamping to 3650.", cfg.access_token_lifetime_days);
         cfg.access_token_lifetime_days = 3650;
+    }
+
+    {
+        auto& lim = cfg.auth_limits;
+        // Fail startup on a bad entry instead of dropping it. The entry that
+        // failed to parse is the one that was meant to stop every client
+        // sharing the proxy's rate-limit bucket.
+        for (const auto& entry : lim.trusted_proxies) {
+            if (!IpNetwork::parse(entry)) {
+                throw std::runtime_error("auth.trusted_proxies: '" + entry +
+                                         "' is not an IP address or CIDR network");
+            }
+        }
+        if (!lim.enabled) {
+            log->warn("auth.rate_limit_enabled is false — /login, /register, /refresh and "
+                      "/account/password accept unlimited attempts. Only sensible if an "
+                      "upstream proxy enforces its own limits.");
+        }
+        // A zero or negative COUNT means "no limit" and is honoured; a zero
+        // window would make every count meaningless, so windows are clamped.
+        if (lim.rate_window_seconds < 1) lim.rate_window_seconds = 1;
+        if (lim.lockout_seconds < 1) lim.lockout_seconds = 1;
+        if (lim.register_window_seconds < 1) lim.register_window_seconds = 1;
+        if (lim.enabled && lim.max_failures > 0 && lim.max_failures < 3) {
+            log->warn("auth.max_failures = {} locks an account out after fewer mistakes than "
+                      "people routinely make; raising to 3.", lim.max_failures);
+            lim.max_failures = 3;
+        }
     }
 
     if (cfg.identity && cfg.identity->client_id.empty()) {

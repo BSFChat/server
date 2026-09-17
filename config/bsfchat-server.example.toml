@@ -95,6 +95,80 @@ password_hash_cost = 19
 # Values below 1 or above 3650 are clamped at startup.
 access_token_lifetime_days = 90
 
+# --- Request limits on /login, /register, /refresh and /account/password ---
+#
+# Over any limit the server answers 429 M_LIMIT_EXCEEDED with a Retry-After
+# header (seconds) and retry_after_ms in the body. State is in memory: a
+# restart clears every counter and lockout.
+#
+# Master switch. Turn off only if an upstream proxy enforces its own limits.
+rate_limit_enabled = true
+
+# READ THIS IF YOU RUN BEHIND A REVERSE PROXY (you should; see [tls]).
+#
+# Behind a proxy, every request reaches this server from the PROXY's address.
+# The limits below are per client address, so unless the server knows which
+# peers are proxies, all of your users share one bucket — and a single abusive
+# client can then lock everyone out of /login. List your proxy here and the
+# client is taken from its X-Forwarded-For instead (the rightmost entry that is
+# not itself a trusted proxy; anything further left is client-supplied and
+# ignored). X-Forwarded-For from a peer NOT listed here is always ignored,
+# otherwise any client could pick a new identity per request.
+#
+# Accepts addresses and CIDR networks, IPv4 or IPv6. An entry that does not
+# parse stops startup. Default: loopback only, which covers a proxy on the same
+# host talking to a server that is NOT in a container.
+#
+# Docker: with nginx on the host and this server in a container, the peer is
+# the bridge gateway (172.x.0.1), not 127.0.0.1. Publish the port on 127.0.0.1
+# only and use:
+#   trusted_proxies = ["127.0.0.0/8", "::1", "172.16.0.0/12"]
+#
+# The server logs a warning when it sees X-Forwarded-For arriving from a
+# private address that is not listed — that is this setting being wrong.
+#
+# If a trusted proxy sends no usable X-Forwarded-For, the client is unknowable
+# and the per-address limits are skipped for that request (the per-username
+# lockout and the server-wide registration ceiling still apply). Make sure the
+# proxy sets it:  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+#
+# IPv6 clients are limited per /64, not per address.
+trusted_proxies = ["127.0.0.0/8", "::1"]
+
+# Requests per client address per window, counted separately for each of the
+# four endpoints. Successful requests count: this bounds how much password
+# hashing one address can make the server do. 0 = unlimited.
+rate_limit = 30
+rate_window_seconds = 60
+
+# Failed password attempts before a lockout. Counted twice, independently:
+#   * per client address — one host trying many accounts (spraying);
+#   * per target username — many hosts trying one account.
+# While locked, attempts are refused before the password is even checked.
+# Failures older than lockout_seconds are forgotten. A successful login resets
+# the username's count but not the address's (otherwise an attacker with one
+# valid account could reset it between guesses).
+#
+# Trade-off to know about: anyone who knows a username can keep that account's
+# NEW sign-ins locked by failing on purpose. Existing sessions keep working,
+# and the lockout is short for that reason. Don't raise it to hours.
+# max_failures: 0 = never lock out; 1-2 are raised to 3.
+max_failures = 10
+lockout_seconds = 300
+
+# Accounts one client address may create per window. Only requests that get as
+# far as creating an account count, not "username taken" and the like.
+# Generous enough for a household or a LAN party behind one address.
+register_limit = 10
+register_window_seconds = 3600
+
+# Accounts the whole server will create per register_window_seconds, from all
+# addresses combined. Backstop for a signup flood from many addresses; when it
+# trips, registration (only) is closed to everyone until the window moves on.
+# 0 = no ceiling. If you expect a big launch-day rush, raise it — or better,
+# use an identity provider and turn local registration off.
+register_global_limit = 200
+
 # Storage backend for media files
 # type = "local" stores files on disk, "s3" uses S3-compatible object storage
 [storage]
