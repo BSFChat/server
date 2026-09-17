@@ -295,6 +295,19 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
         res.set_content(MatrixError::forbidden("Registration is disabled").to_json().dump(), "application/json");
         return;
     }
+    // An identity-only server (identity.required with local accounts off)
+    // advertises no m.login.password flow, so a locally registered account
+    // could never sign in. Until now this handler still created one — and the
+    // client, having been told "password-only" by a failed flow check, walked
+    // people straight into that dead end. Refuse up front and say where to go.
+    if (config_.identity && config_.identity->required && !config_.identity->allow_local_accounts) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden(
+            "This server does not have local accounts. Sign in with your BSFChat ID ("
+            + config_.identity->provider_url + ") and an account is created for you.").to_json().dump(),
+            "application/json");
+        return;
+    }
 
     json body;
     try {

@@ -131,6 +131,38 @@ TEST_F(AuthHandlerTest, WhoamiRejectsUnknownToken) {
 // A username containing '@' or ':' must never survive registration —
 // "@" + "@josh" + ":test" would mint the malformed id "@@josh:test",
 // which breaks every string-equality self-check in clients.
+// An identity-only server (identity.required, local accounts off) advertises
+// no password login flow, so a locally registered account could never sign
+// in. Registration must refuse up front and point at the identity provider
+// instead of minting a dead account.
+TEST_F(AuthHandlerTest, RegisterRefusedOnIdentityOnlyServer) {
+    IdentityConfig id;
+    id.provider_url = "https://id.example.com";
+    id.required = true;
+    id.allow_local_accounts = false;
+    config.identity = id;   // handler holds a reference to config
+
+    auto res = do_register("newcomer", "password1");
+    EXPECT_EQ(res.status, 403);
+    EXPECT_FALSE(store->user_exists("@newcomer:test"));
+    auto body = nlohmann::json::parse(res.body);
+    EXPECT_EQ(body["errcode"], "M_FORBIDDEN");
+    EXPECT_NE(body["error"].get<std::string>().find("https://id.example.com"), std::string::npos);
+}
+
+// Identity required but local accounts still allowed: registration stays open.
+TEST_F(AuthHandlerTest, RegisterAllowedWhenIdentityPermitsLocalAccounts) {
+    IdentityConfig id;
+    id.provider_url = "https://id.example.com";
+    id.required = true;
+    id.allow_local_accounts = true;
+    config.identity = id;
+
+    auto res = do_register("newcomer", "password1");
+    EXPECT_EQ(res.status, 200);
+    EXPECT_TRUE(store->user_exists("@newcomer:test"));
+}
+
 TEST_F(AuthHandlerTest, RegisterRejectsAtSignInUsername) {
     auto res = do_register("@josh", "password1");
     EXPECT_EQ(res.status, 400);
