@@ -146,6 +146,26 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
     return response;
 }
 
+namespace {
+
+// m.direct for `user_id`, derived from rooms.is_direct. It is a full
+// replacement by Matrix convention, so it always lists every DM, never a delta.
+//
+// This is the only thing in /sync that marks a room as a DM. The creating
+// client knows because it made the room; the OTHER side is simply joined to a
+// nameless private room, files it under channels, and — not recognising it —
+// opens a second DM with the same person the first time they reply from the
+// member list.
+void attach_direct_rooms(SqliteStore& store, const std::string& user_id,
+                         SyncResponse& response) {
+    auto direct = store.get_direct_rooms(user_id);
+    if (direct.empty()) return;
+    auto& out = response.direct_rooms.emplace();
+    for (auto& [room_id, peer] : direct) out[peer].push_back(std::move(room_id));
+}
+
+} // namespace
+
 SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
     SyncResponse response;
     PermissionsEngine perms(store_, config_);
@@ -189,6 +209,8 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
         auto it = mentions.find(room_id);
         joined.highlight_count = it == mentions.end() ? 0 : it->second;
     }
+
+    attach_direct_rooms(store_, user_id, response);
 
     response.next_batch = "s" + std::to_string(store_.get_current_stream_position());
     return response;
@@ -254,12 +276,17 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
         joined.timeline.events.push_back(std::move(event));
     }
 
+    bool joined_direct_room = false;
     for (const auto& room_id : newly_joined_rooms) {
         if (!can_view(room_id)) continue;
         auto state = store_.get_state_events(room_id);
         auto& joined = response.rooms.join[room_id];
         joined.state.events = std::move(state);
+        joined_direct_room = joined_direct_room || store_.is_direct_room(room_id);
     }
+    // The DM set only changes when this user lands in a direct room, so that is
+    // the only incremental sync that needs to restate it.
+    if (joined_direct_room) attach_direct_rooms(store_, user_id, response);
 
     auto mentions = store_.get_unread_mention_counts(user_id);
     for (auto& [room_id, joined] : response.rooms.join) {

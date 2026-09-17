@@ -514,6 +514,44 @@ bool SqliteStore::is_direct_room(const std::string& room_id) {
     return sqlite3_column_int(stmt.get(), 0) != 0;
 }
 
+std::vector<std::pair<std::string, std::string>> SqliteStore::get_direct_rooms(
+    const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, R"(
+        SELECT me.room_id, peer.user_id
+        FROM room_members me
+        JOIN rooms r ON r.room_id = me.room_id AND r.is_direct = 1
+        JOIN room_members peer ON peer.room_id = me.room_id AND peer.user_id != me.user_id
+        WHERE me.user_id = ? AND me.membership = 'join'
+        ORDER BY r.rowid
+    )");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::vector<std::pair<std::string, std::string>> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        out.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)),
+                         reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1)));
+    }
+    return out;
+}
+
+std::optional<std::string> SqliteStore::find_direct_room(const std::string& user_a,
+                                                         const std::string& user_b) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, R"(
+        SELECT r.room_id
+        FROM rooms r
+        JOIN room_members a ON a.room_id = r.room_id AND a.user_id = ? AND a.membership = 'join'
+        JOIN room_members b ON b.room_id = r.room_id AND b.user_id = ? AND b.membership = 'join'
+        WHERE r.is_direct = 1
+        ORDER BY r.rowid LIMIT 1
+    )");
+    sqlite3_bind_text(stmt.get(), 1, user_a.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, user_b.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    return std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)));
+}
+
 void SqliteStore::delete_room(const std::string& room_id) {
     std::lock_guard lock(mutex_);
     // foreign_keys=ON means rooms can't be deleted while events or members
