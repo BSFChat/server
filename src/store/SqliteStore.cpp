@@ -1357,9 +1357,22 @@ std::optional<RoomEvent> SqliteStore::get_state_event(const std::string& room_id
 
 std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id, int64_t since_position,
                                                      int64_t& out_max_position, int limit) {
+    int64_t ignored_head = since_position;
+    return get_events_since(user_id, since_position, out_max_position, ignored_head, limit);
+}
+
+std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id, int64_t since_position,
+                                                     int64_t& out_max_position,
+                                                     int64_t& out_stream_head, int limit) {
     std::lock_guard lock(mutex_);
 
     out_max_position = since_position;
+    // Sampled inside the lock, together with the scan below. insert_event
+    // claims its position and commits its transaction while holding this same
+    // mutex_, so while we hold it there is no position that has been issued
+    // but not yet committed: everything at or below this head is in the table
+    // now and is therefore offered to the statement we are about to run.
+    out_stream_head = next_stream_position_ - 1;
 
     auto stmt = prepare(db_,
         std::string("SELECT ") + kEventColumns + ", e.stream_position "

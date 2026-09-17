@@ -47,6 +47,10 @@ void SyncEngine::notify_ephemeral() {
     new_event_cv_.notify_all();
 }
 
+void SyncEngine::set_post_scan_hook_for_test(std::function<void()> hook) {
+    post_scan_hook_for_test_ = std::move(hook);
+}
+
 SyncResponse SyncEngine::handle_sync(const std::string& user_id,
                                       const std::string& since_token,
                                       int timeout_ms) {
@@ -150,7 +154,19 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
     SyncResponse response;
     PermissionsEngine perms(store_, config_);
 
+    // Sampled BEFORE a single room is read, and next_batch is built from it
+    // below. Reading it at the end instead skips every event that landed while
+    // this sync was walking the room list: such an event is not in any
+    // timeline here, yet sits at or below the token the client goes on to poll
+    // with, so nothing ever asks for it again. Taken first, the worst case is
+    // that the client is offered an event twice — which it deduplicates by
+    // event_id — instead of never.
+    const int64_t head_before_scan = store_.get_current_stream_position();
+
     auto rooms = store_.get_joined_rooms(user_id);
+
+    // Stands in for an event committing while the walk below is in progress.
+    if (post_scan_hook_for_test_) post_scan_hook_for_test_();
     for (const auto& room_id : rooms) {
         // Categories bypass VIEW_CHANNEL so the sidebar can still show the
         // container node even when individual child channels are hidden.
@@ -190,7 +206,7 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
         joined.highlight_count = it == mentions.end() ? 0 : it->second;
     }
 
-    response.next_batch = "s" + std::to_string(store_.get_current_stream_position());
+    response.next_batch = "s" + std::to_string(head_before_scan);
     return response;
 }
 
@@ -205,7 +221,17 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
     // read — was skipped permanently.
     int64_t delivered_max = since_pos;
     constexpr int kScanLimit = 1000;
-    auto events = store_.get_events_since(user_id, since_pos, delivered_max, kScanLimit);
+    // `scan_head` is the stream head as of the scan's own snapshot, taken under
+    // the store lock that serialises writes. Reading the head separately after
+    // the scan — as this did — leaves a window in which an insert commits with
+    // a position at or below the head we then read but above anything the scan
+    // returned. next_batch jumped over it and no later sync ever asked for it:
+    // that event was lost to this client for good.
+    int64_t scan_head = since_pos;
+    auto events =
+        store_.get_events_since(user_id, since_pos, delivered_max, scan_head, kScanLimit);
+
+    if (post_scan_hook_for_test_) post_scan_hook_for_test_();
 
     // When the scan was not cut short by the limit, this user has been offered
     // everything on the stream, so their token can jump to the global head even
@@ -219,7 +245,7 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
     // certainly rows past `delivered_max` this user still needs, and skipping
     // to the head would drop them permanently.
     if (static_cast<int>(events.size()) < kScanLimit) {
-        delivered_max = std::max(delivered_max, store_.get_current_stream_position());
+        delivered_max = std::max(delivered_max, scan_head);
     }
 
     std::set<std::string> newly_joined_rooms;
