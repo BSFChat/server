@@ -309,7 +309,11 @@ void SqliteStore::update_password_hash(const std::string& user_id, const std::st
 
 std::optional<std::string> SqliteStore::get_password_hash(const std::string& user_id) {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "SELECT password_hash FROM users WHERE user_id = ?");
+    // `kind = 'user'` is load-bearing, not a tidy-up. It is what makes "a bot can
+    // never log in with a password" a property of the schema rather than a check
+    // somebody has to remember to write. See the header for the full reasoning.
+    auto stmt = prepare(db_,
+        "SELECT password_hash FROM users WHERE user_id = ? AND kind = 'user'");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         return reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
@@ -381,37 +385,69 @@ std::optional<std::string> SqliteStore::get_user_by_token(const std::string& tok
     std::string user_id;
     int64_t expires_at = 0;
     int64_t lifetime_ms = kDefaultAccessTokenLifetimeMs;
+    int64_t last_used_at = 0;  // NULL reads as 0 = "never", which is what we want
     {
         auto stmt = prepare(db_,
-            "SELECT user_id, expires_at, lifetime_ms FROM access_tokens WHERE token_hash = ?");
+            "SELECT user_id, expires_at, lifetime_ms, COALESCE(last_used_at, 0) "
+            "FROM access_tokens WHERE token_hash = ?");
         sqlite3_bind_text(stmt.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
         user_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
         expires_at = sqlite3_column_int64(stmt.get(), 1);
         lifetime_ms = sqlite3_column_int64(stmt.get(), 2);
+        last_used_at = sqlite3_column_int64(stmt.get(), 3);
     }
 
     const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 
-    if (expires_at <= now) {
-        // Reap it rather than leaving a dead row to be re-checked forever.
-        auto del = prepare(db_, "DELETE FROM access_tokens WHERE token_hash = ?");
-        sqlite3_bind_text(del.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_step(del.get());
-        return std::nullopt;
-    }
+    // lifetime_ms == 0 means "this credential does not expire", and the only
+    // thing that writes such a row is rotate_bot_token(). It is separated out
+    // here rather than being expressed as a far-future expires_at, because a
+    // sentinel date is a thing a future reader has to recognise, whereas "no
+    // lifetime, therefore no expiry and no slide" says what it means.
+    //
+    // Why a bot token must not expire: the 90-day slide assumes there is a human
+    // who can log in again when a session lapses. A bot has none. An expiring bot
+    // token is an integration that stops working on a date nobody wrote down,
+    // with a 401 as its only explanation. Rotation and revocation are how a bot
+    // credential ends, and both are explicit operator actions.
+    if (lifetime_ms > 0) {
+        if (expires_at <= now) {
+            // Reap it rather than leaving a dead row to be re-checked forever.
+            auto del = prepare(db_, "DELETE FROM access_tokens WHERE token_hash = ?");
+            sqlite3_bind_text(del.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(del.get());
+            return std::nullopt;
+        }
 
-    // Sliding renewal. Only written once the session is past the halfway point
-    // of its lifetime, so an ordinary request burst costs no writes: a client
-    // polling /sync stays logged in indefinitely, while a token nobody uses
-    // still dies at its expiry.
-    if (lifetime_ms > 0 && (expires_at - now) < lifetime_ms / 2) {
+        // Sliding renewal. Only written once the session is past the halfway
+        // point of its lifetime, so an ordinary request burst costs no writes: a
+        // client polling /sync stays logged in indefinitely, while a token nobody
+        // uses still dies at its expiry.
+        if ((expires_at - now) < lifetime_ms / 2) {
+            auto upd = prepare(db_,
+                "UPDATE access_tokens SET expires_at = ?, last_used_at = ? WHERE token_hash = ?");
+            sqlite3_bind_int64(upd.get(), 1, now + lifetime_ms);
+            sqlite3_bind_int64(upd.get(), 2, now);
+            sqlite3_bind_text(upd.get(), 3, token_hash.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(upd.get());
+        }
+    } else if (last_used_at + kBotLastSeenIntervalMs <= now) {
+        // A non-expiring token never slides, so it would otherwise never record
+        // that it was used — and "when did this bot last do anything" is the
+        // first question asked about a bot that has gone quiet, and the only way
+        // to find the integrations nobody has decommissioned.
+        //
+        // Throttled for exactly the reason the slide above is: a busy bot makes
+        // many requests a second, and a write on each one would put the store's
+        // global mutex on the hot path of every authenticated request it makes.
+        // The cost of the throttle is that last_seen_at is coarse, which is fine
+        // — nobody needs it to the millisecond.
         auto upd = prepare(db_,
-            "UPDATE access_tokens SET expires_at = ?, last_used_at = ? WHERE token_hash = ?");
-        sqlite3_bind_int64(upd.get(), 1, now + lifetime_ms);
-        sqlite3_bind_int64(upd.get(), 2, now);
-        sqlite3_bind_text(upd.get(), 3, token_hash.c_str(), -1, SQLITE_TRANSIENT);
+            "UPDATE access_tokens SET last_used_at = ? WHERE token_hash = ?");
+        sqlite3_bind_int64(upd.get(), 1, now);
+        sqlite3_bind_text(upd.get(), 2, token_hash.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_step(upd.get());
     }
 
@@ -612,6 +648,252 @@ std::vector<std::string> SqliteStore::get_joined_rooms(const std::string& user_i
         rooms.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)));
     }
     return rooms;
+}
+
+// Bot accounts
+//
+// Everything below writes through the same `users` table ordinary accounts live
+// in. There is no second account table and no second authentication path,
+// because the moment a bot stops being a user it stops inheriting every
+// permission check, every role, every endpoint and every audit record that
+// already works — and the shape this replaces (a "service account" bolted on
+// beside users) is exactly how a system ends up with two half-enforced
+// permission models.
+
+namespace {
+
+// Fills a BotRecord from a row shaped by kBotSelectColumns below.
+SqliteStore::BotRecord bot_from_row(sqlite3_stmt* stmt) {
+    SqliteStore::BotRecord bot;
+    bot.user_id = column_text_or_empty(stmt, 0);
+    bot.display_name = column_text_or_empty(stmt, 1);
+    bot.description = column_text_or_empty(stmt, 2);
+    bot.owner_id = column_text_or_empty(stmt, 3);
+    bot.created_at = sqlite3_column_int64(stmt, 4);
+    bot.created_by = column_text_or_empty(stmt, 5);
+    if (sqlite3_column_type(stmt, 6) != SQLITE_NULL) {
+        bot.deactivated_at = sqlite3_column_int64(stmt, 6);
+    }
+    if (sqlite3_column_type(stmt, 7) != SQLITE_NULL) {
+        bot.last_seen_at = sqlite3_column_int64(stmt, 7);
+    }
+    return bot;
+}
+
+// One column list for get_bot and list_bots, so the two can never drift into
+// disagreeing about what a bot record contains.
+//
+// last_seen_at is a correlated MAX over the bot's tokens rather than a column on
+// `bots`: the fact lives on the token that was used, and copying it onto the bot
+// row would mean a second write on the request path that a token's own
+// last_used_at update already covers.
+constexpr const char* kBotSelectColumns =
+    "SELECT b.user_id, COALESCE(u.display_name, ''), COALESCE(b.description, ''), "
+    "       b.owner_id, b.created_at, b.created_by, b.deactivated_at, "
+    "       (SELECT MAX(t.last_used_at) FROM access_tokens t WHERE t.user_id = b.user_id) "
+    "FROM bots b JOIN users u ON u.user_id = b.user_id ";
+
+} // namespace
+
+bool SqliteStore::create_bot(const BotRecord& bot) {
+    std::lock_guard lock(mutex_);
+
+    // One transaction for both rows. A users row whose bots row failed to land
+    // would be an account that is a bot as far as login is concerned (kind =
+    // 'bot', so no password path) but invisible to every bot endpoint — nobody
+    // could list it, rotate it or deactivate it, and the localpart would be taken
+    // forever. Both or neither.
+    exec("BEGIN IMMEDIATE");
+    try {
+        {
+            // Empty password hash, and kind = 'bot'. Two independent reasons the
+            // same account cannot take the password path: get_password_hash()
+            // will not return a bot's hash at all, and there is no hash to
+            // return. Belt and braces, on purpose — this is the one property of a
+            // bot that must not have a single point of failure.
+            auto stmt = prepare(db_,
+                "INSERT INTO users (user_id, password_hash, display_name, kind) "
+                "VALUES (?, '', ?, 'bot')");
+            sqlite3_bind_text(stmt.get(), 1, bot.user_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt.get(), 2, bot.display_name.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+                // Almost always a PRIMARY KEY collision: the localpart is taken.
+                // A refusal, not a fault, so roll back and report it as one.
+                exec("ROLLBACK");
+                return false;
+            }
+        }
+        {
+            auto stmt = prepare(db_,
+                "INSERT INTO bots (user_id, owner_id, description, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, ?)");
+            sqlite3_bind_text(stmt.get(), 1, bot.user_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt.get(), 2, bot.owner_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt.get(), 3, bot.description.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt.get(), 4, bot.created_at);
+            sqlite3_bind_text(stmt.get(), 5, bot.created_by.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("Failed to create bot record: ") +
+                                         sqlite3_errmsg(db_));
+            }
+        }
+        exec("COMMIT");
+        return true;
+    } catch (...) {
+        try {
+            exec("ROLLBACK");
+        } catch (...) {
+        }
+        throw;
+    }
+}
+
+bool SqliteStore::is_bot(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT 1 FROM users WHERE user_id = ? AND kind = 'bot'");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    return sqlite3_step(stmt.get()) == SQLITE_ROW;
+}
+
+std::optional<SqliteStore::BotRecord> SqliteStore::get_bot(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, std::string(kBotSelectColumns) + "WHERE b.user_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    return bot_from_row(stmt.get());
+}
+
+std::vector<SqliteStore::BotRecord> SqliteStore::list_bots() {
+    std::lock_guard lock(mutex_);
+    // Newest first, tie-broken by user_id so the order is total and a listing
+    // does not reshuffle between two calls when bots share a creation
+    // millisecond (a scripted setup creates several in the same tick).
+    auto stmt = prepare(db_,
+        std::string(kBotSelectColumns) + "ORDER BY b.created_at DESC, b.user_id ASC");
+    std::vector<BotRecord> bots;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) bots.push_back(bot_from_row(stmt.get()));
+    return bots;
+}
+
+bool SqliteStore::rotate_bot_token(const std::string& user_id, const std::string& token,
+                                   const std::string& device_id) {
+    std::lock_guard lock(mutex_);
+
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    auto token_hash = hash_access_token(token);
+
+    exec("BEGIN IMMEDIATE");
+    try {
+        // Re-checked inside the transaction rather than trusted from the handler.
+        // This is the only thing in the server that mints a credential which
+        // never expires; it must not be possible to talk it into minting one for
+        // a person, whatever the caller believed when it looked the account up.
+        {
+            auto chk = prepare(db_, "SELECT 1 FROM users WHERE user_id = ? AND kind = 'bot'");
+            sqlite3_bind_text(chk.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(chk.get()) != SQLITE_ROW) {
+                exec("ROLLBACK");
+                return false;
+            }
+        }
+
+        // Every prior token dies here, in the same transaction that mints the
+        // replacement. An operator rotates because the old secret is suspect, so
+        // a window in which both work would defeat the exercise — and deleting
+        // the ROW takes any refresh secret attached to it with it, the same
+        // property delete_all_tokens_for_user relies on.
+        {
+            auto del = prepare(db_, "DELETE FROM access_tokens WHERE user_id = ?");
+            sqlite3_bind_text(del.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(del.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("Failed to revoke bot tokens: ") +
+                                         sqlite3_errmsg(db_));
+            }
+        }
+
+        // lifetime_ms = 0 is what get_user_by_token reads as "never expires,
+        // never slides". expires_at is NOT NULL in the schema, so it is written
+        // as `now`; nothing consults it on this row, because the lifetime check
+        // short-circuits before expiry is considered. A far-future date there
+        // would be a second, contradictory claim about when this token dies.
+        // refresh_hash stays NULL: a bot has no re-authentication flow to refresh
+        // into, and rotation is the operator action that replaces one.
+        {
+            auto ins = prepare(db_,
+                "INSERT INTO access_tokens "
+                "  (token_hash, user_id, device_id, created_at, expires_at, last_used_at, "
+                "   lifetime_ms, refresh_hash, token_kind) "
+                "VALUES (?, ?, ?, ?, ?, NULL, 0, NULL, 'bot')");
+            sqlite3_bind_text(ins.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins.get(), 3, device_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(ins.get(), 4, now);
+            sqlite3_bind_int64(ins.get(), 5, now);
+            if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("Failed to store bot token: ") +
+                                         sqlite3_errmsg(db_));
+            }
+        }
+        exec("COMMIT");
+        return true;
+    } catch (...) {
+        try {
+            exec("ROLLBACK");
+        } catch (...) {
+        }
+        throw;
+    }
+}
+
+bool SqliteStore::deactivate_bot(const std::string& user_id, int64_t when_ms) {
+    std::lock_guard lock(mutex_);
+
+    exec("BEGIN IMMEDIATE");
+    try {
+        // The UPDATE's own WHERE clause is the idempotency test, rather than a
+        // read followed by a write: `deactivated_at IS NULL` matches exactly once
+        // however many callers race, and sqlite3_changes() then says whether THIS
+        // call was the one that did it. A read-then-write would let two
+        // concurrent deletes both believe they were first and both write an audit
+        // record for the same event.
+        {
+            auto upd = prepare(db_,
+                "UPDATE bots SET deactivated_at = ? "
+                "WHERE user_id = ? AND deactivated_at IS NULL");
+            sqlite3_bind_int64(upd.get(), 1, when_ms);
+            sqlite3_bind_text(upd.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(upd.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("Failed to deactivate bot: ") +
+                                         sqlite3_errmsg(db_));
+            }
+        }
+        const bool changed = sqlite3_changes(db_) > 0;
+
+        // Tokens are revoked unconditionally, even when the bot was already
+        // deactivated. `changed` reports who got there first; it must not decide
+        // whether the credentials actually die. A repeat call finding a live
+        // token — because an earlier attempt half-failed, or because somebody
+        // rotated one onto an already-dead bot — must still kill it. Revocation
+        // is the part that has to be true after this returns, not the part that
+        // has to be attributable.
+        {
+            auto del = prepare(db_, "DELETE FROM access_tokens WHERE user_id = ?");
+            sqlite3_bind_text(del.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(del.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("Failed to revoke bot tokens: ") +
+                                         sqlite3_errmsg(db_));
+            }
+        }
+        exec("COMMIT");
+        return changed;
+    } catch (...) {
+        try {
+            exec("ROLLBACK");
+        } catch (...) {
+        }
+        throw;
+    }
 }
 
 std::vector<std::string> SqliteStore::list_all_users() {

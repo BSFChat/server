@@ -4,6 +4,7 @@
 #include "auth/RoleBootstrap.h"
 #include "api/AuditHandler.h"
 #include "api/AuthHandler.h"
+#include "api/BotHandler.h"
 #include "api/RoomHandler.h"
 #include "api/EventHandler.h"
 #include "api/SyncHandler.h"
@@ -283,6 +284,29 @@ void Server::register_routes() {
     auto audit_handler = std::make_shared<AuditHandler>(*store_, config_);
     svr.Get(std::string(api_path::kAuditLog),
             [h = audit_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_audit_log(req, res); });
+
+    // Bot accounts. bsfchat.* namespaced because Matrix has no bot concept —
+    // same precedent as the push notify_level and audit_log routes above.
+    //
+    // These four are the whole bot-specific surface. Everything else a bot does
+    // arrives at the routes already registered above, authenticated by the same
+    // bearer-token middleware, because a bot IS a user account. Permission is
+    // MANAGE_BOTS evaluated at SERVER scope inside each handler, so a
+    // per-channel override cannot unlock the minting of server-wide accounts.
+    //
+    // The {userId} routes are registered BEFORE the bare collection route is
+    // matched for POST, and the DELETE pattern is anchored with $ so that
+    // /bots/{id}/token cannot fall into it.
+    auto bot_handler = std::make_shared<BotHandler>(*store_, *sync_engine_, config_);
+
+    svr.Post(std::string(api_path::kBots),
+             [h = bot_handler](const httplib::Request& req, httplib::Response& res) { h->handle_create_bot(req, res); });
+    svr.Get(std::string(api_path::kBots),
+            [h = bot_handler](const httplib::Request& req, httplib::Response& res) { h->handle_list_bots(req, res); });
+    svr.Post(R"(/_matrix/client/v3/bsfchat/bots/([^/]+)/token$)",
+             [h = bot_handler](const httplib::Request& req, httplib::Response& res) { h->handle_rotate_token(req, res); });
+    svr.Delete(R"(/_matrix/client/v3/bsfchat/bots/([^/]+)$)",
+               [h = bot_handler](const httplib::Request& req, httplib::Response& res) { h->handle_deactivate_bot(req, res); });
 
     // Voice routes — handler is kept as a member so start()/stop() can
     // manage the ghost-participant reaper thread.

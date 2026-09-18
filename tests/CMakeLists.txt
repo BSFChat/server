@@ -29,6 +29,7 @@ add_executable(server_tests
     test_permission_scope.cpp
     test_server_ban.cpp
     test_version.cpp
+    test_bots.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -82,6 +83,7 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/api/PushHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/SearchHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/AuditHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/BotHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/audit/AuditLog.cpp
     ${CMAKE_SOURCE_DIR}/src/identity/Nickname.cpp
     ${CMAKE_SOURCE_DIR}/src/push/PushService.cpp

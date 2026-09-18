@@ -473,7 +473,13 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
     // to unconditionally (@server:<server_name>), so registering it would hand
     // that account god mode. "oidc_*" is the namespace identity logins map
     // into, so a local account must not be able to squat an identity user.
-    if (username == "server" || username.rfind("oidc_", 0) == 0) {
+    // "bot_*" is the same shape of reservation for bot accounts: a client
+    // badges an account as a bot from its profile, and a person who could
+    // register bot_deploy would be a person who can impersonate one. The
+    // reservation also runs the other way — BotHandler REQUIRES the prefix — so
+    // the two sets are disjoint by construction rather than by inspection.
+    if (username == "server" || username.rfind("oidc_", 0) == 0 ||
+        username.rfind(std::string(bot::kLocalpartPrefix), 0) == 0) {
         res.status = 400;
         res.set_content(MatrixError::invalid_username("That username is reserved").to_json().dump(),
                         "application/json");
@@ -782,6 +788,16 @@ void AuthHandler::handle_whoami(const httplib::Request& req, httplib::Response& 
     }
 
     json resp = {{"user_id", *user_id}};
+    // Bot-ness of the CALLER. A bot's own client needs to know what it is — to
+    // skip the "set a password" and "your session expires" affordances that make
+    // no sense for it, and to render itself the way everyone else will see it —
+    // and whoami is already the request it makes to reconcile its identity, so
+    // this costs no extra round trip.
+    //
+    // Emitted only when true, matching /profile: absent means "not a bot", the
+    // same way an unset displayname is absent rather than "". A client reads it
+    // as `resp.value("bsfchat.bot", false)` either way.
+    if (store_.is_bot(*user_id)) resp[std::string(bot::kProfileKey)] = true;
     res.status = 200;
     res.set_content(resp.dump(), "application/json");
 }

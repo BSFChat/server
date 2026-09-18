@@ -1123,6 +1123,85 @@ void migrate_v18(sqlite3* db, bool fresh_database) {
         after - before);
 }
 
+// v19: first-class bot accounts.
+//
+// A bot is a USER. Not a parallel account type, not a service principal sitting
+// beside the user table — a row in `users`, with a role assignment, evaluated by
+// the same PermissionsEngine, authenticated by the same bearer-token middleware.
+// That is the whole design, and it is what makes every existing endpoint work for
+// a bot on the day it is created instead of needing a bot-flavoured twin.
+//
+// Three schema changes, each for a reason the naive version got wrong:
+//
+// 1. `users.kind`. The obvious alternative is to infer bot-ness from the "bot_"
+//    localpart prefix, and the prefix IS enforced — but a string prefix is a
+//    naming convention, and this column is a fact. The distinction matters at
+//    exactly one place and it is the important one: get_password_hash() filters
+//    on `kind = 'user'`, so a bot's (empty) hash cannot be fetched by ANY caller,
+//    present or future. Parsing a user id in that query instead would put the
+//    server's "can this thing log in with a password" answer at the mercy of a
+//    LIKE pattern. Defaulted to 'user' so every pre-existing row is, correctly,
+//    a person.
+//
+// 2. The `bots` table, for the metadata that has no home on `users`: who owns it,
+//    what it is for, who created it and when, and whether it has been
+//    deactivated. Deactivation is a TIMESTAMP, not a boolean — "when did this
+//    stop being live" is the question an operator actually asks, and a boolean
+//    throws that away. `user_id` references users(user_id), unlike server_bans
+//    which deliberately does not: a ban must outlive the account it names, but a
+//    bot's metadata is meaningless without the account it describes.
+//
+// 3. `access_tokens.token_kind`. A bot token lives in access_tokens — it has to,
+//    or the existing middleware would not resolve it and the "a bot is a user"
+//    property would be a fiction. But it is not an access token in the sense the
+//    rest of that table means:
+//
+//      * It does not expire. The 90-day slide (see get_user_by_token) exists so
+//        that a session nobody is using dies, on the assumption that the human
+//        behind it can log in again. A bot has no human. An expiring bot token is
+//        an integration that silently stops working one Sunday morning with no
+//        way to notice, so bot rows carry lifetime_ms = 0, which get_user_by_token
+//        now reads as "never expires, never slides".
+//      * It is the account's ONLY credential, so rotation and revocation are
+//        operator-facing actions rather than a side effect of logging out.
+//
+//    The column exists so that is legible in the database and assertable in a
+//    test, rather than being an implicit consequence of a zero in another column.
+//    Existing rows default to 'access', which is what they are.
+//
+// Tokens are stored HASHED, exactly like access tokens post-v7 — there is no new
+// storage path and no new hash, because a bot token is the same kind of secret
+// (256 bits of CSPRNG output, looked up by index on every request) that
+// hash_access_token() was reasoned about for.
+//
+// Nothing here is backfilled: a deployment upgrading to v19 has no bots, by
+// definition, because there was no way to make one.
+void migrate_v19(sqlite3* db, bool /*fresh_database*/) {
+    if (!column_exists(db, "users", "kind")) {
+        exec(db, "ALTER TABLE users ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'");
+    }
+
+    exec(db, R"(
+        CREATE TABLE IF NOT EXISTS bots (
+            user_id        TEXT PRIMARY KEY REFERENCES users(user_id),
+            owner_id       TEXT NOT NULL,
+            description    TEXT,
+            created_at     INTEGER NOT NULL,
+            created_by     TEXT NOT NULL,
+            deactivated_at INTEGER
+        )
+    )");
+
+    // "Which bots does this person own" is the one query with a non-trivial
+    // shape; the rest go by primary key.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_bots_owner ON bots(owner_id)");
+
+    if (!column_exists(db, "access_tokens", "token_kind")) {
+        exec(db, "ALTER TABLE access_tokens ADD COLUMN token_kind TEXT NOT NULL "
+                 "DEFAULT 'access'");
+    }
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1145,6 +1224,7 @@ const std::vector<Step>& steps() {
         migrate_v16,
         migrate_v17,
         migrate_v18,
+        migrate_v19,
     };
     return kMigrations;
 }

@@ -360,7 +360,16 @@ TEST(LegacyUpgrade, DirectMarkerBackfillTouchesOnlyCurrentStateAndIsIdempotent) 
                            json{{"membership", "join"}}.dump(), now_ms());
     }
 
-    set_user_version(kTargetSchemaVersion - 1);
+    // 17, PINNED — not kTargetSchemaVersion - 1.
+    //
+    // This test is about v18, so it has to rewind to the version v18 upgrades
+    // FROM. Expressed relative to the head it silently stopped exercising v18
+    // the moment anything was appended after it: with a head of 19, "head - 1"
+    // rewinds to 18, so only v19 runs and every assertion below is really
+    // checking that the FIRST pass (which did run v18) left the right thing
+    // behind. A migration test that no longer runs its migration still passes,
+    // which is the worst way for one to break.
+    set_user_version(17);
     { SqliteStore store(path); store.initialize(); }
 
     EXPECT_EQ(json::parse(content_of("$new")).value("is_direct", false), true);
@@ -372,7 +381,7 @@ TEST(LegacyUpgrade, DirectMarkerBackfillTouchesOnlyCurrentStateAndIsIdempotent) 
 
     // Re-running it is a no-op, not a second rewrite.
     const auto after_first = content_of("$new");
-    set_user_version(kTargetSchemaVersion - 1);
+    set_user_version(17);
     { SqliteStore store(path); store.initialize(); }
     EXPECT_EQ(content_of("$new"), after_first);
 

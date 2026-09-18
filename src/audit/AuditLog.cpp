@@ -242,6 +242,25 @@ void audit_nickname_change(SqliteStore& store, const std::string& actor,
     store.append_audit_record(record);
 }
 
+void audit_bot_lifecycle(SqliteStore& store, const std::string& actor,
+                         const std::string& action, const std::string& bot_user_id,
+                         const std::string& after_json) {
+    SqliteStore::AuditRecord record;
+    record.actor = actor;
+    record.action = action;
+    // The bot goes in target_user, not in a field of its own. It IS a user, and
+    // an investigator filtering the log by a user id must get both "what this
+    // account did" and "what was done to this account" from the same query —
+    // which is exactly what the partial index v16 installed on target_user
+    // serves. A bespoke `target_bot` would split that answer in two and index
+    // neither half.
+    record.target_user = bot_user_id;
+    // No target_room: the bot lifecycle is server-wide, and naming a room would
+    // make the record look narrower than the action was.
+    record.after_json = after_json;
+    store.append_audit_record(record);
+}
+
 void audit_room_deletion(SqliteStore& store, const std::string& actor,
                          const std::string& room_id) {
     std::string room_type = "text";

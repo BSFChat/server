@@ -41,6 +41,20 @@ constexpr const char* kRoleDelete = "role.delete";
 // A change to which roles a user holds (bsfchat.member.roles).
 constexpr const char* kRoleAssign = "role.assign";
 
+// The bot lifecycle. All three are acts of authority over the server, performed
+// by a human holding MANAGE_BOTS, and all three create or destroy the ability of
+// a non-human account to act — which makes them exactly the sort of thing
+// somebody asks "who did that, and when" about six months later.
+//
+// bot.create is recorded even though a bot's own later actions are attributed to
+// the bot: without it, an audit log shows an account that has always existed and
+// says nothing about who brought it into being. bot.token.rotate matters because
+// a rotation is how a bot's credential changes hands, which is either an
+// operator responding to a leak or the leak itself.
+constexpr const char* kBotCreate = "bot.create";
+constexpr const char* kBotTokenRotate = "bot.token.rotate";
+constexpr const char* kBotDeactivate = "bot.deactivate";
+
 constexpr const char* kChannelDelete = "channel.delete";
 constexpr const char* kCategoryDelete = "category.delete";
 // A per-channel allow/deny override for a role or user
@@ -89,6 +103,25 @@ void audit_channel_override_change(SqliteStore& store, const std::string& actor,
                                    const std::string& room_id, const std::string& state_key,
                                    const std::optional<std::string>& before_json,
                                    const std::string& after_json);
+
+// Records one bot lifecycle action: creation, token rotation, or deactivation.
+//
+// `after_json` describes the bot AFTER the action and is the only payload —
+// there is no "before", because none of the three is an edit of a previous
+// value: a bot is created, its credential is replaced wholesale, or it is turned
+// off. A before/after pair would be two views of the same row with nothing
+// between them.
+//
+// TOKEN MATERIAL NEVER REACHES THIS FUNCTION, and callers must not put it in
+// `after_json`. A bot token is shown exactly once, to the operator who caused it
+// to be minted; writing it into an append-only table that a second permission
+// (MANAGE_SERVER, to read the audit log) can read would turn "shown once" into
+// "stored forever, readable by a different set of people, and impossible to
+// redact" — the audit log has no delete path, deliberately. What is recorded is
+// that a rotation happened, by whom, and to which bot.
+void audit_bot_lifecycle(SqliteStore& store, const std::string& actor,
+                         const std::string& action, const std::string& bot_user_id,
+                         const std::string& after_json);
 
 // Records a change to server-scoped state (bsfchat.server.roles /
 // bsfchat.member.roles). Called from write_server_scoped_state, which is the one
