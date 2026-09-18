@@ -199,9 +199,10 @@ TEST(MigrationV11, PreExistingV8DatabaseUpgradesAndKeepsItsData) {
     // log; 13 -> 14 added users.nickname; 14 -> 15 added the server_bans table and
     // its backfill from existing room_members ban rows; 15 -> 16 added the
     // audit_log filter indexes; 16 -> 17 added events.signal_to and swept the
-    // stored call signalling that used to publish everyone's IP addresses. A v8
-    // database still upgrades all the way in one go.
-    EXPECT_EQ(kTargetSchemaVersion, 17);
+    // stored call signalling that used to publish everyone's IP addresses;
+    // 17 -> 18 stamped is_direct into the membership state of DMs that predate
+    // the server writing it. A v8 database still upgrades all the way in one go.
+    EXPECT_EQ(kTargetSchemaVersion, 18);
     std::filesystem::remove(path);
 }
 
