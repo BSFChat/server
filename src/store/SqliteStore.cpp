@@ -5,6 +5,7 @@
 #include "store/Migrations.h"
 
 #include <bsfchat/Constants.h>
+#include <bsfchat/Identifiers.h>
 
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -56,9 +57,11 @@ const char* column_text_or_empty(sqlite3_stmt* stmt, int col) {
     return p ? reinterpret_cast<const char*>(p) : "";
 }
 
-// Wall clock in milliseconds, for the one table that timestamps its rows in C++
-// rather than with a SQL default (audit_log, whose caller may supply the exact
-// timestamp of the action being recorded).
+// Wall clock in milliseconds, for the tables that timestamp their rows in C++
+// rather than with a SQL default: audit_log (whose caller may supply the exact
+// timestamp of the action being recorded) and consumed_refresh_tokens (whose
+// retention window is compared against the same millisecond clock the token
+// expiries use, not a second-granular SQL default).
 int64_t audit_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -340,7 +343,8 @@ bool SqliteStore::username_exists(const std::string& localpart) {
 
 void SqliteStore::store_access_token(const std::string& token, const std::string& user_id,
                                       const std::string& device_id, int64_t lifetime_ms,
-                                      const std::optional<std::string>& refresh_token) {
+                                      const std::optional<std::string>& refresh_token,
+                                      const std::string& family_id) {
     if (lifetime_ms <= 0) lifetime_ms = kDefaultAccessTokenLifetimeMs;
     std::lock_guard lock(mutex_);
     // Timestamps come from the C++ clock, not strftime('%s','now') * 1000: the
@@ -352,8 +356,8 @@ void SqliteStore::store_access_token(const std::string& token, const std::string
     auto stmt = prepare(db_,
         "INSERT INTO access_tokens "
         "  (token_hash, user_id, device_id, created_at, expires_at, last_used_at, "
-        "   lifetime_ms, refresh_hash) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+        "   lifetime_ms, refresh_hash, family_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
     auto token_hash = hash_access_token(token);
     sqlite3_bind_text(stmt.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -369,6 +373,11 @@ void SqliteStore::store_access_token(const std::string& token, const std::string
     } else {
         sqlite3_bind_null(stmt.get(), 8);
     }
+    // A login with no family yet starts one. Generated rather than derived
+    // from the token so that the id survives every rotation unchanged — that
+    // persistence is the whole point of it.
+    const std::string family = family_id.empty() ? generate_access_token() : family_id;
+    sqlite3_bind_text(stmt.get(), 9, family.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
         throw std::runtime_error(std::string("Failed to store access token: ") + sqlite3_errmsg(db_));
     }
@@ -479,17 +488,93 @@ SqliteStore::consume_refresh_token(const std::string& refresh_token) {
     TokenSession session;
     {
         auto stmt = prepare(db_,
-            "SELECT user_id, device_id FROM access_tokens WHERE refresh_hash = ?");
+            "SELECT user_id, device_id, family_id FROM access_tokens WHERE refresh_hash = ?");
         sqlite3_bind_text(stmt.get(), 1, refresh_hash.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
-        session.user_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
-        session.device_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
+        session.user_id = column_text_or_empty(stmt.get(), 0);
+        session.device_id = column_text_or_empty(stmt.get(), 1);
+        session.family_id = column_text_or_empty(stmt.get(), 2);
     }
+
+    // Remember that this secret has been spent, BEFORE the row that holds it
+    // goes away. Recorded whether or not anything ever replays it: the record
+    // is the only difference between "that refresh token is not valid" and
+    // "that refresh token was valid once, and someone is presenting it a
+    // second time".
+    {
+        auto note = prepare(db_,
+            "INSERT OR REPLACE INTO consumed_refresh_tokens "
+            "  (refresh_hash, family_id, user_id, consumed_at) VALUES (?, ?, ?, ?)");
+        sqlite3_bind_text(note.get(), 1, refresh_hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(note.get(), 2, session.family_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(note.get(), 3, session.user_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(note.get(), 4, audit_now_ms());
+        sqlite3_step(note.get());
+    }
+
     // Rotate: the old access token dies with the refresh token that minted it.
     auto del = prepare(db_, "DELETE FROM access_tokens WHERE refresh_hash = ?");
     sqlite3_bind_text(del.get(), 1, refresh_hash.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(del.get());
+
+    prune_consumed_refresh_tokens_locked();
     return session;
+}
+
+int SqliteStore::revoke_family_for_replayed_refresh_token(const std::string& refresh_token) {
+    if (refresh_token.empty()) return 0;
+    std::lock_guard lock(mutex_);
+    auto refresh_hash = hash_access_token(refresh_token);
+
+    std::string family_id;
+    std::string user_id;
+    {
+        auto stmt = prepare(db_,
+            "SELECT family_id, user_id FROM consumed_refresh_tokens WHERE refresh_hash = ?");
+        sqlite3_bind_text(stmt.get(), 1, refresh_hash.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt.get()) != SQLITE_ROW) return 0;
+        family_id = column_text_or_empty(stmt.get(), 0);
+        user_id = column_text_or_empty(stmt.get(), 1);
+    }
+    // A pre-v19 session carries its own token_hash as its family, so it is a
+    // family of one and this degrades to revoking just that session. Never
+    // treat an empty family as a wildcard: that would match every row the
+    // migration missed and log the entire server out.
+    if (family_id.empty()) return 0;
+
+    int revoked = 0;
+    {
+        auto del = prepare(db_, "DELETE FROM access_tokens WHERE family_id = ?");
+        sqlite3_bind_text(del.get(), 1, family_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(del.get());
+        revoked = sqlite3_changes(db_);
+    }
+    // The family is finished, so its spent-token records have nothing left to
+    // protect. Dropping them also makes the revocation idempotent rather than
+    // something an attacker can replay to generate log noise indefinitely.
+    {
+        auto del = prepare(db_, "DELETE FROM consumed_refresh_tokens WHERE family_id = ?");
+        sqlite3_bind_text(del.get(), 1, family_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(del.get());
+    }
+
+    get_logger()->warn(
+        "Refresh token for {} was redeemed twice — the chain has been copied. Revoked {} "
+        "session(s) in that family; both the legitimate client and whoever else holds a "
+        "copy must sign in again.", user_id, revoked);
+    return revoked;
+}
+
+void SqliteStore::prune_consumed_refresh_tokens_locked() {
+    // A spent-token record only has to outlive the window in which a replay is
+    // still meaningful. Tokens in a family that is still rotating are refreshed
+    // (and re-recorded) long before this; anything older belongs to a chain
+    // that has not been touched in a full token lifetime, which cannot be
+    // revoked usefully because its sessions have expired anyway.
+    constexpr int64_t kRetentionMs = kDefaultAccessTokenLifetimeMs;
+    auto del = prepare(db_, "DELETE FROM consumed_refresh_tokens WHERE consumed_at < ?");
+    sqlite3_bind_int64(del.get(), 1, audit_now_ms() - kRetentionMs);
+    sqlite3_step(del.get());
 }
 
 // Rooms

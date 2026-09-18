@@ -201,8 +201,11 @@ TEST(MigrationV11, PreExistingV8DatabaseUpgradesAndKeepsItsData) {
     // audit_log filter indexes; 16 -> 17 added events.signal_to and swept the
     // stored call signalling that used to publish everyone's IP addresses;
     // 17 -> 18 stamped is_direct into the membership state of DMs that predate
-    // the server writing it. A v8 database still upgrades all the way in one go.
-    EXPECT_EQ(kTargetSchemaVersion, 18);
+    // the server writing it; 18 -> 19 added access_tokens.family_id and the
+    // consumed_refresh_tokens table, so a refresh token redeemed twice revokes
+    // every session descended from that login. A v8 database still upgrades all
+    // the way in one go.
+    EXPECT_EQ(kTargetSchemaVersion, 19);
     std::filesystem::remove(path);
 }
 

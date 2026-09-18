@@ -61,10 +61,18 @@ public:
     // `lifetime_ms` is both the initial validity window and the window the
     // expiry slides forward by while the session stays in use. Pass a
     // `refresh_token` to attach a refresh secret to the session.
+    //
+    // `family_id` groups a login with every session that later rotates out of
+    // it, so a replayed refresh token can revoke the whole chain (see
+    // revoke_family_for_replayed_refresh_token). Empty means "a new login":
+    // a fresh family id is generated. A refresh MUST pass the family id it got
+    // from consume_refresh_token, or the chain is broken and reuse detection
+    // silently stops covering everything after that point.
     void store_access_token(const std::string& token, const std::string& user_id,
                             const std::string& device_id,
                             int64_t lifetime_ms = kDefaultAccessTokenLifetimeMs,
-                            const std::optional<std::string>& refresh_token = std::nullopt);
+                            const std::optional<std::string>& refresh_token = std::nullopt,
+                            const std::string& family_id = {});
     // Resolves a token to its user. Returns nullopt when the token is unknown
     // OR expired (an expired row is dropped on the way out). Renews the
     // expiry of a live token that is past the halfway point of its lifetime,
@@ -90,6 +98,9 @@ public:
     struct TokenSession {
         std::string user_id;
         std::string device_id;
+        // The rotation chain this session belongs to. Only populated by
+        // consume_refresh_token, which is the one caller that has to pass it on.
+        std::string family_id;
     };
     // Single-use redemption of a refresh token: returns the session it belonged
     // to and removes the row, so the caller can issue a fresh access/refresh
@@ -97,6 +108,19 @@ public:
     // as the legitimate client refreshes. Expiry of the ACCESS token does not
     // block redemption — refreshing an expired access token is the whole point.
     std::optional<TokenSession> consume_refresh_token(const std::string& refresh_token);
+    // Reuse detection, to be called when consume_refresh_token() returned
+    // nothing: if this refresh token was one we have ALREADY redeemed, the
+    // chain has been copied and every session descended from that login is
+    // revoked. Returns the number of sessions revoked, or 0 when the token was
+    // simply never ours (a typo, an expired session, a probe).
+    //
+    // Rotation on its own does not make theft unprofitable: whichever side
+    // redeems second is the one that gets logged out, and if that is the real
+    // user they will just sign in again while the thief keeps a live session
+    // that no longer shares a secret with anyone. Revoking the family is the
+    // only response available, because at this point the two branches are
+    // indistinguishable — which is also why it is deliberately loud in the log.
+    int revoke_family_for_replayed_refresh_token(const std::string& refresh_token);
     // The (user, device) a live access token belongs to. Used where the device
     // matters and not just the identity — e.g. recording which device a pusher
     // was registered from. Does NOT slide the expiry; callers have already
@@ -691,6 +715,10 @@ public:
     bool delete_media(const std::string& media_id);
 
 private:
+    // Drops spent refresh-token records once no live session could still
+    // belong to their family. Called with mutex_ already held.
+    void prune_consumed_refresh_tokens_locked();
+
     void exec(const std::string& sql);
     // Claims the next stream position. Caller must hold mutex_.
     int64_t claim_stream_position_locked();

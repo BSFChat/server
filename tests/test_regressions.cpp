@@ -360,7 +360,11 @@ TEST(LegacyUpgrade, DirectMarkerBackfillTouchesOnlyCurrentStateAndIsIdempotent) 
                            json{{"membership", "join"}}.dump(), now_ms());
     }
 
-    set_user_version(kTargetSchemaVersion - 1);
+    // 17, not kTargetSchemaVersion - 1. This test is about migration v18, so it
+    // has to rewind to the version v18 runs FROM; expressing that relative to
+    // the latest schema quietly stopped exercising v18 the moment v19 was
+    // added, and the test then failed on a backfill that had simply never run.
+    set_user_version(17);
     { SqliteStore store(path); store.initialize(); }
 
     EXPECT_EQ(json::parse(content_of("$new")).value("is_direct", false), true);
@@ -372,7 +376,7 @@ TEST(LegacyUpgrade, DirectMarkerBackfillTouchesOnlyCurrentStateAndIsIdempotent) 
 
     // Re-running it is a no-op, not a second rewrite.
     const auto after_first = content_of("$new");
-    set_user_version(kTargetSchemaVersion - 1);
+    set_user_version(17);
     { SqliteStore store(path); store.initialize(); }
     EXPECT_EQ(content_of("$new"), after_first);
 

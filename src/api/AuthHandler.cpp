@@ -75,6 +75,21 @@ std::string user_failure_key(const std::string& user_id) {
     return "user:" + user_id.substr(0, 255);
 }
 
+// Rejects a client-supplied device_id, answering 400 if it is unusable.
+// Returns true when the response has been sent and the caller must stop.
+//
+// Every login and register path takes device_id straight from the request and
+// stored it unexamined, so this is checked at all three rather than in one of
+// them.
+bool device_id_rejected(const std::optional<std::string>& device_id,
+                        httplib::Response& res) {
+    if (!device_id) return false;
+    auto err = device_id_error(*device_id);
+    if (!err) return false;
+    send_error(res, 400, MatrixError::invalid_param(*err));
+    return true;
+}
+
 } // namespace
 
 AuthHandler::AuthHandler(SqliteStore& store, SyncEngine& sync_engine,
@@ -233,8 +248,30 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
         const auto user_key = config_.auth_limits.enabled ? user_failure_key(user_id) : std::string{};
         if (locked_out(client, user_key, res)) return;
 
+        if (device_id_rejected(login_req.device_id, res)) return;
+
+        // Spend the same PBKDF2 whether or not the account exists.
+        //
+        // The error message below is deliberately identical for "no such user"
+        // and "wrong password", but the CODE was not: `!hash` short-circuited
+        // the `||`, so a login for an account that does not exist returned in
+        // microseconds while one for an account that does spent half a second
+        // in PBKDF2 at cost 19. Nobody needs statistics to read a difference
+        // that size — it is a remote account-enumeration oracle behind an
+        // endpoint whose wording was chosen specifically not to be one, and it
+        // is available before any rate limit has been tripped.
+        //
+        // An account with an EMPTY hash (OIDC-backed — see create_user on the
+        // m.login.token path) goes the same way for the same reason: it must
+        // never authenticate by password, and "this account exists but signs
+        // in elsewhere" is not something an unauthenticated caller should be
+        // able to time.
         auto hash = store_.get_password_hash(user_id);
-        if (!hash || !verify_password(login_req.password, *hash)) {
+        const bool password_usable = hash && !hash->empty();
+        const std::string& material =
+            password_usable ? *hash : dummy_password_hash(config_.password_hash_cost);
+        const bool verified = verify_password(login_req.password, material);
+        if (!password_usable || !verified) {
             record_failure(client, user_key);
             res.status = 403;
             res.set_content(MatrixError::forbidden("Invalid username or password").to_json().dump(), "application/json");
@@ -309,6 +346,8 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
             res.set_content(MatrixError::unknown("Token login is not configured").to_json().dump(), "application/json");
             return;
         }
+
+        if (device_id_rejected(login_req.device_id, res)) return;
 
         if (locked_out(client, {}, res)) return;
 
@@ -480,11 +519,19 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
         return;
     }
 
-    if (reg_req.password.size() < limits::kMinPasswordLength) {
+    // Length was the whole policy. The two additions are the ones that pay for
+    // themselves against how this server is actually attacked: a password
+    // built out of the username defeats the per-account lockout (the attacker
+    // needs one guess, not thousands), and so does spraying a single common
+    // password across many accounts — neither ever accumulates enough failures
+    // on one account to trip a counter. See password_policy_error().
+    if (auto err = password_policy_error(reg_req.password, username)) {
         res.status = 400;
-        res.set_content(MatrixError::invalid_param("Password must be at least 8 characters").to_json().dump(), "application/json");
+        res.set_content(MatrixError::invalid_param(*err).to_json().dump(), "application/json");
         return;
     }
+
+    if (device_id_rejected(reg_req.device_id, res)) return;
 
     std::string user_id = "@" + username + ":" + config_.server_name;
 
@@ -670,9 +717,20 @@ void AuthHandler::handle_password_change(const httplib::Request& req, httplib::R
     if (new_password.empty()) {
         return send_error(res, 400, MatrixError::invalid_param("Missing new_password"));
     }
-    if (new_password.size() < limits::kMinPasswordLength) {
-        return send_error(res, 400,
-            MatrixError::invalid_param("Password must be at least 8 characters"));
+    // The same policy registration applies. A rule that only guards the front
+    // door is not a rule: without this, "password1" is two requests away for
+    // any account — register with something acceptable, then change it.
+    //
+    // Checked against the authenticated user's own localpart, which is why it
+    // is parsed out of *user_id rather than taken from the request.
+    {
+        const auto colon = user_id->find(':');
+        const std::string localpart =
+            (user_id->size() > 1 && colon != std::string::npos)
+                ? user_id->substr(1, colon - 1) : std::string{};
+        if (auto err = password_policy_error(new_password, localpart)) {
+            return send_error(res, 400, MatrixError::invalid_param(*err));
+        }
     }
 
     auto stored = store_.get_password_hash(*user_id);
@@ -706,6 +764,21 @@ void AuthHandler::handle_password_change(const httplib::Request& req, httplib::R
         return send_error(res, 403, MatrixError::forbidden("Invalid password"));
     }
     if (!change_key.empty()) failures_.clear(change_key);
+
+    // Rejected only AFTER the current password has been proved, and only then:
+    // answering "that is your current password" to a caller who has not yet
+    // demonstrated they know it would turn this endpoint into a password
+    // checker. The current password is already in hand here, so this costs a
+    // string comparison of the two plaintexts and no extra hashing.
+    //
+    // Worth refusing because the sessions below are revoked either way: a
+    // no-op change would log every other device out and leave the credential
+    // that prompted it in place, which is the opposite of what the user asked
+    // for.
+    if (new_password == current_password) {
+        return send_error(res, 400, MatrixError::invalid_param(
+            "New password must be different from your current password"));
+    }
 
     // ...and the replacement is always written at the CURRENT configured cost,
     // which makes a password change a second upgrade path alongside
@@ -758,13 +831,31 @@ void AuthHandler::handle_refresh(const httplib::Request& req, httplib::Response&
     // token stops working the moment the legitimate client refreshes.
     auto session = store_.consume_refresh_token(refresh_token);
     if (!session) {
+        // Rotation alone left theft profitable: whoever redeems SECOND is the
+        // one locked out, and if that is the real user they simply sign in
+        // again while the thief keeps rotating a session that no longer shares
+        // a secret with anybody. A second redemption of an already-spent token
+        // is the one observable sign that the chain was copied, so it revokes
+        // everything descended from that login — the two branches cannot be
+        // told apart, and guessing wrong in the other direction leaves the
+        // attacker inside.
+        //
+        // The response is the same 401 either way. A caller who has just had a
+        // family revoked has, by construction, presented a token that is no
+        // longer valid; saying more would tell an attacker probing old tokens
+        // which of them were once real.
+        store_.revoke_family_for_replayed_refresh_token(refresh_token);
         return send_error(res, 401, MatrixError::unknown_token("Invalid refresh token"));
     }
 
     auto access_token = generate_access_token();
     auto new_refresh = generate_access_token();
+    // Carries the family forward. Passing nothing here would start a new
+    // family on every refresh, which quietly reduces reuse detection to "the
+    // single most recent hop" — the chain would be one session long and
+    // revoking it would leave every earlier rotation alive.
     store_.store_access_token(access_token, session->user_id, session->device_id,
-                              token_lifetime_ms(), new_refresh);
+                              token_lifetime_ms(), new_refresh, session->family_id);
 
     res.set_content(json{
         {"access_token", access_token},

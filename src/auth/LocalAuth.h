@@ -39,4 +39,55 @@ std::optional<int> password_hash_cost(const std::string& stored_hash);
 // there is nothing for a precomputed table to attack.
 std::string hash_access_token(const std::string& token);
 
+// A PBKDF2 hash at `cost` of a value nobody can supply — 32 CSPRNG bytes,
+// generated once and never written down.
+//
+// Exists so that "no such user" costs the same as "wrong password". Without
+// it, /login short-circuits before verify_password whenever get_password_hash
+// returns nothing, so a request for an account that does not exist comes back
+// in microseconds while a request for one that does spends half a second in
+// PBKDF2 at cost 19. That difference is not subtle and does not need
+// statistics to read: it is a remote account-enumeration oracle sitting behind
+// an endpoint whose error message was carefully written not to be one.
+//
+// Verify a submitted password against this when the account is missing (or has
+// no usable hash) and throw the result away. The cost must be the one real
+// accounts are hashed at, or the timings still differ.
+//
+// Cached per cost: building it is itself a PBKDF2, and doing that per request
+// would hand back an even louder signal than the one being closed.
+const std::string& dummy_password_hash(int cost);
+
+// Password rules beyond the length minimum, applied identically at
+// registration and at password change. Returns the message to send the user,
+// or nullopt when the password is acceptable.
+//
+// `localpart` is the account's own username, because the single most likely
+// password for account "mike" is some arrangement of "mike". Deliberately
+// small and dependency-free: a real breach-corpus check (HIBP's k-anonymity
+// API, or a multi-megabyte local list) is a different kind of change, with a
+// network dependency or a data file to ship and update. This catches the
+// passwords that a credential-stuffing list tries in its first few hundred
+// guesses, which is the population that the per-account lockout alone does not
+// protect — a sprayer trying ONE common password against many accounts never
+// trips a per-account counter.
+std::optional<std::string> password_policy_error(const std::string& password,
+                                                 const std::string& localpart);
+
+// Generous: the shipped client sends "DEVICE_" plus 10 characters. This is a
+// storage bound, not a format rule.
+inline constexpr size_t kMaxDeviceIdLength = 255;
+
+// Validates a client-supplied device id before it reaches storage. Returns the
+// rejection message, or nullopt when it is usable.
+//
+// device_id arrives straight from the request body and went to the database
+// unexamined: unbounded length (a row per login, kept for the token's 90-day
+// life) and any bytes at all, including the newlines that let a device id
+// forge extra lines in the server log. Bounded and stripped of control
+// characters; everything else a real client might send still passes, because
+// rejecting a device id a client already persisted would lock that client out
+// of logging in at all.
+std::optional<std::string> device_id_error(const std::string& device_id);
+
 } // namespace bsfchat

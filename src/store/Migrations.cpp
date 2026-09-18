@@ -1123,6 +1123,67 @@ void migrate_v18(sqlite3* db, bool fresh_database) {
         after - before);
 }
 
+void migrate_v19(sqlite3* db, bool /*fresh_database*/) {
+    // Refresh-token REUSE detection.
+    //
+    // Rotation was already here: redeeming a refresh token deletes its row, so
+    // the old pair stops working. What rotation alone cannot do is tell you
+    // that a token was stolen, and it leaves the theft profitable. Once the
+    // thief redeems first, the honest client's next refresh simply fails — it
+    // logs the user out, they sign in again, and the thief keeps a live,
+    // self-renewing session that no longer shares a secret with anybody.
+    //
+    // The standard answer (OAuth 2.0 Security BCP §4.14.2) is to remember
+    // which refresh tokens have been spent and treat a second redemption as
+    // proof that the chain was copied — at which point the only safe move is
+    // to kill every session descended from that login, because you cannot tell
+    // the thief's branch from the victim's.
+    //
+    // `family_id` is what makes "descended from that login" answerable: it is
+    // issued at login and carried across every rotation, so one chain of
+    // rotations is one family however many times it has turned over.
+    // Guarded, like every other ADD COLUMN here: several tests (and any
+    // operator debugging an upgrade) rewind PRAGMA user_version on a database
+    // that already has the modern schema, and ALTER TABLE has no
+    // IF NOT EXISTS. A step that throws on a column it already added is a step
+    // that cannot be re-run.
+    if (!column_exists(db, "access_tokens", "family_id")) {
+        exec(db, "ALTER TABLE access_tokens ADD COLUMN family_id TEXT");
+    }
+
+    // Every session that predates this migration becomes a family of one,
+    // keyed on something already unique per row. They cannot be grouped
+    // retroactively — the rotation history that would have linked them was
+    // never recorded — and a shared default like NULL or '' would be far
+    // worse than useless here: one replayed token would revoke every session
+    // on the server.
+    exec(db, "UPDATE access_tokens SET family_id = token_hash WHERE family_id IS NULL");
+
+    exec(db, R"(
+        CREATE TABLE IF NOT EXISTS consumed_refresh_tokens (
+            refresh_hash TEXT PRIMARY KEY,
+            family_id    TEXT NOT NULL,
+            user_id      TEXT NOT NULL,
+            consumed_at  INTEGER NOT NULL
+        )
+    )");
+
+    // Digests only, exactly as for live tokens: this table is a record of
+    // secrets that HAVE been used, and a plaintext copy of them would be a
+    // fresh liability in the same database dump the hashing exists to survive.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_access_tokens_family "
+             "ON access_tokens(family_id)");
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_consumed_refresh_family "
+             "ON consumed_refresh_tokens(family_id)");
+    // Pruning scans by age; without this it is a full scan on every refresh.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_consumed_refresh_at "
+             "ON consumed_refresh_tokens(consumed_at)");
+
+    get_logger()->info(
+        "Schema v19: refresh tokens now carry a family id, and redeeming one twice "
+        "revokes the whole family");
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1145,6 +1206,7 @@ const std::vector<Step>& steps() {
         migrate_v16,
         migrate_v17,
         migrate_v18,
+        migrate_v19,
     };
     return kMigrations;
 }
