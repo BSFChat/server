@@ -350,4 +350,63 @@ TEST_F(SyncLatencyTest, InitialSyncTokenDoesNotSkipAnEventLandingDuringIt) {
               "during the walk");
 }
 
+// Race 3 — the shape production actually hit, and the one that costs the
+// SENDER their own message.
+//
+// The desktop client stops its typing indicator in the same breath as it PUTs
+// the message (ServerConnection::sendMessage), so a typing EDU and the send
+// reach the server microseconds apart. The EDU wakes that client's own parked
+// long poll; the re-scan finds nothing, and because ephemeral_seq_ moved the
+// poll returns AT ONCE rather than going back to sleep. If the message commits
+// between that re-scan and the token the reply is built from, the sender is
+// handed a next_batch past their own message. No later poll asks for it — only
+// leaving the room and coming back, which refetches /messages, shows it.
+//
+// Observed on chat.bsfchat.com (server 0.0.46), nginx access log
+// 18/Sep/2026:03:44:16 +0200: a typing PUT and a send PUT, and in the same
+// second a 418-byte /sync reply to since=s6071 with no timeline in it; that
+// client then polled since=s6072 for the full 30s and got nothing, and the
+// message only appeared when it refetched /messages at 03:44:48.
+//
+// This is a distinct path from NextBatchNeverJumpsPastAnUnscannedEvent above:
+// that one covers the scan a poll does before it parks, this one covers the
+// re-scan inside the wait and the early return on an ephemeral change.
+TEST_F(SyncLatencyTest, AnEphemeralWakeDoesNotHandBackATokenPastAnUnscannedEvent) {
+    const std::string since = sync->handle_sync("@alice:test", "", 0).next_batch;
+
+    // Fires on the re-scan the ephemeral wake triggers — scan 1 is the one
+    // that runs before the poll parks, and must be left alone.
+    std::atomic<int> scans{0};
+    sync->set_post_scan_hook_for_test([&] {
+        if (++scans != 2) return;
+        insert_message("alice's own message");
+        sync->notify_new_event();
+    });
+
+    SyncResponse woken;
+    std::thread alice([&] { woken = sync->handle_sync("@alice:test", since, 4000); });
+
+    // Let the poll reach the wait before the typing indicator stops. It does
+    // not have to: edu_at_entry is sampled at entry, so an EDU that lands
+    // earlier is still seen. The sleep only keeps the test honest about which
+    // path it is exercising.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    sync->notify_ephemeral();
+    alice.join();
+    sync->set_post_scan_hook_for_test(nullptr);
+
+    ASSERT_EQ(scans.load(), 2) << "the ephemeral wake did not re-scan";
+    ASSERT_TRUE(woken.rooms.join.empty())
+        << "the message committed after the re-scan, so it cannot be in this reply";
+
+    auto next = sync->handle_sync("@alice:test", woken.next_batch, 0);
+    ASSERT_EQ(next.rooms.join.count(room_id), 1u)
+        << "next_batch (" << woken.next_batch << ") ran past the sender's own "
+           "message; nothing will ever ask for it again, and the sender only "
+           "sees their message by leaving the channel and coming back";
+    ASSERT_EQ(next.rooms.join[room_id].timeline.events.size(), 1u);
+    EXPECT_EQ(next.rooms.join[room_id].timeline.events[0].content.data["body"],
+              "alice's own message");
+}
+
 } // namespace
