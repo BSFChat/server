@@ -1275,3 +1275,208 @@ TEST(BotJoin, ADeactivatedBotCannotJoin) {
                           401));
     EXPECT_FALSE(fx.store->is_room_member(room, bot_id));
 }
+
+// ── 13. Auto-join on invite ─────────────────────────────────────────────────
+//
+// Inviting a bot joins it immediately. A bot has no human to accept an invite
+// and cannot see one (SyncResponse::rooms has a `join` map and no `invite`
+// section), so an invite row for a bot is invisible to the bot and
+// indistinguishable from a no-op to the operator who sent it.
+//
+// This does NOT contradict the auto-join exclusion above, and the tests are
+// deliberately adjacent so the difference is visible: that exclusion is about
+// the untargeted sweeps that repeat forever, this is one named bot added to one
+// named channel by one person who just passed the permission check.
+
+namespace {
+std::string invite_path(const std::string& room) {
+    return "/_matrix/client/v3/rooms/" + room + "/invite";
+}
+std::string invite_body(const std::string& user) { return json{{"user_id", user}}.dump(); }
+} // namespace
+
+TEST(BotInvite, InvitingABotJoinsItAndEmitsAJoinEvent) {
+    Fixture fx("invite-join");
+    fx.seed_roles();
+    // The inviter needs MANAGE_CHANNELS (what the invite path requires) as well
+    // as MANAGE_BOTS (to create the bot in the first place).
+    auto admin = fx.add_user("admin", {"botmod", "everything_else"});
+    auto room = fx.add_public_channel(admin, "general");
+    auto [bot_id, token] = fx.make_bot("token-admin", "bot_invited");
+
+    ASSERT_TRUE(fx.store->get_joined_rooms(bot_id).empty());
+
+    ASSERT_TRUE(IsOk(call(*fx.rooms, &RoomHandler::handle_invite, invite_path(room),
+                          "token-admin", invite_body(bot_id))));
+
+    // Joined outright — not left sitting on an invite nobody can accept.
+    EXPECT_TRUE(fx.store->is_room_member(room, bot_id));
+    EXPECT_EQ(fx.store->get_membership(room, bot_id), membership::kJoin);
+    EXPECT_EQ(fx.store->get_joined_rooms(bot_id).size(), 1u);
+
+    // A real m.room.member join event, sent BY the bot, so every other member
+    // sees it arrive through the ordinary membership machinery.
+    auto ev = fx.store->get_state_event(room, std::string(event_type::kRoomMember), bot_id);
+    ASSERT_TRUE(ev.has_value());
+    EXPECT_EQ(ev->content.data.value("membership", ""), membership::kJoin);
+    EXPECT_EQ(ev->sender, bot_id);
+    // ...carrying a name, so it renders as something other than a raw user id
+    // from the very first sync.
+    EXPECT_FALSE(ev->content.data.value("displayname", "").empty());
+
+    // Audited, with the INVITER as actor: "who gave this bot access to that
+    // channel" is the question the record exists to answer.
+    int membership_records = 0;
+    for (const auto& r : fx.records()) {
+        if (r.target_user != bot_id || r.target_room != room) continue;
+        ++membership_records;
+        EXPECT_EQ(r.actor, admin);
+        EXPECT_EQ(json::parse(r.after_json).value("membership", ""), membership::kJoin);
+    }
+    EXPECT_EQ(membership_records, 1);
+}
+
+TEST(BotInvite, IsIdempotent) {
+    Fixture fx("invite-idem");
+    fx.seed_roles();
+    auto admin = fx.add_user("admin", {"botmod", "everything_else"});
+    auto room = fx.add_public_channel(admin, "general");
+    auto [bot_id, token] = fx.make_bot("token-admin", "bot_twiceinvited");
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        auto res = call(*fx.rooms, &RoomHandler::handle_invite, invite_path(room),
+                        "token-admin", invite_body(bot_id));
+        EXPECT_TRUE(IsOk(res)) << "attempt " << attempt;
+        EXPECT_EQ(res.body, "{}");
+    }
+
+    EXPECT_TRUE(fx.store->is_room_member(room, bot_id));
+
+    // Exactly ONE join event, not three: a duplicate would render in every
+    // client as the bot arriving again.
+    EXPECT_EQ(raw_int(fx.db_path,
+                      "SELECT COUNT(*) FROM events WHERE room_id = '" + room +
+                          "' AND event_type = 'm.room.member' AND state_key = '" + bot_id + "'"),
+              1);
+
+    // ...and exactly one audit record, for an event that happened once.
+    int membership_records = 0;
+    for (const auto& r : fx.records()) {
+        if (r.target_user == bot_id && r.target_room == room) ++membership_records;
+    }
+    EXPECT_EQ(membership_records, 1);
+}
+
+TEST(BotInvite, RefusesADeactivatedBot) {
+    Fixture fx("invite-dead");
+    fx.seed_roles();
+    auto admin = fx.add_user("admin", {"botmod", "everything_else"});
+    auto room = fx.add_public_channel(admin, "general");
+    auto [bot_id, token] = fx.make_bot("token-admin", "bot_deadinvite");
+    ASSERT_TRUE(IsOk(call(*fx.bots, &BotHandler::handle_deactivate_bot, bot_path(bot_id),
+                          "token-admin")));
+
+    EXPECT_TRUE(RefusedBecause(call(*fx.rooms, &RoomHandler::handle_invite, invite_path(room),
+                                    "token-admin", invite_body(bot_id)),
+                               403, "deactivated"));
+
+    // Nothing was written: no membership row of any kind, no event.
+    EXPECT_FALSE(fx.store->is_room_member(room, bot_id));
+    EXPECT_EQ(raw_int(fx.db_path,
+                      "SELECT COUNT(*) FROM room_members WHERE room_id = '" + room +
+                          "' AND user_id = '" + bot_id + "'"),
+              0);
+}
+
+TEST(BotInvite, RefusesAServerBannedBot) {
+    Fixture fx("invite-banned");
+    fx.seed_roles();
+    auto admin = fx.add_user("admin", {"botmod", "everything_else"});
+    auto room = fx.add_public_channel(admin, "general");
+    auto [bot_id, token] = fx.make_bot("token-admin", "bot_bannedinvite");
+    fx.store->set_server_ban(bot_id, admin, "misbehaving");
+
+    EXPECT_TRUE(RefusedBecause(call(*fx.rooms, &RoomHandler::handle_invite, invite_path(room),
+                                    "token-admin", invite_body(bot_id)),
+                               403, "banned"));
+    EXPECT_FALSE(fx.store->is_room_member(room, bot_id));
+}
+
+// The inviter's own permission check is untouched — this changes what happens
+// AFTER it passes, not whether it runs.
+TEST(BotInvite, StillRequiresTheInvitersPermission) {
+    Fixture fx("invite-perm");
+    fx.seed_roles();
+    auto admin = fx.add_user("admin", {"botmod", "everything_else"});
+    auto room = fx.add_public_channel(admin, "general");
+    auto [bot_id, token] = fx.make_bot("token-admin", "bot_unauthorized");
+
+    // A plain member of the channel, with no MANAGE_CHANNELS.
+    auto plain = fx.add_user("plain");
+    fx.store->set_membership(room, plain, std::string(membership::kJoin));
+
+    EXPECT_TRUE(RefusedBecause(call(*fx.rooms, &RoomHandler::handle_invite, invite_path(room),
+                                    "token-plain", invite_body(bot_id)),
+                               403, "Insufficient permissions"));
+    EXPECT_FALSE(fx.store->is_room_member(room, bot_id));
+}
+
+// Human invite semantics must not change at all. A human gets an `invite` row
+// and an `invite` event, exactly as before — this is a bot-only branch.
+TEST(BotInvite, AHumanInviteStillProducesAnInviteAndNotAJoin) {
+    Fixture fx("invite-human");
+    fx.seed_roles();
+    auto admin = fx.add_user("admin", {"botmod", "everything_else"});
+    auto room = fx.add_public_channel(admin, "general");
+    auto human = fx.add_user("carol");
+
+    ASSERT_TRUE(IsOk(call(*fx.rooms, &RoomHandler::handle_invite, invite_path(room),
+                          "token-admin", invite_body(human))));
+
+    EXPECT_EQ(fx.store->get_membership(room, human), membership::kInvite);
+    // Not a member: an invited human still has to accept.
+    EXPECT_FALSE(fx.store->is_room_member(room, human));
+
+    auto ev = fx.store->get_state_event(room, std::string(event_type::kRoomMember), human);
+    ASSERT_TRUE(ev.has_value());
+    EXPECT_EQ(ev->content.data.value("membership", ""), membership::kInvite);
+    // Sent by the INVITER, which is how a human invite has always been emitted.
+    EXPECT_EQ(ev->sender, admin);
+
+    // And the invited human can then accept it, as before.
+    ASSERT_TRUE(IsOk(call(*fx.rooms, &RoomHandler::handle_join,
+                          "/_matrix/client/v3/join/" + room, "token-carol")));
+    EXPECT_TRUE(fx.store->is_room_member(room, human));
+}
+
+// The exclusion and the invite coexist: an invited bot stays in the ONE channel
+// it was invited to, and backfill does not drag it into any of the others. This
+// is the test that fails if somebody "reconciles" the two behaviours.
+TEST(BotInvite, AnInvitedBotIsNotSweptIntoOtherChannelsByBackfill) {
+    Fixture fx("invite-vs-backfill");
+    fx.seed_roles();
+    auto admin = fx.add_user("admin", {"botmod", "everything_else"});
+    auto invited_room = fx.add_public_channel(admin, "general");
+    fx.add_public_channel(admin, "random");
+    fx.add_public_channel(admin, "offtopic");
+    auto [bot_id, token] = fx.make_bot("token-admin", "bot_scoped_join");
+
+    ASSERT_TRUE(IsOk(call(*fx.rooms, &RoomHandler::handle_invite, invite_path(invited_room),
+                          "token-admin", invite_body(bot_id))));
+    ASSERT_EQ(fx.store->get_joined_rooms(bot_id).size(), 1u);
+
+    // Three simulated boots. The bot stays in exactly the one channel it was
+    // invited to — not evicted from it, not added to the other two.
+    for (int boot = 0; boot < 3; ++boot) {
+        backfill_auto_join(*fx.store, *fx.sync, fx.config);
+        auto joined = fx.store->get_joined_rooms(bot_id);
+        ASSERT_EQ(joined.size(), 1u) << "after backfill pass " << boot;
+        EXPECT_EQ(joined.front(), invited_room);
+    }
+
+    // The human is in all three, so the backfill genuinely ran.
+    auto human = fx.add_user("dave");
+    backfill_auto_join(*fx.store, *fx.sync, fx.config);
+    EXPECT_EQ(fx.store->get_joined_rooms(human).size(), 3u);
+    EXPECT_EQ(fx.store->get_joined_rooms(bot_id).size(), 1u);
+}
