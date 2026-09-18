@@ -742,6 +742,19 @@ std::optional<std::string> SqliteStore::find_membership(const std::string& room_
     return std::nullopt;
 }
 
+std::vector<std::string> SqliteStore::get_invited_rooms(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT room_id FROM room_members WHERE user_id = ? AND membership = 'invite'");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::vector<std::string> rooms;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        rooms.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)));
+    }
+    return rooms;
+}
+
 std::string SqliteStore::get_membership(const std::string& room_id, const std::string& user_id) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_, "SELECT membership FROM room_members WHERE room_id = ? AND user_id = ?");
@@ -1411,6 +1424,88 @@ void SqliteStore::set_meta(const std::string& key, const std::string& value) {
     sqlite3_step(stmt.get());
 }
 
+std::vector<RoomEvent> SqliteStore::get_invite_state(const std::string& room_id,
+                                                      const std::string& invitee) {
+    std::lock_guard lock(mutex_);
+
+    // Latest event per (type, state_key), like get_state_events — but the
+    // whitelist is inside the subquery, so a row outside it is never read at
+    // all. See the header for what is on the list and why.
+    //
+    // No kEditJoin: state events are not editable, and an invitee has no
+    // business resolving edits in a room they have not joined.
+    const std::string room_level_types =
+        std::string("'") + std::string(event_type::kRoomCreate) + "','" +
+        std::string(event_type::kRoomName) + "','" +
+        std::string(event_type::kRoomTopic) + "','" +
+        std::string(event_type::kRoomAvatar) + "','" +
+        std::string(event_type::kRoomJoinRules) + "','" +
+        std::string(event_type::kRoomCanonicalAlias) + "','" +
+        std::string(event_type::kRoomType) + "'";
+
+    // ?1 room, ?2 the member state key wanted on this pass.
+    const std::string sql =
+        "SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content, "
+        "       e.origin_server_ts, e.stream_position "
+        "FROM events e "
+        "INNER JOIN (SELECT event_type, state_key, MAX(stream_position) AS max_pos "
+        "            FROM events "
+        "            WHERE room_id = ?1 AND state_key IS NOT NULL "
+        "              AND ((state_key = '' AND event_type IN (" + room_level_types + ")) "
+        "                   OR (event_type = '" + std::string(event_type::kRoomMember) + "' "
+        "                       AND state_key = ?2)) "
+        "            GROUP BY event_type, state_key) latest "
+        "ON e.event_type = latest.event_type AND e.state_key = latest.state_key "
+        "   AND e.stream_position = latest.max_pos "
+        "WHERE e.room_id = ?1";
+
+    // (stream_position, event), so the caller gets them in the order the room
+    // acquired them regardless of which pass found them. Deterministic output
+    // is what makes this testable.
+    std::vector<std::pair<int64_t, RoomEvent>> found;
+    auto run = [&](const std::string& member_state_key) {
+        auto stmt = prepare(db_, sql);
+        sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 2, member_state_key.c_str(), -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+            RoomEvent ev;
+            ev.event_id = column_text_or_empty(stmt.get(), 0);
+            ev.room_id = column_text_or_empty(stmt.get(), 1);
+            ev.sender = column_text_or_empty(stmt.get(), 2);
+            ev.type = column_text_or_empty(stmt.get(), 3);
+            if (sqlite3_column_type(stmt.get(), 4) != SQLITE_NULL) {
+                ev.state_key = column_text_or_empty(stmt.get(), 4);
+            }
+            ev.content.data =
+                nlohmann::json::parse(column_text_or_empty(stmt.get(), 5), nullptr, false);
+            if (ev.content.data.is_discarded()) ev.content.data = nlohmann::json::object();
+            ev.origin_server_ts = sqlite3_column_int64(stmt.get(), 6);
+            found.emplace_back(sqlite3_column_int64(stmt.get(), 7), std::move(ev));
+        }
+    };
+
+    run(invitee);
+
+    // The inviter is whoever sent the invitee's member event — there is no
+    // other record of it, which is why this is a second pass rather than one
+    // query with both state keys bound up front.
+    std::string inviter;
+    for (const auto& [pos, ev] : found) {
+        if (ev.type == std::string(event_type::kRoomMember) && ev.state_key == invitee) {
+            inviter = ev.sender;
+        }
+    }
+    if (!inviter.empty() && inviter != invitee) run(inviter);
+
+    std::sort(found.begin(), found.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::vector<RoomEvent> events;
+    events.reserve(found.size());
+    for (auto& [pos, ev] : found) events.push_back(std::move(ev));
+    return events;
+}
+
 std::optional<RoomEvent> SqliteStore::get_state_event(const std::string& room_id,
                                                        const std::string& event_type,
                                                        const std::string& state_key) {
@@ -1480,12 +1575,32 @@ std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id,
     // candidate batch comes back with a token that has MOVED, and the client's
     // no-progress backoff never sees it. That interplay is why this filter is
     // here and not in the loop above SyncEngine's own permission check.
+    // The membership filter used to be `rm.membership = 'join'` in the JOIN
+    // condition, which is why a human account could not see it had been
+    // invited anywhere: an invite writes a room_members row with membership
+    // 'invite', that row matched nothing, and so the m.room.member event
+    // announcing the invite was never on any stream the invitee polled.
+    //
+    // A joined member still gets the whole room. An INVITED one gets exactly
+    // one kind of row from it — their own m.room.member — and never any other
+    // event, whatever its type. That is the leak boundary, and it is here in
+    // the SQL rather than in SyncEngine's loop on purpose: a room the reader
+    // has not joined must not be able to put history on the wire because some
+    // caller further out forgot to filter it. SyncEngine reads those rows as a
+    // trigger to build rooms.invite from the stripped state, never as timeline.
+    //
+    // It also means the invite advances out_max_position like any other row, so
+    // next_batch covers it and no later sync has a hole where it was.
     auto stmt = prepare(db_,
         std::string("SELECT ") + kEventColumns + ", e.stream_position "
         "FROM events e "
-        "INNER JOIN room_members rm ON e.room_id = rm.room_id AND rm.user_id = ?1 AND rm.membership = 'join' " +
+        "INNER JOIN room_members rm ON e.room_id = rm.room_id AND rm.user_id = ?1 " +
         kEditJoin +
         "WHERE e.stream_position > ?2 "
+        "AND (rm.membership = 'join' "
+        "     OR (rm.membership = 'invite' "
+        "         AND e.event_type = '" + std::string(event_type::kRoomMember) + "' "
+        "         AND e.state_key = ?1)) "
         "AND (e.signal_to IS NULL OR e.signal_to = ?1 OR e.sender = ?1) "
         "ORDER BY e.stream_position ASC "
         "LIMIT ?3");

@@ -129,6 +129,10 @@ public:
     // read markers). Destructive; intended for admin-driven channel deletion.
     void delete_room(const std::string& room_id);
     std::vector<std::string> get_joined_rooms(const std::string& user_id);
+    // Rooms the user has been invited to and has not answered. The complement
+    // of get_joined_rooms for /sync's purposes: those two together are every
+    // room a client should be told about.
+    std::vector<std::string> get_invited_rooms(const std::string& user_id);
     bool is_room_member(const std::string& room_id, const std::string& user_id);
     // Public, non-category, non-direct rooms — i.e. rooms every user on the
     // instance is expected to be a member of.
@@ -254,6 +258,29 @@ public:
                                             const std::optional<std::string>& from = std::nullopt);
 
     std::vector<RoomEvent> get_state_events(const std::string& room_id);
+    // The stripped state for an invite to `room_id` addressed to `invitee`:
+    // enough to render "somebody invited you to #channel", and nothing that
+    // belongs to people who have accepted.
+    //
+    // NOT get_state_events() with a filter applied afterwards. The whitelist
+    // lives in the SQL, so the set of things an un-joined account can read out
+    // of a room is decided in one place that a later caller cannot widen by
+    // forgetting to re-apply it:
+    //
+    //   * the room-level events that name and describe the room —
+    //     m.room.create, name, topic, avatar, join_rules, canonical_alias,
+    //     and bsfchat.room.type so a client can tell text from voice;
+    //   * `invitee`'s own m.room.member event, which IS the invite and whose
+    //     sender is the inviter;
+    //   * that inviter's m.room.member event, for their display name.
+    //
+    // Withheld: the timeline, power levels, roles and channel permissions, and
+    // every other member event — the membership of a room you are not in is
+    // not yours to read. bsfchat.room.category is withheld too: it names a
+    // parent room the invitee may have no business knowing about, and sidebar
+    // placement means nothing before the invite is accepted.
+    std::vector<RoomEvent> get_invite_state(const std::string& room_id,
+                                            const std::string& invitee);
     std::optional<RoomEvent> get_state_event(const std::string& room_id, const std::string& event_type, const std::string& state_key);
     std::optional<RoomEvent> get_event_by_id(const std::string& event_id);
 

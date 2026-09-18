@@ -710,7 +710,17 @@ void RoomHandler::handle_leave(const httplib::Request& req, httplib::Response& r
     }
 
     auto& room_id = match.params["roomId"];
-    if (!store_.is_room_member(room_id, *user_id)) {
+    // Declining an invite is a leave. Matrix has no separate endpoint for it,
+    // and this used to be `is_room_member`, which is join-only — so an invitee
+    // could accept but not refuse, and a client's Decline button would have had
+    // nothing to call. It only became reachable once /sync started telling
+    // people they had been invited at all.
+    //
+    // Enumerated rather than "anything but leave": writing 'leave' over a 'ban'
+    // row would quietly lift the ban, and 'knock' is not a membership this
+    // server issues.
+    const auto current = store_.get_membership(room_id, *user_id);
+    if (current != std::string(membership::kJoin) && current != std::string(membership::kInvite)) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(), "application/json");
         return;
