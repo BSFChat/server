@@ -2465,8 +2465,11 @@ TEST(SendEventGates, AMutedUserCannotReactOrSendAnArbitraryEventType) {
     f.store->set_membership(room, alice, "join");
     f.store->set_membership(room, mod, "join");
 
-    // Muted in this channel: SEND_MESSAGES explicitly denied.
-    deny_in_channel(f, room, mod, alice, permission::kSendMessages);
+    // Muted in this channel. Both bits, because reactions have their own
+    // permission now — muting someone means they cannot post OR react, and a
+    // moderator UI that offers "mute" should clear both.
+    deny_in_channel(f, room, mod, alice,
+                    permission::kSendMessages | permission::kAddReactions);
 
     EventHandler handler(*f.store, *f.sync, f.config);
     const auto send = [&](const std::string& type, const json& content) {
@@ -2806,4 +2809,252 @@ TEST(TrustedProxies, PublicNetworksAreNotMistakenForPrivateOnes) {
         ASSERT_TRUE(net.has_value()) << bad;
         EXPECT_FALSE(is_private_or_loopback_network(*net)) << bad;
     }
+}
+
+// ── Reactions: their own permission, a validated shape, and idempotence ────
+
+TEST(Reactions, AreGatedSeparatelyFromSendingMessages) {
+    Fixture f;
+    auto mod = f.add_user("mod");      // oldest account: the owner, so not muteable
+    auto alice = f.add_user("alice");
+    bootstrap_roles(*f.store, *f.sync, f.config);
+
+    auto room = generate_room_id("test");
+    f.store->create_room(room, mod);
+    f.store->set_membership(room, mod, "join");
+    f.store->set_membership(room, alice, "join");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    const auto post = [&](const std::string& token, const std::string& txn) {
+        auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.room.message/" + txn,
+                                token, json{{"msgtype", "m.text"}, {"body", "hi"}}.dump());
+        httplib::Response res;
+        handler.handle_send_event(req, res);
+        return res;
+    };
+    const auto react = [&](const std::string& txn, const std::string& target,
+                           const std::string& key) {
+        auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.reaction/" + txn,
+                                "token-alice",
+                                json{{"m.relates_to", {{"rel_type", "m.annotation"},
+                                                       {"event_id", target},
+                                                       {"key", key}}}}.dump());
+        httplib::Response res;
+        handler.handle_send_event(req, res);
+        return res;
+    };
+
+    auto msg = post("token-mod", "m1");
+    ASSERT_TRUE(IsOk(msg));
+    const std::string target = json::parse(msg.body).at("event_id");
+
+    // A read-mostly channel: alice may react but not post. This arrangement is
+    // the reason reactions did not simply inherit SEND_MESSAGES.
+    deny_in_channel(f, room, mod, alice, permission::kSendMessages);
+    EXPECT_EQ(post("token-alice", "a1").status, 403);
+    EXPECT_TRUE(IsOk(react("r1", target, "👍"))) << "denying posts must not deny reactions";
+}
+
+TEST(Reactions, ExistingRolesKeepReactingAfterTheUpgrade) {
+    // The regression this guards is the whole reason ADD_REACTIONS is
+    // backfilled: kEveryoneDefault only seeds a NEW deployment, so without the
+    // backfill the first restart after upgrading would leave every stored role
+    // short of the bit and nobody on the server able to react.
+    Fixture f;
+    auto owner = f.add_user("owner");
+    auto alice = f.add_user("alice");
+
+    // A server as it was BEFORE the upgrade: roles already seeded, with the
+    // permission bits a pre-ADD_REACTIONS build would have written, and the
+    // backfill marker never set. Written directly rather than by seeding and
+    // then clearing, because the marker cannot be unset — which is the point of
+    // it, and would make a "rewound" fixture lie about the state under test.
+    {
+        ServerRolesContent c;
+        ServerRole everyone;
+        everyone.id = permission::role_id::kEveryone;
+        everyone.name = "@everyone";
+        everyone.position = 0;
+        everyone.permissions = permission::kViewChannel | permission::kSendMessages |
+                               permission::kAttachFiles | permission::kEmbedLinks |
+                               permission::kChangeNickname;
+        c.roles.push_back(everyone);
+        json j;
+        to_json(j, c);
+        f.store->set_server_state(std::string(event_type::kServerRoles), "", "@server:test",
+                                  j.dump());
+    }
+    {
+        auto roles = f.store->get_server_roles();
+        auto everyone = std::find_if(roles.begin(), roles.end(), [](const ServerRole& r) {
+            return r.id == permission::role_id::kEveryone;
+        });
+        ASSERT_NE(everyone, roles.end());
+        ASSERT_FALSE(permission::has(everyone->permissions, permission::kAddReactions));
+    }
+
+    auto room = generate_room_id("test");
+    f.store->create_room(room, owner);
+    f.store->set_membership(room, owner, "join");
+    f.store->set_membership(room, alice, "join");
+    EventHandler handler(*f.store, *f.sync, f.config);
+
+    auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.room.message/m1",
+                            "token-owner", json{{"msgtype", "m.text"}, {"body", "hi"}}.dump());
+    httplib::Response res;
+    handler.handle_send_event(req, res);
+    ASSERT_TRUE(IsOk(res));
+    const std::string target = json::parse(res.body).at("event_id");
+
+    const auto react = [&](const std::string& txn) {
+        auto rq = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.reaction/" + txn,
+                               "token-alice",
+                               json{{"m.relates_to", {{"rel_type", "m.annotation"},
+                                                      {"event_id", target},
+                                                      {"key", "👍"}}}}.dump());
+        httplib::Response rs;
+        handler.handle_send_event(rq, rs);
+        return rs;
+    };
+
+    EXPECT_EQ(react("r1").status, 403) << "pre-upgrade state: the bit really is missing";
+
+    // The restart. bootstrap_roles runs on every start, and this is the step
+    // that makes the new permission invisible to an existing deployment.
+    bootstrap_roles(*f.store, *f.sync, f.config);
+    EXPECT_TRUE(IsOk(react("r2"))) << "the upgrade took reacting away from an existing server";
+
+    // ...and it does not fight an operator who later removes the permission on
+    // purpose. A second restart must not hand it back.
+    {
+        ServerRolesContent c;
+        c.roles = f.store->get_server_roles();
+        for (auto& r : c.roles) r.permissions &= ~permission::kAddReactions;
+        json j;
+        to_json(j, c);
+        f.store->set_server_state(std::string(event_type::kServerRoles), "", "@server:test",
+                                  j.dump());
+    }
+    bootstrap_roles(*f.store, *f.sync, f.config);
+    EXPECT_EQ(react("r3").status, 403) << "the backfill re-ran and overrode a deliberate change";
+}
+
+TEST(Reactions, DuplicatesAreIdempotentAndUnreactingStillWorks) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.room.message/m1",
+                            "token-alice", json{{"msgtype", "m.text"}, {"body", "hi"}}.dump());
+    httplib::Response res;
+    handler.handle_send_event(req, res);
+    ASSERT_TRUE(IsOk(res));
+    const std::string target = json::parse(res.body).at("event_id");
+
+    const auto react = [&](const std::string& txn, const std::string& key) {
+        auto rq = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.reaction/" + txn,
+                               "token-alice",
+                               json{{"m.relates_to", {{"rel_type", "m.annotation"},
+                                                      {"event_id", target},
+                                                      {"key", key}}}}.dump());
+        httplib::Response rs;
+        handler.handle_send_event(rq, rs);
+        EXPECT_TRUE(IsOk(rs)) << rs.body;
+        return json::parse(rs.body).at("event_id").get<std::string>();
+    };
+
+    const auto first = react("r1", "👍");
+    // A different txn id, so this is not the transaction replay path: it is the
+    // same person pressing the same emoji again, which used to store a second
+    // event and render them twice in one bubble.
+    EXPECT_EQ(react("r2", "👍"), first);
+    EXPECT_EQ(count_events_of_type(f, room, "m.reaction"), 1);
+
+    // A different emoji is a different reaction.
+    EXPECT_NE(react("r3", "🎉"), first);
+    EXPECT_EQ(count_events_of_type(f, room, "m.reaction"), 2);
+
+    // Un-reacting is a redaction of the reaction event — and afterwards the
+    // same emoji must work again. If redacted reactions counted as duplicates,
+    // a reaction could be taken back but never put back.
+    ASSERT_TRUE(f.store->redact_event(first, alice));
+    const auto again = react("r4", "👍");
+    EXPECT_NE(again, first);
+}
+
+TEST(Reactions, AnotherUserReactingWithTheSameKeyIsNotADuplicate) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+    f.store->set_membership(room, bob, "join");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.room.message/m1",
+                            "token-alice", json{{"msgtype", "m.text"}, {"body", "hi"}}.dump());
+    httplib::Response res;
+    handler.handle_send_event(req, res);
+    ASSERT_TRUE(IsOk(res));
+    const std::string target = json::parse(res.body).at("event_id");
+
+    const auto react = [&](const std::string& token, const std::string& txn) {
+        auto rq = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.reaction/" + txn,
+                               token,
+                               json{{"m.relates_to", {{"rel_type", "m.annotation"},
+                                                      {"event_id", target},
+                                                      {"key", "👍"}}}}.dump());
+        httplib::Response rs;
+        handler.handle_send_event(rq, rs);
+        EXPECT_TRUE(IsOk(rs)) << rs.body;
+        return json::parse(rs.body).at("event_id").get<std::string>();
+    };
+
+    // The count on a reaction bubble is the number of DISTINCT people.
+    EXPECT_NE(react("token-alice", "r1"), react("token-bob", "r2"));
+    EXPECT_EQ(count_events_of_type(f, room, "m.reaction"), 2);
+}
+
+TEST(Reactions, TheKeyIsRequiredAndBounded) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.room.message/m1",
+                            "token-alice", json{{"msgtype", "m.text"}, {"body", "hi"}}.dump());
+    httplib::Response res;
+    handler.handle_send_event(req, res);
+    ASSERT_TRUE(IsOk(res));
+    const std::string target = json::parse(res.body).at("event_id");
+
+    const auto react = [&](const std::string& txn, const json& rel) {
+        auto rq = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.reaction/" + txn,
+                               "token-alice", json{{"m.relates_to", rel}}.dump());
+        httplib::Response rs;
+        handler.handle_send_event(rq, rs);
+        return rs.status;
+    };
+
+    const json base = {{"rel_type", "m.annotation"}, {"event_id", target}};
+    json no_key = base;
+    EXPECT_EQ(react("k1", no_key), 400);
+    json empty_key = base; empty_key["key"] = "";
+    EXPECT_EQ(react("k2", empty_key), 400);
+    json huge = base; huge["key"] = std::string(limits::kMaxReactionKeyLength + 1, 'x');
+    EXPECT_EQ(react("k3", huge), 400);
+
+    // A long ZWJ emoji sequence with modifiers is well inside the bound — this
+    // is what the ceiling has to accommodate to be a storage bound rather than
+    // an accidental emoji policy.
+    json family = base; family["key"] = "👨‍👩‍👧‍👦";
+    EXPECT_GT(family["key"].get<std::string>().size(), 20u);
+    EXPECT_LE(family["key"].get<std::string>().size(), limits::kMaxReactionKeyLength);
+    EXPECT_EQ(react("k4", family), -1) << "a handler that succeeds leaves the status untouched";
 }

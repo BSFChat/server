@@ -1296,6 +1296,37 @@ std::optional<std::string> SqliteStore::get_edit_pointer(const std::string& even
     return reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
 }
 
+std::optional<std::string> SqliteStore::find_reaction_event(const std::string& room_id,
+                                                           const std::string& sender,
+                                                           const std::string& target_event_id,
+                                                           const std::string& key) {
+    if (room_id.empty() || sender.empty() || target_event_id.empty()) return std::nullopt;
+    std::lock_guard lock(mutex_);
+    // The relation lives inside the content JSON, so this reads it with
+    // json_extract rather than a column. `m.relates_to` has to be quoted in the
+    // path: an unquoted dot is a path separator, so '$.m.relates_to.event_id'
+    // would look for a member "relates_to" of a member "m" and always miss.
+    //
+    // Narrowed by (room_id, event_type, sender) before any JSON is touched, and
+    // reactions are a small slice of a room, so this is not the scan it looks
+    // like. redacted_by IS NULL is what keeps un-react/re-react working.
+    auto stmt = prepare(db_,
+        "SELECT event_id FROM events "
+        " WHERE room_id = ? AND event_type = ? AND sender = ? AND redacted_by IS NULL "
+        "   AND json_valid(content) "
+        "   AND json_extract(content, '$.\"m.relates_to\".event_id') = ? "
+        "   AND IFNULL(json_extract(content, '$.\"m.relates_to\".key'), '') = ? "
+        " ORDER BY stream_position ASC LIMIT 1");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, std::string(event_type::kReaction).c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, sender.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, target_event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 5, key.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    return column_text_or_empty(stmt.get(), 0);
+}
+
 bool SqliteStore::is_event_redacted(const std::string& event_id) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_, "SELECT redacted_by FROM events WHERE event_id = ?");

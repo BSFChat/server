@@ -77,20 +77,28 @@ SendGate send_gate_for(std::string_view evt_type) {
     if (evt_type == event_type::kRoomMessage) {
         return {true, permission::kSendMessages};
     }
-    // A reaction is a message the user is putting in the room, so it answers to
-    // the same permission. Discord has a separate ADD_REACTIONS bit and this
-    // server has no equivalent; inventing one is a permissions-model change,
-    // not a fix for this defect, and SEND_MESSAGES is the conservative reading
-    // in the meantime — nobody who can post text is newly blocked, and everyone
-    // who was muted now actually is.
+    // Its own permission, not SEND_MESSAGES. "Everyone may react, only a few
+    // may post" is an ordinary read-mostly channel, and folding reactions into
+    // SEND_MESSAGES would take that arrangement away in the course of fixing a
+    // different problem. ADD_REACTIONS is in kEveryoneDefault and is backfilled
+    // onto existing roles, so nobody loses the ability to react on upgrade —
+    // what changes is that denying it now works at all.
     if (evt_type == event_type::kReaction) {
-        return {true, permission::kSendMessages};
+        return {true, permission::kAddReactions};
     }
     // Call signalling. VIEW_CHANNEL only, which is the same gate
     // VoiceHandler::handle_voice_join applies — these are the events an
     // in-call client exchanges, and a participant who may be in the channel may
     // signal in it. They are addressed events (see the signal_to handling in
     // SqliteStore::insert_event), not room-wide chatter.
+    //
+    // bsfchat.call.negotiate is in this list on purpose, and its absence would
+    // be a field break rather than a tightening: VoiceEngine.cpp sends it
+    // mid-call to add RTP video m-lines to an established call, so refusing it
+    // would leave video renegotiation failing on a call that had already
+    // connected. m.call.member is a state event the server writes itself
+    // (VoiceHandler), never one a client PUTs here, so it is listed for
+    // completeness rather than because anything sends it.
     if (evt_type == event_type::kCallInvite || evt_type == event_type::kCallAnswer ||
         evt_type == event_type::kCallCandidates || evt_type == event_type::kCallHangup ||
         evt_type == event_type::kCallNegotiate || evt_type == event_type::kCallMember) {
@@ -332,6 +340,22 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
         if (target_id.empty()) {
             return send_error(res, 400, MatrixError::bad_json("Reaction missing target event_id"));
         }
+        // The key is the emoji, and it is what a client groups and counts by.
+        // An empty one aggregates into a bubble with no label; an unbounded one
+        // is an arbitrary attacker-chosen string stored per reaction and sent to
+        // every member of the room on every sync. The ceiling is generous —
+        // a long ZWJ emoji sequence with skin-tone modifiers runs to tens of
+        // bytes — and this is a storage bound, not an emoji validator: deciding
+        // what counts as an emoji is a client concern and a moving target.
+        const std::string key = rel->value("key", "");
+        if (key.empty()) {
+            return send_error(res, 400, MatrixError::bad_json("Reaction missing key"));
+        }
+        if (key.size() > limits::kMaxReactionKeyLength) {
+            return send_error(res, 400, MatrixError::invalid_param(
+                "Reaction key must be at most " +
+                std::to_string(limits::kMaxReactionKeyLength) + " bytes"));
+        }
         auto target = store_.get_event_by_id(target_id);
         if (!target) {
             return send_error(res, 404, MatrixError::not_found("Reaction target does not exist"));
@@ -347,6 +371,24 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
         if (store_.is_event_redacted(target_id)) {
             return send_error(res, 404, MatrixError::not_found(
                 "Reaction target has been deleted"));
+        }
+
+        // Reacting twice with the same emoji is idempotent, not an error.
+        //
+        // 200 with the existing event id, exactly like the transaction-id
+        // replay above, because that is what the situation actually is: a
+        // second request for a state the server is already in. A 403 or a 409
+        // would put an error in front of a user who double-tapped, and the
+        // client has nowhere sensible to put it. Storing a second event instead
+        // — which is what happened before — rendered the same person twice in
+        // the same reaction bubble.
+        //
+        // Un-reacting is a redaction of the reaction event, and a redacted
+        // reaction is not a duplicate (see find_reaction_event), so react →
+        // unreact → react still works.
+        if (auto existing = store_.find_reaction_event(room_id, *user_id, target_id, key)) {
+            res.set_content(json{{"event_id", *existing}}.dump(), "application/json");
+            return;
         }
     }
 

@@ -308,6 +308,22 @@ public:
     // The replacement currently winning for an event, or nullopt if unedited.
     std::optional<std::string> get_edit_pointer(const std::string& event_id);
 
+    // An existing, un-redacted m.reaction from `sender` in `room_id` annotating
+    // `target_event_id` with `key`, if there is one.
+    //
+    // Exists so a duplicate reaction is idempotent rather than a second event:
+    // the client renders one bubble per reaction EVENT, so pressing the same
+    // emoji twice used to show the same person twice.
+    //
+    // Redacted reactions are deliberately excluded, and that exclusion is
+    // load-bearing rather than tidiness: un-reacting IS redacting the reaction
+    // event (MatrixClient::unreact), so treating a redacted one as a duplicate
+    // would make a reaction impossible to take back and put back.
+    std::optional<std::string> find_reaction_event(const std::string& room_id,
+                                                   const std::string& sender,
+                                                   const std::string& target_event_id,
+                                                   const std::string& key);
+
     // True if the event has been redacted. get_event_by_id() cannot answer this
     // — a redacted event and a legitimately contentless one both read as `{}`.
     bool is_event_redacted(const std::string& event_id);

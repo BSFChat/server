@@ -22,7 +22,7 @@ e2e scripts pass.
 | 4 | `/send` applied no permission gate to any type but `m.room.message` | **High** | Fixed |
 | 5 | No rate limit on send, redact or media upload | **Medium** | Fixed (`[limits]`) |
 | 6 | Transaction ids scoped too widely: cross-room and cross-device collisions | **Medium** | Fixed (schema v20) |
-| 7 | Reaction targets unvalidated | **Medium** | Fixed — *shape decision pending, see below* |
+| 7 | Reactions: no permission gate, unvalidated target and key, no dedup | **Medium** | Fixed (approved by Josh) |
 | 8 | Password policy was a length floor only | **Medium** | Fixed |
 | 9 | `device_id` unvalidated and unbounded | **Medium** | Fixed |
 | 10 | A password change could be a no-op that still revoked every session | **Low** | Fixed |
@@ -36,7 +36,7 @@ e2e scripts pass.
 | 18 | Account enumeration through `/register` | — | Partly unavoidable, **not fixed** |
 | 19 | Auth events absent from `AuditLog` | — | **Not fixed, by design** |
 | 20 | Localpart homoglyph impersonation (`l`/`1`, `0`/`o`) | Low | **Not fixed — needs a decision** |
-| 21 | Reactions have no dedup | Low | **Not fixed — needs a decision** |
+| 21 | Reactions have no dedup | Low | Fixed, folded into finding 7 |
 | 22 | `/redact` parses a txn id and ignores it | Low | **Not fixed** |
 
 ---
@@ -150,14 +150,28 @@ default is what produced the hole; adding a sendable type should be a deliberate
 | Type | Gate |
 |---|---|
 | `m.room.message` | `SEND_MESSAGES` (+ the existing content gates: attach / embed / mention-everyone, and slowmode) |
-| `m.reaction` | `SEND_MESSAGES` |
+| `m.reaction` | `ADD_REACTIONS` (see finding 7) |
 | `m.call.invite` / `answer` / `candidates` / `hangup`, `bsfchat.call.negotiate`, `m.call.member` | `VIEW_CHANNEL` only — the same gate `VoiceHandler::handle_voice_join` applies |
 | anything else | refused, 403 |
 
-Reactions gate on `SEND_MESSAGES` because this server has no `ADD_REACTIONS` bit. Adding one is
-a permissions-model change (and `Permissions.h` is being edited on `feat/bots`), not a fix for
-this defect. `SEND_MESSAGES` is the conservative reading: nobody who can post text is newly
-blocked, and everyone who was muted now actually is.
+The list was verified against what actually sends, not derived from `Constants.h`:
+
+* **Client.** `MatrixClient::sendRoomEvent` is the generic call site and has exactly one
+  caller, `ServerConnection.cpp:1146`, which passes `"m.room.message"`. `sendReaction` posts
+  `m.reaction`. `sendCallEvent` is driven by `VoiceEngine`, which sends five types —
+  including **`bsfchat.call.negotiate`**, which was missing from the proposed list. Omitting
+  it would not have been a tightening but a field break: it carries mid-call SDP
+  renegotiation to add video to an established call, so video would have started failing on
+  calls that had already connected.
+* **Reference bot** (`examples/python-bot/bsfchat_bot.py`): `send_text`, `send_html` →
+  `m.room.message`; `react` → `m.reaction`. It also exposes a generic
+  `send_event(room, type, content)`, and `docs/bots.md` §6 documents
+  `PUT .../send/{eventType}/{txnId}` as a general endpoint — so a third-party bot using a
+  custom event type **will now get a 403**. That is the intended consequence of deny-by-default,
+  but it needs a line in `docs/bots.md`, which lives on another branch (see the report).
+
+`m.call.member` is listed for completeness; it is a state event `VoiceHandler` writes itself
+and no client PUTs it here.
 
 State events are absent from the table because they belong on `PUT /rooms/{id}/state/...`, which
 has its own per-type authorisation in `RoomHandler`.
@@ -204,39 +218,59 @@ in flight across the upgrade could post twice, on a server that has just restart
 The retry-dedup property migration v6 was written for is now covered by a test, alongside the
 per-room and per-device cases.
 
-### 7. Reaction targets unvalidated — MEDIUM (shape decision pending)
+### 7. Reactions: no gate, unvalidated target and key, no dedup — MEDIUM
 
-A reaction names the event it annotates and that was taken entirely on trust: any string was
-accepted, including the id of an event in a room the sender cannot see. The reaction was then
-stored in *this* room referring to an event that is not in it.
+Four problems in one event type, fixed together to Josh's approved spec.
 
-**What is now accepted, unchanged from what the client sends:**
+**A permission of their own.** Reactions now answer to `ADD_REACTIONS`
+(`permission::kAddReactions`, bit 14 — bit 13 is `MANAGE_BOTS` on the bot-accounts
+branch), not to `SEND_MESSAGES`. Folding them into `SEND_MESSAGES` would have closed the
+hole while taking away an ordinary arrangement: a read-mostly channel where everyone may
+react and only a few may post. It is in `kEveryoneDefault` and `kAllFlags`, so nothing
+becomes privileged — what changes is that *denying* it now works.
+
+> **Upgrade hazard, handled.** `kEveryoneDefault` only seeds a **new** deployment.
+> An existing server stored `@everyone`'s permissions as a number in its `server.roles`
+> event at first start, and `bootstrap_roles` re-seeds only when roles are missing or
+> legacy-shaped. Shipping the flag without more would therefore have left every existing
+> role short of bit 14 and **nobody on the server able to react** — the precise regression
+> that putting it in `kEveryoneDefault` was meant to prevent. `backfill_add_reactions()`
+> grants the bit, once, to every role that already had `SEND_MESSAGES`, marked in `meta`
+> so an operator who later removes it is not overruled on the next restart. Tested from
+> both directions.
+
+**Target validation.** The annotated event id was taken entirely on trust — any string was
+accepted, including the id of an event in a room the sender cannot see, which then sat in
+*this* room's timeline referring to an event that is not in it.
+
+**Key validation.** The key was unbounded and could be empty: an attacker-chosen string
+stored per reaction and pushed to every member of the room on every sync. Bounded at
+`limits::kMaxReactionKeyLength` (64 bytes — a ZWJ family sequence is 25, so this is a
+storage bound and not an accidental emoji policy) and required to be non-empty.
+
+**Duplicates are idempotent.** The same `(sender, target, key)` returns 200 with the
+existing event id, exactly as a transaction replay does, rather than storing a second
+event that renders the same person twice in one bubble. A 403 or 409 would put an error
+in front of someone who double-tapped. Redacted reactions are deliberately excluded from
+the duplicate check, and that exclusion is load-bearing: un-reacting *is* redacting the
+reaction event, so counting a redacted one as a duplicate would make a reaction
+impossible to take back and put back.
+
+**What is accepted**, unchanged from what the client sends:
 
 ```json
 {"m.relates_to": {"rel_type": "m.annotation", "event_id": "$...", "key": "👍"}}
 ```
 
-**What is now refused:**
-
 | Condition | Response |
 |---|---|
-| `m.relates_to` missing, not an object, or `rel_type` != `m.annotation` | 400 `M_BAD_JSON` |
-| `event_id` empty or missing | 400 `M_BAD_JSON` |
-| target event does not exist | 404 |
-| target event exists but is in another room | 404 — deliberately the same answer, since "real, but elsewhere" is the confirmation being withheld |
-| target event is redacted | 404 (matches how edits already treat a redacted target) |
-| sender lacks `SEND_MESSAGES` | 403 |
-
-`key` is **not** validated at all: any value, including absent or empty, is still accepted.
-That was deliberate — narrowing it is a wire-shape decision.
-
-> **This landed on the branch before the request to propose it first arrived.** It is confined
-> to one block in `EventHandler::handle_send_event` in commit `e35cbf7` and can be dropped
-> without touching the permission gate in finding 4. The client's `sendReaction` always sends
-> all three fields and always targets an event in the room being viewed, so no existing flow is
-> refused. The two behaviour changes worth weighing are that reacting to a *redacted* event now
-> fails (a client would show an error toast), and that reacting to an event the server does not
-> have — an optimistic local id, say — now 404s instead of silently storing a dangling reaction.
+| `m.relates_to` missing/not an object, or `rel_type` != `m.annotation` | 400 `M_BAD_JSON` |
+| `event_id` missing or empty | 400 `M_BAD_JSON` |
+| `key` missing or empty | 400 `M_BAD_JSON` |
+| `key` longer than 64 bytes | 400 `M_INVALID_PARAM` |
+| target does not exist, is in another room, or is redacted | 404 (same answer for all three — "real, but elsewhere" is the confirmation being withheld) |
+| sender lacks `ADD_REACTIONS` | 403 |
+| same `(sender, target, key)` already reacted | **200**, existing event id |
 
 ### 8. Password policy was a length floor only — MEDIUM
 
@@ -491,8 +525,13 @@ recommendation below.
    ones. `DELETE FROM access_tokens;` logs everyone out once and they sign in again. Whether a
    self-hosted instance with a known user list warrants that is Josh's call — it is disruptive,
    and the attack needs sustained online spraying that would be visible in the logs.
-2. **Decide on findings 20, 21 and 22**, all of which are product calls rather than defects.
-3. **The `m.reaction` shape in finding 7** needs sign-off, per the note there.
-4. A dedicated `ADD_REACTIONS` permission bit, if reactions should be mutable separately from
-   messages. Touches `Permissions.h`, which `feat/bots` is also editing — worth sequencing after
-   that branch.
+2. **Decide on findings 20 and 22**, both product calls rather than defects.
+3. **`docs/bots.md` is now wrong in two places** and lives on the bot-docs branch: §6 presents
+   `send/{eventType}` as accepting any type (deny-by-default now refuses unknown ones), and the
+   reaction section states "No server-side validation of any kind: the target is not checked for
+   existence, room membership or visibility, and duplicates are not deduplicated" — all four of
+   which are now false.
+4. **The client's `PermissionMath.h` needs `kAddReactions`.** Its
+   `everyEnforcedPermissionHasASwitchInTheRoleEditor` test reconstructs the role editor's mask
+   from QML and compares it to `kAllFlags`, so adding a flag correctly breaks it until the
+   editor gains a switch. Not touched here.
