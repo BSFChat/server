@@ -5,8 +5,7 @@ Scope: the registration and authentication path (`api/AuthHandler`, `auth/LocalA
 v7 hashed/expiring migration, and the `[auth]` limits block), plus the abuse surface past
 authentication (`api/EventHandler`, `api/MediaHandler`).
 
-Branch: `harden/auth` in both `server/` and `protocol/`. Tests went 621 → 654 (unit), and the
-e2e scripts pass.
+Branch: `harden/auth` in both `server/` and `protocol/`. Tests went 621 → 659 (unit), and the e2e scripts pass.
 
 **The two repositories must land together.** See [Production notes](#production-notes).
 
@@ -485,6 +484,35 @@ namespace. Worth doing; not worth widening this branch for. The redact limiter n
 duplicate events a loop can produce.
 
 ---
+
+## Branch coordination
+
+Three branches, two repositories, and they land together:
+
+| Repo | Branch | Contains |
+|---|---|---|
+| `protocol/` | `harden/auth` | CSPRNG identifiers, `ADD_REACTIONS` (bit 14), `m.reaction`/`m.annotation` names, the reaction-key bound |
+| `server/` | `harden/auth` | everything else here |
+| `server/` | `trial/rebase-onto-bots` | the same server work rebased onto `feat/bots`, kept so the sequencing is already proven |
+
+`server/harden/auth` **will not compile against protocol `main`** — that is deliberate. It
+`#error`s on the missing `BSFCHAT_PROTOCOL_CSPRNG_IDENTIFIERS`, because the server otherwise
+falls back to fetching protocol `main` from GitHub and would silently issue 32-bit tokens.
+Push the protocol branch first.
+
+**Against `feat/bots`,** which was at three commits when this was written:
+
+* Schema versions collide. `feat/bots` takes v19; rebased, this work becomes **v20**
+  (refresh-token families) and **v21** (the transaction-id key).
+* Permission bits do not collide: `MANAGE_BOTS` is 13, `ADD_REACTIONS` is 14. `kAllFlags` needs
+  both, which is the one conflict hunk in `protocol/include/bsfchat/Permissions.h`.
+* Both branches independently found and fixed the same defect in
+  `LegacyUpgrade.DirectMarkerBackfillTouchesOnlyCurrentStateAndIsIdempotent` (it rewound to
+  `kTargetSchemaVersion - 1` to re-run v18, which stops exercising v18 the moment anything is
+  appended). Their write-up is the fuller one and is the one kept in the trial rebase.
+
+Verified, not predicted: `trial/rebase-onto-bots` against both protocol branches merged builds
+clean and runs **704/704** tests — this work's and the bot work's together.
 
 ## Production notes
 
