@@ -2,6 +2,7 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
+#include "http/RateLimitResponse.h"
 #include "storage/MediaStorage.h"
 #include "store/SqliteStore.h"
 
@@ -114,8 +115,9 @@ bool ranges_unsatisfiable(const httplib::Ranges& ranges, size_t content_length) 
 } // namespace
 
 MediaHandler::MediaHandler(SqliteStore& store, const Config& config,
-                           std::shared_ptr<MediaStorage> storage)
-    : store_(store), config_(config), storage_(std::move(storage)) {
+                           std::shared_ptr<MediaStorage> storage, LimiterClock clock)
+    : store_(store), config_(config), storage_(std::move(storage))
+    , limits_(config.send_limits, std::move(clock)) {
 }
 
 std::string MediaHandler::generate_media_id() const {
@@ -139,6 +141,19 @@ void MediaHandler::handle_upload(const httplib::Request& req, httplib::Response&
         res.set_content(R"({"errcode":"M_UNKNOWN_TOKEN","error":"Invalid or missing access token"})",
                         "application/json");
         return;
+    }
+
+    // Per-account upload ceiling, before the body is written anywhere.
+    //
+    // It cannot come any earlier than this — the limiter keys on the account,
+    // which is only known once the token has resolved — and by the time this
+    // runs httplib has already buffered the request body in memory. So this
+    // bounds STORAGE growth and the number of media rows an account can create,
+    // not the bandwidth it can spend; the byte ceiling on any single request is
+    // Server::set_payload_max_length(), configured from max_upload_size_mb.
+    if (const auto wait = limits_.acquire(SendLimiter::Bucket::kMediaUpload, *user_id)) {
+        return send_rate_limited(res, wait,
+                                 SendLimiter::message_for(SendLimiter::Bucket::kMediaUpload));
     }
 
     // No copy: `auto body = req.body` duplicated the entire upload, doubling

@@ -94,10 +94,14 @@ pass "config honoured: database created at $DB"
 grep -q "Database: $DB" "$LOG" || fail "server log does not report the configured database path"
 pass "no fallback database was created"
 
-# The schema this test is about.
+# The schema this test is about. A FLOOR, not an exact match: the subject is
+# the v16 audit_log filter indexes, which every later schema still carries, and
+# an exact pin here simply breaks on the next migration (it had already been
+# failing at 16 against a v18 schema, unnoticed, because no ctest label runs
+# this script).
 VER=$(python3 -c 'import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute("PRAGMA user_version").fetchone()[0])' "$DB")
-[ "$VER" = "16" ] || fail "expected schema v16, got v$VER"
-pass "fresh database is at schema v16"
+[ "$VER" -ge 16 ] 2>/dev/null || fail "expected schema v16 or newer, got v$VER"
+pass "fresh database is at schema v$VER (>= 16, which is where the filter indexes arrived)"
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 api() {
@@ -118,7 +122,7 @@ register() {
     local user=$1
     local out
     out=$(api POST /_matrix/client/v3/register "" \
-        "{\"username\":\"$user\",\"password\":\"password123\",\"auth\":{\"type\":\"m.login.dummy\"}}")
+        "{\"username\":\"$user\",\"password\":\"e2e-correct-horse-7\",\"auth\":{\"type\":\"m.login.dummy\"}}")
     [ "$(status "$out")" = "200" ] || { echo "$out" >&2; fail "register $user failed"; }
     body "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
 }

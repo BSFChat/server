@@ -108,7 +108,7 @@ register() {
     local user=$1
     local out
     out=$(api POST /_matrix/client/v3/register "" \
-        "{\"username\":\"$user\",\"password\":\"password123\",\"auth\":{\"type\":\"m.login.dummy\"}}")
+        "{\"username\":\"$user\",\"password\":\"e2e-correct-horse-7\",\"auth\":{\"type\":\"m.login.dummy\"}}")
     [ "$(status "$out")" = "200" ] || { echo "$out" >&2; fail "register $user failed"; }
     body "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
 }

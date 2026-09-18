@@ -6,6 +6,8 @@
 #include "api/AuthHandler.h"
 #include "api/EventHandler.h"
 #include "api/ProfileHandler.h"
+#include "core/RateLimiter.h"
+#include "http/ClientAddress.h"
 #include "api/RoomHandler.h"
 #include "auth/AutoJoin.h"
 #include "auth/LocalAuth.h"
@@ -2430,6 +2432,14 @@ void deny_in_channel(Fixture& f, const std::string& room, const std::string& act
                           "user:" + user_id, ov_json.dump(), now_ms());
 }
 
+// Moves time instead of sleeping out a rate-limit window. Same shape as the
+// one in test_auth.cpp, which the auth limiter's tests use.
+struct FakeClock {
+    std::shared_ptr<int64_t> now = std::make_shared<int64_t>(1'000'000);
+    LimiterClock fn() const { return [n = now] { return *n; }; }
+    void advance_s(int64_t s) { *now += s * 1000; }
+};
+
 int count_events_of_type(Fixture& f, const std::string& room, const std::string& type) {
     auto [events, _] = f.store->get_room_events_paginated(room, 200, "b");
     return static_cast<int>(std::count_if(events.begin(), events.end(),
@@ -2623,4 +2633,177 @@ TEST(SendEventGates, TransactionIdsAreScopedPerRoomAndPerDevice) {
     // request is still deduplicated.
     EXPECT_EQ(send(room_a, "token-alice", "in A"), first);
     EXPECT_EQ(count_events_of_type(f, room_a, "m.room.message"), 2);
+}
+
+// ── Send-side rate limiting ───────────────────────────────────────────────
+//
+// Until this existed, everything past authentication was unmetered: the auth
+// limiter covers /login, /register, /refresh and /account/password and nothing
+// covered /send, /redact or media upload. A looping client or a buggy bot
+// could fill a channel as fast as the socket allowed.
+
+TEST(SendLimits, AnAccountCannotOutrunItsSendBudgetAcrossConnections) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    // A second session for the SAME account, which is the thing a per-token or
+    // per-connection limit would hand a fresh budget to for free.
+    f.store->store_access_token("alice-second", alice, "SECOND");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+
+    FakeClock clock;
+    f.config.send_limits.send_limit = 3;
+    f.config.send_limits.window_seconds = 60;
+    EventHandler handler(*f.store, *f.sync, f.config, nullptr, clock.fn());
+
+    int txn = 0;
+    const auto send = [&](const std::string& token) {
+        auto req = make_request(
+            "/_matrix/client/v3/rooms/" + room + "/send/m.room.message/t" + std::to_string(++txn),
+            token, json{{"msgtype", "m.text"}, {"body", "spam"}}.dump());
+        httplib::Response res;
+        handler.handle_send_event(req, res);
+        return res;
+    };
+
+    EXPECT_TRUE(IsOk(send("token-alice")));
+    EXPECT_TRUE(IsOk(send("token-alice")));
+    // Third from the OTHER session: same account, same budget.
+    EXPECT_TRUE(IsOk(send("alice-second")));
+
+    auto refused = send("alice-second");
+    EXPECT_EQ(refused.status, 429);
+    auto body = json::parse(refused.body);
+    EXPECT_EQ(body["errcode"], "M_LIMIT_EXCEEDED");
+    EXPECT_GT(body["retry_after_ms"].get<int64_t>(), 0);
+    ASSERT_TRUE(refused.has_header("Retry-After"));
+    const auto secs = std::stoll(refused.get_header_value("Retry-After"));
+    EXPECT_GE(secs, 1);
+    // Rounded up, never down — the same contract the auth limiter's 429 keeps.
+    EXPECT_GE(secs * 1000, body["retry_after_ms"].get<int64_t>());
+
+    // Nothing was written for the refused request.
+    EXPECT_EQ(count_events_of_type(f, room, "m.room.message"), 3);
+
+    // The window slides.
+    clock.advance_s(61);
+    EXPECT_TRUE(IsOk(send("token-alice")));
+}
+
+TEST(SendLimits, ARetryOfTheSameTransactionDoesNotSpendTheBudget) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+
+    FakeClock clock;
+    f.config.send_limits.send_limit = 2;
+    EventHandler handler(*f.store, *f.sync, f.config, nullptr, clock.fn());
+
+    const auto send = [&](const std::string& txn) {
+        auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.room.message/" + txn,
+                                "token-alice", json{{"msgtype", "m.text"}, {"body", "hi"}}.dump());
+        httplib::Response res;
+        handler.handle_send_event(req, res);
+        return res;
+    };
+
+    ASSERT_TRUE(IsOk(send("t1")));
+    // Retrying is the behaviour we ask clients for on a flaky connection.
+    // Charging it would punish exactly the client doing the right thing, and a
+    // flood is made of DISTINCT transactions by definition.
+    for (int i = 0; i < 20; ++i) ASSERT_TRUE(IsOk(send("t1")));
+    EXPECT_TRUE(IsOk(send("t2"))) << "retries consumed the budget";
+    EXPECT_EQ(send("t3").status, 429);
+}
+
+TEST(SendLimits, SendingAndDeletingHaveSeparateBudgets) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+
+    FakeClock clock;
+    f.config.send_limits.send_limit = 1;
+    f.config.send_limits.redact_limit = 5;
+    EventHandler handler(*f.store, *f.sync, f.config, nullptr, clock.fn());
+
+    auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.room.message/t1",
+                            "token-alice", json{{"msgtype", "m.text"}, {"body", "hi"}}.dump());
+    httplib::Response res;
+    handler.handle_send_event(req, res);
+    ASSERT_TRUE(IsOk(res));
+    const std::string event_id = json::parse(res.body).at("event_id");
+
+    // Send budget is now spent...
+    auto req2 = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.room.message/t2",
+                             "token-alice", json{{"msgtype", "m.text"}, {"body", "hi"}}.dump());
+    httplib::Response res2;
+    handler.handle_send_event(req2, res2);
+    ASSERT_EQ(res2.status, 429);
+
+    // ...but deleting is a separate counter, so the user can still clean up.
+    auto req3 = make_request(
+        "/_matrix/client/v3/rooms/" + room + "/redact/" + event_id + "/r1", "token-alice", "{}");
+    httplib::Response res3;
+    handler.handle_redact(req3, res3);
+    EXPECT_TRUE(IsOk(res3)) << res3.body;
+}
+
+TEST(SendLimits, TheMasterSwitchTurnsThemOff) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+
+    FakeClock clock;
+    f.config.send_limits.enabled = false;
+    f.config.send_limits.send_limit = 1;
+    EventHandler handler(*f.store, *f.sync, f.config, nullptr, clock.fn());
+
+    for (int i = 0; i < 10; ++i) {
+        auto req = make_request(
+            "/_matrix/client/v3/rooms/" + room + "/send/m.room.message/t" + std::to_string(i),
+            "token-alice", json{{"msgtype", "m.text"}, {"body", "hi"}}.dump());
+        httplib::Response res;
+        handler.handle_send_event(req, res);
+        ASSERT_TRUE(IsOk(res)) << "request " << i << ": " << res.body;
+    }
+}
+
+TEST(SendLimits, DefaultsAreFarAboveWhatAHumanCanDo) {
+    // The defaults exist to stop a loop, not to pace a conversation. If anyone
+    // ever lowers them into the range a person could reach by typing or by
+    // clicking reactions, that should be a deliberate edit with this test in
+    // front of them.
+    const Config cfg;
+    EXPECT_GE(cfg.send_limits.send_limit, 60);
+    EXPECT_GE(cfg.send_limits.redact_limit, 30);
+    EXPECT_GE(cfg.send_limits.media_upload_limit, 10);
+    EXPECT_EQ(cfg.send_limits.window_seconds, 60);
+    EXPECT_TRUE(cfg.send_limits.enabled);
+}
+
+TEST(TrustedProxies, PublicNetworksAreNotMistakenForPrivateOnes) {
+    // A trusted network reaching into public address space is an off switch
+    // for every per-address limit: anything inside it can choose its own
+    // X-Forwarded-For, and so its own identity, once per request.
+    for (const char* ok : {"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.1.1",
+                           "::1", "fc00::/7", "fd00:1234::/32"}) {
+        auto net = IpNetwork::parse(ok);
+        ASSERT_TRUE(net.has_value()) << ok;
+        EXPECT_TRUE(is_private_or_loopback_network(*net)) << ok;
+    }
+    for (const char* bad : {"0.0.0.0/0", "::/0", "203.0.113.5", "8.8.8.0/24",
+                            // Overlaps private space without being contained
+                            // in it: /4 covers 0.0.0.0-15.255.255.255.
+                            "10.0.0.0/4"}) {
+        auto net = IpNetwork::parse(bad);
+        ASSERT_TRUE(net.has_value()) << bad;
+        EXPECT_FALSE(is_private_or_loopback_network(*net)) << bad;
+    }
 }

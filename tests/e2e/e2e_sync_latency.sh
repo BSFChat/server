@@ -71,7 +71,7 @@ grep -q "Server name: latency.test" "$RUN/server.log" || {
 
 jqf(){ python3 -c "import sys,json;d=json.load(sys.stdin);print(d$1)" 2>/dev/null; }
 reg(){ curl -s -X POST "$BASE/_matrix/client/v3/register" -H 'Content-Type: application/json' \
-       -d "{\"username\":\"$1\",\"password\":\"password123\"}"; }
+       -d "{\"username\":\"$1\",\"password\":\"e2e-correct-horse-7\"}"; }
 
 A=$(reg alice); B=$(reg bob)
 AT=$(printf '%s' "$A" | jqf "['access_token']")

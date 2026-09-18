@@ -160,6 +160,34 @@ struct PushConfig {
     std::vector<std::string> allowed_gateway_prefixes;
 };
 
+// Per-account limits on the endpoints that write to a room. Flat keys under
+// [limits]; see core/SendLimiter.h for why these key on the ACCOUNT while the
+// [auth] limits below key on the client address.
+//
+// Separate from AuthLimitsConfig on purpose. That block is about credential
+// guessing on endpoints with no authenticated caller yet; this one is about
+// how much an account that has already signed in may do. Folding them together
+// would mean one `enabled` switch turning off two unrelated protections.
+struct SendLimitsConfig {
+    // Master switch for everything below.
+    bool enabled = true;
+
+    // Deliberately far above human use: this exists to stop a loop, not to
+    // pace a conversation. 120 events/minute is two a second sustained, which
+    // no one reaches by typing or by clicking reactions. Anything that trips
+    // it is a script or a bug. 0 = unlimited.
+    int send_limit = 120;
+    // Lower, because deleting is rarer than sending and a deletion loop is
+    // more destructive than a send loop. Still well above a moderator clearing
+    // a run of messages by hand.
+    int redact_limit = 60;
+    // Lowest of the three: an upload carries a whole file into storage, so the
+    // unit of work behind each one is orders of magnitude larger.
+    int media_upload_limit = 30;
+
+    int window_seconds = 60;
+};
+
 // Rate limiting and lockout for /login, /register, /refresh and
 // /account/password. Flat keys under [auth]; grouped here so AuthHandler can
 // take the lot.
@@ -287,6 +315,8 @@ struct Config {
     // Request limits on the unauthenticated credential endpoints. See
     // AuthLimitsConfig. TOML keys live flat under [auth].
     AuthLimitsConfig auth_limits;
+    // SendLimitsConfig. TOML keys live flat under [limits].
+    SendLimitsConfig send_limits;
 
     // TLS. NOTE: not implemented — HttpServer has no SSLServer path. Kept in
     // the schema so an existing config with a [tls] block still parses, but

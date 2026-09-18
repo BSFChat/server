@@ -104,6 +104,24 @@ bool IpNetwork::contains(const Bytes16& ip) const {
     return (addr[full] & mask) == (ip[full] & mask);
 }
 
+bool is_private_or_loopback_network(const IpNetwork& net) {
+    // A shorter prefix means a WIDER network, so a candidate is only fully
+    // contained when the private range's prefix is no longer than its own and
+    // its base address falls inside. Checking containment of the base address
+    // alone would accept 0.0.0.0/0, whose base 0.0.0.0 is in no private range
+    // but whose membership is everything.
+    static const char* kPrivate[] = {
+        "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+        "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
+    };
+    for (const char* cidr : kPrivate) {
+        const auto range = IpNetwork::parse(cidr);
+        if (!range) continue;
+        if (range->prefix_bits <= net.prefix_bits && range->contains(net.addr)) return true;
+    }
+    return false;
+}
+
 ClientAddressResolver::ClientAddressResolver(const std::vector<std::string>& trusted_proxies) {
     for (const auto& entry : trusted_proxies) {
         auto net = IpNetwork::parse(entry);

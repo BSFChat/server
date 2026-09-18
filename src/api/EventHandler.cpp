@@ -3,6 +3,7 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
+#include "http/RateLimitResponse.h"
 #include "http/Router.h"
 #include "push/PushService.h"
 #include "store/SqliteStore.h"
@@ -206,8 +207,9 @@ MentionParse parse_mentions(const json& content, const std::string& sender,
 } // namespace
 
 EventHandler::EventHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config,
-                           PushService* push)
-    : store_(store), sync_engine_(sync_engine), config_(config), push_(push) {}
+                           PushService* push, LimiterClock clock)
+    : store_(store), sync_engine_(sync_engine), config_(config), push_(push)
+    , limits_(config.send_limits, std::move(clock)) {}
 
 void EventHandler::handle_send_event(const httplib::Request& req, httplib::Response& res) {
     const auto auth_header = req.get_header_value("Authorization");
@@ -247,6 +249,22 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
             res.set_content(json{{"event_id", *existing}}.dump(), "application/json");
             return;
         }
+    }
+
+    // Per-account send ceiling, checked AFTER the idempotency short-circuit
+    // above and BEFORE the permission computation below.
+    //
+    // After, because a retry of a request the server has already accepted is
+    // the behaviour we asked clients for; charging it to the budget would
+    // punish a client on a bad connection for doing exactly the right thing,
+    // and a flood is made of DISTINCT transactions by definition.
+    //
+    // Before, because everything past this point — resolving every role and
+    // override for the caller, then writing the event, its mentions and its
+    // push rows — is the work worth refusing to do.
+    if (const auto wait = limits_.acquire(SendLimiter::Bucket::kSend, *user_id)) {
+        return send_rate_limited(res, wait,
+                                 SendLimiter::message_for(SendLimiter::Bucket::kSend));
     }
 
     PermissionsEngine perms(store_, config_);
@@ -623,6 +641,16 @@ void EventHandler::handle_redact(const httplib::Request& req, httplib::Response&
 
     if (!store_.is_room_member(room_id, *user_id)) {
         return send_error(res, 403, MatrixError::forbidden("Not a member of this room"));
+    }
+
+    // Its own budget, separate from sending: a client that has exhausted one
+    // can still do the other, and a deletion loop is the more destructive of
+    // the two. Unlike /send there is no idempotency record to check first —
+    // this endpoint parses a txnId out of the path and ignores it, so a retry
+    // does cost a slot here. See the audit doc.
+    if (const auto wait = limits_.acquire(SendLimiter::Bucket::kRedact, *user_id)) {
+        return send_rate_limited(res, wait,
+                                 SendLimiter::message_for(SendLimiter::Bucket::kRedact));
     }
 
     PermissionsEngine perms(store_, config_);

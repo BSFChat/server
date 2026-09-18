@@ -111,12 +111,12 @@ jfield() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get(sy
 
 register() {
   curl -s -o "$WORK/last-body.json" -X POST "${BASE}/register" -H 'Content-Type: application/json' \
-    -d "{\"username\":\"$1\",\"password\":\"pw-$1-12345\",\"auth\":{\"type\":\"m.login.dummy\"}}" >/dev/null
+    -d "{\"username\":\"$1\",\"password\":\"e2e-correct-horse-7\",\"auth\":{\"type\":\"m.login.dummy\"}}" >/dev/null
   jfield access_token
 }
 login() {
   curl -s -o "$WORK/last-body.json" -X POST "${BASE}/login" -H 'Content-Type: application/json' \
-    -d "{\"type\":\"m.login.password\",\"identifier\":{\"type\":\"m.id.user\",\"user\":\"$1\"},\"password\":\"pw-$1-12345\"}" >/dev/null
+    -d "{\"type\":\"m.login.password\",\"identifier\":{\"type\":\"m.id.user\",\"user\":\"$1\"},\"password\":\"e2e-correct-horse-7\"}" >/dev/null
   jfield access_token
 }
 
@@ -163,7 +163,7 @@ check "admin CAN ban (server-wide role)"        200 "$(req POST "/rooms/$ROOM/ba
 # Carol's token from before the ban is dead from here on, so every later check
 # that acts as carol must use a token minted AFTER the unban below.
 check "ban revoked carol's existing session"    401 "$(req GET "/account/whoami" "$T_CAROL")"
-check "banned identity cannot log in"           403 "$(req POST "/login" "" '{"type":"m.login.password","identifier":{"type":"m.id.user","user":"carol"},"password":"pw-carol-12345"}')"
+check "banned identity cannot log in"           403 "$(req POST "/login" "" '{"type":"m.login.password","identifier":{"type":"m.id.user","user":"carol"},"password":"e2e-correct-horse-7"}')"
 
 check "admin CAN unban"                         200 "$(req POST "/rooms/$ROOM/unban" "$T_ALICE" "{\"user_id\":\"$C\"}")"
 T_CAROL=$(login carol)
