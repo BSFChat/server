@@ -45,6 +45,31 @@ bool is_category_room(SqliteStore& store, const std::string& room_id) {
     return ev->content.data.value("type", "") == "category";
 }
 
+// Stamps `is_direct` onto an m.room.member content when the room is a DM. See
+// the comment at the creator's join in handle_create_room for why the room's
+// own state — and not only m.direct account data — has to say so.
+json direct_marked(json content, bool is_direct) {
+    if (is_direct) content["is_direct"] = true;
+    return content;
+}
+
+// A DM is a conversation between exactly the two people in it. Everything that
+// would change who is in it, or would file it under the server's channel tree,
+// is refused on a direct room whatever permissions the caller holds: a role
+// that lets someone run the SERVER must not let them run somebody's private
+// conversation. Read and send are gated by membership at each handler; this is
+// the structural half — nothing can make a DM reachable or listable in the
+// first place.
+//
+// Returns true (and answers the request) when the room is direct.
+bool refuse_on_direct_room(SqliteStore& store, httplib::Response& res,
+                           const std::string& room_id, const char* what) {
+    if (!store.is_direct_room(room_id)) return false;
+    res.status = 403;
+    res.set_content(MatrixError::forbidden(what).to_json().dump(), "application/json");
+    return true;
+}
+
 // Membership alone is NOT authorization here: everyone is force-joined into
 // every public room, so a user whose VIEW_CHANNEL was explicitly denied for a
 // channel was still a joined member and could read its name, topic and full
@@ -411,9 +436,20 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
 
     // Creator joins — include their current display name + avatar so
     // clients don't need a separate profile fetch for the first sender.
+    //
+    // `is_direct` on the membership content is the Matrix marker, and it is
+    // written for BOTH sides (see the invite loop below). m.direct in /sync
+    // already tells each participant which of their rooms are DMs, but it is
+    // account data: a client that has never seen the one sync response
+    // carrying it — a fresh profile, a reset settings file, a sync that
+    // errored at the wrong moment — has nothing in the room itself to
+    // classify it by, and files the DM under channels. The marker rides along
+    // in the room's own state, which every client gets on every initial sync
+    // and can never be out of step with the room.
     store_.set_membership(room_id, *user_id, std::string(membership::kJoin));
     emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), *user_id,
-                     member_event_content(store_, *user_id, std::string(membership::kJoin)));
+                     direct_marked(member_event_content(
+                         store_, *user_id, std::string(membership::kJoin)), is_direct));
 
     // Set join rules.
     // Discord-like default: rooms are public unless explicitly marked private
@@ -508,7 +544,8 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
         // invite carried no name. Both now carry the effective name, which is what
         // the invitee's nickname makes it.
         emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), invitee,
-                         member_event_content(store_, invitee, std::string(state)));
+                         direct_marked(member_event_content(store_, invitee, std::string(state)),
+                                       is_direct));
     }
 
     // Auto-join all existing users if this is a public, non-category,
@@ -617,6 +654,19 @@ void RoomHandler::handle_delete_room(const httplib::Request& req, httplib::Respo
     if (!store_.room_exists(room_id)) {
         res.status = 404;
         res.set_content(MatrixError::not_found("Room not found").to_json().dump(), "application/json");
+        return;
+    }
+
+    // A DM is not server structure, so MANAGE_CHANNELS does not reach it. This
+    // endpoint has no membership check at all — deliberately, because deleting
+    // a channel is a moderator act performed from outside it — which meant a
+    // role that runs the server could destroy any two people's conversation,
+    // and audit_room_deletion below would record its member list on the way
+    // out. Participants only.
+    if (store_.is_direct_room(room_id) && !store_.is_room_member(room_id, *user_id)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden(
+            "Not a participant in this direct message").to_json().dump(), "application/json");
         return;
     }
 
@@ -1110,6 +1160,12 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
         res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(), "application/json");
         return;
     }
+    // Even a participant cannot widen a DM: "only the two of us" is the whole
+    // guarantee, and a third member would also be handed the entire backlog.
+    if (refuse_on_direct_room(store_, res, room_id,
+                              "Cannot invite someone into a direct message")) {
+        return;
+    }
 
     json body;
     try {
@@ -1188,6 +1244,18 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     if (!store_.is_room_member(room_id, *user_id)) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(), "application/json");
+        return;
+    }
+
+    // The generic state route is the back door to the dedicated ones, so the
+    // DM guards on /category and /order have to hold here too — otherwise a
+    // participant with MANAGE_CHANNELS re-files their DM into a category, or
+    // reopens its join rules, by writing the state event directly.
+    if ((evt_type == std::string(event_type::kRoomCategory) ||
+         evt_type == std::string(event_type::kRoomType) ||
+         evt_type == std::string(event_type::kRoomJoinRules)) &&
+        refuse_on_direct_room(store_, res, room_id,
+                              "A direct message is not a channel and its structure cannot be changed")) {
         return;
     }
 
@@ -1424,6 +1492,12 @@ void RoomHandler::handle_move_channel(const httplib::Request& req, httplib::Resp
         res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(), "application/json");
         return;
     }
+    // A DM has no place in the server's channel tree, so it cannot be given a
+    // parent category — which is exactly what would make it render as one.
+    if (refuse_on_direct_room(store_, res, room_id,
+                              "A direct message is not a channel and cannot be categorised")) {
+        return;
+    }
 
     PermissionsEngine perms(store_, config_);
     if (!perms.can(*user_id, room_id, permission::kManageChannels)) {
@@ -1505,6 +1579,11 @@ void RoomHandler::handle_set_order(const httplib::Request& req, httplib::Respons
     if (!store_.is_room_member(room_id, *user_id)) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(), "application/json");
+        return;
+    }
+
+    if (refuse_on_direct_room(store_, res, room_id,
+                              "A direct message is not a channel and cannot be reordered")) {
         return;
     }
 

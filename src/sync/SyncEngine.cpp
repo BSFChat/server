@@ -20,6 +20,22 @@ bool is_category_room(SqliteStore& store, const std::string& room_id) {
     return ev->content.data.value("type", "") == "category";
 }
 
+// m.direct for `user_id`, derived from rooms.is_direct. It is a full
+// replacement by Matrix convention, so it always lists every DM, never a delta
+// — which is what makes restating it on a delivered response harmless.
+//
+// The room marks itself direct too (is_direct on both participants'
+// m.room.member content, see RoomHandler), but only for DMs opened by a server
+// that writes it. For every DM that already existed when such a server was
+// installed, this is still the only thing in /sync that says the room is one.
+void attach_direct_rooms(SqliteStore& store, const std::string& user_id,
+                         SyncResponse& response) {
+    auto direct = store.get_direct_rooms(user_id);
+    if (direct.empty()) return;
+    auto& out = response.direct_rooms.emplace();
+    for (auto& [room_id, peer] : direct) out[peer].push_back(std::move(room_id));
+}
+
 } // namespace
 
 SyncEngine::SyncEngine(SqliteStore& store, const Config& config)
@@ -83,6 +99,34 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
         return build_initial_sync(user_id);
     }
 
+    // Every response this function DELIVERS restates m.direct; the ones it
+    // discards inside the long poll below do not.
+    //
+    // It used to be attached only on an initial sync and on the one
+    // incremental sync where the user newly joined a direct room. That is
+    // enough for a DM opened from now on, and nothing at all for a DM that
+    // already exists: a client resumes from a persisted sync token, so it
+    // never asks for an initial sync again, and it joined its existing DMs
+    // long ago. Upgrading the server therefore changed nothing for the rooms
+    // the complaint is actually about — they stay filed under channels until
+    // the client is reinstalled. Restating it fixes that within one poll.
+    //
+    // Safe for the long poll, and structurally so: the decision to keep
+    // waiting is `response.rooms.join.empty()`, taken on the response BEFORE
+    // deliver() ever sees it. m.direct can therefore never make an empty
+    // response look non-empty, and the wait's own re-scans never call this at
+    // all — so the cost is one indexed lookup per response actually returned
+    // (once per poll cycle), not one per spurious wake.
+    //
+    // Safe for the client, too: m.direct is a full replacement, the client's
+    // merge is idempotent and reports only what changed, and next_batch is
+    // untouched — so a restatement on an idle timeout cannot be mistaken for
+    // progress, and cannot churn the sidebar.
+    auto deliver = [this, &user_id](SyncResponse&& r) {
+        if (!r.direct_rooms) attach_direct_rooms(store_, user_id, r);
+        return std::move(r);
+    };
+
     int64_t since_pos = 0;
     if (since_token.size() > 1 && since_token[0] == 's') {
         // A malformed token used to throw std::invalid_argument /
@@ -106,7 +150,7 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
     int64_t covered_pos = since_pos;
     auto response = build_incremental_sync(user_id, since_pos, &covered_pos);
     if (!response.rooms.join.empty()) {
-        return response;
+        return deliver(std::move(response));
     }
 
     if (timeout_ms > 0) {
@@ -156,7 +200,7 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
             // presence from — either is worth returning immediately.
             if (!response.rooms.join.empty() ||
                 ephemeral_seq_.load() != edu_at_entry) {
-                return response;
+                return deliver(std::move(response));
             }
             // Woken for an event this user cannot see. Keep the poll parked,
             // now against the position that re-scan reached.
@@ -175,28 +219,12 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
         response = build_incremental_sync(user_id, since_pos, &covered_pos);
     }
 
-    return response;
+    // The idle-timeout reply, and the timeout_ms == 0 poll. Both are delivered
+    // responses, so both restate it — which is what lets a client whose server
+    // is completely quiet still learn its existing DMs are DMs, within one
+    // poll rather than never.
+    return deliver(std::move(response));
 }
-
-namespace {
-
-// m.direct for `user_id`, derived from rooms.is_direct. It is a full
-// replacement by Matrix convention, so it always lists every DM, never a delta.
-//
-// This is the only thing in /sync that marks a room as a DM. The creating
-// client knows because it made the room; the OTHER side is simply joined to a
-// nameless private room, files it under channels, and — not recognising it —
-// opens a second DM with the same person the first time they reply from the
-// member list.
-void attach_direct_rooms(SqliteStore& store, const std::string& user_id,
-                         SyncResponse& response) {
-    auto direct = store.get_direct_rooms(user_id);
-    if (direct.empty()) return;
-    auto& out = response.direct_rooms.emplace();
-    for (auto& [room_id, peer] : direct) out[peer].push_back(std::move(room_id));
-}
-
-} // namespace
 
 SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
     SyncResponse response;

@@ -1061,6 +1061,68 @@ void migrate_v17(sqlite3* db, bool /*fresh_database*/) {
         purged, limits::kCallSignallingTtlMs / 1000, before - purged);
 }
 
+// v18: existing DMs say so in their own room state, like new ones do.
+//
+// RoomHandler now stamps `is_direct: true` onto both participants' m.room.member
+// content when a DM is created, so the room itself tells every client what it
+// is. Rooms created before that have `rooms.is_direct = 1` and membership events
+// with nothing in them — and those are precisely the DMs a running deployment
+// has. This backfills them so the two kinds are indistinguishable from here on.
+//
+// Strictly additive and idempotent: it sets one key on rows that lack it, adds
+// no rows, deletes none, and emits no events — a re-run matches nothing.
+//
+// Safe against the event store's shape:
+//   - `content` is plain TEXT holding the JSON a handler dumped. There is no
+//     hash, signature or content-derived id over it (no federation), so nothing
+//     is invalidated by rewriting it.
+//   - `events` carries no triggers, and `event_search` is populated only for
+//     m.room.message, so no FTS row can drift out of step with a member event.
+//   - Only the CURRENT state row per (room, state_key) is touched, matched the
+//     same way get_state_events() resolves current state. History keeps saying
+//     what it said at the time, and stream positions are untouched, so no
+//     client's sync token moves.
+//   - json_valid() guards the rewrite: a row whose content somehow is not JSON
+//     is skipped rather than being set to NULL by json_set().
+//
+// This is belt to the braces of restating m.direct in /sync — a client that has
+// both needs neither — but it is what makes an existing DM classifiable from
+// room state alone, which is the property new DMs get for free.
+void migrate_v18(sqlite3* db, bool fresh_database) {
+    // A fresh database has no rooms at all, let alone legacy ones.
+    if (fresh_database) return;
+
+    const int before = scalar_int(db,
+        "SELECT COUNT(*) FROM events "
+        "WHERE event_type = 'm.room.member' "
+        "  AND json_valid(content) AND json_extract(content, '$.is_direct') IS NOT NULL");
+
+    exec(db, R"(
+        UPDATE events
+           SET content = json_set(content, '$.is_direct', json('true'))
+         WHERE event_type = 'm.room.member'
+           AND state_key IS NOT NULL
+           AND json_valid(content)
+           AND json_extract(content, '$.is_direct') IS NULL
+           AND room_id IN (SELECT room_id FROM rooms WHERE is_direct = 1)
+           AND stream_position = (
+                 SELECT MAX(prev.stream_position) FROM events prev
+                  WHERE prev.room_id = events.room_id
+                    AND prev.event_type = 'm.room.member'
+                    AND prev.state_key = events.state_key)
+    )");
+
+    const int after = scalar_int(db,
+        "SELECT COUNT(*) FROM events "
+        "WHERE event_type = 'm.room.member' "
+        "  AND json_valid(content) AND json_extract(content, '$.is_direct') IS NOT NULL");
+
+    get_logger()->info(
+        "Schema v18: marked {} membership event(s) in pre-existing direct rooms as "
+        "is_direct, so clients can tell a DM from a channel without m.direct",
+        after - before);
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1082,6 +1144,7 @@ const std::vector<Step>& steps() {
         migrate_v15,
         migrate_v16,
         migrate_v17,
+        migrate_v18,
     };
     return kMigrations;
 }
