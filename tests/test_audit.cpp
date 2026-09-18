@@ -482,8 +482,9 @@ TEST(AuditMigration, FreshDatabaseGetsV13WithAnAppendOnlySchema) {
     // users.nickname, v15 server_bans, v16 the audit_log filter indexes, v17
     // events.signal_to and the call-signalling sweep, v18 the is_direct
     // backfill onto pre-existing DMs' membership state, v19 refresh-token
-    // families). This test's subject remains the v13 audit_log shape below.
-    EXPECT_EQ(kTargetSchemaVersion, 19);
+    // families, v20 the narrower transaction-id key). This test's subject
+    // remains the v13 audit_log shape below.
+    EXPECT_EQ(kTargetSchemaVersion, 20);
 
     // AUTOINCREMENT, not a bare INTEGER PRIMARY KEY. Without it SQLite reuses
     // max(rowid) + 1, which is exactly the position-reuse defect v4 fixed for
@@ -516,7 +517,13 @@ TEST(AuditMigration, PreExistingV12DatabaseUpgradesAndKeepsItsData) {
         EXPECT_EQ(store.get_room_members("!general:test").size(), 2u);
         EXPECT_EQ(store.get_display_name("@alice:test").value_or(""), "Alice");
         EXPECT_EQ(store.get_read_marker("@bob:test", "!general:test"), 1);
-        EXPECT_EQ(store.get_transaction_event("@alice:test", "txn-1").value_or(""), "$m1");
+        // v20 rescoped transaction ids to (user, device, room) and dropped the
+        // pre-existing retry-dedup records with the old table: device_id was
+        // never recorded for them, so any backfilled value would be a guess
+        // that matched either nothing or everything. This is the one thing an
+        // upgrade discards, and it is state with a lifetime of seconds.
+        EXPECT_FALSE(store.get_transaction_event(
+            {"@alice:test", "dev", "!general:test", "txn-1"}).has_value());
         EXPECT_EQ(store.get_server_roles().size(), 1u);
         EXPECT_EQ(store.get_pushers("@bob:test").size(), 1u);
         EXPECT_EQ(store.get_room_notify_level("@bob:test", "!general:test").value_or(""), "all");

@@ -47,6 +47,57 @@ void send_error(httplib::Response& res, int status, const MatrixError& err) {
     res.set_content(err.to_json().dump(), "application/json");
 }
 
+// What may be PUT to /rooms/{id}/send/{eventType}, and what it takes.
+//
+// This used to be decided by one `if (evt_type == "m.room.message")`, with
+// SEND_MESSAGES, ATTACH_FILES and EMBED_LINKS all nested inside it. Everything
+// else in the universe passed on VIEW_CHANNEL alone. That was not a gap in
+// coverage of a few event types — it meant a member with SEND_MESSAGES
+// explicitly DENIED could still write an event of any type at all, with
+// arbitrary content, into the room timeline, where it is stored and delivered
+// to every member through /sync. Reactions were the visible case (a muted user
+// could still react); an undefined type nobody has ever heard of was the
+// general one.
+//
+// A table, and an unrecognised type is REFUSED. Allowing by default is what
+// produced the hole: the safe direction is that adding a new sendable event
+// type is a deliberate edit here, not something that works by accident.
+//
+// State events are not in this table because they do not belong on this
+// endpoint at all — PUT /rooms/{id}/state/... is where they go, with its own
+// per-type authorisation in RoomHandler.
+struct SendGate {
+    bool allowed = false;
+    // Required IN ADDITION to VIEW_CHANNEL, which every send already checks.
+    permission::Flags required = 0;
+};
+
+SendGate send_gate_for(std::string_view evt_type) {
+    if (evt_type == event_type::kRoomMessage) {
+        return {true, permission::kSendMessages};
+    }
+    // A reaction is a message the user is putting in the room, so it answers to
+    // the same permission. Discord has a separate ADD_REACTIONS bit and this
+    // server has no equivalent; inventing one is a permissions-model change,
+    // not a fix for this defect, and SEND_MESSAGES is the conservative reading
+    // in the meantime — nobody who can post text is newly blocked, and everyone
+    // who was muted now actually is.
+    if (evt_type == event_type::kReaction) {
+        return {true, permission::kSendMessages};
+    }
+    // Call signalling. VIEW_CHANNEL only, which is the same gate
+    // VoiceHandler::handle_voice_join applies — these are the events an
+    // in-call client exchanges, and a participant who may be in the channel may
+    // signal in it. They are addressed events (see the signal_to handling in
+    // SqliteStore::insert_event), not room-wide chatter.
+    if (evt_type == event_type::kCallInvite || evt_type == event_type::kCallAnswer ||
+        evt_type == event_type::kCallCandidates || evt_type == event_type::kCallHangup ||
+        evt_type == event_type::kCallNegotiate || evt_type == event_type::kCallMember) {
+        return {true, 0};
+    }
+    return {};
+}
+
 // ── @mentions (MSC3952 `m.mentions`) ──────────────────────────────────────
 //
 // The shape on the wire is
@@ -159,9 +210,18 @@ EventHandler::EventHandler(SqliteStore& store, SyncEngine& sync_engine, const Co
     : store_(store), sync_engine_(sync_engine), config_(config), push_(push) {}
 
 void EventHandler::handle_send_event(const httplib::Request& req, httplib::Response& res) {
-    auto user_id = authenticate(store_, req.get_header_value("Authorization"));
+    const auto auth_header = req.get_header_value("Authorization");
+    auto user_id = authenticate(store_, auth_header);
     if (!user_id) {
-        return send_error(res, 401, auth_error(req.get_header_value("Authorization")));
+        return send_error(res, 401, auth_error(auth_header));
+    }
+    // The DEVICE, not just the identity: it is half the transaction-id key
+    // below. authenticate() above is what validates the token and slides its
+    // expiry; this is a second probe of the same indexed row for the device
+    // the now-validated token belongs to.
+    std::string device_id;
+    if (auto token = extract_access_token(auth_header)) {
+        if (auto session = store_.get_session_by_token(*token)) device_id = session->device_id;
     }
 
     // Match: PUT /rooms/{roomId}/send/{eventType}/{txnId}
@@ -181,8 +241,9 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
     // Transaction-id idempotency. txnId was parsed out of the path and then
     // never used, so any client retry — a flaky connection, a resend after a
     // timeout — silently duplicated the message.
+    const SqliteStore::TransactionKey txn_key{*user_id, device_id, room_id, txn_id};
     if (!txn_id.empty()) {
-        if (auto existing = store_.get_transaction_event(*user_id, txn_id)) {
+        if (auto existing = store_.get_transaction_event(txn_key)) {
             res.set_content(json{{"event_id", *existing}}.dump(), "application/json");
             return;
         }
@@ -194,6 +255,20 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
     // VIEW_CHANNEL is a prerequisite for anything happening in the room.
     if (!permission::has(user_perms, permission::kViewChannel)) {
         return send_error(res, 403, MatrixError::forbidden("No access to this channel"));
+    }
+
+    // Then the per-type gate. Refusing an unrecognised type is the point: the
+    // previous shape allowed every type except m.room.message through on
+    // VIEW_CHANNEL alone, so a muted member could still write arbitrary events
+    // into the timeline. See send_gate_for().
+    const auto gate = send_gate_for(evt_type);
+    if (!gate.allowed) {
+        return send_error(res, 403, MatrixError::forbidden(
+            "Events of type '" + evt_type + "' cannot be sent to a room"));
+    }
+    if (gate.required != 0 && !permission::has(user_perms, gate.required)) {
+        return send_error(res, 403, MatrixError::forbidden(
+            "You don't have permission to send this here"));
     }
 
     json content;
@@ -211,14 +286,53 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
     // an edit — see the comment at the record_mentions() call below.
     MentionSet mentions;
 
-    // Additional per-event-type gates. We focus on m.room.message because
-    // non-message timeline events (call signaling, etc.) use separate
-    // permission semantics not worth spelling out here.
-    if (evt_type == std::string(event_type::kRoomMessage)) {
-        if (!permission::has(user_perms, permission::kSendMessages)) {
-            return send_error(res, 403, MatrixError::forbidden("You don't have permission to send messages here"));
+    // Content-dependent gates, on top of the per-type one above. These cannot
+    // live in the table because they depend on what is IN the event.
+    //
+    // (The comment that used to sit here claimed non-message types "use
+    // separate permission semantics not worth spelling out". For reactions
+    // that was simply untrue — there were none — and the sentence is what kept
+    // anyone from noticing that this `if` was the only authorisation in the
+    // handler.)
+    if (evt_type == std::string(event_type::kReaction)) {
+        // A reaction names an event it annotates, and that was taken entirely
+        // on trust: any string was accepted as a target, including the id of an
+        // event in a room the sender cannot see. The reaction is then delivered
+        // to THIS room referring to an event that is not in it — at best a
+        // dangling reference, at worst a way to confirm an event id exists
+        // somewhere else.
+        //
+        // The accepted shape is unchanged: this validates the fields the client
+        // already sends, and rejects nothing it has ever sent.
+        const auto* rel = content.contains("m.relates_to") && content["m.relates_to"].is_object()
+                              ? &content["m.relates_to"] : nullptr;
+        if (!rel || rel->value("rel_type", "") != std::string(event_type::kRelAnnotation)) {
+            return send_error(res, 400, MatrixError::bad_json(
+                "A reaction must carry m.relates_to with rel_type m.annotation"));
         }
+        const std::string target_id = rel->value("event_id", "");
+        if (target_id.empty()) {
+            return send_error(res, 400, MatrixError::bad_json("Reaction missing target event_id"));
+        }
+        auto target = store_.get_event_by_id(target_id);
+        if (!target) {
+            return send_error(res, 404, MatrixError::not_found("Reaction target does not exist"));
+        }
+        if (target->room_id != room_id) {
+            // Deliberately the same answer as "does not exist": telling the
+            // caller that the id is real but lives elsewhere is the confirmation
+            // the check exists to withhold.
+            return send_error(res, 404, MatrixError::not_found("Reaction target does not exist"));
+        }
+        // Consistent with edits, which already refuse a redacted target: a
+        // deleted message must not acquire new reactions.
+        if (store_.is_event_redacted(target_id)) {
+            return send_error(res, 404, MatrixError::not_found(
+                "Reaction target has been deleted"));
+        }
+    }
 
+    if (evt_type == std::string(event_type::kRoomMessage)) {
         const std::string msgtype = content.value("msgtype", "m.text");
         const std::string body = content.value("body", "");
         const bool has_attachment = msgtype != std::string(msg_type::kText) && msgtype != std::string(msg_type::kEmote) && msgtype != std::string(msg_type::kNotice);
@@ -391,7 +505,7 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
     }
 
     if (!txn_id.empty()) {
-        store_.record_transaction(*user_id, txn_id, event_id);
+        store_.record_transaction(txn_key, event_id);
     }
     sync_engine_.notify_new_event();
 

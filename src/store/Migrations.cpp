@@ -1184,6 +1184,51 @@ void migrate_v19(sqlite3* db, bool /*fresh_database*/) {
         "revokes the whole family");
 }
 
+void migrate_v20(sqlite3* db, bool /*fresh_database*/) {
+    // Narrow the transaction-id idempotency key.
+    //
+    // v6 keyed it on (user_id, txn_id) alone, which is wider than the thing a
+    // txn id actually identifies. Two consequences, both silent:
+    //
+    //   * reusing a txn id in a DIFFERENT room returned 200 with the FIRST
+    //     message's event id and posted nothing to the second room. To the
+    //     caller that is indistinguishable from success;
+    //   * two clients signed in as the same user both start their counters at
+    //     1, so the second one's early messages disappeared into the first
+    //     one's records.
+    //
+    // Matrix scopes a txn id per access token; (user, device, room) is that,
+    // plus the room, so the key now matches the unit the caller is actually
+    // retrying.
+    //
+    // The old rows are dropped rather than migrated. device_id is not
+    // recoverable for them — it was never written — so any backfilled value
+    // would be a guess that either matches nothing (useless) or matches
+    // everything (the bug again). These records exist only to absorb a retry
+    // that arrives seconds after the original, so the entire cost of dropping
+    // them is that a retry in flight ACROSS the upgrade could post twice, on a
+    // server that has just restarted.
+    exec(db, "DROP TABLE IF EXISTS event_transactions");
+    exec(db, R"(
+        CREATE TABLE event_transactions (
+            user_id    TEXT NOT NULL,
+            device_id  TEXT NOT NULL,
+            room_id    TEXT NOT NULL,
+            txn_id     TEXT NOT NULL,
+            event_id   TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+            PRIMARY KEY (user_id, device_id, room_id, txn_id)
+        )
+    )");
+    // Redaction deletes these rows by event_id, which is not the primary key.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_event_transactions_event "
+             "ON event_transactions(event_id)");
+
+    get_logger()->info(
+        "Schema v20: transaction ids are now scoped per (user, device, room); previous "
+        "retry-dedup records dropped");
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1207,6 +1252,7 @@ const std::vector<Step>& steps() {
         migrate_v17,
         migrate_v18,
         migrate_v19,
+        migrate_v20,
     };
     return kMigrations;
 }

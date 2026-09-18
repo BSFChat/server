@@ -1405,27 +1405,31 @@ bool SqliteStore::redact_event(const std::string& event_id, const std::string& r
     return true; // the row exists; already-redacted counts as success
 }
 
-std::optional<std::string> SqliteStore::get_transaction_event(const std::string& user_id,
-                                                               const std::string& txn_id) {
+std::optional<std::string> SqliteStore::get_transaction_event(const TransactionKey& key) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
-        "SELECT event_id FROM event_transactions WHERE user_id = ? AND txn_id = ?");
-    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 2, txn_id.c_str(), -1, SQLITE_TRANSIENT);
+        "SELECT event_id FROM event_transactions "
+        " WHERE user_id = ? AND device_id = ? AND room_id = ? AND txn_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, key.user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, key.device_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, key.room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, key.txn_id.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-        return reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        return column_text_or_empty(stmt.get(), 0);
     }
     return std::nullopt;
 }
 
-void SqliteStore::record_transaction(const std::string& user_id, const std::string& txn_id,
-                                      const std::string& event_id) {
+void SqliteStore::record_transaction(const TransactionKey& key, const std::string& event_id) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
-        "INSERT OR IGNORE INTO event_transactions (user_id, txn_id, event_id) VALUES (?, ?, ?)");
-    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 2, txn_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 3, event_id.c_str(), -1, SQLITE_TRANSIENT);
+        "INSERT OR IGNORE INTO event_transactions "
+        "  (user_id, device_id, room_id, txn_id, event_id) VALUES (?, ?, ?, ?, ?)");
+    sqlite3_bind_text(stmt.get(), 1, key.user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, key.device_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, key.room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, key.txn_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 5, event_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt.get());
 }
 

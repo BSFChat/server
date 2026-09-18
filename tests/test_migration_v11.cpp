@@ -179,7 +179,13 @@ TEST(MigrationV11, PreExistingV8DatabaseUpgradesAndKeepsItsData) {
         EXPECT_EQ(store.get_display_name("@alice:test").value_or(""), "Alice");
         EXPECT_EQ(store.get_read_marker("@bob:test", "!general:test"), 1);
         EXPECT_TRUE(store.get_meta("next_stream_position").has_value());
-        EXPECT_EQ(store.get_transaction_event("@alice:test", "txn-1").value_or(""), "$m1");
+        // v20 rescoped transaction ids to (user, device, room) and dropped the
+        // pre-existing retry-dedup records with the old table: device_id was
+        // never recorded for them, so any backfilled value would be a guess
+        // that matched either nothing or everything. This is the one thing an
+        // upgrade discards, and it is state with a lifetime of seconds.
+        EXPECT_FALSE(store.get_transaction_event(
+            {"@alice:test", "dev", "!general:test", "txn-1"}).has_value());
         EXPECT_EQ(store.get_server_roles().size(), 1u);
 
         // The v8 edit reconciliation is untouched: $m1 still resolves through
@@ -203,9 +209,10 @@ TEST(MigrationV11, PreExistingV8DatabaseUpgradesAndKeepsItsData) {
     // 17 -> 18 stamped is_direct into the membership state of DMs that predate
     // the server writing it; 18 -> 19 added access_tokens.family_id and the
     // consumed_refresh_tokens table, so a refresh token redeemed twice revokes
-    // every session descended from that login. A v8 database still upgrades all
-    // the way in one go.
-    EXPECT_EQ(kTargetSchemaVersion, 19);
+    // every session descended from that login; 19 -> 20 rescoped transaction
+    // ids to (user, device, room). A v8 database still upgrades all the way in
+    // one go.
+    EXPECT_EQ(kTargetSchemaVersion, 20);
     std::filesystem::remove(path);
 }
 

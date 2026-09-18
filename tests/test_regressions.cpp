@@ -2411,3 +2411,216 @@ TEST(AccessTokens, MissingAndInvalidTokensAreDistinguishable) {
     EXPECT_EQ(auth_error("").errcode, "M_MISSING_TOKEN");
     EXPECT_EQ(auth_error("Bearer something").errcode, "M_UNKNOWN_TOKEN");
 }
+
+// ── /send: what may be sent, by whom, and what a txn id identifies ─────────
+
+namespace {
+
+// A per-channel DENY override — the mirror of allow_in_channel above, and the
+// thing a moderator reaches for to mute somebody in one channel.
+void deny_in_channel(Fixture& f, const std::string& room, const std::string& actor,
+                     const std::string& user_id, permission::Flags perms) {
+    ChannelPermissionOverride ov;
+    ov.allow = 0;
+    ov.deny = perms;
+    json ov_json;
+    to_json(ov_json, ov);
+    f.store->insert_event(generate_event_id("test"), room, actor,
+                          std::string(event_type::kChannelPermissions),
+                          "user:" + user_id, ov_json.dump(), now_ms());
+}
+
+int count_events_of_type(Fixture& f, const std::string& room, const std::string& type) {
+    auto [events, _] = f.store->get_room_events_paginated(room, 200, "b");
+    return static_cast<int>(std::count_if(events.begin(), events.end(),
+        [&](const auto& ev) { return ev.type == type; }));
+}
+
+} // namespace
+
+TEST(SendEventGates, AMutedUserCannotReactOrSendAnArbitraryEventType) {
+    Fixture f;
+    // `mod` first, deliberately: bootstrap_roles makes the oldest account the
+    // owner, and an Administrator short-circuits to every permission — an admin
+    // cannot be muted, so muting one would prove nothing.
+    auto mod = f.add_user("mod");
+    auto alice = f.add_user("alice");
+    // Roles have to exist for channel overrides to be consulted at all:
+    // PermissionsEngine::compute returns the @everyone defaults early when a
+    // server has no roles yet, before it reaches any override.
+    bootstrap_roles(*f.store, *f.sync, f.config);
+
+    auto room = generate_room_id("test");
+    f.store->create_room(room, mod);
+    f.store->set_membership(room, alice, "join");
+    f.store->set_membership(room, mod, "join");
+
+    // Muted in this channel: SEND_MESSAGES explicitly denied.
+    deny_in_channel(f, room, mod, alice, permission::kSendMessages);
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    const auto send = [&](const std::string& type, const json& content) {
+        auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/" + type + "/t-" + type,
+                                "token-alice", content.dump());
+        httplib::Response res;
+        handler.handle_send_event(req, res);
+        return res;
+    };
+
+    // This part already worked.
+    EXPECT_EQ(send("m.room.message", {{"msgtype", "m.text"}, {"body", "hi"}}).status, 403);
+
+    // These did not. Every permission check in the handler lived inside
+    // `if (evt_type == "m.room.message")`, so a muted member could still write
+    // anything else at all into the timeline, where it is stored and delivered
+    // to the whole room through /sync.
+    EXPECT_EQ(send("m.reaction", {{"m.relates_to",
+                                   {{"rel_type", "m.annotation"},
+                                    {"event_id", "$whatever"},
+                                    {"key", "👍"}}}}).status, 403);
+    EXPECT_EQ(send("com.evil.spam", {{"payload", "anything I like"}}).status, 403);
+
+    EXPECT_EQ(count_events_of_type(f, room, "m.reaction"), 0);
+    EXPECT_EQ(count_events_of_type(f, room, "com.evil.spam"), 0);
+}
+
+TEST(SendEventGates, AnUnrecognisedEventTypeIsRefusedEvenWithEveryPermission) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+    f.grant(alice, define_role(f, "god", permission::kAllFlags, 100));
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/not.a.real.type/t1",
+                            "token-alice", json{{"anything", true}}.dump());
+    httplib::Response res;
+    handler.handle_send_event(req, res);
+
+    // Default DENY. Allowing unknown types by default is what produced the
+    // hole; a new sendable type should be a deliberate edit to send_gate_for().
+    EXPECT_EQ(res.status, 403);
+    EXPECT_EQ(count_events_of_type(f, room, "not.a.real.type"), 0);
+}
+
+TEST(SendEventGates, ReactionsAndCallSignallingStillWorkForAnOrdinaryMember) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    const auto send = [&](const std::string& type, const std::string& txn, const json& content) {
+        auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/" + type + "/" + txn,
+                                "token-alice", content.dump());
+        httplib::Response res;
+        handler.handle_send_event(req, res);
+        return res;
+    };
+
+    auto msg = send("m.room.message", "t1", {{"msgtype", "m.text"}, {"body", "hi"}});
+    ASSERT_TRUE(IsOk(msg));
+    const std::string target = json::parse(msg.body).at("event_id");
+
+    EXPECT_TRUE(IsOk(send("m.reaction", "t2",
+                          {{"m.relates_to", {{"rel_type", "m.annotation"},
+                                             {"event_id", target},
+                                             {"key", "👍"}}}})));
+    // Call signalling passes on VIEW_CHANNEL, the same gate voice join uses.
+    EXPECT_TRUE(IsOk(send("m.call.invite", "t3",
+                          {{"call_id", "c1"}, {"offer", {{"sdp", "v=0"}}}})));
+}
+
+TEST(SendEventGates, AReactionMustTargetAnEventInThisRoom) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    auto other = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->create_room(other, alice);
+    f.store->set_membership(room, alice, "join");
+    f.store->set_membership(other, alice, "join");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    const auto react = [&](const std::string& txn, const json& rel) {
+        auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.reaction/" + txn,
+                                "token-alice", json{{"m.relates_to", rel}}.dump());
+        httplib::Response res;
+        handler.handle_send_event(req, res);
+        return res;
+    };
+
+    const auto elsewhere = generate_event_id("test");
+    f.store->insert_event(elsewhere, other, alice, std::string(event_type::kRoomMessage),
+                          std::nullopt, json{{"msgtype", "m.text"}, {"body", "over here"}}.dump(),
+                          now_ms());
+
+    // The target id was previously taken entirely on trust, so a reaction could
+    // be posted into this room naming an event that is not in it.
+    EXPECT_EQ(react("t1", {{"rel_type", "m.annotation"}, {"event_id", elsewhere}, {"key", "x"}})
+                  .status, 404);
+    EXPECT_EQ(react("t2", {{"rel_type", "m.annotation"}, {"event_id", "$never-existed"},
+                           {"key", "x"}}).status, 404);
+    // Same answer for both: "that id is real but lives elsewhere" is exactly
+    // the confirmation this check exists to withhold.
+    EXPECT_EQ(react("t3", {{"event_id", "$x"}, {"key", "x"}}).status, 400);
+
+    // A real target in this room is fine, and a deleted one is not — matching
+    // how edits already treat a redacted target.
+    const auto here = generate_event_id("test");
+    f.store->insert_event(here, room, alice, std::string(event_type::kRoomMessage), std::nullopt,
+                          json{{"msgtype", "m.text"}, {"body", "hi"}}.dump(), now_ms());
+    EXPECT_TRUE(IsOk(react("t4", {{"rel_type", "m.annotation"}, {"event_id", here},
+                                  {"key", "👍"}})));
+    f.store->redact_event(here, alice);
+    EXPECT_EQ(react("t5", {{"rel_type", "m.annotation"}, {"event_id", here}, {"key", "👍"}})
+                  .status, 404);
+
+    EXPECT_EQ(count_events_of_type(f, room, "m.reaction"), 1);
+}
+
+TEST(SendEventGates, TransactionIdsAreScopedPerRoomAndPerDevice) {
+    Fixture f;
+    auto alice = f.add_user("alice");           // token-alice, device "dev"
+    auto room_a = generate_room_id("test");
+    auto room_b = generate_room_id("test");
+    f.store->create_room(room_a, alice);
+    f.store->create_room(room_b, alice);
+    f.store->set_membership(room_a, alice, "join");
+    f.store->set_membership(room_b, alice, "join");
+    // The same account signed in on a second client. Both clients start their
+    // txn counters at 1, which is what made this collide.
+    f.store->store_access_token("alice-phone", alice, "PHONE");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    const auto send = [&](const std::string& room, const std::string& token,
+                          const std::string& text) {
+        auto req = make_request("/_matrix/client/v3/rooms/" + room + "/send/m.room.message/txn-1",
+                                token, json{{"msgtype", "m.text"}, {"body", text}}.dump());
+        httplib::Response res;
+        handler.handle_send_event(req, res);
+        EXPECT_TRUE(IsOk(res)) << res.body;
+        return json::parse(res.body).at("event_id").get<std::string>();
+    };
+
+    const auto first = send(room_a, "token-alice", "in A");
+    // Same txn id, different ROOM. This used to return 200 with the first
+    // message's event id and post nothing here at all — indistinguishable from
+    // success to the caller.
+    const auto in_other_room = send(room_b, "token-alice", "in B");
+    EXPECT_NE(first, in_other_room);
+    EXPECT_EQ(count_events_of_type(f, room_b, "m.room.message"), 1);
+
+    // Same txn id, same room, different DEVICE. The second client's message
+    // used to vanish into the first client's record.
+    const auto from_phone = send(room_a, "alice-phone", "from my phone");
+    EXPECT_NE(first, from_phone);
+    EXPECT_EQ(count_events_of_type(f, room_a, "m.room.message"), 2);
+
+    // And the property the key exists for is intact: a retry of the SAME
+    // request is still deduplicated.
+    EXPECT_EQ(send(room_a, "token-alice", "in A"), first);
+    EXPECT_EQ(count_events_of_type(f, room_a, "m.room.message"), 2);
+}

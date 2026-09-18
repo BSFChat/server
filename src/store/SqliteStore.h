@@ -313,10 +313,23 @@ public:
     bool is_event_redacted(const std::string& event_id);
 
     // Transaction-id idempotency for client sends.
-    std::optional<std::string> get_transaction_event(const std::string& user_id,
-                                                     const std::string& txn_id);
-    void record_transaction(const std::string& user_id, const std::string& txn_id,
-                            const std::string& event_id);
+    //
+    // All four parts are the key, and each one is load-bearing. It was
+    // (user_id, txn_id) alone, which is wider than what a txn id identifies:
+    // reusing an id in a different room answered 200 with the FIRST message's
+    // event id and posted nothing to the second room, and two clients signed in
+    // as the same user — both starting their counters at 1 — swallowed each
+    // other's early messages. A txn id is scoped to the sending DEVICE (Matrix
+    // scopes it per access token); the room is ours, and makes the key match the
+    // request being retried rather than merely the sender.
+    struct TransactionKey {
+        std::string user_id;
+        std::string device_id;
+        std::string room_id;
+        std::string txn_id;
+    };
+    std::optional<std::string> get_transaction_event(const TransactionKey& key);
+    void record_transaction(const TransactionKey& key, const std::string& event_id);
 
     // Sync
     // Returns events strictly after `since_position` that the user can see.
