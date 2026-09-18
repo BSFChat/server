@@ -5,6 +5,7 @@
 
 #include "api/AuthHandler.h"
 #include "api/EventHandler.h"
+#include "api/ProfileHandler.h"
 #include "api/RoomHandler.h"
 #include "auth/AutoJoin.h"
 #include "auth/LocalAuth.h"
@@ -554,6 +555,259 @@ TEST(DirectRooms, CreatingADmThatAlreadyExistsReturnsTheExistingRoom) {
     // Once a side has left, the old room is no longer a usable answer.
     f.store->set_membership(first, alice, "leave");
     EXPECT_NE(open_dm("token-alice", bob), first);
+}
+
+// ── DM isolation: a DM is not a channel, and only its two people are in it ──
+
+namespace {
+
+// Alice and bob's DM, with carol standing by as the third party. Carol is the
+// FIRST registered user, so role bootstrap makes her the server's Admin: every
+// "carol cannot" below is therefore a statement about the most privileged
+// account on the server, not about an ordinary one.
+struct DmFixture : Fixture {
+    std::string carol = add_user("carol");
+    std::string alice = add_user("alice");
+    std::string bob = add_user("bob");
+    RoomHandler rooms{*store, *sync, config};
+    std::string room_id;
+
+    DmFixture() {
+        bootstrap_roles(*store, *sync, config);
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/createRoom", "token-alice",
+                                json{{"is_direct", true},
+                                     {"invite", json::array({bob})}}.dump());
+        rooms.handle_create_room(req, res);
+        EXPECT_TRUE(IsOk(res));
+        room_id = json::parse(res.body).at("room_id").get<std::string>();
+    }
+};
+
+// The `is_direct` flag on a user's m.room.member content, or nullopt when there
+// is no such member event.
+std::optional<bool> member_is_direct(SqliteStore& store, const std::string& room_id,
+                                     const std::string& user_id) {
+    auto ev = store.get_state_event(room_id, std::string(event_type::kRoomMember), user_id);
+    if (!ev) return std::nullopt;
+    return ev->content.data.value("is_direct", false);
+}
+
+} // namespace
+
+// m.direct is account data: it rides in exactly one /sync response, and a
+// client that never sees that one response has nothing in the room itself to
+// classify it by — so it files somebody's DM under the server's channels. The
+// room's own membership state says what the room is, for BOTH sides, and every
+// client gets it on every initial sync.
+TEST(DirectRoomIsolation, BothParticipantsMembershipEventSaysItIsDirect) {
+    DmFixture f;
+
+    EXPECT_EQ(member_is_direct(*f.store, f.room_id, f.alice), std::optional<bool>(true));
+    EXPECT_EQ(member_is_direct(*f.store, f.room_id, f.bob), std::optional<bool>(true));
+
+    // An ordinary channel carries no such marker — the client must not start
+    // hiding real channels.
+    httplib::Response res;
+    auto req = make_request("/_matrix/client/v3/createRoom", "token-carol",
+                            json{{"name", "general"}}.dump());
+    f.rooms.handle_create_room(req, res);
+    ASSERT_TRUE(IsOk(res));
+    auto chan = json::parse(res.body).at("room_id").get<std::string>();
+    EXPECT_EQ(member_is_direct(*f.store, chan, f.carol), std::optional<bool>(false));
+}
+
+// broadcastMemberUpdate REPLACES the member event in every joined room, so
+// anything it does not rebuild is erased. Renaming yourself must not turn both
+// sides' DM back into a channel.
+TEST(DirectRoomIsolation, AProfileChangeDoesNotEraseTheDirectMarker) {
+    DmFixture f;
+    ProfileHandler profiles(*f.store, *f.sync, f.config);
+
+    httplib::Response res;
+    auto req = make_request("/_matrix/client/v3/profile/" + f.alice + "/displayname",
+                            "token-alice", json{{"displayname", "Alice B"}}.dump());
+    profiles.handle_put_displayname(req, res);
+    ASSERT_TRUE(IsOk(res));
+
+    EXPECT_EQ(member_is_direct(*f.store, f.room_id, f.alice), std::optional<bool>(true));
+    EXPECT_EQ(member_is_direct(*f.store, f.room_id, f.bob), std::optional<bool>(true));
+}
+
+// Read. Every read path on a room is membership-gated, and a DM has exactly two
+// members — so the server's Admin is as much an outsider here as anyone.
+TEST(DirectRoomIsolation, ANonParticipantCannotReadADm) {
+    DmFixture f;
+    EventHandler events(*f.store, *f.sync, f.config);
+
+    f.store->insert_event(generate_event_id("test"), f.room_id, f.alice,
+                          std::string(event_type::kRoomMessage), std::nullopt,
+                          json{{"msgtype", "m.text"}, {"body", "secret"}}.dump(), now_ms());
+
+    auto expect_forbidden = [&](const char* what, httplib::Response& res) {
+        EXPECT_EQ(res.status, 403) << what << ": " << res.body;
+        EXPECT_EQ(json::parse(res.body).value("errcode", ""), "M_FORBIDDEN") << what;
+    };
+
+    {
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/rooms/" + f.room_id + "/messages",
+                                "token-carol");
+        events.handle_room_messages(req, res);
+        expect_forbidden("/messages", res);
+    }
+    {
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/rooms/" + f.room_id + "/state",
+                                "token-carol");
+        f.rooms.handle_room_state(req, res);
+        expect_forbidden("/state", res);
+    }
+    {
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/rooms/" + f.room_id + "/members",
+                                "token-carol");
+        f.rooms.handle_room_members(req, res);
+        expect_forbidden("/members", res);
+    }
+    // ...and /sync, the path that would otherwise put it in her sidebar.
+    auto carol_sync = f.sync->handle_sync(f.carol, "", 0);
+    EXPECT_EQ(carol_sync.rooms.join.count(f.room_id), 0u);
+    EXPECT_FALSE(carol_sync.direct_rooms.has_value());
+}
+
+// Send.
+TEST(DirectRoomIsolation, ANonParticipantCannotSendIntoADm) {
+    DmFixture f;
+    EventHandler events(*f.store, *f.sync, f.config);
+
+    httplib::Response res;
+    auto req = make_request(
+        "/_matrix/client/v3/rooms/" + f.room_id + "/send/m.room.message/txn1",
+        "token-carol", json{{"msgtype", "m.text"}, {"body", "hello"}}.dump());
+    events.handle_send_event(req, res);
+
+    EXPECT_EQ(res.status, 403) << res.body;
+    EXPECT_EQ(json::parse(res.body).value("errcode", ""), "M_FORBIDDEN");
+
+    // And nothing landed: bob's timeline is exactly what alice and bob put there.
+    for (const auto& ev : f.store->get_room_events(f.room_id, 50)) {
+        EXPECT_NE(ev.sender, f.carol);
+    }
+}
+
+// Enumeration. A DM must not appear in any sweep that answers "what channels
+// does this server have" — those feed auto-join, the public room directory and
+// the historical publicize migration.
+TEST(DirectRoomIsolation, ADmIsNotInAnyServerChannelEnumeration) {
+    DmFixture f;
+
+    httplib::Response res;
+    auto req = make_request("/_matrix/client/v3/createRoom", "token-carol",
+                            json{{"name", "general"}}.dump());
+    f.rooms.handle_create_room(req, res);
+    ASSERT_TRUE(IsOk(res));
+    auto chan = json::parse(res.body).at("room_id").get<std::string>();
+
+    auto lacks = [&](const std::vector<std::string>& v, const std::string& id) {
+        return std::find(v.begin(), v.end(), id) == v.end();
+    };
+
+    auto all = f.store->list_all_non_category_rooms();
+    EXPECT_TRUE(lacks(all, f.room_id));
+    EXPECT_FALSE(lacks(all, chan)) << "the real channel must still be listed";
+
+    EXPECT_TRUE(lacks(f.store->list_public_rooms(), f.room_id));
+    EXPECT_TRUE(lacks(f.store->list_legacy_untyped_rooms(), f.room_id));
+
+    // The auto-join sweep a new channel triggers must not drag carol into the
+    // DM on its way past.
+    EXPECT_FALSE(f.store->is_room_member(f.room_id, f.carol));
+    backfill_auto_join(*f.store, *f.sync, f.config);
+    EXPECT_FALSE(f.store->is_room_member(f.room_id, f.carol));
+}
+
+// A DM is a conversation between exactly two people. Nothing may add a third,
+// and nothing may file it under the server's channel tree — not the dedicated
+// endpoints and not the generic state route behind them.
+TEST(DirectRoomIsolation, ADmCannotBeWidenedOrTurnedIntoAChannel) {
+    DmFixture f;
+
+    auto expect_forbidden = [&](const char* what, const httplib::Response& res) {
+        EXPECT_EQ(res.status, 403) << what << ": " << res.body;
+        EXPECT_EQ(json::parse(res.body).value("errcode", ""), "M_FORBIDDEN") << what;
+    };
+
+    // A category to aim at, and alice as an Admin so the refusals below are
+    // about the room being a DM rather than about her permissions.
+    f.grant(f.alice, std::string(permission::role_id::kAdmin));
+    std::string category;
+    {
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/createRoom", "token-carol",
+                                json{{"name", "Text"}, {"is_category", true}}.dump());
+        f.rooms.handle_create_room(req, res);
+        ASSERT_TRUE(IsOk(res));
+        category = json::parse(res.body).at("room_id").get<std::string>();
+    }
+
+    {   // Alice is a participant AND an admin. She still cannot add carol.
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/rooms/" + f.room_id + "/invite",
+                                "token-alice", json{{"user_id", f.carol}}.dump());
+        f.rooms.handle_invite(req, res);
+        expect_forbidden("/invite", res);
+        EXPECT_FALSE(f.store->is_room_member(f.room_id, f.carol));
+    }
+    {   // Nor give it a place in the sidebar.
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/rooms/" + f.room_id + "/category",
+                                "token-alice", json{{"parent_id", category}}.dump());
+        f.rooms.handle_move_channel(req, res);
+        expect_forbidden("/category", res);
+    }
+    {
+        httplib::Response res;
+        auto req = make_request("/_matrix/client/v3/rooms/" + f.room_id + "/order",
+                                "token-alice", json{{"order", 3}}.dump());
+        f.rooms.handle_set_order(req, res);
+        expect_forbidden("/order", res);
+    }
+    {   // The generic state route is the back door to both of the above.
+        httplib::Response res;
+        auto req = make_request(
+            "/_matrix/client/v3/rooms/" + f.room_id + "/state/bsfchat.room.category",
+            "token-alice", json{{"parent_id", category}, {"order", 0}}.dump());
+        f.rooms.handle_set_state(req, res);
+        expect_forbidden("state/bsfchat.room.category", res);
+    }
+    {   // Reopening the join rules would make it joinable by anyone.
+        httplib::Response res;
+        auto req = make_request(
+            "/_matrix/client/v3/rooms/" + f.room_id + "/state/m.room.join_rules",
+            "token-alice", json{{"join_rule", "public"}}.dump());
+        f.rooms.handle_set_state(req, res);
+        expect_forbidden("state/m.room.join_rules", res);
+    }
+
+    EXPECT_FALSE(f.store->get_state_event(
+        f.room_id, std::string(event_type::kRoomCategory), "").has_value());
+}
+
+// Deleting a channel is a moderator act performed from OUTSIDE it, so
+// handle_delete_room has no membership check — which made every DM on the
+// server destroyable by whoever holds MANAGE_CHANNELS, with the member list
+// captured into the audit log on the way out.
+TEST(DirectRoomIsolation, AnAdminOutsideADmCannotDeleteIt) {
+    DmFixture f;
+
+    httplib::Response res;
+    auto req = make_request("/_matrix/client/v3/rooms/" + f.room_id, "token-carol");
+    f.rooms.handle_delete_room(req, res);
+
+    EXPECT_EQ(res.status, 403) << res.body;
+    EXPECT_TRUE(f.store->room_exists(f.room_id));
+    EXPECT_TRUE(f.store->is_room_member(f.room_id, f.bob));
 }
 
 // ── S2: room creation authorization ───────────────────────────────────────

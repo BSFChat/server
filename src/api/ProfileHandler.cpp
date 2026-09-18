@@ -366,9 +366,15 @@ void ProfileHandler::broadcastMemberUpdate(const std::string& user_id)
 
     for (const auto& room_id : rooms) {
         auto event_id = generate_event_id(config_.server_name);
+        // This rewrite REPLACES the member event, so anything the original
+        // carried that isn't rebuilt here is erased. `is_direct` is the DM
+        // marker clients classify a room by; without this, renaming yourself
+        // once would turn both participants' DM back into a plain channel.
+        auto room_content = content;
+        if (store_.is_direct_room(room_id)) room_content["is_direct"] = true;
         store_.insert_event(event_id, room_id, user_id,
                             std::string(event_type::kRoomMember),
-                            user_id, content.dump(), now_ms());
+                            user_id, room_content.dump(), now_ms());
     }
     if (!rooms.empty()) sync_engine_.notify_new_event();
 }
