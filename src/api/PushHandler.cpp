@@ -45,7 +45,7 @@ std::string url_host(const std::string& url) {
     } else if (const auto colon = authority.rfind(':');
                colon != std::string::npos
                && authority.find(':') == colon) {   // host:port, not bare IPv6
-        authority = authority.substr(0, colon);
+        authority.resize(colon);
     }
 
     std::transform(authority.begin(), authority.end(), authority.begin(),

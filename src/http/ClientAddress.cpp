@@ -39,9 +39,9 @@ std::optional<Bytes16> parse_ip(std::string s) {
         if (close == std::string::npos) return std::nullopt;
         s = s.substr(1, close - 1);
     } else if (std::count(s.begin(), s.end(), ':') == 1 && s.find('.') != std::string::npos) {
-        s = s.substr(0, s.find(':'));
+        s.resize(s.find(':'));
     }
-    if (const auto zone = s.find('%'); zone != std::string::npos) s = s.substr(0, zone);
+    if (const auto zone = s.find('%'); zone != std::string::npos) s.resize(zone);
 
     Bytes16 out{};
     uint8_t v4[4];
