@@ -221,6 +221,27 @@ else
   note "listing does not leak the token"
 fi
 
+# The listing contract: owner_id and deactivated are ALWAYS present; the
+# timestamps are present only when they mean something, so a reader is never
+# handed a 0 that looks like "deactivated at the epoch".
+if python3 - "$WORK/last-body.json" "$BOT_ID" "$ADMIN" <<'PY'
+import json, sys
+bots = json.load(open(sys.argv[1])).get("bots", [])
+row = next((b for b in bots if b.get("user_id") == sys.argv[2]), None)
+if row is None:
+    sys.exit(1)
+ok = (row.get("owner_id") == sys.argv[3]
+      and row.get("deactivated") is False
+      and "created_at" in row
+      and "deactivated_at" not in row)      # absent while live
+sys.exit(0 if ok else 1)
+PY
+then
+  note "listing shape: owner_id, deactivated, no deactivated_at"
+else
+  fail "listing shape: owner_id, deactivated, no deactivated_at" "body=$(cat "$WORK/last-body.json")"
+fi
+
 # ── phase 2: the bot authenticates ───────────────────────────────────────
 echo
 echo "── T2: bot auth ─────────────────────────────────────────────────────"
@@ -235,6 +256,34 @@ check "bot cannot password-login"               403 "$(req POST "/login" "" \
 check "profile marks it as a bot"               200 "$(req GET "/profile/${BOT_ID}" "")"
 check "  bsfchat.bot is true"                   "True" "$(python3 -c 'import json,sys
 print(json.load(open(sys.argv[1])).get("bsfchat.bot"))' "$WORK/last-body.json")"
+
+# whoami carries the same flag, for the CALLER — so shared client code can
+# discover it is running as a bot on the request it already makes at startup.
+req GET "/account/whoami" "$BOT_TOKEN" >/dev/null
+check "  whoami carries bsfchat.bot"            "True" "$(python3 -c 'import json,sys
+print(json.load(open(sys.argv[1])).get("bsfchat.bot"))' "$WORK/last-body.json")"
+
+# For a human the key is ABSENT, not false.
+#
+# Note the body may be the literal JSON `null` rather than `{}`: the handler
+# builds a default-constructed json and only ever assigns keys, so a user with
+# no displayname, avatar or nickname who is not a bot serialises as null. That
+# is a real wire-shape quirk a bot parsing profiles has to survive, so assert
+# the property a bot actually depends on — "not flagged as a bot" — over both
+# shapes, rather than pretending only one occurs.
+req GET "/profile/@alice:e2e" "" >/dev/null
+if python3 - "$WORK/last-body.json" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+if doc is None:                       # the null-profile shape
+    sys.exit(0)
+sys.exit(0 if doc.get("bsfchat.bot") is None else 1)
+PY
+then
+  note "human profile OMITS the key" "$(cat "$WORK/last-body.json")"
+else
+  fail "human profile OMITS the key" "body=$(cat "$WORK/last-body.json")"
+fi
 
 # ── phase 3: auto-join exclusion ─────────────────────────────────────────
 echo
@@ -262,6 +311,8 @@ check "bot cannot send before joining"          403 "$(req PUT "/rooms/${ROOM}/s
 
 check "bot joins explicitly"                    200 "$(req POST "/rooms/${ROOM}/join" "$BOT_TOKEN")"
 check "  join returns the room id"              "$ROOM" "$(jfield room_id)"
+# The other spelling of the same thing, and joining twice must be harmless.
+check "  /join/{roomId} works too"              200 "$(req POST "/join/${ROOM}" "$BOT_TOKEN")"
 
 # ── phase 4: receive via sync, then reply ────────────────────────────────
 echo
@@ -362,9 +413,103 @@ print(json.dumps({"m.relates_to":{"rel_type":"m.annotation",
                                   "event_id":sys.argv[1],"key":"\U0001F44D"}}))' "$CMD_EVENT")
 check "bot can react"                           200 "$(req PUT "/rooms/${ROOM}/send/m.reaction/rx1" "$BOT_TOKEN" "$RX_BODY")"
 
-# ── phase 5: token rotation ──────────────────────────────────────────────
+# ── phase 5: invite auto-joins a bot ─────────────────────────────────────
 echo
-echo "── T5: token rotation revokes the old credential ────────────────────"
+echo "── T5: inviting a bot joins it outright ─────────────────────────────"
+
+# A SECOND channel, which the bot is not in — bots are excluded from auto-join,
+# so a channel created now leaves the bot outside it.
+curl -s -o "$WORK/last-body.json" -X POST "${BASE}/createRoom" -H "Authorization: Bearer $T_ADMIN" \
+  -H 'Content-Type: application/json' -d '{"name":"ops","visibility":"public"}' >/dev/null
+ROOM2=$(jfield room_id)
+[[ -n "$ROOM2" ]] || die "admin could not create the second channel"
+echo "     room2 = $ROOM2"
+
+req GET "/joined_rooms" "$BOT_TOKEN" >/dev/null
+if grep -q "$ROOM2" "$WORK/last-body.json"; then
+  fail "bot is outside the new channel" "already in $ROOM2"
+else
+  note "bot is outside the new channel"
+fi
+
+# Park the bot's poll FIRST. The whole point of the design is that the bot does
+# nothing: no invite to accept, no join call. It must simply observe itself
+# joined, as an ordinary m.room.member event in the timeline.
+#
+# Drain first with timeout=0. The bot's own reply and reaction from T4 are still
+# unconsumed, and a poll started from a token behind them returns instantly with
+# those instead of waiting for the invite — which is exactly the "initial sync
+# replays history" trap the docs warn bot authors about.
+curl -s -o "$WORK/bot-drain.json" "${BASE}/sync?timeout=0&since=$(jfield_of "$WORK/bot-sync.json" next_batch)" \
+  -H "Authorization: Bearer $BOT_TOKEN"
+SINCE2=$(jfield_of "$WORK/bot-drain.json" next_batch)
+[[ -n "$SINCE2" ]] || die "could not establish a drained sync position for the invite test"
+( curl -s -o "$WORK/bot-invite-sync.json" \
+    "${BASE}/sync?timeout=60000&since=${SINCE2}" \
+    -H "Authorization: Bearer $BOT_TOKEN" ) &
+SYNC_PID=$!
+sleep 0.7
+
+check "admin invites the bot"                   200 "$(req POST "/rooms/${ROOM2}/invite" "$T_ADMIN" \
+  "{\"user_id\":\"${BOT_ID}\"}")"
+
+wait $SYNC_PID 2>/dev/null
+
+# The assertion that matters: a JOIN membership for the bot itself, in the new
+# room, delivered without the bot ever calling /join.
+if python3 - "$WORK/bot-invite-sync.json" "$ROOM2" "$BOT_ID" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+room = doc.get("rooms", {}).get("join", {}).get(sys.argv[2], {})
+for e in room.get("timeline", {}).get("events", []):
+    if (e.get("type") == "m.room.member"
+            and e.get("state_key") == sys.argv[3]
+            and e.get("content", {}).get("membership") == "join"):
+        sys.exit(0)
+sys.exit(1)
+PY
+then
+  note "bot observed itself JOINED via sync" "no join call made"
+else
+  fail "bot observed itself JOINED via sync" "body=$(head -c 500 "$WORK/bot-invite-sync.json")"
+fi
+
+# Membership is real, not cosmetic: it can act there.
+check "invited bot can post in that channel"    200 "$(req PUT "/rooms/${ROOM2}/send/m.room.message/inv1" "$BOT_TOKEN" \
+  '{"msgtype":"m.notice","body":"invited, and here"}')"
+
+req GET "/joined_rooms" "$BOT_TOKEN" >/dev/null
+if grep -q "$ROOM2" "$WORK/last-body.json"; then
+  note "joined_rooms now lists the channel"
+else
+  fail "joined_rooms now lists the channel" "body=$(cat "$WORK/last-body.json")"
+fi
+
+# Re-inviting a bot that is already in must be a no-op, not an error.
+check "re-inviting is idempotent"               200 "$(req POST "/rooms/${ROOM2}/invite" "$T_ADMIN" \
+  "{\"user_id\":\"${BOT_ID}\"}")"
+
+# Human invite semantics must be UNCHANGED — a human is not force-joined by an
+# invite. Bob is auto-joined to public channels, so use a private room to tell
+# an invite apart from auto-join.
+curl -s -o "$WORK/last-body.json" -X POST "${BASE}/createRoom" -H "Authorization: Bearer $T_ADMIN" \
+  -H 'Content-Type: application/json' -d '{"name":"private-room","visibility":"private"}' >/dev/null
+ROOM3=$(jfield room_id)
+if [[ -n "$ROOM3" ]]; then
+  check "admin invites a HUMAN"                 200 "$(req POST "/rooms/${ROOM3}/invite" "$T_ADMIN" '{"user_id":"@bob:e2e"}')"
+  req GET "/joined_rooms" "$T_BOB" >/dev/null
+  if grep -q "$ROOM3" "$WORK/last-body.json"; then
+    fail "  human is NOT force-joined" "bob was auto-joined to $ROOM3 by an invite"
+  else
+    note "  human is NOT force-joined" "invite semantics unchanged for people"
+  fi
+else
+  fail "could not create a private room for the human-invite check"
+fi
+
+# ── phase 6: token rotation ──────────────────────────────────────────────
+echo
+echo "── T6: token rotation revokes the old credential ────────────────────"
 
 OLD_TOKEN="$BOT_TOKEN"
 check "admin rotates the bot token"             200 "$(req POST "/bsfchat/bots/${BOT_ID}/token" "$T_ADMIN")"
@@ -391,9 +536,9 @@ check "NEW token is still in the room"          200 "$(req PUT "/rooms/${ROOM}/s
 
 check "plain user cannot rotate"                403 "$(req POST "/bsfchat/bots/${BOT_ID}/token" "$T_BOB")"
 
-# ── phase 6: deactivation ────────────────────────────────────────────────
+# ── phase 7: deactivation ────────────────────────────────────────────────
 echo
-echo "── T6: deactivation ─────────────────────────────────────────────────"
+echo "── T7: deactivation ─────────────────────────────────────────────────"
 
 # DELETE is a DEACTIVATION, not a hard delete, and deliberately so: the row
 # stays so the localpart remains reserved (a recreated "bot_deploy" would
@@ -409,6 +554,15 @@ check "  and it cannot send"                    401 "$(req PUT "/rooms/${ROOM}/s
 # Deactivation must be a one-way door. If rotating could mint a fresh token,
 # "deactivated" would only mean "until somebody rotates it".
 check "deactivated bot cannot be revived"       400 "$(req POST "/bsfchat/bots/${BOT_ID}/token" "$T_ADMIN")"
+
+# Nor talked back into a channel by inviting it. If an invite could re-join a
+# deactivated bot, "deactivated" would only hold until somebody invited it.
+INV_STATUS=$(req POST "/rooms/${ROOM2}/invite" "$T_ADMIN" "{\"user_id\":\"${BOT_ID}\"}")
+if [[ "$INV_STATUS" == "400" || "$INV_STATUS" == "403" ]]; then
+  note "inviting a deactivated bot is refused" "$INV_STATUS"
+else
+  fail "inviting a deactivated bot is refused" "got $INV_STATUS body=$(cat "$WORK/last-body.json")"
+fi
 
 # Deactivating twice must not error or double-log.
 check "deactivation is idempotent"              200 "$(req DELETE "/bsfchat/bots/${BOT_ID}" "$T_ADMIN")"

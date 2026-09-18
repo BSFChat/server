@@ -96,6 +96,7 @@ class BSFChatBot:
 
         self.since: str | None = None
         self._handlers: list[tuple[str, Callable[[dict, dict], None]]] = []
+        self._joined_handlers: list[Callable[[str, dict], None]] = []
 
         # Transaction ids must be globally unique per bot, for the lifetime of
         # the account — NOT just per room and NOT just per process.
@@ -142,7 +143,15 @@ class BSFChatBot:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 payload = resp.read()
-                return json.loads(payload) if payload else {}
+                if not payload:
+                    return {}
+                # `or {}` is load-bearing, not defensive noise: GET
+                # /profile/{userId} answers the literal JSON `null` (not `{}`)
+                # for an account with no displayname, avatar, nickname or bot
+                # flag, because the handler only ever assigns keys to an empty
+                # value. Without this, a profile lookup for a freshly
+                # registered user raises TypeError on the caller's .get().
+                return json.loads(payload) or {}
         except urllib.error.HTTPError as exc:
             payload = exc.read()
             try:
@@ -185,12 +194,17 @@ class BSFChatBot:
         )
 
     def join(self, room_id: str) -> str:
-        """Join a room.
+        """Join a public room by id.
 
         Bots are EXCLUDED from the auto-join that force-joins human accounts to
-        every public channel, so this is always explicit. Note also that a bot
-        cannot see that it has been invited — /sync has no rooms.invite section
-        — so room ids have to come from configuration. See docs/bots.md §3.
+        every public channel, so getting in is always deliberate.
+
+        This is the SECOND way in, for a bot configured with a list of channels.
+        The normal gesture is for an operator to invite the bot, which joins it
+        outright server-side — there is no pending invite to accept and no
+        invite-handling code to write. Use on_joined() to react to that.
+
+        Joining a room we are already in is harmless. See docs/bots.md §3.
         """
         path = f"/_matrix/client/v3/rooms/{urllib.parse.quote(room_id)}/join"
         return self._request("POST", path)["room_id"]
@@ -299,6 +313,38 @@ class BSFChatBot:
             return fn
 
         return decorate
+
+    def on_joined(self, fn: Callable[[str, dict], None]) -> Callable:
+        """Decorator: called as fn(room_id, event) when this bot joins a room.
+
+        This is how you react to being invited. Inviting a bot joins it
+        immediately server-side — there is no pending invitation and nothing to
+        accept — so the invite reaches us as an ordinary m.room.member join
+        event in the timeline, exactly like any other membership change.
+
+        Also fires for a room we joined ourselves via join(), so whatever you do
+        here should be safe to run either way.
+        """
+        self._joined_handlers.append(fn)
+        return fn
+
+    def _dispatch_membership(self, room_id: str, event: dict) -> None:
+        """Notice that WE were added to a room."""
+        if event.get("type") != "m.room.member":
+            return
+        # state_key is the member the event is ABOUT; sender is whoever acted.
+        # For an invite-join those differ, so match on state_key.
+        if event.get("state_key") != self.user_id:
+            return
+        if (event.get("content") or {}).get("membership") != "join":
+            return
+        for fn in self._joined_handlers:
+            try:
+                fn(room_id, event)
+            except BotError as exc:
+                log.error("on_joined handler failed: %s", exc)
+            except Exception:
+                log.exception("on_joined handler raised")
 
     def _dispatch(self, room_id: str, event: dict) -> None:
         # ── the two footguns, in the order they must be checked ──────────
@@ -417,6 +463,7 @@ class BSFChatBot:
 
             for room_id, room in (resp.get("rooms", {}).get("join", {}) or {}).items():
                 for event in (room.get("timeline", {}) or {}).get("events", []) or []:
+                    self._dispatch_membership(room_id, event)
                     self._dispatch(room_id, event)
 
             if on_sync:

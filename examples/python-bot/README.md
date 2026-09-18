@@ -35,9 +35,26 @@ than removing it, and the localpart stays reserved for good — so pick the name
 deliberately.
 
 **2. Give it somewhere to talk.** Bots are excluded from the auto-join that puts
-human accounts in every public channel, and a bot cannot see that it has been
-invited. So: get the room id of a channel, and make sure the bot is allowed to
-speak there. The minimum grant, scoped to one channel:
+human accounts in every public channel, so getting in is deliberate.
+
+The normal gesture is to **invite the bot**, exactly as you would a person:
+
+```bash
+curl -X POST "$HOMESERVER/_matrix/client/v3/rooms/$ROOM/invite" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"@bot_example:chat.example.com"}'
+```
+
+Inviting a bot **joins it immediately** — there is no pending invitation to
+accept, and the bot needs no invite-handling code. It just sees itself joined on
+its next sync; the `@bot.on_joined` handler in `bot.py` shows how to react.
+
+Alternatively, for public channels, set `BSFCHAT_ROOMS` and the bot lets itself
+in by room id at startup.
+
+Either way the bot needs permission to speak. The minimum grant, scoped to one
+channel:
 
 ```bash
 curl -X PUT "$HOMESERVER/_matrix/client/v3/rooms/$ROOM/state/bsfchat.channel.permissions/user:@bot_example:chat.example.com" \
@@ -106,9 +123,12 @@ The methods you have:
 | `send_event(room, type, content)` | The escape hatch — any event type, any content. |
 | `join(room_id)` / `joined_rooms()` | Membership. |
 
-To handle something other than commands — every message, state changes, voice
-roster events — pass `on_sync=` to `bot.run()` and read the raw response, or
-subclass and override `_dispatch()`.
+`@bot.on_joined` registers a callback for "this bot was added to a channel",
+called as `fn(room_id, event)`. That is how you react to being invited.
+
+To handle anything else — every message, other state changes, voice roster
+events — pass `on_sync=` to `bot.run()` and read the raw response, or subclass
+and override `_dispatch()`.
 
 ## Four things that will bite you
 
@@ -143,8 +163,9 @@ are a WebRTC mesh between C++ desktop clients and the server never touches a
 media packet. A music bot is not possible. You can read the voice roster and
 post about it.
 
-**No invite flow.** `/sync` has no `rooms.invite` section, so a bot cannot
-detect being invited. Room ids come from config.
+**No invite *acceptance* flow** — and you do not need one. Inviting a bot joins
+it outright, so it arrives as a normal join event (`@bot.on_joined`). `/sync`
+still has no `rooms.invite` section, which matters only for human accounts.
 
 **No single-event fetch, no `/relations`, no filters, no account data, no
 E2EE.** See [`../../docs/bots.md` §0 and §11](../../docs/bots.md).

@@ -112,6 +112,23 @@ def build_bot() -> BSFChatBot:
             notice=True,
         )
 
+    # ── being added to a channel ────────────────────────────────────────
+    @bot.on_joined
+    def greet(room_id, event):
+        """Say hello when we are added to a channel.
+
+        Inviting a bot joins it outright server-side, so an invite needs NO
+        handling code: it arrives here as an ordinary m.room.member join event.
+        `event["sender"]` is whoever added us (ourselves, if we joined by id).
+        """
+        if event.get("sender") == bot.user_id:
+            return  # we let ourselves in; no need to announce it
+        bot.send_text(
+            room_id,
+            f"Hello! I'm {bot.user_id}. Try {bot.command_prefix}ping.",
+            notice=True,
+        )
+
     return bot
 
 
@@ -125,9 +142,12 @@ def main() -> int:
     bot.connect()  # verifies the token and learns our own user id
 
     # Bots are EXCLUDED from the auto-join that force-joins human accounts to
-    # every public channel, and a bot cannot observe an invite (/sync has no
-    # rooms.invite section). So the rooms come from configuration and we join
-    # explicitly. Joining a room we are already in is harmless.
+    # every public channel, so getting in is deliberate.
+    #
+    # BSFCHAT_ROOMS is the optional belt-and-braces path for public channels we
+    # always want to be in. The normal way in is for an operator to invite the
+    # bot, which joins it outright — see the @bot.on_joined handler above.
+    # Joining a room we are already in is harmless.
     wanted = [r.strip() for r in os.environ.get("BSFCHAT_ROOMS", "").split(",") if r.strip()]
     for room_id in wanted:
         try:
@@ -139,8 +159,8 @@ def main() -> int:
     joined = bot.joined_rooms()
     if not joined:
         logging.warning(
-            "not in any room — set BSFCHAT_ROOMS, or have an admin grant the "
-            "bot VIEW_CHANNEL and join it to a channel"
+            "not in any room yet — invite the bot to a channel (that joins it "
+            "immediately), or set BSFCHAT_ROOMS to public channel ids"
         )
     else:
         logging.info("listening in %d room(s): %s", len(joined), ", ".join(joined))

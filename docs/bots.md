@@ -87,12 +87,20 @@ GET /_matrix/client/v3/bsfchat/bots
                "description": "Forecasts on demand",
                "owner_id": "@alice:chat.example.com",
                "created_at": 1758000000000,
-               "deactivated": false}]}
+               "deactivated": false,
+               "last_seen_at": 1758003600000}]}
 ```
 
-Listing never returns tokens. `owner_id` is who is currently responsible for the
-bot. Deactivated bots are **included and flagged**, not hidden (see below), and
-carry a `deactivated_at` timestamp.
+Listing never returns tokens — no branch of it can, because the plaintext was
+never stored.
+
+| Field | Notes |
+| --- | --- |
+| `owner_id` | Who is currently responsible for the bot. A current fact, not a historical one. |
+| `created_at` | Always present, ms since epoch. |
+| `deactivated` | **Always present**, so "not deactivated" and "server too old to say" are not the same value. |
+| `deactivated_at` | Present **only when deactivated** — you never get a `0` that reads as "deactivated at the epoch". |
+| `last_seen_at` | Present **only once the bot has authenticated**. Coarse: it is throttled to one write per minute so a busy bot does not put a store write on every request. It answers "has anyone decommissioned this integration?" |
 
 ### Rotate the token
 
@@ -140,8 +148,37 @@ bot accounts:
 200 {"displayname": "Weather", "bsfchat.bot": true}
 ```
 
-This endpoint is **unauthenticated** — it takes no token and checks none. Handy,
-but do not treat a profile lookup as proof of anything privileged.
+**The key is emitted only when it is true.** For a human it is *absent*, not
+`false` — the same convention as an unset `displayname`. Read it as
+`profile.get("bsfchat.bot", False)` and never test for the key's presence
+expecting a boolean either way.
+
+This endpoint is **unauthenticated** — it takes no token and checks none. That
+is deliberate: bot-ness is a label meant to be shown to everyone who sees the
+account, not a secret. But do not treat a profile lookup as proof of anything
+privileged.
+
+> **Watch out:** this endpoint can return the literal JSON `null` with a `200`,
+> not `{}`. The response is built by assigning keys to an empty value, so an
+> account with no displayname, no avatar, no nickname and no bot flag — a
+> freshly registered user — serialises as `null`. Code like
+> `requests.get(...).json()["displayname"]` or `.get("bsfchat.bot", False)` will
+> raise a `TypeError` on such a user. Guard it:
+>
+> ```python
+> profile = resp.json() or {}
+> is_bot = profile.get("bsfchat.bot", False)
+> ```
+
+`GET /_matrix/client/v3/account/whoami` carries the same key, for the **caller**:
+
+```json
+200 {"user_id": "@bot_weather:chat.example.com", "bsfchat.bot": true}
+```
+
+Since you should be calling `whoami` at startup anyway (§2), that is a free way
+for shared code to discover it is running as a bot — and skip the password and
+session-expiry affordances that mean nothing for one.
 
 ---
 
@@ -166,6 +203,14 @@ Things that do **not** apply to bots:
   refused. There is no bot login flow. Your token *is* your session.
 - `POST /refresh` — bot tokens are not part of the refresh-token scheme.
 - `POST /logout` / `/logout/all` — rotation is the revocation mechanism.
+
+**A bot token never expires.** Human access tokens have a 90-day sliding
+lifetime, on the assumption that there is a person who can log in again when a
+session lapses; a bot has nobody. An expiring bot token would be an integration
+that stops working on a date nobody wrote down, with a `401` as its only
+explanation. A bot credential ends only by rotation or deactivation, and both
+are explicit operator actions. Do not write refresh logic; you will never need
+it.
 
 Two failure codes you will see, and they mean different things:
 
@@ -193,33 +238,70 @@ to every new public channel as it is created. **Bots are excluded from this.**
 That is deliberate: a server with forty channels should not have every bot
 sitting in all forty, holding membership rows and receiving every message.
 
-A bot joins a room explicitly:
+There are two ways in, and the first is the one to reach for.
+
+### Being invited (the normal gesture)
+
+An operator invites the bot the same way they would invite anyone:
+
+```http
+POST /_matrix/client/v3/rooms/{roomId}/invite
+{"user_id": "@bot_weather:chat.example.com"}
+```
+
+**Inviting a bot joins it immediately, server-side.** There is no pending
+invitation to accept and nothing for the bot to do: the server writes a real
+`m.room.member` join event, and your bot simply observes itself joined on its
+next `/sync`, in the ordinary timeline, like any other membership change.
+
+From the bot author's side that means: **you write no invite-handling code at
+all.** If your bot needs to react to being added to a channel — post a greeting,
+register the room in its own state — watch for an `m.room.member` event whose
+`state_key` is your own user id and whose `content.membership` is `join`:
+
+```python
+if event["type"] == "m.room.member" \
+        and event.get("state_key") == self.user_id \
+        and event["content"].get("membership") == "join":
+    # we were just added to event["room_id"]
+```
+
+The gesture is idempotent — inviting a bot already in the channel changes
+nothing and does not error. It is refused for a **deactivated** bot and for a
+**banned** one.
+
+This is bot-specific behaviour. **Inviting a human still creates an ordinary
+pending invite** that the person accepts in their client; nothing about human
+invite semantics changed.
+
+### Joining by room id (public channels)
+
+A bot can also let itself into any public channel using its own token, which is
+useful when the bot is configured with a list of channels rather than being
+invited to them. Both spellings work:
 
 ```http
 POST /_matrix/client/v3/rooms/{roomId}/join
+POST /_matrix/client/v3/join/{roomId}
 ```
 ```json
 200 {"room_id": "!abc:chat.example.com"}
 ```
 
 For a channel whose `m.room.join_rules` is `public` this succeeds for any
-non-banned account. For `invite` it requires a pending invite, and for a direct
-message room it always fails with `403` — DMs are never joinable by request.
+non-banned account. For `invite` it requires a pending invite — so for a
+private channel, have an operator invite the bot instead, which joins it
+outright. A direct message room always fails with `403`: DMs are never joinable
+by request.
+
+Joining a room the bot is already in is harmless, so a bot can simply attempt
+its configured rooms at every startup.
+
+### Knowing where you are
 
 `GET /_matrix/client/v3/joined_rooms` returns `{"joined_rooms": [...]}`, which is
-how a bot discovers what it is already in across restarts.
-
-> ### Gotcha: a bot cannot see that it has been invited
->
-> `/sync` only ever returns a `rooms.join` block. There is **no `rooms.invite`
-> and no `rooms.leave` section**, and the event query that feeds sync joins
-> against `room_members` with `membership = 'join'` — so an invite creates no
-> event your bot can ever observe.
->
-> In practice this means the "invite the bot to a channel" flow does not work
-> end to end today. Configure your bot with the room ids it should be in (or
-> have it join every public channel it is told about) and call
-> `POST /rooms/{id}/join` at startup. See §11.
+how a bot rediscovers itself across restarts — including channels it was invited
+into while it was down.
 
 ---
 
@@ -641,17 +723,26 @@ A bot that only reads and replies in one channel does **not** need a role.
 
 ## 9. Rate limits, backoff, and error handling
 
-### What is actually rate-limited
+### What is actually rate-limited *today*
 
 Only the **credential endpoints** — `/login`, `/register`, `/refresh`,
-`/account/password` — carry a rate limiter (30 attempts per address per 60 s by
-default, plus a failure lockout). **A bot touches none of these.**
+`/account/password` — carry a rate limiter: 30 attempts per client address per
+60 s by default, plus a failure lockout tracked per address and per target
+username. **A bot touches none of these**, so in practice none of it applies to
+you.
 
-There is **no general request rate limit.** `/sync`, `/send`, `/messages`,
-`/upload` are ungated. That is a reason to be well-behaved, not a licence: the
-limit you will hit is the thread pool, not a 429.
+Everything else — `/sync`, `/send`, `/messages`, `/upload` — is **currently
+ungated**. Do not read that as a licence. The limit you will actually hit is the
+thread pool, not a `429`, and the failure mode there is degraded service for
+every human on the server rather than a clean error for you.
 
-The one 429 a bot will genuinely see is **slowmode**:
+> **Send-side rate limiting is coming.** A per-account limiter on the send path
+> is in progress. Write your bot as though it were already there: use the
+> backoff table below, honour `retry_after_ms`, and do not assume an
+> unrestricted send rate is a durable property of the server. A bot that is
+> well-behaved today needs no changes when it lands.
+
+The one 429 a bot meets today is **slowmode**:
 
 ```json
 429 {"errcode": "M_LIMIT_EXCEEDED",
@@ -733,15 +824,18 @@ Honest list, as of this writing:
   On a server predating it, only `ADMINISTRATOR` can manage bots.
 - **There is no hard delete for a bot account.** `DELETE` deactivates (§1). That
   is the right default, but it means a typo'd localpart is burned permanently.
-- **Invites are invisible to bots** (§3). `/sync` has no `rooms.invite` section
-  and the sync query filters to `membership = 'join'`, so a bot cannot detect
-  that it was invited. Until that is fixed, configure room ids explicitly.
+- **`/sync` has no `rooms.invite` or `rooms.leave` section.** This does not
+  affect bots — inviting a bot joins it outright, so the invite arrives as an
+  ordinary join in the timeline (§3). It does mean a *human* account's pending
+  invites are not visible in `/sync`, which is a separate, open issue.
 - **No way to fetch one event by id.** If you hold an `event_id` from a relation
   and want its content, you must page `/messages` backwards until you find it.
 - **No `/relations`.** Aggregating reactions, threads and replies is your job.
 - **Reactions are unvalidated and ungated** beyond `VIEW_CHANNEL` (§8).
 - **`formatted_body` is passed through verbatim** and rendered by the desktop
   client as Qt RichText. Emit only the tag subset in §6.
+- **`GET /profile/{userId}` can answer the literal `null`** instead of `{}` for
+  an account with no profile fields set (§1). Parse defensively.
 - **No structured command framework.** No slash-command registration, no
   autocomplete, no interaction model. A command is a message body your bot
   chooses to match on.
