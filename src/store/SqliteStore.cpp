@@ -1443,28 +1443,36 @@ std::vector<RoomEvent> SqliteStore::get_invite_state(const std::string& room_id,
         std::string(event_type::kRoomCanonicalAlias) + "','" +
         std::string(event_type::kRoomType) + "'";
 
-    // ?1 room, ?2 the member state key wanted on this pass.
-    const std::string sql =
-        "SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content, "
-        "       e.origin_server_ts, e.stream_position "
-        "FROM events e "
-        "INNER JOIN (SELECT event_type, state_key, MAX(stream_position) AS max_pos "
-        "            FROM events "
-        "            WHERE room_id = ?1 AND state_key IS NOT NULL "
-        "              AND ((state_key = '' AND event_type IN (" + room_level_types + ")) "
-        "                   OR (event_type = '" + std::string(event_type::kRoomMember) + "' "
-        "                       AND state_key = ?2)) "
-        "            GROUP BY event_type, state_key) latest "
-        "ON e.event_type = latest.event_type AND e.state_key = latest.state_key "
-        "   AND e.stream_position = latest.max_pos "
-        "WHERE e.room_id = ?1";
+    // ?1 room, ?2 the member state key wanted on this pass. `with_room_level`
+    // is false on the second pass: the room's own state does not depend on
+    // which member is being asked for, and re-selecting it would put every
+    // name, topic and join rule in the response twice.
+    auto build_sql = [&](bool with_room_level) {
+        std::string want =
+            with_room_level
+                ? "((state_key = '' AND event_type IN (" + room_level_types + ")) OR "
+                : "(";
+        want += "(event_type = '" + std::string(event_type::kRoomMember) +
+                "' AND state_key = ?2))";
+        return "SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content, "
+               "       e.origin_server_ts, e.stream_position "
+               "FROM events e "
+               "INNER JOIN (SELECT event_type, state_key, MAX(stream_position) AS max_pos "
+               "            FROM events "
+               "            WHERE room_id = ?1 AND state_key IS NOT NULL "
+               "              AND " + want + " "
+               "            GROUP BY event_type, state_key) latest "
+               "ON e.event_type = latest.event_type AND e.state_key = latest.state_key "
+               "   AND e.stream_position = latest.max_pos "
+               "WHERE e.room_id = ?1";
+    };
 
     // (stream_position, event), so the caller gets them in the order the room
     // acquired them regardless of which pass found them. Deterministic output
     // is what makes this testable.
     std::vector<std::pair<int64_t, RoomEvent>> found;
-    auto run = [&](const std::string& member_state_key) {
-        auto stmt = prepare(db_, sql);
+    auto run = [&](const std::string& member_state_key, bool with_room_level) {
+        auto stmt = prepare(db_, build_sql(with_room_level));
         sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt.get(), 2, member_state_key.c_str(), -1, SQLITE_TRANSIENT);
         while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
@@ -1484,7 +1492,7 @@ std::vector<RoomEvent> SqliteStore::get_invite_state(const std::string& room_id,
         }
     };
 
-    run(invitee);
+    run(invitee, true);
 
     // The inviter is whoever sent the invitee's member event — there is no
     // other record of it, which is why this is a second pass rather than one
@@ -1495,7 +1503,7 @@ std::vector<RoomEvent> SqliteStore::get_invite_state(const std::string& room_id,
             inviter = ev.sender;
         }
     }
-    if (!inviter.empty() && inviter != invitee) run(inviter);
+    if (!inviter.empty() && inviter != invitee) run(inviter, false);
 
     std::sort(found.begin(), found.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });

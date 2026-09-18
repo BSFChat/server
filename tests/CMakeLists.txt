@@ -134,6 +134,17 @@ set_tests_properties(e2e_sync_latency PROPERTIES
     # Times a latency budget, so it must not share the box with another test.
     RUN_SERIAL TRUE)
 
+add_test(NAME e2e_invites
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/e2e/e2e_invites.sh)
+set_tests_properties(e2e_invites PROPERTIES
+    LABELS e2e
+    ENVIRONMENT "BSFCHAT_SERVER_BIN=$<TARGET_FILE:bsfchat-server>"
+    # It registers three accounts (bcrypt), restarts the server so role
+    # bootstrap runs, and parks two long polls it has to let expire.
+    TIMEOUT 300
+    # Fixed port, plus two timing assertions on how long a poll blocks.
+    RUN_SERIAL TRUE)
+
 # --- release-channel script --------------------------------------------------
 #
 # scripts/channel_tags.py decides which of :latest / :latest-beta a pushed

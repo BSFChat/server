@@ -43,6 +43,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <string>
@@ -306,6 +307,17 @@ TEST(SyncInvites, InviteStateIdentifiesTheRoomAndTheInviterAndNothingElse) {
         EXPECT_NE(ev.type, std::string(event_type::kRoomMessage)) << ev.event_id;
     }
     EXPECT_EQ(resp.rooms.join.count(room), 0u);
+
+    // Each (type, state_key) exactly once. The inviter is found by reading the
+    // invitee's member event and asking again, and asking again used to
+    // re-select the room's own state along with it — so every name, topic and
+    // join rule arrived twice.
+    auto keys = keys_of(invited);
+    auto sorted = keys;
+    std::sort(sorted.begin(), sorted.end());
+    EXPECT_EQ(std::adjacent_find(sorted.begin(), sorted.end()), sorted.end())
+        << "invite_state carries a duplicate state event";
+    EXPECT_EQ(keys.size(), 6u) << "expected exactly the six whitelisted events";
 }
 
 TEST(SyncInvites, MessagesSentWhileTheInviteIsPendingDoNotReachTheInvitee) {
