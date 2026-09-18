@@ -37,6 +37,13 @@ StmtPtr prepare(sqlite3* db, const std::string& sql) {
 // the way they all used to: the server stored an m.replace as a sibling event
 // and then returned the PRE-EDIT content forever.
 //
+// STATE reads (get_state_events, get_state_event) are the exception and build
+// their own RoomEvent: they resolve the current value of one (type, state_key)
+// and an m.replace never targets a state event, so edit resolution would be
+// dead code there. Anything that must apply to EVERY event a client receives —
+// stamp_bot_flag() is the current example — therefore has to be applied in
+// three places, not one. Check both when adding another.
+//
 // Column order: 0 event_id, 1 room_id, 2 sender, 3 event_type, 4 state_key,
 // 5 content, 6 origin_server_ts, then the winning replacement (if any):
 // 7 rep.event_id, 8 rep.sender, 9 rep.origin_server_ts, 10 rep.content.
@@ -97,7 +104,59 @@ std::optional<std::string> replacement_target(const std::string& content_json) {
     return target;
 }
 
-RoomEvent read_event_row(sqlite3_stmt* stmt) {
+// Stamps `bsfchat.bot` onto an m.room.member event's content, DERIVED from the
+// member's user id rather than read back from what was stored.
+//
+// Why derived and not stored. The obvious alternative is to write the key in
+// member_event_content() when the event is emitted, and backfill the existing
+// ones with a migration — which is what v18 did for is_direct. That is the wrong
+// shape here, for three reasons:
+//
+//   * It would be a MIRROR of an account fact into room state, and Nickname.h
+//     already documents where that leads: a value that lives in room state is
+//     silently reverted by whichever unrelated path next rewrites a member event.
+//     Bot-ness happens to be immutable today, so a mirror would not actually
+//     drift — but it would be one more thing that has to STAY immutable for the
+//     roster to keep telling the truth, and nothing would notice if it stopped.
+//   * A backfill only fixes the events that exist when it runs. Every member
+//     event written by a path that builds content by hand — handle_invite for a
+//     human, project_membership_everywhere for a kick or ban — would still be
+//     missing the key, and those paths have no reason to know about bots.
+//   * Derivation needs no migration and costs no query: the member's id IS the
+//     state_key, already in hand, and bot::is_bot_user_id is a constexpr prefix
+//     test. Doing it from users.kind instead would be a database read per member
+//     event, under the store's global mutex, on the initial-sync path.
+//
+// SET-OR-ERASE, not set-if-bot. Whatever the stored content says is replaced by
+// the server's own answer, so a forged "bsfchat.bot": true cannot survive a read
+// even if some future write path lets one be stored. Today it cannot be stored
+// at all (handle_set_state rebuilds self-membership content through
+// member_event_content and discards the client's body), which makes this the
+// second lock rather than the only one.
+//
+// Absent means "not a bot", matching /profile and /whoami — a client reads it as
+// content.value("bsfchat.bot", false) on all three.
+//
+// Applied to every membership, including leave and ban, unlike displayname and
+// nickname. Those are omitted for a departing member because they are profile
+// data the event does not need and that a client would cache from a forged
+// value. This is neither: it is a fact about the user id already in the
+// state_key, so a client could compute it itself and nothing is disclosed by
+// stating it.
+void stamp_bot_flag(RoomEvent& ev) {
+    if (ev.type != event_type::kRoomMember) return;
+    if (!ev.state_key.has_value()) return;
+    if (!ev.content.data.is_object()) return;
+
+    const std::string key{bot::kProfileKey};
+    if (bot::is_bot_user_id(*ev.state_key)) {
+        ev.content.data[key] = true;
+    } else {
+        ev.content.data.erase(key);
+    }
+}
+
+RoomEvent read_event_row_raw(sqlite3_stmt* stmt) {
     RoomEvent ev;
     ev.event_id = column_text_or_empty(stmt, 0);
     ev.room_id = column_text_or_empty(stmt, 1);
@@ -136,6 +195,19 @@ RoomEvent read_event_row(sqlite3_stmt* stmt) {
     unsigned_data["bsfchat.original_content"] = ev.content.data;
     ev.unsigned_data = EventContent{.data = std::move(unsigned_data)};
     ev.content.data = std::move(new_content);
+    return ev;
+}
+
+// The read choke point proper: raw row, then the derived fields.
+//
+// Wrapped rather than stamped inline because read_event_row_raw has several
+// returns and one of them replaces content.data wholesale with the edit's
+// content. Stamping inside it would be correct only for whichever return the
+// author happened to think about — here it is correct for all of them, by
+// construction, and stays correct if another branch is added.
+RoomEvent read_event_row(sqlite3_stmt* stmt) {
+    RoomEvent ev = read_event_row_raw(stmt);
+    stamp_bot_flag(ev);
     return ev;
 }
 
@@ -696,6 +768,18 @@ constexpr const char* kBotSelectColumns =
 } // namespace
 
 bool SqliteStore::create_bot(const BotRecord& bot) {
+    // The namespace is enforced HERE as well as in the handler, because the
+    // server now derives bot-ness from the user id on a hot path:
+    // stamp_bot_flag() reads bot::is_bot_user_id(state_key) rather than querying
+    // users.kind, so that the initial-sync roster costs no query per member.
+    //
+    // That derivation is only sound while "kind = 'bot'" and "localpart starts
+    // bot_" name the same set. The handler's grammar check keeps them aligned
+    // today; this keeps them aligned for any future caller, including an admin
+    // script or a test reaching past the handler. A bot the roster would not
+    // badge is not a bot this store is willing to create.
+    if (!bsfchat::bot::is_bot_user_id(bot.user_id)) return false;
+
     std::lock_guard lock(mutex_);
 
     // One transaction for both rows. A users row whose bots row failed to land
@@ -1451,6 +1535,12 @@ std::vector<RoomEvent> SqliteStore::get_state_events(const std::string& room_id)
         ev.content.data = nlohmann::json::parse(
             reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 5)));
         ev.origin_server_ts = sqlite3_column_int64(stmt.get(), 6);
+        // State reads build their own RoomEvent rather than going through
+        // read_event_row (they resolve no edits, so they never needed it), which
+        // means the derived fields have to be applied here too. This is the path
+        // /sync serves room state from, so it is the one an ordinary member's
+        // roster comes out of at startup.
+        stamp_bot_flag(ev);
         events.push_back(std::move(ev));
     }
     return events;
@@ -1717,6 +1807,8 @@ std::optional<RoomEvent> SqliteStore::get_state_event(const std::string& room_id
         ev.content.data = nlohmann::json::parse(
             reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 5)));
         ev.origin_server_ts = sqlite3_column_int64(stmt.get(), 6);
+        // Same reason as in get_state_events above.
+        stamp_bot_flag(ev);
         return ev;
     }
     return std::nullopt;

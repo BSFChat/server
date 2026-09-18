@@ -36,6 +36,7 @@
 #include "auth/RoleBootstrap.h"
 #include "core/Config.h"
 #include "http/Middleware.h"
+#include "identity/Nickname.h"
 #include "store/Migrations.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
@@ -1479,4 +1480,236 @@ TEST(BotInvite, AnInvitedBotIsNotSweptIntoOtherChannelsByBackfill) {
     backfill_auto_join(*fx.store, *fx.sync, fx.config);
     EXPECT_EQ(fx.store->get_joined_rooms(human).size(), 3u);
     EXPECT_EQ(fx.store->get_joined_rooms(bot_id).size(), 1u);
+}
+
+// ── 14. bsfchat.bot in m.room.member content ────────────────────────────────
+//
+// The flag has to reach an ORDINARY member — someone with no MANAGE_BOTS, who
+// can therefore never call GET /bsfchat/bots — through the roster they already
+// load, with no extra request per user. It is derived at read time from the
+// member's user id (see stamp_bot_flag in SqliteStore.cpp), so it needs no
+// migration and cannot go stale.
+//
+// Every path a client can learn membership from is covered here. A flag that
+// appears on live joins but not in the roster fetched at startup would make the
+// badge flicker depending on how the user was learned about, which is worse
+// than not having it.
+
+namespace {
+
+// The bsfchat.bot value in a member event's content: true, false, or "absent".
+std::string bot_flag_of(const json& content) {
+    const std::string key{bot::kProfileKey};
+    if (!content.is_object() || !content.contains(key)) return "absent";
+    return content[key].get<bool>() ? "true" : "false";
+}
+
+// The member event for `user` out of a /sync response's state or timeline.
+std::string flag_in_events(const std::vector<RoomEvent>& events, const std::string& user) {
+    for (const auto& ev : events) {
+        if (ev.type != event_type::kRoomMember) continue;
+        if (!ev.state_key || *ev.state_key != user) continue;
+        return bot_flag_of(ev.content.data);
+    }
+    return "no-event";
+}
+
+} // namespace
+
+TEST(BotMemberEvent, FlagIsPresentForABotAndAbsentForAHumanOnEveryPath) {
+    Fixture fx("memberflag");
+    fx.seed_roles();
+    auto admin = fx.add_user("admin", {"botmod", "everything_else"});
+    auto room = fx.add_public_channel(admin, "general");
+
+    // An ordinary member with NO special permission — the whole point of putting
+    // the flag in the roster is that this user can see it.
+    auto plain = fx.add_user("plain");
+    fx.store->set_membership(room, plain, std::string(membership::kJoin));
+    fx.store->insert_event(generate_event_id("test"), room, plain,
+                           std::string(event_type::kRoomMember), plain,
+                           member_event_content(*fx.store, plain,
+                                                std::string(membership::kJoin)).dump(),
+                           1010);
+    {
+        PermissionsEngine perms(*fx.store, fx.config);
+        ASSERT_FALSE(perms.can(plain, "", permission::kManageBots));
+    }
+
+    auto [bot_id, token] = fx.make_bot("token-admin", "bot_badged", "Badged Bot");
+    // Joined through the invite auto-join path, i.e. a real emitted join event.
+    ASSERT_TRUE(IsOk(call(*fx.rooms, &RoomHandler::handle_invite, invite_path(room),
+                          "token-admin", invite_body(bot_id))));
+
+    // (a) The stored state event, read back through the store's choke point.
+    {
+        auto ev = fx.store->get_state_event(room, std::string(event_type::kRoomMember), bot_id);
+        ASSERT_TRUE(ev.has_value());
+        EXPECT_EQ(bot_flag_of(ev->content.data), "true");
+        auto human_ev = fx.store->get_state_event(room, std::string(event_type::kRoomMember),
+                                                  plain);
+        ASSERT_TRUE(human_ev.has_value());
+        EXPECT_EQ(bot_flag_of(human_ev->content.data), "absent");
+    }
+
+    // (b) GET /rooms/{id}/members, fetched by the UNPRIVILEGED member. This
+    // endpoint synthesises content from the membership table, so it is a
+    // separate code path from (a) and had to be covered separately.
+    {
+        auto res = call(*fx.rooms, &RoomHandler::handle_room_members,
+                        "/_matrix/client/v3/rooms/" + room + "/members", "token-plain");
+        ASSERT_TRUE(IsOk(res));
+        auto chunk = json::parse(res.body).at("chunk");
+        std::map<std::string, json> by_key;
+        for (const auto& e : chunk) by_key[e.value("state_key", "")] = e.at("content");
+        ASSERT_TRUE(by_key.count(bot_id));
+        ASSERT_TRUE(by_key.count(plain));
+        EXPECT_EQ(bot_flag_of(by_key[bot_id]), "true");
+        EXPECT_EQ(bot_flag_of(by_key[plain]), "absent");
+        EXPECT_EQ(bot_flag_of(by_key[admin]), "absent");
+    }
+
+    // (c) INITIAL /sync state, as the unprivileged member.
+    {
+        auto resp = fx.sync->handle_sync(plain, "", 0);
+        ASSERT_TRUE(resp.rooms.join.count(room));
+        const auto& state = resp.rooms.join.at(room).state.events;
+        EXPECT_EQ(flag_in_events(state, bot_id), "true");
+        EXPECT_EQ(flag_in_events(state, plain), "absent");
+    }
+
+    // (d) INCREMENTAL /sync, for a bot that joins after the client synced —
+    // the live-join case, which arrives in the timeline.
+    {
+        auto before = fx.sync->handle_sync(plain, "", 0);
+        auto [late_id, late_tok] = fx.make_bot("token-admin", "bot_latecomer");
+        ASSERT_TRUE(IsOk(call(*fx.rooms, &RoomHandler::handle_invite, invite_path(room),
+                              "token-admin", invite_body(late_id))));
+
+        auto resp = fx.sync->handle_sync(plain, before.next_batch, 0);
+        ASSERT_TRUE(resp.rooms.join.count(room));
+        const auto& joined = resp.rooms.join.at(room);
+        // Present wherever the incremental response carries it — a member event
+        // is both a state event and a timeline event.
+        const auto in_timeline = flag_in_events(joined.timeline.events, late_id);
+        const auto in_state = flag_in_events(joined.state.events, late_id);
+        EXPECT_TRUE(in_timeline == "true" || in_state == "true")
+            << "timeline: " << in_timeline << ", state: " << in_state;
+        EXPECT_NE(in_timeline, "false");
+        EXPECT_NE(in_state, "false");
+    }
+}
+
+// A human's member event never carries the key, even when the stored content
+// says it does. Derivation is set-or-erase, so the server's answer wins over
+// whatever is on disk — which makes a forged flag unable to survive a read even
+// if some future write path let one be stored.
+TEST(BotMemberEvent, AForgedFlagIsScrubbedOnRead) {
+    Fixture fx("memberflag-forged");
+    fx.seed_roles();
+    auto admin = fx.add_user("admin", {"botmod", "everything_else"});
+    auto room = fx.add_public_channel(admin, "general");
+    auto human = fx.add_user("mallory");
+
+    // Write a member event that CLAIMS to be a bot, straight into the store,
+    // bypassing every handler.
+    fx.store->set_membership(room, human, std::string(membership::kJoin));
+    fx.store->insert_event(generate_event_id("test"), room, human,
+                           std::string(event_type::kRoomMember), human,
+                           json{{"membership", membership::kJoin},
+                                {"displayname", "Totally A Bot"},
+                                {std::string(bot::kProfileKey), true}}
+                               .dump(),
+                           1010);
+
+    // It is on disk...
+    EXPECT_NE(raw_text(fx.db_path,
+                       "SELECT content FROM events WHERE state_key = '" + human + "'")
+                  .find("bsfchat.bot"),
+              std::string::npos);
+
+    // ...and it does not survive a read, on any path.
+    auto ev = fx.store->get_state_event(room, std::string(event_type::kRoomMember), human);
+    ASSERT_TRUE(ev.has_value());
+    EXPECT_EQ(bot_flag_of(ev->content.data), "absent");
+
+    auto resp = fx.sync->handle_sync(admin, "", 0);
+    ASSERT_TRUE(resp.rooms.join.count(room));
+    EXPECT_EQ(flag_in_events(resp.rooms.join.at(room).state.events, human), "absent");
+
+    auto members = call(*fx.rooms, &RoomHandler::handle_room_members,
+                        "/_matrix/client/v3/rooms/" + room + "/members", "token-admin");
+    ASSERT_TRUE(IsOk(members));
+    EXPECT_EQ(members.body.find("bsfchat.bot"), std::string::npos);
+}
+
+// Member events that predate this change carry no stored flag, and must still
+// report it — that is the whole reason it is derived rather than backfilled.
+TEST(BotMemberEvent, EventsStoredWithoutTheFlagStillReportIt) {
+    Fixture fx("memberflag-legacy");
+    fx.seed_roles();
+    auto admin = fx.add_user("admin", {"botmod", "everything_else"});
+    auto room = fx.add_public_channel(admin, "general");
+    auto [bot_id, token] = fx.make_bot("token-admin", "bot_legacy");
+
+    // A member event as an older server would have written it: no flag at all.
+    fx.store->set_membership(room, bot_id, std::string(membership::kJoin));
+    fx.store->insert_event(generate_event_id("test"), room, bot_id,
+                           std::string(event_type::kRoomMember), bot_id,
+                           json{{"membership", membership::kJoin}}.dump(), 1010);
+    ASSERT_EQ(raw_text(fx.db_path,
+                       "SELECT content FROM events WHERE state_key = '" + bot_id + "'")
+                  .find("bsfchat.bot"),
+              std::string::npos);
+
+    auto ev = fx.store->get_state_event(room, std::string(event_type::kRoomMember), bot_id);
+    ASSERT_TRUE(ev.has_value());
+    EXPECT_EQ(bot_flag_of(ev->content.data), "true");
+}
+
+// The flag rides along on leave and ban too, unlike displayname and nickname.
+// Those are omitted for a departed member because they are forgeable profile
+// data; this is derived from the state_key, so a client could compute it itself
+// and stating it discloses nothing.
+TEST(BotMemberEvent, FlagIsPresentOnLeaveEventsToo) {
+    Fixture fx("memberflag-leave");
+    fx.seed_roles();
+    auto admin = fx.add_user("admin", {"botmod", "everything_else"});
+    auto room = fx.add_public_channel(admin, "general");
+    auto [bot_id, token] = fx.make_bot("token-admin", "bot_departing");
+    ASSERT_TRUE(IsOk(call(*fx.rooms, &RoomHandler::handle_invite, invite_path(room),
+                          "token-admin", invite_body(bot_id))));
+
+    ASSERT_TRUE(IsOk(call(*fx.bots, &BotHandler::handle_deactivate_bot, bot_path(bot_id),
+                          "token-admin")));
+
+    auto ev = fx.store->get_state_event(room, std::string(event_type::kRoomMember), bot_id);
+    ASSERT_TRUE(ev.has_value());
+    EXPECT_EQ(ev->content.data.value("membership", ""), membership::kLeave);
+    EXPECT_EQ(bot_flag_of(ev->content.data), "true");
+    // ...and still no profile data on a leave, as before.
+    EXPECT_FALSE(ev->content.data.contains("displayname"));
+}
+
+// The store refuses to create a bot outside the namespace, because the roster
+// derivation reads the user id rather than users.kind. A bot the roster would
+// not badge must not be creatable, even by a caller reaching past the handler.
+TEST(BotMemberEvent, TheStoreRefusesABotOutsideTheNamespace) {
+    Fixture fx("memberflag-namespace");
+    fx.seed_roles();
+
+    SqliteStore::BotRecord bad;
+    bad.user_id = "@notabot:test";
+    bad.display_name = "Sneaky";
+    bad.owner_id = "@admin:test";
+    bad.created_by = "@admin:test";
+    bad.created_at = 1;
+    EXPECT_FALSE(fx.store->create_bot(bad));
+    EXPECT_FALSE(fx.store->user_exists("@notabot:test"));
+
+    SqliteStore::BotRecord good = bad;
+    good.user_id = "@bot_fine:test";
+    EXPECT_TRUE(fx.store->create_bot(good));
+    EXPECT_TRUE(fx.store->is_bot("@bot_fine:test"));
+    EXPECT_TRUE(bot::is_bot_user_id("@bot_fine:test"));
 }

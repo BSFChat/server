@@ -829,10 +829,23 @@ void RoomHandler::handle_room_members(const httplib::Request& req, httplib::Resp
     auto members = store_.get_room_members(room_id);
     json chunk = json::array();
     for (const auto& [member_id, member_membership] : members) {
+        json content = {{"membership", member_membership}};
+        // This endpoint synthesises member content from the membership table
+        // rather than serving the stored events, so it does NOT go through
+        // read_event_row and does not inherit the bot flag from there. Derived
+        // the same way and from the same helper, so the roster a client loads
+        // here agrees with the one it gets from /sync.
+        //
+        // Without this the badge would depend on how the client happened to
+        // learn about a user — present on a live join, absent in the roster
+        // fetched at startup — which is worse than not having the flag at all.
+        if (bot::is_bot_user_id(member_id)) {
+            content[std::string(bot::kProfileKey)] = true;
+        }
         chunk.push_back({
             {"type", event_type::kRoomMember},
             {"state_key", member_id},
-            {"content", {{"membership", member_membership}}},
+            {"content", std::move(content)},
             {"sender", member_id},
             {"room_id", room_id},
         });
