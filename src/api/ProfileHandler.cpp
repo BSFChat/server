@@ -52,7 +52,15 @@ void ProfileHandler::handle_get_profile(const httplib::Request& req, httplib::Re
         return;
     }
 
-    json resp;
+    // json::object(), not a default-constructed json. A default-constructed
+    // nlohmann json IS null, and every field below is conditional, so a user with
+    // no displayname, no avatar and no nickname dumped the four characters `null`
+    // — a 200 whose body is not an object. That breaks the obvious client idioms
+    // (`resp.json()["displayname"]`, and even the defensive `.get(key, default)`,
+    // both raise), contradicts the spec, which has this endpoint returning an
+    // object, and is inconsistent with the rest of the API, which returns `{}`.
+    // The same applies to the two single-field getters below.
+    json resp = json::object();
     auto display_name = store_.get_display_name(user_id);
     auto avatar_url = store_.get_avatar_url(user_id);
 
@@ -83,7 +91,7 @@ void ProfileHandler::handle_get_displayname(const httplib::Request& req, httplib
         return;
     }
 
-    json resp;
+    json resp = json::object();
     auto display_name = store_.get_display_name(user_id);
     if (display_name) resp["displayname"] = *display_name;
 
@@ -153,7 +161,7 @@ void ProfileHandler::handle_get_avatar_url(const httplib::Request& req, httplib:
         return;
     }
 
-    json resp;
+    json resp = json::object();
     auto avatar_url = store_.get_avatar_url(user_id);
     if (avatar_url) resp["avatar_url"] = *avatar_url;
 
