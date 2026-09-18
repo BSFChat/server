@@ -443,7 +443,17 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
         // in has older member events of its own in that room, and any of them
         // can land in the same delta as the invite. What decides where the room
         // goes is where the user stands now.
-        if (membership_of(event.room_id) == std::string(membership::kInvite)) {
+        //
+        // Only this user's own member event can have come from a room they
+        // have merely been invited to — the query admits nothing else out of
+        // one — so every other row is from a joined room by construction. That
+        // is what confines the membership lookup, which is a store call behind
+        // the global mutex, to a rare row instead of one per room per delta.
+        const bool own_member_event =
+            event.type == std::string(event_type::kRoomMember) &&
+            event.state_key.has_value() && *event.state_key == user_id;
+        if (own_member_event &&
+            membership_of(event.room_id) == std::string(membership::kInvite)) {
             if (can_view(event.room_id)) invited_rooms.insert(event.room_id);
             continue;
         }

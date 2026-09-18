@@ -1583,6 +1583,7 @@ std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id,
     // candidate batch comes back with a token that has MOVED, and the client's
     // no-progress backoff never sees it. That interplay is why this filter is
     // here and not in the loop above SyncEngine's own permission check.
+    //
     // The membership filter used to be `rm.membership = 'join'` in the JOIN
     // condition, which is why a human account could not see it had been
     // invited anywhere: an invite writes a room_members row with membership
