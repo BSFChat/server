@@ -1123,6 +1123,80 @@ void migrate_v18(sqlite3* db, bool fresh_database) {
         after - before);
 }
 
+// v19: media gets a per-room ACL, and the existing corpus is backfilled into it.
+//
+// Until now a media id was a server-wide capability: `handle_download` checked
+// only "is this a live token for *some* user" and threw the resulting user id
+// away. Anyone with an account could fetch any object on the server given its
+// id, which made locking a channel down cosmetic for everything already posted
+// in it — a member who kept the id (client cache, scrollback, a screenshot of
+// the URL) kept the bytes forever (audit B3).
+//
+// The table is the missing join: media has no room of its own and cannot have
+// one, because POST /upload carries no room. What it has is the set of events
+// that NAME it, and each of those has a room whose VIEW_CHANNEL is already the
+// authority on who may read it.
+//
+// `mxc_uri` is the whole `mxc://host/id`, not the bare id. With only the id,
+// posting `mxc://anything/<id-from-a-private-channel>` into a channel you
+// control would bind that id to your channel; the download path looks up the
+// URI built from its own configured server name, so a foreign host cannot
+// collide with a local object.
+//
+// THE BACKFILL IS THE LOAD-BEARING HALF. Without it, every attachment on an
+// existing deployment has no rows here the moment this ships, and the download
+// path — which must read "no rows" as "nobody but the uploader", never as
+// "public", or the gap becomes the bypass — would 404 every historical image
+// for everyone. So the fail-closed rule and the backfill have to land together.
+//
+// json_tree() walks the whole content document, so the SQL rule is the same
+// rule media_uris_in_content() applies in C++: index every string anywhere in
+// the event that looks like an mxc URI. That is the invariant we want — a
+// reader of the event can learn every id printed in it, so a reader of the
+// event may fetch every one of them — and matching the two implementations
+// exactly is what stops a message shape being indexed on ingest but not in the
+// backfill (or the reverse).
+//
+// Redacted events are excluded: redact_event() strips the URI out of content,
+// so a redacted row has nothing to find anyway, and the explicit predicate
+// makes that a rule rather than a coincidence.
+void migrate_v19(sqlite3* db, bool fresh_database) {
+    exec(db, R"(
+        CREATE TABLE IF NOT EXISTS media_refs (
+            mxc_uri   TEXT NOT NULL,
+            room_id   TEXT NOT NULL,
+            event_id  TEXT NOT NULL,
+            PRIMARY KEY (mxc_uri, room_id, event_id)
+        )
+    )");
+    // The download path's only query is `WHERE mxc_uri = ?`, which the primary
+    // key's own index already serves. These two are for the deletes:
+    // redact_event() by event, delete_room() by room.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_media_refs_event ON media_refs(event_id)");
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_media_refs_room ON media_refs(room_id)");
+
+    if (fresh_database) return;
+
+    // json_tree() throws on malformed JSON rather than returning no rows, and
+    // `content` is plain TEXT with no constraint, so the guard has to be inside
+    // its argument — a json_valid() in the WHERE clause is not ordered before
+    // the table-valued function's own evaluation.
+    exec(db, R"(
+        INSERT OR IGNORE INTO media_refs (mxc_uri, room_id, event_id)
+        SELECT jt.value, e.room_id, e.event_id
+          FROM events e,
+               json_tree(CASE WHEN json_valid(e.content) THEN e.content ELSE '{}' END) jt
+         WHERE e.redacted_by IS NULL
+           AND jt.type = 'text'
+           AND jt.value LIKE 'mxc://%/%'
+    )");
+
+    get_logger()->info(
+        "Schema v19: indexed {} media reference(s) from existing events; media "
+        "downloads are now gated on VIEW_CHANNEL in a room that names the object",
+        scalar_int(db, "SELECT COUNT(*) FROM media_refs"));
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1145,6 +1219,7 @@ const std::vector<Step>& steps() {
         migrate_v16,
         migrate_v17,
         migrate_v18,
+        migrate_v19,
     };
     return kMigrations;
 }

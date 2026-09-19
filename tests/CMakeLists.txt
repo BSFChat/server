@@ -18,6 +18,7 @@ add_executable(server_tests
     test_call_privacy.cpp
     test_permissions.cpp
     test_media.cpp
+    test_media_security.cpp
     test_voice.cpp
     test_typing.cpp
     test_regressions.cpp
@@ -78,6 +79,7 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/api/SyncHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/PresenceHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/MediaHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/MediaPolicy.cpp
     ${CMAKE_SOURCE_DIR}/src/api/ProfileHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/PushHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/SearchHandler.cpp
