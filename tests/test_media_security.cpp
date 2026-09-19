@@ -583,6 +583,29 @@ TEST(MediaAcl, PostingAForeignHostUriCannotBindSomeoneElsesMediaId) {
     EXPECT_EQ(f.download_status(id, "mallory"), 404);
 }
 
+TEST(MediaAcl, ANonMemberIsRefusedEvenThoughEveryoneHasViewChannelByDefault) {
+    // VIEW_CHANNEL alone is not the gate. A DM carries no channel overrides, so
+    // @everyone's default VIEW_CHANNEL evaluates TRUE for a user who has never
+    // been near it — checking only the permission would have made every DM
+    // attachment on the server readable by any account. can_read_room() pairs
+    // membership with VIEW_CHANNEL for exactly this reason; so does this.
+    AclFixture f;
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto mallory = f.add_user("mallory");
+
+    auto dm = generate_room_id("test");
+    f.store->create_room(dm, alice, /*is_direct=*/true);
+    f.store->set_membership(dm, alice, std::string(membership::kJoin));
+    f.store->set_membership(dm, bob, std::string(membership::kJoin));
+
+    auto id = f.upload(alice);
+    f.post(dm, alice, f.mxc(id));
+
+    EXPECT_EQ(f.download_status(id, "bob"), 200);
+    EXPECT_EQ(f.download_status(id, "mallory"), 404);
+}
+
 TEST(MediaAcl, RedactingTheMessageRevokesTheGrantItCarried) {
     AclFixture f;
     auto alice = f.add_user("alice");

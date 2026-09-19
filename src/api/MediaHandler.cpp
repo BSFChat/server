@@ -280,7 +280,24 @@ bool MediaHandler::may_download(const std::string& user_id,
     if (!rooms.empty()) {
         PermissionsEngine perms(store_, config_);
         for (const auto& room_id : rooms) {
-            if (perms.can(user_id, room_id, permission::kViewChannel)) return true;
+            // Membership AND VIEW_CHANNEL, the same pair can_read_room() uses.
+            //
+            // Neither half is redundant. Everyone is force-joined into every
+            // public channel, so membership alone is not authorization — that
+            // is the bug can_read_room's own comment describes. And VIEW_CHANNEL
+            // alone is not either: a DM has no channel overrides, so @everyone's
+            // default VIEW_CHANNEL evaluates true for a user who has never been
+            // near it, which would have made every DM attachment on the server
+            // world-readable.
+            //
+            // Deliberately NOT mirroring can_read_room's is_category_room()
+            // short-circuit: that exemption is an unbounded VIEW_CHANNEL bypass
+            // (audit A3/B2, work package P2) and reproducing it here would carry
+            // it into the media path too.
+            if (store_.is_room_member(room_id, user_id) &&
+                perms.can(user_id, room_id, permission::kViewChannel)) {
+                return true;
+            }
         }
         return false;
     }
