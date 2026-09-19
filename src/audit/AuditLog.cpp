@@ -8,6 +8,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
 #include <map>
 #include <set>
 #include <string>
@@ -301,6 +302,20 @@ void audit_channel_override_change(SqliteStore& store, const std::string& actor,
     }
     record.before_json = override_payload(before);
     record.after_json = override_payload(after);
+    store.append_audit_record(record);
+}
+
+void audit_voice_rekey(SqliteStore& store, const std::string& actor,
+                       const std::string& room_id, uint64_t before, uint64_t after) {
+    SqliteStore::AuditRecord record;
+    record.actor = actor;
+    record.action = audit_action::kVoiceRekey;
+    record.target_room = room_id;
+    // The generations rather than any key material: a record of WHICH key was
+    // in force is a record an attacker could derive the key from, and the audit
+    // log is readable by everyone with the audit permission.
+    record.before_json = json{{"key_generation", before}}.dump();
+    record.after_json = json{{"key_generation", after}}.dump();
     store.append_audit_record(record);
 }
 

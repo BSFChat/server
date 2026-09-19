@@ -159,19 +159,18 @@ private:
     std::mutex heartbeat_mutex_;
     std::map<std::pair<std::string, std::string>, std::chrono::steady_clock::time_point> heartbeats_;
 
-    // room_id -> media-key generation. Absent means generation 0.
+    // The media-key generation is NOT held here. It used to be — a
+    // std::map<room_id, uint64_t> that defaulted to 0 — and that map was the
+    // whole of audit A finding 4: every restart silently reverted each
+    // channel's key to its generation-0 value and handed decryption back to
+    // everyone a moderator had rotated out, while the endpoint kept reporting
+    // that the rotation had worked.
     //
-    // In memory on purpose. A generation is not a secret and holds no value
-    // across a restart: after a bounce every room is back at generation 0,
-    // every client re-fetches on its next token request, and they all agree
-    // again. The cost of a restart is therefore one rekey, not a broken
-    // room. Rotations requested before the restart are forgotten, which is
-    // the honest limitation — a departed member regains decryption of NEW
-    // traffic after a server restart unless rekey is called again. That is
-    // documented next to the endpoint and is why this design is described as
-    // "encrypted to the relay" and never as end-to-end.
-    std::mutex key_generation_mutex_;
-    std::map<std::string, uint64_t> key_generations_;
+    // It now lives in the store (SqliteStore::get_voice_key_generation /
+    // bump_voice_key_generation, schema v19), and is read on each use rather
+    // than cached. A cache here would be a second copy of the one number the
+    // security of this feature rests on, for the sake of saving an indexed
+    // primary-key lookup on a request that already does several.
 
     // Reaper thread lifecycle.
     std::thread reaper_thread_;

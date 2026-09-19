@@ -71,7 +71,10 @@ struct LiveKitConfig {
     //      generation can compute every later one. Only issuing a fresh
     //      unrelated key excludes them, which is what rekey does.
     //
-    // Rekey-on-leave is not automatic; call the rekey endpoint.
+    // Rekey-on-leave is not automatic; call the rekey endpoint. A rotation is
+    // durable: the generation lives in the database (schema v19), not in the
+    // handler, so it survives a restart. The one thing that can undo it is
+    // restoring a database snapshot taken before it.
     bool room_encryption = true;
 
     // Key-derivation secret for room keys. Optional: when empty, api_secret

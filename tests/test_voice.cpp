@@ -7,6 +7,8 @@
 
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
+#include <sqlite3.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <filesystem>
@@ -1155,8 +1157,14 @@ constexpr const char* kLkSecret = "test-livekit-api-secret-do-not-log";
 
 class LiveKitTokenTest : public ::testing::Test {
 protected:
+    // Where this fixture's database lives. ":memory:" for everything that does
+    // not care; LiveKitRekeyDurabilityTest overrides it with a real file,
+    // because "does this survive a restart" cannot be asked of a database that
+    // only exists inside the process being restarted.
+    virtual std::string db_path() const { return ":memory:"; }
+
     void SetUp() override {
-        store = std::make_unique<SqliteStore>(":memory:");
+        store = std::make_unique<SqliteStore>(db_path());
         store->initialize();
         config = Config::defaults();
         config.server_name = "test";
@@ -1282,6 +1290,13 @@ protected:
         return body["encryption"].value("key", "");
     }
 
+    // The key generation from a token response, or 0 when absent.
+    static uint64_t generation_of(const httplib::Response& res) {
+        auto body = json::parse(res.body);
+        if (!body.contains("encryption")) return 0;
+        return body["encryption"].value("key_generation", uint64_t{0});
+    }
+
     std::unique_ptr<SqliteStore> store;
     Config config;
     std::unique_ptr<SyncEngine> sync_engine;
@@ -1305,7 +1320,11 @@ TEST_F(LiveKitTokenTest, TokenResponseCarriesASharedMediaKey) {
     auto body = json::parse(res.body);
     ASSERT_TRUE(body.contains("encryption"));
     EXPECT_EQ(body["encryption"]["mode"], "shared_key");
-    EXPECT_EQ(body["encryption"]["key_generation"], 0);
+    // The generation is whatever this install's persisted baseline is, not a
+    // literal: pinning a number here is what let the in-memory counter's
+    // "always starts at 0" pass for correct.
+    ASSERT_TRUE(body["encryption"].contains("key_generation"));
+    EXPECT_TRUE(body["encryption"]["key_generation"].is_number_unsigned());
     // 32 raw bytes -> 44 base64 chars with one '=' of padding.
     EXPECT_EQ(key_of(res).size(), 44u);
 }
@@ -1410,18 +1429,21 @@ TEST_F(LiveKitTokenTest, NoMediaKeyWithoutAuthentication) {
 
 TEST_F(LiveKitTokenTest, RekeyChangesTheIssuedKey) {
     const auto before = key_of(request(room, "token-alice"));
+    const auto gen_before = generation_of(request(room, "token-alice"));
     auto rot = rekey(room, "token-mod"); // mod has kManageChannels
     ASSERT_EQ(status_of(rot), 200);
-    EXPECT_EQ(json::parse(rot.body)["key_generation"], 1);
+    EXPECT_GT(json::parse(rot.body)["key_generation"].get<uint64_t>(), gen_before);
     const auto after = key_of(request(room, "token-alice"));
     EXPECT_NE(before, after);
 }
 
 TEST_F(LiveKitTokenTest, RekeyAdvancesGenerationMonotonically) {
-    EXPECT_EQ(json::parse(rekey(room, "token-mod").body)["key_generation"], 1);
-    EXPECT_EQ(json::parse(rekey(room, "token-mod").body)["key_generation"], 2);
-    auto body = json::parse(request(room, "token-alice").body);
-    EXPECT_EQ(body["encryption"]["key_generation"], 2);
+    const auto first = json::parse(rekey(room, "token-mod").body)["key_generation"].get<uint64_t>();
+    const auto second = json::parse(rekey(room, "token-mod").body)["key_generation"].get<uint64_t>();
+    EXPECT_GT(second, first);
+    // The token endpoint reports the same generation the rotation returned;
+    // a client that re-fetches gets the key the moderator just minted.
+    EXPECT_EQ(generation_of(request(room, "token-alice")), second);
 }
 
 TEST_F(LiveKitTokenTest, RekeyIsScopedToOneChannel) {
@@ -1478,6 +1500,228 @@ TEST_F(LiveKitTokenTest, RekeyResponseCarriesNoKeyMaterial) {
     EXPECT_FALSE(body.contains("key"));
     EXPECT_FALSE(body.contains("encryption"));
     EXPECT_EQ(res.body.find(kLkSecret), std::string::npos);
+}
+
+// A rotation is a moderation action with a durable consequence, so it must
+// leave a durable record. Without one, an operator who restores a backup has
+// no way to learn that a rotation they are about to lose ever happened.
+TEST_F(LiveKitTokenTest, RekeyIsRecordedInTheAuditLog) {
+    const auto before = generation_of(request(room, "token-alice"));
+    ASSERT_EQ(status_of(rekey(room, "token-mod")), 200);
+
+    auto page = store->list_audit_records(10, std::nullopt, {});
+    ASSERT_EQ(page.records.size(), 1u);
+    const auto& rec = page.records[0];
+    // The literal rather than audit_action::kVoiceRekey: action names are a
+    // stable part of the read API, so the test pins the string an operator
+    // greps for, not the constant that happens to spell it today.
+    EXPECT_EQ(rec.action, "voice.rekey");
+    EXPECT_EQ(rec.actor, mod);
+    EXPECT_EQ(rec.target_room, room);
+    ASSERT_FALSE(rec.before_json.empty());
+    ASSERT_FALSE(rec.after_json.empty());
+    EXPECT_EQ(json::parse(rec.before_json).value("key_generation", uint64_t{0}), before);
+    EXPECT_GT(json::parse(rec.after_json).value("key_generation", uint64_t{0}), before);
+}
+
+TEST_F(LiveKitTokenTest, DeniedRekeyIsNotAudited) {
+    ASSERT_EQ(status_of(rekey(room, "token-alice")), 403);
+    EXPECT_TRUE(store->list_audit_records(10, std::nullopt, {}).records.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Rotation durability — audit A finding 4.
+//
+// The generation the media key is derived from used to live in a std::map on
+// this handler that defaulted to 0 for any room it had not seen. Every restart
+// therefore undid every rotation ever performed: the key reverted to the
+// generation-0 key and everyone a moderator had rotated out could decrypt
+// again, silently, with the endpoint still reporting success. Server.cpp
+// advertises this endpoint as "the only way to stop a departed member
+// decrypting", so what follows is the guarantee itself, not a detail.
+//
+// A real file rather than ":memory:": "does this survive the process" cannot
+// be asked of a database that only exists inside it.
+// ---------------------------------------------------------------------------
+class LiveKitRekeyDurabilityTest : public LiveKitTokenTest {
+protected:
+    LiveKitRekeyDurabilityTest() {
+        // The pid matters: ctest runs each test as its own process, in
+        // parallel, so a name built only from a clock and a per-process
+        // counter collides and the two runs stamp on each other's database.
+        static std::atomic<int> counter{0};
+        path_ = (std::filesystem::temp_directory_path() /
+                 ("bsfchat-rekey-" + std::to_string(::getpid()) + "-" +
+                  std::to_string(counter++) + ".db")).string();
+        backup_ = path_ + ".backup";
+        remove_db(path_);
+        remove_db(backup_);
+    }
+
+    std::string db_path() const override { return path_; }
+
+    void TearDown() override {
+        close_server();
+        remove_db(path_);
+        remove_db(backup_);
+    }
+
+    // Everything the process was holding goes away and comes back against the
+    // same file, exactly as `docker compose up -d` does. Whatever was only in
+    // memory is gone — which is the whole question.
+    void restart() {
+        close_server();
+        open_server();
+    }
+
+    // The operator's nightly backup: a copy of the database taken while the
+    // server is down, so there is no WAL to reconcile.
+    void snapshot() {
+        close_server();
+        std::filesystem::copy_file(path_, backup_,
+                                   std::filesystem::copy_options::overwrite_existing);
+        open_server();
+    }
+
+    // ...and the restore. Everything written since the snapshot is gone.
+    void restore_snapshot() {
+        close_server();
+        remove_db(path_);
+        std::filesystem::copy_file(backup_, path_);
+        open_server();
+    }
+
+    // Hand the process the shape a pre-v19 deployment has: no generation
+    // table, no baseline, user_version back where it was. Same approach as the
+    // v17 test — the data half is what the migration acts on.
+    void rewind_below_v19() {
+        close_server();
+        sqlite3* db = nullptr;
+        ASSERT_EQ(sqlite3_open(path_.c_str(), &db), SQLITE_OK);
+        auto run = [&](const char* sql) {
+            char* err = nullptr;
+            ASSERT_EQ(sqlite3_exec(db, sql, nullptr, nullptr, &err), SQLITE_OK) << (err ? err : "");
+            sqlite3_free(err);
+        };
+        run("DROP TABLE IF EXISTS voice_key_generations");
+        run("DELETE FROM server_meta WHERE key = 'voice.key_generation_baseline'");
+        run("PRAGMA user_version = 18");
+        sqlite3_close(db);
+        open_server();
+    }
+
+    // Any wall clock a real deployment could have. Generations at or above this
+    // cannot collide with anything the old in-memory counter reached, because
+    // that counter started at 0 and stepped by one per rotation.
+    static constexpr uint64_t kAnyPlausibleClock = 1'600'000'000'000ull; // Sept 2020, ms
+
+private:
+    void close_server() {
+        handler.reset();
+        sync_engine.reset();
+        store.reset();
+    }
+
+    void open_server() {
+        store = std::make_unique<SqliteStore>(path_);
+        store->initialize();
+        sync_engine = std::make_unique<SyncEngine>(*store, config);
+        handler = std::make_unique<VoiceHandler>(*store, *sync_engine, config);
+    }
+
+    static void remove_db(const std::string& path) {
+        std::error_code ec;
+        for (const char* suffix : {"", "-wal", "-shm"}) {
+            std::filesystem::remove(path + suffix, ec);
+        }
+    }
+
+    std::string path_;
+    std::string backup_;
+};
+
+// THE test for this finding. Bob keeps the key he was handed, a moderator
+// rotates him out, the server restarts — and Bob's key must stay dead.
+TEST_F(LiveKitRekeyDurabilityTest, RotationSurvivesARestart) {
+    const auto departed_key = key_of(request(room, "token-alice"));
+    ASSERT_EQ(status_of(rekey(room, "token-mod")), 200);
+    const auto rotated_key = key_of(request(room, "token-alice"));
+    ASSERT_NE(rotated_key, departed_key);
+
+    restart();
+
+    const auto after_restart = key_of(request(room, "token-alice"));
+    EXPECT_NE(after_restart, departed_key)
+        << "a restart handed the departed member's key back";
+    EXPECT_EQ(after_restart, rotated_key)
+        << "a restart changed the key out from under everyone still in the channel";
+}
+
+TEST_F(LiveKitRekeyDurabilityTest, GenerationSurvivesARestart) {
+    const auto rotated = json::parse(rekey(room, "token-mod").body)["key_generation"].get<uint64_t>();
+    restart();
+    EXPECT_EQ(generation_of(request(room, "token-alice")), rotated);
+}
+
+// Rotating twice across a restart must keep climbing rather than restart the
+// sequence — otherwise the second rotation re-issues the first one's key.
+TEST_F(LiveKitRekeyDurabilityTest, GenerationKeepsClimbingAcrossARestart) {
+    const auto first = json::parse(rekey(room, "token-mod").body)["key_generation"].get<uint64_t>();
+    restart();
+    const auto second = json::parse(rekey(room, "token-mod").body)["key_generation"].get<uint64_t>();
+    EXPECT_GT(second, first);
+}
+
+// A room nobody ever rotated must keep the same key across a restart too: a
+// restart is not a rotation, and rotating everyone on every deploy would break
+// every call in progress.
+TEST_F(LiveKitRekeyDurabilityTest, UnrotatedRoomKeepsItsKeyAcrossARestart) {
+    const auto before = key_of(request(room, "token-alice"));
+    restart();
+    EXPECT_EQ(key_of(request(room, "token-alice")), before);
+}
+
+// Upgrading a deployment that rotated keys in memory. Those generations are
+// lost — they were never written down — so the migration must land every
+// existing channel somewhere the old counter could never have reached, or the
+// upgrade itself silently re-admits whoever the last rotation removed.
+TEST_F(LiveKitRekeyDurabilityTest, UpgradeLandsExistingChannelsAboveAnyInMemoryGeneration) {
+    rewind_below_v19();
+
+    const auto generation = generation_of(request(room, "token-alice"));
+    EXPECT_GE(generation, kAnyPlausibleClock)
+        << "an upgraded channel came back at a generation the old in-memory "
+           "counter could have reached, so a pre-upgrade key may still be live";
+    // Distinct generations give distinct keys (MediaKeyDiffersPerGeneration),
+    // so a generation no old counter could reach is a key no old client holds.
+    for (uint64_t legacy = 0; legacy <= 64; ++legacy) {
+        ASSERT_NE(generation, legacy);
+    }
+}
+
+// Rolling the database back to a backup loses the record of any rotation made
+// since — that is what a rollback is, and no design inside that same database
+// can prevent it. What it must NOT do is let the sequence walk back over
+// generations that were already live, because re-issuing one hands a departed
+// member a key they kept. Generations are floored at the wall clock, which a
+// restore cannot rewind, so the next rotation lands above every generation
+// ever issued on this install.
+TEST_F(LiveKitRekeyDurabilityTest, RestoredBackupNeverReissuesARotatedGeneration) {
+    snapshot();
+    ASSERT_EQ(status_of(rekey(room, "token-mod")), 200);
+    const auto rotated = generation_of(request(room, "token-alice"));
+    const auto rotated_key = key_of(request(room, "token-alice"));
+
+    restore_snapshot();
+
+    // The floor is wall-clock based, so the guarantee is "the clock moved on",
+    // and the test moves it on rather than racing the millisecond.
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+
+    ASSERT_EQ(status_of(rekey(room, "token-mod")), 200);
+    EXPECT_GT(generation_of(request(room, "token-alice")), rotated);
+    EXPECT_NE(key_of(request(room, "token-alice")), rotated_key)
+        << "a rotation after a restore re-issued a key that was already retired";
 }
 
 TEST_F(LiveKitTokenTest, IssuesTokenForPermittedMember) {

@@ -1411,6 +1411,69 @@ void SqliteStore::set_meta(const std::string& key, const std::string& value) {
     sqlite3_step(stmt.get());
 }
 
+uint64_t SqliteStore::voice_key_generation_locked(const std::string& room_id) {
+    // One statement, so a channel with no row and a channel whose row was just
+    // written are answered by the same read and cannot disagree. The trailing
+    // 0 is unreachable in practice — migration v19 always writes the baseline —
+    // and is here only so a hand-edited database cannot make this throw.
+    auto stmt = prepare(db_,
+        "SELECT COALESCE("
+        "  (SELECT generation FROM voice_key_generations WHERE room_id = ?1),"
+        "  (SELECT CAST(value AS INTEGER) FROM server_meta"
+        "    WHERE key = 'voice.key_generation_baseline'),"
+        "  0)");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return 0;
+    const int64_t value = sqlite3_column_int64(stmt.get(), 0);
+    return value < 0 ? 0 : static_cast<uint64_t>(value);
+}
+
+uint64_t SqliteStore::get_voice_key_generation(const std::string& room_id) {
+    std::lock_guard lock(mutex_);
+    return voice_key_generation_locked(room_id);
+}
+
+SqliteStore::VoiceKeyRotation SqliteStore::bump_voice_key_generation(const std::string& room_id) {
+    std::lock_guard lock(mutex_);
+    exec("BEGIN IMMEDIATE");
+    try {
+        const uint64_t current = voice_key_generation_locked(room_id);
+        const auto now_ms = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        // See the header: the clock floor is what a restored backup cannot
+        // rewind, and current + 1 is what a rewound clock cannot break.
+        const uint64_t next = std::max(current + 1, now_ms);
+
+        auto stmt = prepare(db_,
+            "INSERT INTO voice_key_generations (room_id, generation, rotated_at) "
+            "VALUES (?1, ?2, ?3) "
+            "ON CONFLICT(room_id) DO UPDATE SET "
+            // MAX(), not a plain assignment. Belt to the braces of the read
+            // above: no path through this statement can lower a generation.
+            "  generation = MAX(excluded.generation, voice_key_generations.generation), "
+            "  rotated_at = excluded.rotated_at");
+        sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt.get(), 2, static_cast<int64_t>(next));
+        sqlite3_bind_int64(stmt.get(), 3, static_cast<int64_t>(now_ms));
+        if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+            throw std::runtime_error(std::string("could not persist the media-key generation: ") +
+                                     sqlite3_errmsg(db_));
+        }
+
+        // Read back rather than return `next`: the caller derives a key from
+        // this number and tells every client it is the current one, so it has
+        // to be the number on disk and not the one we hoped to write.
+        const uint64_t stored = voice_key_generation_locked(room_id);
+        exec("COMMIT");
+        return VoiceKeyRotation{current, stored};
+    } catch (...) {
+        exec("ROLLBACK");
+        throw;
+    }
+}
+
 std::optional<RoomEvent> SqliteStore::get_state_event(const std::string& room_id,
                                                        const std::string& event_type,
                                                        const std::string& state_key) {

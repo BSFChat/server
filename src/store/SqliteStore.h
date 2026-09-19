@@ -357,6 +357,51 @@ public:
     std::optional<std::string> get_meta(const std::string& key);
     void set_meta(const std::string& key, const std::string& value);
 
+    // ── LiveKit media-key generation ──────────────────────────────────────
+    //
+    // The channel's media key is HKDF(key_material, server_name ‖ room_id ‖
+    // generation), so the generation IS the key: rotating it is what stops a
+    // departed member decrypting, and reusing one hands their key back. It
+    // lives here rather than in VoiceHandler because it was in a std::map
+    // there, and every restart quietly undid every rotation ever performed
+    // (schema v19).
+    //
+    // Returns the generation currently in force for `room_id` — the stored
+    // value, or this install's baseline for a channel that has never been
+    // rotated. Never fabricates 0: 0 is a real, derivable key, and defaulting
+    // to it is precisely the bug.
+    uint64_t get_voice_key_generation(const std::string& room_id);
+
+    // What a rotation replaced and what it installed. Returned as a pair, and
+    // read inside the write's own lock, for the same reason set_server_state
+    // returns the content it superseded: a separate read first would leave a
+    // window in which two concurrent rotations both report the same "before"
+    // to the audit log.
+    struct VoiceKeyRotation {
+        uint64_t previous = 0;
+        uint64_t current = 0;
+    };
+
+    // Rotates `room_id` onto a new generation and returns it with its
+    // predecessor.
+    //
+    // MONOTONIC IN TWO DIRECTIONS. The new value is
+    // max(current + 1, wall clock in ms), and the write itself takes the MAX of
+    // what is already stored, so:
+    //   * a generation never decreases within an install, and
+    //   * it never decreases ACROSS one either. A database restored from an
+    //     older backup loses the record of rotations made since — nothing
+    //     stored in that same database can survive its own rollback — but the
+    //     wall clock cannot be rolled back with it, so the next rotation lands
+    //     above every generation this install ever issued instead of walking
+    //     back over keys that were already retired.
+    // A backwards jump of the system clock costs nothing either: current + 1
+    // still applies. The two floors cover each other.
+    //
+    // Throws if the new generation cannot be persisted. A rotation that reports
+    // success without being durable is the defect this method exists to fix.
+    VoiceKeyRotation bump_voice_key_generation(const std::string& room_id);
+
     // Permissions / roles (reads)
     // Returns the server-wide role definitions, empty if unset.
     std::vector<ServerRole> get_server_roles();
@@ -715,6 +760,10 @@ private:
     // (resolving any winning edit, honouring redaction) and reindexes.
     // Caller must hold mutex_.
     void refresh_search_for_event_locked(const std::string& event_id);
+    // The generation in force for `room_id`: its stored value, or the install
+    // baseline when it has never been rotated. Caller must hold mutex_.
+    uint64_t voice_key_generation_locked(const std::string& room_id);
+
     // Cached result of "does event_search_fts exist"; -1 = not yet checked.
     int fts5_available_ = -1;
     bool fts5_available_locked();

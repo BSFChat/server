@@ -1123,6 +1123,57 @@ void migrate_v18(sqlite3* db, bool fresh_database) {
         after - before);
 }
 
+// v19: persist the LiveKit media-key generation.
+//
+// The generation the room key is derived from lived in a std::map on
+// VoiceHandler that defaulted to 0 for any room it had not seen. A restart
+// therefore reverted every channel's key to its generation-0 value and
+// re-admitted everyone a moderator had rotated out — while the route comment on
+// POST /rooms/{id}/voice/livekit_rekey called rotation "the only way to stop a
+// departed member decrypting". This table is what makes that sentence true.
+//
+// No REFERENCES rooms(room_id), on purpose. foreign_keys=ON would then make
+// delete_room fail unless it deleted the generation first, and deleting it is
+// the wrong behaviour: the one invariant this table exists to hold is that a
+// generation never goes backwards. Room ids are CSPRNG-random and never reused,
+// so an orphan row is a few dozen bytes that can only ever protect the
+// invariant.
+//
+// `voice.key_generation_baseline` is the generation a channel with no row has.
+// It is the wall clock at upgrade, not 0, and that choice is the whole answer to
+// "what happens to channels that were already rotated in memory":
+//
+//   * Those rotations were never written down, so their generation cannot be
+//     recovered — it is genuinely lost on this upgrade.
+//   * Coming back at 0 (or at 1, or any small number) would reissue a key some
+//     departed member may still hold, which is the exact defect being fixed,
+//     performed once more by the fix itself.
+//   * A millisecond timestamp is unreachable by the old counter, which started
+//     at 0 and stepped by one per rotation. So every channel comes up on a key
+//     that no pre-upgrade client was ever handed. The cost is that the upgrade
+//     rotates every voice channel once — clients re-fetch on their next token
+//     request, and an upgrade is a restart, which already changed these keys.
+void migrate_v19(sqlite3* db, bool /*fresh_database*/) {
+    exec(db, R"(
+        CREATE TABLE IF NOT EXISTS voice_key_generations (
+            room_id    TEXT PRIMARY KEY,
+            generation INTEGER NOT NULL,
+            rotated_at INTEGER NOT NULL
+        )
+    )");
+
+    // INSERT OR IGNORE, not a plain INSERT: the baseline is the floor under
+    // every unrotated channel's key, so re-running this step must never move it.
+    exec(db, "INSERT OR IGNORE INTO server_meta (key, value) "
+             "VALUES ('voice.key_generation_baseline', "
+             "        CAST(strftime('%s','now') AS INTEGER) * 1000)");
+
+    get_logger()->info(
+        "Schema v19: LiveKit media-key generations are now persisted; every voice "
+        "channel starts from a fresh key, because rotations performed before this "
+        "upgrade were only ever held in memory");
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1145,6 +1196,7 @@ const std::vector<Step>& steps() {
         migrate_v16,
         migrate_v17,
         migrate_v18,
+        migrate_v19,
     };
     return kMigrations;
 }

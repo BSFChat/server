@@ -1,4 +1,5 @@
 #include "api/VoiceHandler.h"
+#include "audit/AuditLog.h"
 #include "auth/Permissions.h"
 #include "core/Config.h"
 #include "core/Logger.h"
@@ -904,14 +905,10 @@ void VoiceHandler::handle_livekit_token(const httplib::Request& req, httplib::Re
     // Delivered in the RESPONSE BODY over TLS, never in a URL. Query strings
     // land in access logs, proxy logs and browser history.
     if (config_.voice.livekit.room_encryption) {
-        uint64_t generation = 0;
-        {
-            std::lock_guard<std::mutex> lock(key_generation_mutex_);
-            auto it = key_generations_.find(room_id);
-            if (it != key_generations_.end()) {
-                generation = it->second;
-            }
-        }
+        // From the store, which is the only place a rotation is recorded. A
+        // read that defaulted to 0 for an unknown room would be the finding-4
+        // bug back again by another route.
+        const uint64_t generation = store_.get_voice_key_generation(room_id);
         try {
             const auto key = livekit_room_key(config_.voice.livekit.key_material(),
                                               config_.server_name, room_id, generation);
@@ -1004,17 +1001,34 @@ void VoiceHandler::handle_livekit_rekey(const httplib::Request& req, httplib::Re
         return;
     }
 
-    uint64_t generation = 0;
-    {
-        std::lock_guard<std::mutex> lock(key_generation_mutex_);
-        generation = ++key_generations_[room_id];
+    // Durable before the response says it happened. bump_voice_key_generation
+    // throws rather than returning a generation it could not write, so a 500
+    // here means the old key is still the live one — which is the honest
+    // answer. The alternative, reporting a rotation that the next restart
+    // undoes, is the defect this endpoint was found to have.
+    SqliteStore::VoiceKeyRotation rotation;
+    try {
+        rotation = store_.bump_voice_key_generation(room_id);
+    } catch (const std::exception& e) {
+        get_logger()->error("LiveKit rekey could not persist a new generation for room {}: {}",
+                            room_id, e.what());
+        res.status = 500;
+        res.set_content(MatrixError::unknown("Could not rotate this channel's media key")
+                            .to_json().dump(),
+                        "application/json");
+        return;
     }
+
+    // Rotation is the control an operator reaches for when somebody leaves, so
+    // whether it was used has to be answerable later — not least when deciding
+    // whether a backup being restored predates it.
+    audit_voice_rekey(store_, *user_id, room_id, rotation.previous, rotation.current);
 
     // The new key is NOT returned here. The caller re-fetches it from the
     // token endpoint like everyone else, so there is exactly one code path
     // that hands out key material and exactly one permission gate on it.
     res.set_content(json{
-        {"key_generation", generation},
+        {"key_generation", rotation.current},
     }.dump(), "application/json");
 }
 
