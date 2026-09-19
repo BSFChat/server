@@ -33,6 +33,7 @@ add_executable(bsfchat-server
     src/auth/Permissions.cpp
     src/auth/PowerLevels.cpp
     src/auth/RoleBootstrap.cpp
+    src/auth/RoomVisibility.cpp
     src/audit/AuditLog.cpp
     src/identity/Nickname.cpp
     src/api/AuditHandler.cpp

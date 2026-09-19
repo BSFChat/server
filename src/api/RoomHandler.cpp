@@ -3,6 +3,7 @@
 #include "auth/AutoJoin.h"
 #include "auth/Permissions.h"
 #include "auth/RoleBootstrap.h"
+#include "auth/RoomVisibility.h"
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
@@ -39,12 +40,6 @@ int64_t now_ms() {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-bool is_category_room(SqliteStore& store, const std::string& room_id) {
-    auto ev = store.get_state_event(room_id, std::string(event_type::kRoomType), "");
-    if (!ev) return false;
-    return ev->content.data.value("type", "") == "category";
-}
-
 // Stamps `is_direct` onto an m.room.member content when the room is a DM. See
 // the comment at the creator's join in handle_create_room for why the room's
 // own state — and not only m.direct account data — has to say so.
@@ -78,9 +73,8 @@ bool refuse_on_direct_room(SqliteStore& store, httplib::Response& res,
 bool can_read_room(SqliteStore& store, const Config& config,
                    const std::string& user_id, const std::string& room_id) {
     if (!store.is_room_member(room_id, user_id)) return false;
-    if (is_category_room(store, room_id)) return true;
     PermissionsEngine perms(store, config);
-    return perms.can(user_id, room_id, permission::kViewChannel);
+    return can_view_room(store, perms, user_id, room_id);
 }
 
 // What a membership transition IS, and therefore what gates it.
@@ -731,7 +725,18 @@ void RoomHandler::handle_joined_rooms(const httplib::Request& req, httplib::Resp
         return;
     }
 
-    auto rooms = store_.get_joined_rooms(*user_id);
+    // Membership is not the answer to "which rooms may this user be told
+    // about" — see auth/RoomVisibility.h. Returning it raw made this endpoint a
+    // complete index of every private channel on the server: ids only, since
+    // /messages, /state and /members each gate on VIEW_CHANNEL, but an id is
+    // what you need to ask any of them, and the existence and count of the
+    // private channels is itself the disclosure.
+    //
+    // One engine for the whole list. Per-room construction would re-read the
+    // server roles and this user's role assignment once per room, all of it
+    // serialised behind the store's single mutex.
+    PermissionsEngine perms(store_, config_);
+    auto rooms = visible_joined_rooms(store_, perms, *user_id);
     res.set_content(json{{"joined_rooms", rooms}}.dump(), "application/json");
 }
 
