@@ -97,6 +97,52 @@ bool can_read_room(SqliteStore& store, const Config& config,
 
 // What a membership transition IS, and therefore what gates it.
 //
+// Marks an m.room.member `leave` that a MODERATOR wrote as a removal, carrying
+// the actor's id. Room state, not a new table, so it needs no migration and it
+// travels with the event that already describes the act.
+//
+// WHY THE SENDER IS NOT ENOUGH, which is the entire reason this key exists.
+// "the member event says leave and somebody else sent it" looks like a complete
+// definition of a kick. It is not: unban_intent projects
+// `{"membership":"leave"}` with the MODERATOR as sender into every room where
+// the target's row was `ban` (see project_membership_everywhere), precisely so
+// that lifting a ban restores the ability to come back — its own comment says
+// it "does not decide for them that they have". By sender alone that event is a
+// kick in every channel at once, so a sender-only rule would leave every
+// unbanned account permanently locked out of the entire server. This key is
+// written by exactly one intent, so the two acts cannot be confused.
+//
+// ON THE KICK RATHER THAN ON THE UNBAN, deliberately. Neither marker exists on
+// rows written before this change. Marking the kick means those historical
+// kicks stay rejoinable, which is today's behaviour and therefore no
+// regression; marking the unban instead would silently re-lock everybody
+// unbanned before the upgrade, which is a new lockout nobody asked for. When
+// the evidence is missing, fail open: this is a moderation control, not a
+// confidentiality boundary — a kicked user could already read the channel
+// (finding 6: "This is not disclosure") — so wrongly refusing a legitimate
+// member is the worse error.
+//
+// Server-local, not a protocol constant: no client has to understand it, and an
+// unknown key in a member event is ignored. It disappears on its own, because
+// every later membership write REPLACES the state event — an invite writes a
+// fresh content object, and so does a join — so re-admitting somebody clears it
+// without anything having to remember to.
+constexpr std::string_view kRemovedByKey = "bsfchat.removed_by";
+
+// True when `user_id`'s CURRENT membership in `room_id` is a removal somebody
+// else performed. Both halves are required: the marker says which act it was,
+// and the sender check keeps a self-write from ever counting however the
+// content was built.
+bool was_removed_by_moderator(SqliteStore& store, const std::string& room_id,
+                              const std::string& user_id) {
+    auto ev = store.get_state_event(room_id, std::string(event_type::kRoomMember), user_id);
+    if (!ev) return false;
+    if (ev->sender == user_id) return false;
+    if (!ev->content.data.is_object()) return false;
+    if (ev->content.data.value("membership", "") != membership::kLeave) return false;
+    return ev->content.data.contains(std::string(kRemovedByKey));
+}
+
 // Derived from the (before, after) pair and the ban list — NOT from which URL the
 // request arrived at. That is the whole point: POST /rooms/{id}/ban and
 // PUT /rooms/{id}/state/m.room.member/{user} describe the same act, so they must
@@ -111,6 +157,10 @@ struct MembershipIntent {
     bool lifts_server_ban = false;
     bool require_target_in_room = false;
     bool require_target_banned = false;
+    // Stamps kRemovedByKey onto the member event this writes, so /join can tell
+    // "a moderator removed you" from every other way a row reads `leave`.
+    // See kRemovedByKey for why the sender is not enough on its own.
+    bool records_removal = false;
     const char* verb = "";           // "ban"/"unban"/"kick"/"invite", for messages
 };
 
@@ -149,6 +199,7 @@ MembershipIntent kick_intent() {
     i.server_scope = true;
     i.needs_rank = true;
     i.require_target_in_room = true;
+    i.records_removal = true;
     i.verb = "kick";
     return i;
 }
@@ -364,6 +415,11 @@ RoomHandler::ModerationResult RoomHandler::apply_membership_moderation(
         store_.set_membership(room_id, target_user, target_membership);
         json content = {{"membership", target_membership}};
         if (!reason.empty()) content["reason"] = reason;
+        // Recorded from the INTENT, like everything else in this function, so the
+        // marker cannot disagree with which act was authorised — the same reason
+        // the permission, the scope and the rank check are read from here rather
+        // than from the URL the request arrived at.
+        if (intent.records_removal) content[std::string(kRemovedByKey)] = actor;
         ok.event_id = emit_state_event(room_id, actor, std::string(event_type::kRoomMember),
                                        target_user, content);
     }
@@ -621,6 +677,39 @@ void RoomHandler::handle_join(const httplib::Request& req, httplib::Response& re
         res.status = 403;
         res.set_content(MatrixError::forbidden("Cannot join a direct message room").to_json().dump(),
                         "application/json");
+        return;
+    }
+
+    // A kick has to mean something, and this is the only thing that makes it
+    // mean anything.
+    //
+    // Before this check, `kick` set membership='leave' and the target was back
+    // with one empty POST to this endpoint — no body, no prerequisite. The
+    // join_rule below could never stop them, because it is not a privacy control
+    // on this deployment: the client hardcodes visibility="public" for every
+    // channel it creates and expresses privacy as an @everyone DENY VIEW_CHANNEL
+    // override instead (see docs/membership-vs-visibility.md), so EVERY channel,
+    // including every "private" one, has join_rule "public" and that branch
+    // always passes. A moderator's only working remedy was a server-wide ban,
+    // which nukes every channel and every session. The middle rung of the ladder
+    // did not exist.
+    //
+    // Scoped to this room, deliberately: a kick is a per-channel act and must not
+    // become a soft server ban. The server-wide one is the check at the top.
+    //
+    // A VOLUNTARY leave is untouched, which matters more here than it would
+    // elsewhere: auto-join puts every user in every channel, so leaving is how
+    // somebody hides a channel they do not want, and it has to stay reversible.
+    // was_removed_by_moderator distinguishes the two.
+    //
+    // The way back in is POST /rooms/{id}/invite, which writes membership
+    // 'invite' and lets the next join through. That is a deliberate act by
+    // somebody holding MANAGE_CHANNELS, which is what un-kicking should be.
+    if (was_removed_by_moderator(store_, room_id, *user_id)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden(
+            "You were removed from this channel and cannot rejoin unless you are invited "
+            "back").to_json().dump(), "application/json");
         return;
     }
 

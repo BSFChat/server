@@ -31,7 +31,7 @@ Where I disagree with either, it is called out explicitly under
 | 3 | `/sync`, `/rooms/{id}/state`, `/state/{type}`, `/members` | The category exemption is an unbounded VIEW_CHANNEL bypass, flippable by MANAGE_CHANNELS | **High** | Must fix |
 | 4 | `POST /rooms/{id}/voice/livekit_rekey` | Key generation is in-memory only; a restart reverts the media key and re-admits every departed member | **High** | Must fix |
 | 5 | `PUT /rooms/{id}/send/…` (edit path) | Global event-existence oracle: 404 / 400 / 403 distinguish "no such event" from "exists elsewhere" | Medium | **Fixed** |
-| 6 | `POST /rooms/{id}/join` | Kick is unenforceable — the target rejoins any public-join_rule channel immediately | Medium | **Open — needs a product decision** |
+| 6 | `POST /rooms/{id}/join` | Kick is unenforceable — the target rejoins any public-join_rule channel immediately | Medium | **Fixed** |
 | 7 | `PUT /profile/{me}/displayname`, `/avatar_url`, `/nickname` | Unlimited (channels × 1) event amplification per request | Medium | **Fixed** |
 | 8 | `PUT /rooms/{id}/send/…` | EMBED_LINKS is checked against `body` only; `formatted_body` bypasses it | Medium | **Fixed** |
 | 9 | `GET /_matrix/client/versions` | Unauthenticated exact version **and git revision** — tells an attacker which hosts are unpatched | Medium | **Fixed** |
@@ -438,63 +438,83 @@ Note this is one more argument for that document's §"Recommendation": under
 `join_rule: "invite"` for private channels, `/join` would refuse and the problem
 disappears for the channels where it matters.
 
-**Open — analysed, not fixed; it needs a product decision.** Every workable fix
-changes what a kick MEANS to an operator, and there is no version of this that is
-purely a bug fix.
+**Resolved** (`fix/kick-enforceable`). `POST /join` refuses when the caller's
+current `m.room.member` in that room is a removal somebody else performed.
 
-**What has already changed under the finding.** The finding says "`kick_intent()`
-sets `membership='leave'` and nothing else". That is still true, but the merge
-train has closed the other half of the problem: `AutoJoin::join_user_to_room` now
-returns early when *any* membership row exists, with a comment saying exactly why
-("a kick was silently undone by the next restart or deploy"). So a kick already
-survives a restart. `POST /join` is now the only way back in, which makes this a
-single-endpoint decision rather than a data-model one.
+**The finding was partly stale, and the next reader should not have to
+rediscover it.** It says `kick_intent()` "sets `membership='leave'` and nothing
+else — no ban row, no token revocation, no join_rule change", and infers a
+data-model problem. The membership half has since been fixed elsewhere:
+`AutoJoin::join_user_to_room` now returns early when *any* membership row
+exists, with a comment saying exactly why ("a kick was silently undone by the
+next restart or deploy"). So a kick already survived a restart, and `/join` was
+the only remaining way back in. That narrowed this to one endpoint.
 
-**Why the finding's own two options are both wrong for this codebase.**
+**Both options the finding offers were rejected.** A *cooldown* — its "minimal" —
+is now strictly worse than doing nothing: with the auto-join fix in place a kick
+is permanent until somebody acts, so a timer converts a permanent removal into a
+delayed re-entry. A *per-user deny override* — its "correct" — is a channel ban
+wearing a kick's name: it writes permission state from a moderation endpoint, so
+the kicked user's id becomes permanent channel state readable by anyone who can
+read the channel's overrides; it survives a later re-invite, so re-admitting
+somebody silently fails until a second, different action is taken; and it leaves
+kick and ban differing only in scope, which is the middle rung the finding set
+out to create.
 
-*A cooldown* (its "minimal") is the weaker of the two and was weakened further by
-the auto-join fix: a kick is now permanent until someone acts, so putting a timer
-on `/join` converts a permanent removal into a delayed re-entry. It makes the
-moderation ladder worse, not better.
+**What shipped instead.** A kick stamps `bsfchat.removed_by` (the actor's id)
+onto the `m.room.member` event it already writes, from `MembershipIntent` so the
+marker cannot disagree with which act was authorised; `/join` refuses when the
+current member event is a `leave` carrying that key and sent by somebody else.
+No schema change, no migration, no new table — it reads state that was already
+being written.
 
-*A per-user deny override* (its "correct") does fit the data model — privacy here
-IS the override set — but it is a channel ban wearing a kick's name. It writes
-permission state from a moderation endpoint, so the kicked user's id becomes
-permanent, readable channel state visible to anyone who can read the channel's
-overrides; it survives a later re-invite, so re-admitting someone silently fails
-until a second, different action is taken; and it makes kick and ban differ only
-in scope, which is precisely the middle rung the finding is trying to create.
+**Why the sender alone is not the rule, which is the trap here.** "The member
+event says `leave` and somebody else sent it" looks like a complete definition of
+a kick. It is not. `unban_intent` projects `{"membership":"leave"}` with the
+**moderator** as sender into every room where the target's row was `ban`
+(`project_membership_everywhere`), deliberately, so that lifting a ban restores
+the ability to return without deciding that they have — its own comment says so.
+By sender alone that is a kick in every channel at once, so a sender-only rule
+would have left every unbanned account permanently locked out of the whole
+server: a worse bug than the one being fixed, and silent. A regression test
+covers it, and reverting the rule to sender-only fails that test and nothing
+else.
 
-**The option the finding does not consider, and the one I would ship.** Refuse
-`/join` when the caller's current `m.room.member` state event says `leave` **and
-its sender is somebody else**. That is the definition of "was kicked", it is
-already recorded, and it needs no schema change and no migration:
-`apply_membership_moderation` emits the kick event with `sender = actor`, while
-`handle_leave` and the self-membership state write both emit with
-`sender = the user`. So a voluntary leave stays rejoinable — which matters,
-because in this model leaving a channel is how you hide one you do not care about
-— and a removal does not.
+The marker goes on the **kick** rather than on the unban because rows written
+before this change carry neither. Marking the kick leaves historical kicks
+rejoinable — today's behaviour, so no regression — where marking the unban would
+have re-locked everyone unbanned before the upgrade. When the evidence is
+missing, fail open: this is a moderation control, not a confidentiality boundary
+(the finding itself says "This is not disclosure"), so wrongly refusing a
+legitimate member is the worse error.
 
-**What needs deciding before it can land, and why I stopped.** The re-entry path.
-Under this rule a kicked user returns when somebody invites them, via
-`POST /rooms/{id}/invite` (MANAGE_CHANNELS), which writes `membership: invite` and
-lets the next `/join` through. The server side of that works today. The question
-is the client: a kicked user is no longer in the member list, so a moderator has
-nowhere obvious to click to reverse a kick, and they would need the raw mxid. So
-the choice is between
+**The un-kick path is `POST /rooms/{id}/invite`, and it is now the only one.**
+Decided deliberately: a kick that does not kick is a moderation control that
+lies, which is worse than an un-kick that needs a moderator to paste a user id.
+The server capability exists and is tested; what is missing is a button, and a
+missing button is a UI gap, not a security hole. The client side is filed
+separately. Until it lands, reversing a kick means inviting the user by mxid —
+worth a line in the release notes.
 
-1. ship the server rule now and accept that un-kicking is mxid-only until the
-   client grows an affordance,
-2. ship it together with a client change, or
-3. leave kick unenforceable for this RC and fold it into the `join_rule: "invite"`
-   model change that `docs/membership-vs-visibility.md` §Recommendation already
-   describes — which is where this problem actually disappears, and which that
-   document is explicit should not start in the RC.
+Eleven tests in `tests/test_kick_enforcement.cpp`: the kicked user refused; the
+voluntary leaver still rejoins (which matters more here than elsewhere — with
+auto-join putting everyone in everything, leaving is how a user hides a channel);
+invite-after-kick re-admits; a re-admitted user can leave and rejoin again; a ban
+is unaffected and still refused by the server-wide check ahead of this one; an
+unbanned user can rejoin every channel; the refusal holds on a `join_rule:
+"public"` channel, asserted explicitly so nobody "simplifies" the check into a
+join-rule test that would do nothing on a real deployment; a kick in one channel
+does not affect another; and the two last-writer cases — the dedicated `/kick`
+endpoint refuses a target who already left, while the generic state route *can*
+write `leave` over a self-leave (`classify_transition` clears
+`require_target_in_room` there) and when it does, the moderator is the last
+writer and the user is kicked. That last one was checked rather than assumed.
 
-That is a product call about a moderation workflow, not a security judgement, so
-it is not mine to make quietly. Nothing in this branch touches `/join`.
-
----
+**This does not replace the model change.** `docs/membership-vs-visibility.md`
+§Recommendation is still where this problem actually disappears: under
+`join_rule: "invite"` for private channels there is nothing for `/join` to
+refuse. This is the one-endpoint fix that makes kick work today, not an argument
+against that.
 
 ---
 

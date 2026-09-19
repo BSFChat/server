@@ -125,6 +125,24 @@ Numbering follows the original audit; 1–3 are in the table above.
   on the least-settled part of the codebase, and getting it wrong drops people
   mid-call — worth doing deliberately rather than alongside this fix.
 
+## Update: kick is now enforced at `/join`
+
+`fix/kick-enforceable` (audit-requests finding 6) closed the hole this document's
+model made easy: a kicked user could rejoin any channel with one empty POST,
+because every channel carries `join_rule: "public"` and nothing else was checked.
+A kick now stamps `bsfchat.removed_by` on the member event it writes, and `/join`
+refuses when the caller's current member event is a `leave` carrying that key
+from somebody else. A voluntary leave stays rejoinable — under this model leaving
+is how a user hides a channel, so it has to.
+
+**It reinforces the recommendation below rather than replacing it.** The fix is a
+check on one endpoint, and it needs a marker precisely because membership here
+carries no meaning on its own: with `join_rule: "invite"` for private channels
+there would be nothing for `/join` to refuse and no marker to write.
+
+Note for operators until the client catches up: reversing a kick means inviting
+the user back by mxid, since a removed user is no longer in the member list.
+
 ## Recommendation: stop modelling private channels as public-rooms-plus-override
 
 **Do not start this in the RC.** It is a data-model change, and the fix above is
