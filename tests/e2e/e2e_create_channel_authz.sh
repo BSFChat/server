@@ -69,6 +69,10 @@ password_hash_cost = 12
 
 [voice]
 enabled = false
+
+[push]
+# Not exercised here, and push with no gateway allowlist is now a startup error.
+enabled = false
 EOF
 
 cd "$WORK" || exit 1

@@ -149,15 +149,47 @@ struct PushConfig {
 
     // URL prefixes a client is allowed to register as a push gateway.
     //
-    // This matters more than it looks. /pushers/set lets any authenticated user
-    // name a URL that the SERVER will then POST to, which is a server-side
-    // request forgery primitive: without a restriction, a user can aim it at
-    // cloud metadata endpoints or at services that are only reachable from
-    // inside the deployment's network, and use notification timing as the oracle.
-    // Empty means "any absolute http(s) URL", which Config::validate warns about
-    // loudly — appropriate for a single-admin self-hosted instance, not for one
-    // with untrusted accounts.
+    // This matters more than it looks, and it is DEFAULT CLOSED. /pushers/set
+    // lets any authenticated user name a URL that the SERVER will then POST the
+    // notification to, so an unrestricted list is two things at once: a
+    // server-side request forgery primitive aimed at whatever this host can
+    // reach, and a self-serve exfiltration feed — any account can point a pusher
+    // at a collector it owns and have message content delivered there forever,
+    // with the client closed and nothing in any moderator surface to show it.
+    //
+    // Empty therefore means "no gateway is permitted", not "any gateway". A
+    // deployment that wants mobile push names its gateway here; one that does
+    // not gets push.enabled forced to false at startup with an error, so the
+    // failure is loud and the feature is off rather than open.
+    //
+    // Entries are matched on scheme + host + port, then on a path-segment
+    // boundary — never as a raw string prefix, which would let
+    // "https://push.example.com" also authorise "https://push.example.com.evil.tld/".
     std::vector<std::string> allowed_gateway_prefixes;
+
+    // Whether an allowlisted gateway may live on an internal address (loopback,
+    // RFC1918, link-local/metadata, a bare compose service name...).
+    //
+    // Separate from the allowlist on purpose: the allowlist answers "which
+    // gateway", this answers "may the server be made to talk to the inside of
+    // its own network at all". Sygnal in the same compose file is a legitimate
+    // and common self-hosted shape, so it is configurable — but it is off by
+    // default, so an allowlist entry typo'd onto an internal host fails closed
+    // rather than becoming an SSRF aperture.
+    bool allow_internal_gateway = false;
+
+    // What a pusher that does not ask for a specific format gets.
+    //
+    // "event_id_only": the gateway learns that something happened in a room and
+    // nothing about what was said. "full": the verbatim event content, sender
+    // and display name, the Matrix default.
+    //
+    // event_id_only is the default here because the third party behind the
+    // gateway is exactly the party this product exists not to trust, and
+    // because a pusher omitting `format` is saying nothing about consent. An
+    // operator who runs their own gateway and wants rich notifications sets
+    // "full" deliberately.
+    std::string default_payload = "event_id_only";
 };
 
 // Rate limiting and lockout for /login, /register, /refresh and

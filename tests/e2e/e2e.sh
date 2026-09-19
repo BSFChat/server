@@ -35,6 +35,13 @@ enabled = false
 enabled = true
 worker_poll_ms = 200
 allowed_gateway_prefixes = ["http://127.0.0.1:$((PORT+1))/"]
+# The stand-in gateway below runs on loopback, which the SSRF gate refuses
+# unless the operator says the gateway really is internal. Same two settings a
+# deployment running sygnal in its own compose file needs.
+allow_internal_gateway = true
+# The server default is "event_id_only"; this run exercises the full payload
+# path (the checks below read sender and body out of the notify).
+default_payload = "full"
 EOF
 
 # A stand-in push gateway: logs each notify body and answers 200 {}.

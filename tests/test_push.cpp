@@ -11,11 +11,14 @@
 
 #include <gtest/gtest.h>
 
+#include <spdlog/sinks/ringbuffer_sink.h>
+
 #include "api/EventHandler.h"
 #include "api/PushHandler.h"
 #include "auth/LocalAuth.h"
 #include "auth/Permissions.h"
 #include "core/Config.h"
+#include "core/Logger.h"
 #include "push/PushService.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
@@ -111,6 +114,10 @@ struct PushFixture {
         config.push.base_backoff_ms = 100;
         config.push.max_backoff_ms = 100;
         config.push.max_attempts = 2;
+        // An empty allowlist now means "no gateway is permitted at all", so a
+        // fixture that wants to register a pusher has to configure one — the
+        // same thing a real deployment has to do.
+        config.push.allowed_gateway_prefixes = {"https://gateway.example/"};
 
         store = std::make_unique<SqliteStore>(":memory:");
         store->initialize();
@@ -295,15 +302,23 @@ TEST(Pushers, GatewayUrlMustBeAbsoluteHttpAndCarryNoCredentials) {
     EXPECT_EQ(attempt("https://gateway.example/notify\r\nX-Injected: 1"), 400);
 }
 
-// With no allowlist configured the handler used to accept any absolute
-// http(s) URL, which made an out-of-the-box deployment a ready-made SSRF
-// primitive: /pushers/set is the one endpoint where an ordinary user names a
-// URL that the SERVER then POSTs to, and the delivery worker runs inside the
-// compose network. The allowlist is still the real control (and the example
-// config ships one); this is the backstop for deployments that never set it.
-TEST(Pushers, InternalTargetsAreRefusedWithNoAllowlist) {
+// The internal-address gate is applied ON TOP of the allowlist, not only when
+// the allowlist is empty: /pushers/set is the one endpoint where an ordinary
+// user names a URL that the SERVER then POSTs to, and the delivery worker runs
+// inside the compose network. Every host below is allowlisted here on purpose —
+// an entry typo'd onto an internal address must fail closed rather than become
+// an SSRF aperture.
+TEST(Pushers, InternalTargetsAreRefusedEvenWhenAllowlisted) {
     PushFixture f;
-    ASSERT_TRUE(f.config.push.allowed_gateway_prefixes.empty());
+    f.config.push.allowed_gateway_prefixes = {
+        "http://169.254.169.254/", "http://localhost:8448/",  "http://127.0.0.1:8448/",
+        "http://[::1]:8448/",      "http://[::ffff:127.0.0.1]/",
+        "http://10.0.0.5/",        "http://172.16.0.9/",      "http://172.31.255.254/",
+        "http://192.168.1.1/",     "http://100.64.0.1/",      "http://[fd00::1]/",
+        "http://[fe80::1]/",       "http://identity:9000/",   "http://db/",
+        "http://gateway.internal/", "http://printer.local/",
+        "https://push.example.com/",
+    };
     f.add_user("alice");
 
     auto attempt = [&](const std::string& url) {
@@ -358,7 +373,8 @@ TEST(Pushers, InternalTargetsAreRefusedWithNoAllowlist) {
 // block a legitimate gateway.
 TEST(Pushers, AddressesAdjacentToPrivateRangesAreStillAllowed) {
     PushFixture f;
-    ASSERT_TRUE(f.config.push.allowed_gateway_prefixes.empty());
+    f.config.push.allowed_gateway_prefixes = {"http://172.15.0.1/", "http://172.32.0.1/",
+                                              "http://11.0.0.1/", "http://8.8.8.8/"};
     f.add_user("alice");
 
     auto attempt = [&](const std::string& url) {
@@ -379,12 +395,14 @@ TEST(Pushers, AddressesAdjacentToPrivateRangesAreStillAllowed) {
     EXPECT_TRUE(IsOk(attempt("http://8.8.8.8/notify")));
 }
 
-// The allowlist overrides the backstop: a deployment whose gateway really is
-// on localhost (sygnal in the same compose file) says so and keeps working.
-// tests/e2e/e2e.sh depends on exactly this.
-TEST(Pushers, AllowlistOverridesTheInternalHostBackstop) {
+// A deployment whose gateway really is on localhost (sygnal in the same compose
+// file) allowlists it AND opts in to internal addresses, and keeps working.
+// Both are needed: the allowlist says which gateway, the opt-in says the server
+// may be pointed at its own network at all. tests/e2e/e2e.sh depends on this.
+TEST(Pushers, AllowlistPlusOptInReachesAnInternalGateway) {
     PushFixture f;
     f.config.push.allowed_gateway_prefixes = {"http://127.0.0.1:9999/"};
+    f.config.push.allow_internal_gateway = true;
     f.add_user("alice");
 
     auto req = make_request("/_matrix/client/v3/pushers/set", "token-alice",
@@ -634,8 +652,12 @@ TEST(PushEvaluation, EventIdOnlyPushersDoNotLeakMessageContent) {
     (void)bob;
 }
 
-TEST(PushEvaluation, DefaultFormatCarriesContentAndDeviceIdentity) {
+// With push.default_payload = "full" restored, a pusher that names no format
+// gets the Matrix default shape. (That the SERVER default is event_id_only is
+// PushPayload.DefaultsToEventIdOnly.)
+TEST(PushEvaluation, FullPayloadCarriesContentAndDeviceIdentity) {
     PushFixture f;
+    f.config.push.default_payload = "full";
     f.add_user("alice");
     f.add_user("bob");
     f.register_pusher("bob", "bob-device");
@@ -860,4 +882,339 @@ TEST(PushDelivery, WorkerThreadStartsAndStopsCleanly) {
     EXPECT_EQ(f.gateway.call_count(), 1u);
     f.push->stop();
     f.push->stop(); // idempotent
+}
+
+// ── P4: gateway allowlist, gateway trust, payload default, log injection ───
+//
+// The shape shared by everything below is "the gateway is a third party and a
+// pushkey is not an authorisation". A pusher URL is a request the SERVER will
+// issue; a gateway's answer is untrusted input; a pushkey is an opaque device
+// token anybody may happen to know.
+
+namespace {
+
+// A config with push configured the way a real deployment must configure it:
+// an explicit allowlist. Tests that are about something other than the
+// allowlist start from this.
+void allow_test_gateway(Config& cfg) {
+    cfg.push.allowed_gateway_prefixes = {"https://gateway.example/"};
+}
+
+int attempt_register(PushFixture& f, const std::string& url,
+                     const std::string& pushkey = "k",
+                     const std::string& app_id = "a") {
+    auto req = make_request("/_matrix/client/v3/pushers/set", "token-alice",
+                            json{{"kind", "http"},
+                                 {"pushkey", pushkey},
+                                 {"app_id", app_id},
+                                 {"data", {{"url", url}}}}
+                                .dump());
+    httplib::Response res;
+    f.pushers->handle_set_pusher(req, res);
+    return res.status == -1 ? 200 : res.status;
+}
+
+} // namespace
+
+// B6. The headline: with no allowlist the server must not accept ANY gateway.
+// Before this, an empty list meant "anything public", which is a self-serve
+// exfiltration feed — collect.attacker.tld is a perfectly ordinary public host
+// and was therefore allowed.
+TEST(PushAllowlist, EmptyAllowlistPermitsNoGatewayAtAll) {
+    PushFixture f;
+    f.config.push.allowed_gateway_prefixes.clear();
+    f.add_user("alice");
+
+    EXPECT_EQ(attempt_register(f, "https://collect.attacker.tld/n"), 400);
+    EXPECT_EQ(attempt_register(f, "https://push.example.com/_matrix/push/v1/notify"), 400);
+}
+
+// B6. `push.enabled` with no allowlist is a misconfiguration the operator has
+// to notice. Forcing the feature OFF is the loud, non-silent failure mode: the
+// server still starts (an upgrade must not brick a running deployment) but
+// push stops rather than staying open.
+TEST(PushAllowlist, EnabledWithNoAllowlistDisablesPushAtStartup) {
+    Config cfg = Config::defaults();
+    cfg.push.enabled = true;
+    cfg.push.allowed_gateway_prefixes.clear();
+    Config::validate(cfg);
+    EXPECT_FALSE(cfg.push.enabled);
+
+    Config ok = Config::defaults();
+    ok.push.enabled = true;
+    ok.push.allowed_gateway_prefixes = {"https://gateway.example/"};
+    Config::validate(ok);
+    EXPECT_TRUE(ok.push.enabled);
+}
+
+// B6. A raw string prefix is not an origin. "https://push.example.com" as a
+// plain prefix also matches "https://push.example.com.evil.tld/", which hands
+// the attacker the allowlisted deployment's own feed.
+TEST(PushAllowlist, MatchesOnOriginNotRawStringPrefix) {
+    PushFixture f;
+    f.config.push.allowed_gateway_prefixes = {"https://push.example.com"};
+    f.add_user("alice");
+
+    EXPECT_EQ(attempt_register(f, "https://push.example.com.evil.tld/n"), 400);
+    EXPECT_EQ(attempt_register(f, "https://push.example.com@evil.tld/n"), 400);
+    // Scheme and port are part of the origin, not decoration.
+    EXPECT_EQ(attempt_register(f, "http://push.example.com/n"), 400);
+    EXPECT_EQ(attempt_register(f, "https://push.example.com:8443/n"), 400);
+    // The gateway itself still works, case-insensitively on the host.
+    EXPECT_EQ(attempt_register(f, "https://push.example.com/_matrix/push/v1/notify"), 200);
+    EXPECT_EQ(attempt_register(f, "https://PUSH.EXAMPLE.COM/notify"), 200);
+}
+
+// B6. An entry with a path scopes to that path, on a segment boundary — so
+// ".../push/v1/" does not also authorise ".../push/v1backdoor".
+TEST(PushAllowlist, PathScopingHonoursSegmentBoundaries) {
+    PushFixture f;
+    f.config.push.allowed_gateway_prefixes = {"https://push.example.com/_matrix/push/v1/"};
+    f.add_user("alice");
+
+    EXPECT_EQ(attempt_register(f, "https://push.example.com/_matrix/push/v1/notify"), 200);
+    EXPECT_EQ(attempt_register(f, "https://push.example.com/_matrix/push/v1"), 200);
+    EXPECT_EQ(attempt_register(f, "https://push.example.com/_matrix/push/v1backdoor"), 400);
+    EXPECT_EQ(attempt_register(f, "https://push.example.com/admin"), 400);
+}
+
+// SSRF. The internal-address backstop is a check on the RESOLVED shape of the
+// host, so it has to understand the shapes a resolver understands. These all
+// reach 127.0.0.1 through inet_aton/getaddrinfo but were classified as public,
+// because the check parsed only dotted-quad decimal.
+TEST(PushSsrf, ObfuscatedLoopbackFormsAreRecognised) {
+    PushFixture f;
+    // Allowlisted deliberately: this is testing the internal-address gate, not
+    // the allowlist. Both must hold.
+    f.config.push.allowed_gateway_prefixes = {
+        "http://0177.0.0.1/",  "http://0x7f.0.0.1/", "http://127.1/",
+        "http://2130706433/",  "http://localhost./", "http://127.0.0.1.:8448/",
+        "http://010.0.0.1/",   "http://0177.1/",     "http://[0:0:0:0:0:ffff:7f00:1]/",
+        "http://0.0.0.0/",
+    };
+    f.add_user("alice");
+
+    EXPECT_EQ(attempt_register(f, "http://0177.0.0.1/n"), 400) << "octal dotted quad";
+    EXPECT_EQ(attempt_register(f, "http://0x7f.0.0.1/n"), 400) << "hex octet";
+    EXPECT_EQ(attempt_register(f, "http://127.1/n"), 400) << "short form";
+    EXPECT_EQ(attempt_register(f, "http://2130706433/n"), 400) << "integer form";
+    EXPECT_EQ(attempt_register(f, "http://localhost./n"), 400) << "trailing dot";
+    EXPECT_EQ(attempt_register(f, "http://127.0.0.1.:8448/n"), 400) << "trailing dot, v4";
+    // ...and accurate in the other direction: inet_aton reads "010" as octal 8,
+    // so this is 8.0.0.1, a public address. The old sscanf("%u") parser read it
+    // as 10.0.0.1 and blocked a legitimate gateway.
+    EXPECT_EQ(attempt_register(f, "http://010.0.0.1/n"), 200) << "octal 8.0.0.1 is public";
+    EXPECT_EQ(attempt_register(f, "http://0177.1/n"), 400) << "octal short form";
+    EXPECT_EQ(attempt_register(f, "http://[0:0:0:0:0:ffff:7f00:1]/n"), 400)
+        << "uncompressed IPv4-mapped IPv6";
+    EXPECT_EQ(attempt_register(f, "http://0.0.0.0/n"), 400) << "this host";
+}
+
+// SSRF. The internal-address gate applies to allowlisted hosts too. An
+// operator whose gateway really is on loopback (sygnal in the same compose
+// file) opts in explicitly rather than getting it as a side effect of the
+// allowlist.
+TEST(PushSsrf, InternalGatewayNeedsAnExplicitOptIn) {
+    PushFixture f;
+    f.config.push.allowed_gateway_prefixes = {"http://127.0.0.1:9999/"};
+    f.add_user("alice");
+    EXPECT_EQ(attempt_register(f, "http://127.0.0.1:9999/notify"), 400);
+
+    f.config.push.allow_internal_gateway = true;
+    EXPECT_EQ(attempt_register(f, "http://127.0.0.1:9999/notify"), 200);
+}
+
+// A17. `data.url` had no length bound at all — only pushkey and app_id did.
+TEST(PushLogging, GatewayUrlIsLengthBounded) {
+    PushFixture f;
+    allow_test_gateway(f.config);
+    f.add_user("alice");
+    EXPECT_EQ(attempt_register(f, "https://gateway.example/" + std::string(8192, 'a')), 400);
+}
+
+// A17. The rejected URL was logged verbatim by the very check that rejected it
+// for containing control characters, so any account could write arbitrary
+// lines into the server log — which is where auth events (lockouts, logins,
+// password changes) are recorded and nowhere else.
+TEST(PushLogging, RejectedGatewayUrlCannotForgeLogLines) {
+    auto ring = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(64);
+    get_logger()->sinks().push_back(ring);
+    struct Pop {
+        ~Pop() { get_logger()->sinks().pop_back(); }
+    } pop;
+
+    PushFixture f;
+    allow_test_gateway(f.config);
+    f.add_user("alice");
+
+    const std::string forged =
+        "https://gateway.example/n\n[2026-09-19 03:11:00.000] [warning] "
+        "Auth lockout engaged for ip:203.0.113.9\n";
+    EXPECT_EQ(attempt_register(f, forged), 400);
+
+    bool saw_rejection = false;
+    for (const auto& line : ring->last_formatted()) {
+        if (line.find("rejected pusher registration") == std::string::npos) continue;
+        saw_rejection = true;
+        // One log record is one line. Anything past the record's own trailing
+        // newline is a line the user wrote.
+        auto body = line;
+        if (!body.empty() && body.back() == '\n') body.pop_back();
+        // The property that matters: one record is one line, so whatever the
+        // user wrote can only ever be a suffix INSIDE a genuine record, never a
+        // record of its own. The forged text survives as escaped bytes.
+        EXPECT_EQ(body.find('\n'), std::string::npos) << body;
+        EXPECT_NE(body.find("Push: rejected pusher registration"), std::string::npos) << body;
+        EXPECT_NE(body.find("\\x0a"), std::string::npos)
+            << "the newline should be escaped, not dropped: " << body;
+    }
+    EXPECT_TRUE(saw_rejection) << "the rejection should still be diagnosable";
+}
+
+// B7. The headline integrity bug: a gateway's `rejected` list was applied with
+// DELETE FROM pushers WHERE pushkey = ?, unscoped by user and unchecked
+// against the pushkeys this request actually carried. One gateway — hostile or
+// merely compromised — could wipe push for the whole server.
+TEST(PushGatewayTrust, RejectionCannotTouchAnotherUsersPusher) {
+    PushFixture f;
+    allow_test_gateway(f.config);
+    f.add_user("alice");
+    f.add_user("bob");
+    f.add_user("carol");
+    f.register_pusher("bob", "bob-device");
+    f.register_pusher("carol", "carol-device");
+    f.set_level("bob", PushService::kLevelAll);
+    f.set_level("carol", PushService::kLevelNone);
+
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "hi"}}, "t1")));
+    ASSERT_EQ(f.store->count_queued_pushes(), 1);
+
+    // Bob's gateway answers the push for bob-device by rejecting carol's key.
+    f.gateway.response = {true, 200, {"carol-device"}};
+    f.push->drain_once();
+
+    EXPECT_EQ(f.store->get_pushers("@carol:test").size(), 1u)
+        << "a gateway must not be able to mutate an account it was never given";
+    EXPECT_EQ(f.store->get_pushers("@bob:test").size(), 1u)
+        << "nor a pusher this request did not carry";
+}
+
+// B7. A rejection is only meaningful for the device this request was actually
+// addressed to. One notify carries exactly one device.
+TEST(PushGatewayTrust, RejectionOnlyAppliesToThePushkeyThatWasSent) {
+    PushFixture f;
+    allow_test_gateway(f.config);
+    f.add_user("alice");
+    f.add_user("bob");
+    f.register_pusher("bob", "bob-phone");
+    f.register_pusher("bob", "bob-tablet");
+    f.set_level("bob", PushService::kLevelAll);
+
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "hi"}}, "t1")));
+    ASSERT_EQ(f.store->count_queued_pushes(), 2);
+
+    // Whatever the gateway says, each row may only retire its own pushkey.
+    f.gateway.response = {true, 200, {"bob-phone", "bob-tablet"}};
+    // Drain only the first claimed row by shrinking the batch.
+    f.config.push.batch_size = 1;
+    f.push->drain_once();
+
+    EXPECT_EQ(f.store->get_pushers("@bob:test").size(), 1u)
+        << "exactly one pusher — the one this notify addressed — should be gone";
+}
+
+// A14. `append: false` is spec'd as "this App ID + pushkey pair is mine now".
+// It was implemented as "this pushkey is mine now", across app_ids as well as
+// accounts — so a pushkey is an authorisation to delete unrelated rows.
+TEST(PushGatewayTrust, PushkeyTakeoverIsScopedToTheSameAppId) {
+    PushFixture f;
+    allow_test_gateway(f.config);
+    f.add_user("alice");
+    f.add_user("mallory");
+
+    // Alice's phone: the same device token registered by two different apps.
+    ASSERT_EQ(attempt_register(f, "https://gateway.example/n", "device-token", "com.bsfchat.app"), 200);
+    ASSERT_EQ(attempt_register(f, "https://gateway.example/n", "device-token", "com.bsfchat.beta"), 200);
+    ASSERT_EQ(f.store->get_pushers("@alice:test").size(), 2u);
+
+    // Mallory knows the token and claims it for ONE app id.
+    auto req = make_request("/_matrix/client/v3/pushers/set", "token-mallory",
+                            json{{"kind", "http"},
+                                 {"pushkey", "device-token"},
+                                 {"app_id", "com.bsfchat.app"},
+                                 {"data", {{"url", "https://gateway.example/n"}}}}
+                                .dump());
+    httplib::Response res;
+    f.pushers->handle_set_pusher(req, res);
+    ASSERT_TRUE(IsOk(res)) << res.body;
+
+    auto remaining = f.store->get_pushers("@alice:test");
+    ASSERT_EQ(remaining.size(), 1u)
+        << "only the contested (app_id, pushkey) pair may be displaced";
+    EXPECT_EQ(remaining[0].app_id, "com.bsfchat.beta");
+}
+
+// B17. What leaves this server, to a third party, when a pusher says nothing
+// about what it wants. It used to be the whole message.
+TEST(PushPayload, DefaultsToEventIdOnly) {
+    PushFixture f;
+    allow_test_gateway(f.config);
+    f.add_user("alice");
+    f.add_user("bob");
+    f.register_pusher("bob", "bob-device"); // no `format`
+    f.set_level("bob", PushService::kLevelAll);
+
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "sensitive text"}}, "t1")));
+    f.push->drain_once();
+
+    auto payload = f.gateway.last_payload();
+    const auto& n = payload["notification"];
+    EXPECT_FALSE(n.contains("content")) << n.dump();
+    EXPECT_FALSE(n.contains("sender")) << n.dump();
+    EXPECT_FALSE(n.contains("sender_display_name")) << n.dump();
+    EXPECT_FALSE(n.contains("type")) << n.dump();
+    // Still enough for the device to fetch the event and show a badge.
+    EXPECT_TRUE(n["event_id"].is_string());
+    EXPECT_EQ(n["room_id"], PushFixture::kRoom);
+    EXPECT_EQ(n["devices"][0]["pushkey"], "bob-device");
+    EXPECT_EQ(n["counts"]["unread"], 1);
+}
+
+// B17. The operator can still choose the Matrix default deployment-wide; the
+// point is that it is a choice someone made, not what happens by omission.
+TEST(PushPayload, OperatorCanRestoreFullPayloads) {
+    PushFixture f;
+    allow_test_gateway(f.config);
+    f.config.push.default_payload = "full";
+    f.add_user("alice");
+    f.add_user("bob");
+    f.register_pusher("bob", "bob-device");
+    f.set_level("bob", PushService::kLevelAll);
+
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "visible"}}, "t1")));
+    f.push->drain_once();
+
+    auto payload = f.gateway.last_payload();
+    const auto& n = payload["notification"];
+    EXPECT_EQ(n["content"]["body"], "visible");
+    EXPECT_EQ(n["sender"], "@alice:test");
+}
+
+// B17. An explicit `format: event_id_only` is still honoured under a "full"
+// default — a client asking for privacy outranks the deployment default.
+TEST(PushPayload, ExplicitEventIdOnlyBeatsAFullDefault) {
+    PushFixture f;
+    allow_test_gateway(f.config);
+    f.config.push.default_payload = "full";
+    f.add_user("alice");
+    f.add_user("bob");
+    f.register_pusher("bob", "bob-device", "event_id_only");
+    f.set_level("bob", PushService::kLevelAll);
+
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "sensitive"}}, "t1")));
+    f.push->drain_once();
+
+    auto payload = f.gateway.last_payload();
+    const auto& n = payload["notification"];
+    EXPECT_FALSE(n.contains("content")) << n.dump();
 }

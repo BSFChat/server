@@ -2171,22 +2171,14 @@ void SqliteStore::delete_pusher(const std::string& user_id, const std::string& a
 }
 
 int SqliteStore::delete_pushers_by_pushkey_except(const std::string& pushkey,
-                                                 const std::string& keep_user_id,
-                                                 const std::string& keep_app_id) {
+                                                 const std::string& app_id,
+                                                 const std::string& keep_user_id) {
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
-        "DELETE FROM pushers WHERE pushkey = ? AND NOT (user_id = ? AND app_id = ?)");
+        "DELETE FROM pushers WHERE pushkey = ? AND app_id = ? AND user_id != ?");
     sqlite3_bind_text(stmt.get(), 1, pushkey.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 2, keep_user_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 3, keep_app_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt.get());
-    return sqlite3_changes(db_);
-}
-
-int SqliteStore::delete_pushers_by_pushkey(const std::string& pushkey) {
-    std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "DELETE FROM pushers WHERE pushkey = ?");
-    sqlite3_bind_text(stmt.get(), 1, pushkey.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, app_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, keep_user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt.get());
     return sqlite3_changes(db_);
 }

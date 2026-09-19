@@ -438,15 +438,20 @@ public:
     std::vector<Pusher> get_pushers(const std::string& user_id);
     void delete_pusher(const std::string& user_id, const std::string& app_id,
                        const std::string& pushkey);
-    // `append: false` semantics: a pushkey belongs to exactly one session, so
-    // registering it removes every other pusher holding it, including ones
-    // belonging to other users (a reused device token must not keep delivering
-    // the previous account's messages).
+    // `append: false` semantics: an (app_id, pushkey) pair belongs to exactly
+    // one account, so registering it removes other accounts' pushers holding
+    // the same pair (a reused device token must not keep delivering the
+    // previous account's messages).
+    //
+    // Scoped to one app_id deliberately. A pushkey is a token issued to one
+    // application by APNs or FCM, so it carries no claim over a row with a
+    // different app_id — and an unscoped delete made "knows a pushkey" into
+    // "may delete other people's rows". There is deliberately no
+    // delete-by-pushkey-alone: the gateway rejection path used to call one, and
+    // that let any gateway wipe push for the whole server.
     int delete_pushers_by_pushkey_except(const std::string& pushkey,
-                                        const std::string& keep_user_id,
-                                        const std::string& keep_app_id);
-    // A gateway reporting a pushkey as rejected means the device is gone.
-    int delete_pushers_by_pushkey(const std::string& pushkey);
+                                        const std::string& app_id,
+                                        const std::string& keep_user_id);
 
     // Pushers belonging to joined members of `room_id`, excluding
     // `exclude_user`. Restricting to users who actually have a pusher is what

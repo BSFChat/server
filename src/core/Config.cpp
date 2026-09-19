@@ -150,6 +150,10 @@ Config Config::load(const std::string& path) {
             if (auto v = push->get("max_backoff_ms")) cfg.push.max_backoff_ms = v->value_or(cfg.push.max_backoff_ms);
             if (auto v = push->get("batch_size")) cfg.push.batch_size = v->value_or(cfg.push.batch_size);
             if (auto v = push->get("lease_ms")) cfg.push.lease_ms = v->value_or(cfg.push.lease_ms);
+            if (auto v = push->get("allow_internal_gateway"))
+                cfg.push.allow_internal_gateway = v->value_or(cfg.push.allow_internal_gateway);
+            if (auto v = push->get("default_payload"))
+                cfg.push.default_payload = v->value_or(cfg.push.default_payload);
             // Accepts a single string or an array, same as voice.turn_uri.
             if (auto v = push->get("allowed_gateway_prefixes")) {
                 if (auto arr = v->as_array()) {
@@ -317,12 +321,72 @@ void Config::validate(Config& cfg) {
         }
     }
 
+    if (cfg.push.default_payload != "event_id_only" && cfg.push.default_payload != "full") {
+        log->warn("push.default_payload = \"{}\" is not one of \"event_id_only\" or \"full\"; "
+                  "using \"event_id_only\".",
+                  cfg.push.default_payload);
+        cfg.push.default_payload = "event_id_only";
+    }
+
     if (cfg.push.enabled && cfg.push.allowed_gateway_prefixes.empty()) {
-        log->warn("push.allowed_gateway_prefixes is empty — any authenticated user can register "
-                  "an arbitrary push gateway URL that this server will then POST to, which is a "
-                  "server-side request forgery primitive against anything reachable from this "
-                  "host. Set it to the URL prefix(es) of your push gateway if this instance has "
-                  "accounts you do not fully trust.");
+        // Fail CLOSED, and loudly.
+        //
+        // This used to be a warning over a default-open allowlist, which meant
+        // any authenticated user could register a gateway they controlled and
+        // have message content POSTed there forever — an exfiltration feed and
+        // an SSRF primitive in one, on an out-of-the-box deployment.
+        //
+        // Turning the feature off rather than refusing to start is deliberate:
+        // an upgrade must not brick a running deployment over a key that did
+        // not exist in the previous release, and push stopping is a visible
+        // failure an operator can act on, whereas push staying open is not.
+        log->error("push.enabled is true but push.allowed_gateway_prefixes is empty. Push is "
+                   "now DISABLED. An empty allowlist means no gateway is permitted, not any "
+                   "gateway: /pushers/set is the one endpoint where an ordinary user names a "
+                   "URL this server will POST notification data to, so an open list is both a "
+                   "self-serve exfiltration channel for message content and a server-side "
+                   "request forgery primitive. Set push.allowed_gateway_prefixes to your push "
+                   "gateway's URL to turn push back on.");
+        cfg.push.enabled = false;
+    } else if (cfg.push.enabled) {
+        // Say out loud, at every startup, where this server is willing to send
+        // message data. An operator should never have to read the config to
+        // find out.
+        std::string list;
+        for (const auto& prefix : cfg.push.allowed_gateway_prefixes) {
+            if (!list.empty()) list += ", ";
+            list += prefix;
+        }
+        log->info("Push enabled. Permitted push gateways: {}. Default payload: {}. "
+                  "Internal-address gateways: {}.",
+                  list, cfg.push.default_payload,
+                  cfg.push.allow_internal_gateway ? "permitted" : "refused");
+        for (const auto& prefix : cfg.push.allowed_gateway_prefixes) {
+            // An entry with no scheme can never match anything, and the only
+            // symptom would be every pusher registration failing with "not an
+            // allowed push gateway". Name it here instead.
+            if (prefix.rfind("http://", 0) != 0 && prefix.rfind("https://", 0) != 0) {
+                log->error("push.allowed_gateway_prefixes entry \"{}\" is not an absolute "
+                           "http(s) URL and will never match any pusher. Entries are compared "
+                           "on scheme, host and port, so the scheme is required — write "
+                           "\"https://{}/\".",
+                           prefix, prefix);
+                continue;
+            }
+            if (prefix.rfind("http://", 0) == 0) {
+                log->warn("push.allowed_gateway_prefixes contains a cleartext entry ({}). "
+                          "Notification payloads and pushkeys will cross the network "
+                          "unencrypted, and an on-path attacker can forge the gateway's "
+                          "response. Use https:// unless the gateway is on this host.",
+                          prefix);
+            }
+        }
+        if (cfg.push.default_payload == "full") {
+            log->warn("push.default_payload = \"full\": a pusher that does not ask for "
+                      "\"event_id_only\" will have verbatim message content, the sender and "
+                      "their display name sent to the push gateway and stored in push_queue "
+                      "in the clear until delivery.");
+        }
     }
 
     if (cfg.workers < 1) cfg.workers = 1;

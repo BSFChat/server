@@ -80,6 +80,12 @@ enabled = true
 # No TURN and no relay: this script asserts server-side roster state only,
 # so peer-to-peer is all it needs and coturn is not a dependency.
 allow_peer_to_peer = true
+
+[push]
+# Nothing here exercises push, and leaving it on with no gateway allowlist is
+# now a startup error (an empty allowlist means no gateway is permitted), which
+# this script's "no error-level log lines" check would flag.
+enabled = false
 EOF
 
 ( cd "$WORK" && exec "$BIN" --config "$CONF" ) > "$LOG" 2>&1 &
