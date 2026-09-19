@@ -2407,3 +2407,91 @@ TEST(AccessTokens, MissingAndInvalidTokensAreDistinguishable) {
     EXPECT_EQ(auth_error("").errcode, "M_MISSING_TOKEN");
     EXPECT_EQ(auth_error("Bearer something").errcode, "M_UNKNOWN_TOKEN");
 }
+
+// ── Profile response shape ────────────────────────────────────────────────
+//
+// `json resp;` default-constructs a NULL json, not an empty object. Every
+// field in these three handlers is assigned conditionally, so an account with
+// nothing set serialised as the four characters `null` under a 200 — a body
+// that is not an object at all. Matrix specifies an object here, the rest of
+// this API returns `{}` for an empty result, and a null body breaks the
+// ordinary client idioms: in Python `r.json()["displayname"]` raises TypeError
+// instead of KeyError, and so does the defensive-looking
+// `r.json().get("bsfchat.bot", False)`.
+//
+// A bare account is the DEFAULT state of a new registration, not an edge case,
+// so this was the response most new users got.
+
+TEST(ProfileShape, BareUserProfileIsAnEmptyObjectNotNull) {
+    Fixture f;
+    auto user = f.add_user("bare");
+
+    ProfileHandler handler(*f.store, *f.sync, f.config);
+    auto req = make_request("/_matrix/client/v3/profile/" + user, "token-bare");
+    httplib::Response res;
+    handler.handle_get_profile(req, res);
+
+    ASSERT_TRUE(IsOk(res));
+    EXPECT_EQ(res.body, "{}") << "a user with nothing set must serialise as {}";
+    auto parsed = json::parse(res.body);
+    EXPECT_TRUE(parsed.is_object()) << "body was: " << res.body;
+    EXPECT_FALSE(parsed.is_null());
+}
+
+TEST(ProfileShape, BareUserSingleFieldGettersAreObjectsNotNull) {
+    Fixture f;
+    auto user = f.add_user("bare");
+    ProfileHandler handler(*f.store, *f.sync, f.config);
+
+    {
+        auto req = make_request("/_matrix/client/v3/profile/" + user + "/displayname",
+                                "token-bare");
+        httplib::Response res;
+        handler.handle_get_displayname(req, res);
+        ASSERT_TRUE(IsOk(res));
+        EXPECT_TRUE(json::parse(res.body).is_object()) << "body was: " << res.body;
+    }
+    {
+        auto req = make_request("/_matrix/client/v3/profile/" + user + "/avatar_url",
+                                "token-bare");
+        httplib::Response res;
+        handler.handle_get_avatar_url(req, res);
+        ASSERT_TRUE(IsOk(res));
+        EXPECT_TRUE(json::parse(res.body).is_object()) << "body was: " << res.body;
+    }
+}
+
+TEST(ProfileShape, UnsetFieldsAreAbsentKeysNotExplicitNulls) {
+    Fixture f;
+    auto user = f.add_user("half");
+    // Displayname set, avatar and nickname not. The half-populated case is the
+    // one where "absent key" and "key present but null" diverge for a client.
+    f.store->set_display_name(user, "Half Set");
+
+    ProfileHandler handler(*f.store, *f.sync, f.config);
+    auto req = make_request("/_matrix/client/v3/profile/" + user, "token-half");
+    httplib::Response res;
+    handler.handle_get_profile(req, res);
+
+    ASSERT_TRUE(IsOk(res));
+    auto parsed = json::parse(res.body);
+    ASSERT_TRUE(parsed.is_object()) << "body was: " << res.body;
+    EXPECT_EQ(parsed.value("displayname", ""), "Half Set");
+    EXPECT_FALSE(parsed.contains("avatar_url")) << "unset avatar must be an absent key";
+    for (const auto& [key, value] : parsed.items()) {
+        EXPECT_FALSE(value.is_null()) << "field '" << key << "' is an explicit null";
+    }
+}
+
+TEST(ProfileShape, AnUnknownUserIsStill404RatherThanAnEmptyObject) {
+    Fixture f;
+    f.add_user("real");
+    ProfileHandler handler(*f.store, *f.sync, f.config);
+
+    // "Empty" and "absent" have to stay distinguishable — returning {} for a
+    // user who does not exist would be the obvious wrong way to fix the above.
+    auto req = make_request("/_matrix/client/v3/profile/@ghost:test", "token-real");
+    httplib::Response res;
+    handler.handle_get_profile(req, res);
+    EXPECT_EQ(res.status, 404);
+}

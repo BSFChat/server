@@ -133,6 +133,19 @@ set_tests_properties(e2e_sync_latency PROPERTIES
     # Times a latency budget, so it must not share the box with another test.
     RUN_SERIAL TRUE)
 
+add_test(NAME e2e_profile_shape
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/e2e/e2e_profile_shape.sh)
+set_tests_properties(e2e_profile_shape PROPERTIES
+    LABELS e2e
+    ENVIRONMENT "BSFCHAT_SERVER_BIN=$<TARGET_FILE:bsfchat-server>"
+    # The shape of a response body is exactly what a unit test on the handler
+    # cannot see: the bug it pins down was a `json resp;` that serialised as
+    # `null` rather than `{}`, which is only visible once something dumps it
+    # and a client parses it off the wire.
+    TIMEOUT 300
+    # Registers two users (bcrypt) and starts a server process.
+    RUN_SERIAL TRUE)
+
 # --- release-channel script --------------------------------------------------
 #
 # scripts/channel_tags.py decides which of :latest / :latest-beta a pushed
