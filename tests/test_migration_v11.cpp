@@ -201,8 +201,12 @@ TEST(MigrationV11, PreExistingV8DatabaseUpgradesAndKeepsItsData) {
     // audit_log filter indexes; 16 -> 17 added events.signal_to and swept the
     // stored call signalling that used to publish everyone's IP addresses;
     // 17 -> 18 stamped is_direct into the membership state of DMs that predate
-    // the server writing it. A v8 database still upgrades all the way in one go.
-    EXPECT_EQ(kTargetSchemaVersion, 18);
+    // the server writing it; 18 -> 19 added push_queue.event_id so a redaction
+    // can destroy a notification that has not been dispatched yet; 19 -> 20
+    // finished the redactions an earlier build left half-done, stripping the
+    // message edits it had left readable. A v8 database still upgrades all the
+    // way in one go.
+    EXPECT_EQ(kTargetSchemaVersion, 20);
     std::filesystem::remove(path);
 }
 

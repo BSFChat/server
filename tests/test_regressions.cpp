@@ -360,7 +360,7 @@ TEST(LegacyUpgrade, DirectMarkerBackfillTouchesOnlyCurrentStateAndIsIdempotent) 
                            json{{"membership", "join"}}.dump(), now_ms());
     }
 
-    set_user_version(kTargetSchemaVersion - 1);
+    set_user_version(17); // just before v18, the step under test
     { SqliteStore store(path); store.initialize(); }
 
     EXPECT_EQ(json::parse(content_of("$new")).value("is_direct", false), true);
@@ -372,7 +372,7 @@ TEST(LegacyUpgrade, DirectMarkerBackfillTouchesOnlyCurrentStateAndIsIdempotent) 
 
     // Re-running it is a no-op, not a second rewrite.
     const auto after_first = content_of("$new");
-    set_user_version(kTargetSchemaVersion - 1);
+    set_user_version(17); // just before v18, the step under test
     { SqliteStore store(path); store.initialize(); }
     EXPECT_EQ(content_of("$new"), after_first);
 

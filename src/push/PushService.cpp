@@ -152,6 +152,9 @@ int PushService::evaluate_message(const MessageNotification& n, PermissionsEngin
         }
 
         SqliteStore::QueuedPush q;
+        // What this notification is about, kept alongside the frozen payload so
+        // a redaction can find and destroy the row before it is dispatched.
+        q.event_id = n.event_id;
         q.user_id = pusher.user_id;
         q.app_id = pusher.app_id;
         q.pushkey = pusher.pushkey;
