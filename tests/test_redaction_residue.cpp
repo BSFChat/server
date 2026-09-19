@@ -522,3 +522,21 @@ TEST(RedactionResidue, EarlierRedactionsAreRepairedOnUpgrade) {
     }
     std::filesystem::remove(path);
 }
+
+// Deleting a channel makes the same promise a redaction does. The queue is the
+// one place that kept the text afterwards: the events are gone, so the
+// dispatch-time check cannot help — a missing event is not a redacted one.
+TEST(RedactionResidue, DeletingARoomDropsItsQueuedNotifications) {
+    ResidueFixture f;
+    f.register_pusher("bob", "bob-phone");
+    f.store->set_room_notify_level(f.bob, f.room, "all");
+    f.send(kSecret, "t1");
+    ASSERT_EQ(f.store->count_queued_pushes(), 1);
+
+    f.store->delete_room(f.room);
+    EXPECT_EQ(f.store->count_queued_pushes(), 0)
+        << "a deleted channel's message text was still queued for delivery";
+
+    f.push->drain_once();
+    EXPECT_FALSE(f.gateway.any_body_contains(kSecret));
+}

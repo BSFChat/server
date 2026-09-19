@@ -586,6 +586,13 @@ void SqliteStore::delete_room(const std::string& room_id) {
                 reindex_search_locked(id, room_id, "", 0, std::nullopt);
             }
         }
+        // Undelivered notifications for this channel's messages, before the
+        // events they name disappear and leave the rows unmatchable. Deleting a
+        // channel is the same promise redaction makes — the content is gone —
+        // and a queued push would otherwise keep delivering its text for as
+        // long as the retry schedule allows.
+        run("DELETE FROM push_queue WHERE event_id IN "
+            "(SELECT event_id FROM events WHERE room_id = ?)");
         run("DELETE FROM events WHERE room_id = ?");
         run("DELETE FROM room_members WHERE room_id = ?");
         run("DELETE FROM rooms WHERE room_id = ?");
