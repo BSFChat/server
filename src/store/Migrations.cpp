@@ -1327,6 +1327,89 @@ void migrate_v21(sqlite3* db, bool fresh_database) {
         scalar_int(db, "SELECT COUNT(*) FROM media_refs"));
 }
 
+// v22: `push_queue.event_id` — a queued notification remembers which event it
+// is about.
+//
+// v11 snapshots the payload at enqueue time and that is still the right call:
+// delivery must not depend on the events table, and an edit must not rewrite a
+// notification that was already queued. What it cost was redaction. A queue row
+// named a user, a device and a URL, and never the event, so nothing in
+// handle_redact could find the row holding the message's plaintext. With
+// max_attempts retries and backoff capped at an hour, a gateway that was down
+// when the message was sent still received the full pre-redaction text long
+// after the message was deleted for everyone — and the text sat in
+// push_queue.payload in the clear meanwhile.
+//
+// Rows queued before this migration cannot be matched to a redaction, so they
+// are dropped rather than kept. The queue is a delivery buffer measured in
+// minutes: losing a row costs one missed notification on one device, and
+// keeping one is exactly the leak this column exists to close.
+void migrate_v22(sqlite3* db, bool /*fresh_database*/) {
+    if (!column_exists(db, "push_queue", "event_id")) {
+        exec(db, "ALTER TABLE push_queue ADD COLUMN event_id TEXT");
+    }
+    const int orphaned = scalar_int(db, "SELECT COUNT(*) FROM push_queue WHERE event_id IS NULL");
+    exec(db, "DELETE FROM push_queue WHERE event_id IS NULL");
+    // Redaction deletes by event id, and it runs on a request path.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_push_queue_event ON push_queue(event_id)");
+    if (orphaned > 0) {
+        get_logger()->info(
+            "Schema v22: dropped {} queued push notification(s) predating event-id tracking; "
+            "they could not be matched against a redaction, so they are not safe to deliver.",
+            orphaned);
+    }
+}
+
+// v23: finish the redactions this server has already performed.
+//
+// Until now redact_event() stripped exactly the row it was given, so every
+// m.replace of a redacted message kept its text — in `body` and again in
+// `m.new_content.body` — and /messages handed it to any member who asked. The
+// code is fixed, but the residue is already in every deployed database and no
+// future redaction will touch it: the message is redacted, so nobody will
+// redact it again.
+//
+// The repair is the same rule the fixed redaction applies: a surviving
+// replacement of a redacted event is tombstoned, keeping only its relation (so
+// a client can still pair it with the message it edits and hide it), and
+// inheriting the redactor recorded on its target. Run to a fixed point because
+// a replacement may itself be replaced.
+//
+// The search index needs nothing here: a replacement is never indexed as
+// itself, and the target's own index row was cleared when it was redacted.
+// Mention rows need nothing either: an edit never records mentions.
+void migrate_v23(sqlite3* db, bool fresh_database) {
+    if (fresh_database) return;
+
+    int repaired = 0;
+    for (int pass = 0; pass < 32; ++pass) {
+        exec(db, R"(
+            UPDATE events
+               SET content = json_object('m.relates_to',
+                                         json_object('rel_type', 'm.replace',
+                                                     'event_id', replaces)),
+                   edited_by = NULL,
+                   redacted_by = (SELECT target.redacted_by FROM events target
+                                   WHERE target.event_id = events.replaces)
+             WHERE replaces IS NOT NULL
+               AND redacted_by IS NULL
+               AND EXISTS (SELECT 1 FROM events target
+                            WHERE target.event_id = events.replaces
+                              AND target.redacted_by IS NOT NULL)
+        )");
+        const int changed = sqlite3_changes(db);
+        repaired += changed;
+        if (changed == 0) break;
+    }
+
+    if (repaired > 0) {
+        get_logger()->warn(
+            "Schema v23: stripped {} message edit(s) left readable by an earlier redaction. "
+            "Their text was retrievable from /messages by any member of the channel until now.",
+            repaired);
+    }
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1352,6 +1435,8 @@ const std::vector<Step>& steps() {
         migrate_v19,
         migrate_v20,
         migrate_v21,
+        migrate_v22,
+        migrate_v23,
     };
     return kMigrations;
 }

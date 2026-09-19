@@ -23,6 +23,7 @@ add_executable(server_tests
     test_voice.cpp
     test_typing.cpp
     test_regressions.cpp
+    test_redaction_residue.cpp
     test_mentions.cpp
     test_push.cpp
     test_migration_v11.cpp

@@ -485,7 +485,7 @@ TEST(AuditMigration, FreshDatabaseGetsV13WithAnAppendOnlySchema) {
     // bots table and access_tokens.token_kind, v20 the persisted LiveKit
     // media-key generation). This test's subject remains the v13 audit_log
     // shape below.
-    EXPECT_EQ(kTargetSchemaVersion, 21);
+    EXPECT_EQ(kTargetSchemaVersion, 23);
 
     // AUTOINCREMENT, not a bare INTEGER PRIMARY KEY. Without it SQLite reuses
     // max(rowid) + 1, which is exactly the position-reuse defect v4 fixed for

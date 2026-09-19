@@ -410,10 +410,25 @@ public:
     // timestamp) survives as a tombstone, per the Matrix redaction algorithm.
     // Returns false if the event doesn't exist. Idempotent.
     //
+    // THE INVARIANT, which every part of this class is here to keep: once this
+    // returns, no surface of the server still holds the text of `event_id` or
+    // of any edit of it — not the events table, not the FTS index, not the
+    // bundled edit history under `unsigned`, not the mention rows, and not the
+    // undispatched push queue.
+    //
+    // "A message" is therefore not a row. It is the original event plus every
+    // m.replace of it, transitively, because an edit is stored as its own
+    // ordinary m.room.message and /messages returns it with no type and no
+    // relation filter. Stripping only the row named in the request left the
+    // edit — usually the newest and most sensitive version of the text — fully
+    // readable to any member with an access token.
+    //
     // Interacts with edits in both directions: redacting an original discards
-    // its edit pointer (an edit must never resurrect redacted content), and
-    // redacting a replacement re-resolves its target to the newest surviving
-    // replacement, or back to the pristine original if there is none.
+    // its edit pointer and cascades to its replacements, and redacting a
+    // replacement re-resolves its target to the newest surviving replacement,
+    // or back to the pristine original if there is none. The cascade runs
+    // DOWNWARDS only: deleting one edit still means "undo this edit", not
+    // "delete the message".
     bool redact_event(const std::string& event_id, const std::string& redacted_by);
 
     // Message edits (m.replace).
@@ -424,6 +439,12 @@ public:
     // row is untouched apart from the pointer: same event id, same sender, same
     // origin_server_ts, pristine content still on disk and still exposed under
     // `unsigned`, and the replacement remains an ordinary timeline event.
+    //
+    // That an edit PRESERVES the text it replaced is a decision, not an
+    // accident — see docs/redaction-and-edit-history.md. Editing is revision;
+    // redaction is removal, and it is the only removal. The decision is only
+    // defensible because redact_event() reaches every version, so the two must
+    // be changed together if they are changed at all.
     //
     // Refuses to apply to a redacted event. Returns false if the target does
     // not exist or is redacted.
@@ -680,16 +701,34 @@ public:
         std::string url;
         std::string payload;
         int attempts = 0;
+        // What the notification is about. The payload is a snapshot taken at
+        // enqueue time and is never re-derived, so this id is the only thing
+        // that lets a later redaction find the row and destroy it. A push whose
+        // event id is empty (a test harness, a future non-event notification)
+        // is delivered as before.
+        std::string event_id;
     };
 
     // Enqueue only. Never performs network I/O, so the event-insert path is
     // never blocked on a gateway.
+    //
+    // Skips any push whose event is already redacted. That is not the main
+    // guard — redaction deletes queued rows itself — but enqueue happens after
+    // the event is visible to /sync, so a fast redaction can land in between
+    // and find nothing to delete.
     void enqueue_pushes(const std::vector<QueuedPush>& pushes);
     // Claims up to `limit` rows that are due at `now`, pushing their
     // next_attempt_at out by `lease_ms` so the same row is not picked up again
     // while it is in flight. Returns with the store mutex RELEASED — the caller
     // must do its HTTP work outside any store call, never holding the store's
     // global lock across network I/O.
+    //
+    // A claimed row whose event has since been redacted is deleted and not
+    // returned. This is the last gate before the payload leaves the process and
+    // the only one that cannot be raced: enqueue and redaction both write under
+    // this mutex, but the worker POSTs outside it, so "was it redacted?" has to
+    // be asked at the moment of claiming. A push already handed to a gateway
+    // cannot be recalled.
     std::vector<QueuedPush> claim_due_pushes(int64_t now_ms, int limit, int64_t lease_ms);
     void delete_queued_push(int64_t id);
     // Records a failed attempt and schedules the retry. Returns false when the
@@ -926,6 +965,24 @@ private:
     // replacement, clearing the pointer when none is left. Caller must hold
     // mutex_.
     void reresolve_edit_locked(const std::string& room_id, const std::string& target_event_id);
+
+    // Every event that can carry `event_id`'s text: the event itself, then each
+    // m.replace of it, transitively. Our own client chain-resolves an edit to
+    // the original before sending, so in practice this is one hop — but
+    // `replaces` records whatever the sender claimed, and a third-party client
+    // that edits an edit must not leave the newest version behind. Bounded:
+    // a cycle or a flood of relations cannot make this walk forever.
+    // Caller must hold mutex_.
+    std::vector<std::string> edit_family_locked(const std::string& event_id);
+
+    // Drops every queued push notification for the given events, so a redaction
+    // reaches the copy of the text that is sitting in the delivery buffer.
+    // Caller must hold mutex_.
+    void delete_queued_pushes_for_events_locked(const std::vector<std::string>& event_ids);
+
+    // As is_event_redacted(), for callers that already hold mutex_. An empty id
+    // is "not an event", not "redacted".
+    bool is_event_redacted_locked(const std::string& event_id);
 
     // THE single choke point for the search index. Upserts the searchable text
     // for `event_id`, or removes it when `body` is empty/absent.

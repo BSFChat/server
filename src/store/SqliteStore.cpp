@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace bsfchat {
 
@@ -757,6 +758,14 @@ void SqliteStore::delete_room(const std::string& room_id) {
         // attachment ever posted in a deleted channel fetchable by whoever was
         // in it, keyed off a room whose permissions can no longer be evaluated.
         run("DELETE FROM media_refs WHERE room_id = ?");
+
+        // Undelivered notifications for this channel's messages, before the
+        // events they name disappear and leave the rows unmatchable. Deleting a
+        // channel is the same promise redaction makes — the content is gone —
+        // and a queued push would otherwise keep delivering its text for as
+        // long as the retry schedule allows.
+        run("DELETE FROM push_queue WHERE event_id IN "
+            "(SELECT event_id FROM events WHERE room_id = ?)");
         run("DELETE FROM events WHERE room_id = ?");
         run("DELETE FROM room_members WHERE room_id = ?");
         run("DELETE FROM rooms WHERE room_id = ?");
@@ -1731,6 +1740,34 @@ void SqliteStore::reresolve_edit_locked(const std::string& room_id,
     sqlite3_step(upd.get());
 }
 
+std::vector<std::string> SqliteStore::edit_family_locked(const std::string& event_id) {
+    // A ceiling rather than a correctness bound: the walk already refuses to
+    // revisit an id, so this only caps how much work one request can cause if
+    // somebody points ten thousand relations at one message. Exceeding it is
+    // logged, because it would mean a redaction that did not finish.
+    constexpr size_t kMaxFamily = 512;
+
+    std::vector<std::string> family{event_id};
+    std::unordered_set<std::string> seen{event_id};
+    for (size_t i = 0; i < family.size(); ++i) {
+        auto sel = prepare(db_, "SELECT event_id FROM events WHERE replaces = ?");
+        sqlite3_bind_text(sel.get(), 1, family[i].c_str(), -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(sel.get()) == SQLITE_ROW) {
+            std::string child = column_text_or_empty(sel.get(), 0);
+            if (child.empty() || !seen.insert(child).second) continue;
+            if (family.size() >= kMaxFamily) {
+                get_logger()->error(
+                    "Redaction of {} stopped after {} related events; some edits may still "
+                    "carry the redacted text and must be removed by hand.",
+                    event_id, kMaxFamily);
+                return family;
+            }
+            family.push_back(std::move(child));
+        }
+    }
+    return family;
+}
+
 bool SqliteStore::redact_event(const std::string& event_id, const std::string& redacted_by) {
     std::lock_guard lock(mutex_);
 
@@ -1754,58 +1791,128 @@ bool SqliteStore::redact_event(const std::string& event_id, const std::string& r
         }
     }
 
-    // Matrix redaction: the event row survives as a tombstone (same id, type,
-    // sender and timestamp) but its content is stripped. Previously the server
-    // only appended an m.room.redaction event and left the original intact, so
-    // "deleted" messages were still fully readable from /rooms/{id}/messages.
-    //
-    // edited_by is cleared in the same statement: deleting a message that had
-    // been edited must not leave the edit behind to be resolved back into view.
-    auto stmt = prepare(db_,
-        "UPDATE events SET content = '{}', edited_by = NULL, redacted_by = ? "
-        "WHERE event_id = ? AND redacted_by IS NULL");
-    sqlite3_bind_text(stmt.get(), 1, redacted_by.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 2, event_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt.get());
-    const bool newly_redacted = sqlite3_changes(db_) > 0;
+    // One transaction for the whole family. A redaction that stripped the
+    // original and then failed before reaching its edits would leave the text
+    // on display under a message the user has been told is deleted, which is
+    // the worst of the three possible outcomes; all-or-nothing means a failed
+    // redaction can be retried and still means something.
+    exec("BEGIN IMMEDIATE");
+    try {
+        // Everything that can carry this message's text, target first.
+        const auto family = edit_family_locked(event_id);
 
-    // A redacted message must stop badging anybody: its content is gone, so a
-    // mention inside it can no longer be read and must not keep a highlight lit.
-    // Inlined rather than calling delete_mentions_for_event() — mutex_ is
-    // already held here.
-    if (newly_redacted) {
-        auto del = prepare(db_, "DELETE FROM event_mentions WHERE event_id = ?");
-        sqlite3_bind_text(del.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_step(del.get());
-    }
+        // Matrix redaction: the event row survives as a tombstone (same id,
+        // type, sender and timestamp) but its content is stripped. Previously
+        // the server only appended an m.room.redaction event and left the
+        // original intact, so "deleted" messages were still fully readable from
+        // /rooms/{id}/messages.
+        //
+        // edited_by is cleared in the same statement: deleting a message that
+        // had been edited must not leave the edit behind to be resolved back
+        // into view.
+        auto stmt = prepare(db_,
+            "UPDATE events SET content = '{}', edited_by = NULL, redacted_by = ? "
+            "WHERE event_id = ? AND redacted_by IS NULL");
+        sqlite3_bind_text(stmt.get(), 1, redacted_by.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 2, event_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(stmt.get());
+        const bool newly_redacted = sqlite3_changes(db_) > 0;
 
-    // ...and stop granting media access through it. The UPDATE above stripped
-    // the mxc URI out of the content, so the event no longer tells anyone what
-    // the id is; leaving the ACL row behind would keep the object fetchable for
-    // everyone who had already seen it, through an event that no longer exists
-    // as far as every read path is concerned.
-    //
-    // The blob itself still survives — nothing in the codebase deletes media
-    // (audit B11), so someone who noted the id before the redaction keeps their
-    // copy. Narrowing the grant is what this row can do; erasure is a separate
-    // piece of work that this index is the prerequisite for.
-    if (newly_redacted) {
-        auto del = prepare(db_, "DELETE FROM media_refs WHERE event_id = ?");
-        sqlite3_bind_text(del.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_step(del.get());
-    }
+        // The replacements are stripped whether or not the target was newly
+        // redacted, and that is deliberate: a message redacted by an earlier
+        // build still has its edits intact, and re-running /redact on it is the
+        // one thing an operator or a user can do to finish the job. Migration
+        // v20 repairs the ones nobody thinks to redact twice.
+        //
+        // A tombstoned replacement keeps its relation and nothing else. The
+        // spec preserves content.m.relates_to through redaction, and it is what
+        // lets a client recognise the empty row as an edit and hide it instead
+        // of drawing a blank message under the one it just saw deleted.
+        {
+            // The relation is rebuilt from the row's own `replaces` column, not
+            // from the id being redacted: an edit of an edit must keep pointing
+            // at the version it actually replaced.
+            auto strip = prepare(db_,
+                "UPDATE events "
+                "   SET content = json_object('m.relates_to', "
+                "                             json_object('rel_type', 'm.replace', "
+                "                                         'event_id', replaces)), "
+                "       edited_by = NULL, redacted_by = ? "
+                " WHERE event_id = ? AND redacted_by IS NULL");
+            auto drop_mentions = prepare(db_, "DELETE FROM event_mentions WHERE event_id = ?");
+            for (size_t i = 1; i < family.size(); ++i) {
+                sqlite3_reset(strip.get());
+                sqlite3_bind_text(strip.get(), 1, redacted_by.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(strip.get(), 2, family[i].c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_step(strip.get());
 
-    // Deleting an edit rolls its target back to the newest edit that survives,
-    // or to the pristine original when none does.
-    if (newly_redacted && replaced_target) {
-        reresolve_edit_locked(room_id, *replaced_target);
-        // ...and search follows it back, so a deleted edit's words stop matching
-        // and the surviving text starts matching again.
-        refresh_search_for_event_locked(*replaced_target);
+                // An edit never records mentions (EventHandler skips extraction
+                // for replacements), so this normally deletes nothing. It costs
+                // one statement and removes the need to be sure of that.
+                sqlite3_reset(drop_mentions.get());
+                sqlite3_bind_text(drop_mentions.get(), 1, family[i].c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_step(drop_mentions.get());
+
+                // A replacement is not indexed as itself, so this is a no-op
+                // today. It goes through the one choke point anyway: if that
+                // ever changes, the index must not be the thing that remembers.
+                refresh_search_for_event_locked(family[i]);
+            }
+        }
+
+        // A redacted message must stop badging anybody: its content is gone, so
+        // a mention inside it can no longer be read and must not keep a
+        // highlight lit. Inlined rather than calling delete_mentions_for_event()
+        // — mutex_ is already held here.
+        if (newly_redacted) {
+            auto del = prepare(db_, "DELETE FROM event_mentions WHERE event_id = ?");
+            sqlite3_bind_text(del.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(del.get());
+        }
+
+
+        // ...and stop granting media access through it. The content no longer
+        // names the mxc id, so leaving the ACL row would keep the object
+        // fetchable by everyone who had already seen the event. Inside the
+        // transaction with the rest, so a rollback cannot strip the grant from
+        // a redaction that did not land.
+        //
+        // The blob itself still survives — nothing deletes media (audit B11) —
+        // so someone who noted the id keeps their copy. Narrowing the grant is
+        // what this row can do.
+        if (newly_redacted) {
+            auto delm = prepare(db_, "DELETE FROM media_refs WHERE event_id = ?");
+            sqlite3_bind_text(delm.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(delm.get());
+        }
+
+        // Deleting an edit rolls its target back to the newest edit that
+        // survives, or to the pristine original when none does.
+        if (newly_redacted && replaced_target) {
+            reresolve_edit_locked(room_id, *replaced_target);
+            // ...and search follows it back, so a deleted edit's words stop
+            // matching and the surviving text starts matching again.
+            refresh_search_for_event_locked(*replaced_target);
+        }
+        // Redacted content must not be searchable. refresh_ recomputes to
+        // "nothing" because the row now has redacted_by set.
+        if (newly_redacted) refresh_search_for_event_locked(event_id);
+
+        // The last copy: a notification carrying this text may already be
+        // queued for a gateway that was unreachable when the message was sent.
+        // Delivery is out of band and can be an hour behind, so a redaction
+        // that does not reach the queue is a redaction the recipient's phone
+        // will contradict.
+        delete_queued_pushes_for_events_locked(family);
+
+        exec("COMMIT");
+    } catch (...) {
+        try {
+            exec("ROLLBACK");
+        } catch (...) {
+        }
+        throw;
     }
-    // Redacted content must not be searchable. refresh_ recomputes to "nothing"
-    // because the row now has redacted_by set.
-    if (newly_redacted) refresh_search_for_event_locked(event_id);
     return true; // the row exists; already-redacted counts as success
 }
 
@@ -2848,6 +2955,17 @@ void SqliteStore::delete_pusher(const std::string& user_id, const std::string& a
     sqlite3_bind_text(stmt.get(), 2, app_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 3, pushkey.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt.get());
+
+    // The queue is addressed to a pusher, so unregistering one must take its
+    // undelivered notifications with it. Otherwise removing a device leaves
+    // rows that keep POSTing that user's message text to the gateway URL the
+    // device used to have — for as long as the retry schedule allows.
+    auto del = prepare(db_,
+        "DELETE FROM push_queue WHERE user_id = ? AND app_id = ? AND pushkey = ?");
+    sqlite3_bind_text(del.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(del.get(), 2, app_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(del.get(), 3, pushkey.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(del.get());
 }
 
 int SqliteStore::delete_pushers_by_pushkey_except(const std::string& pushkey,
@@ -2860,7 +2978,15 @@ int SqliteStore::delete_pushers_by_pushkey_except(const std::string& pushkey,
     sqlite3_bind_text(stmt.get(), 2, app_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 3, keep_user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt.get());
-    return sqlite3_changes(db_);
+    const int removed = sqlite3_changes(db_);
+
+    // The gateway has told us this device is gone. Retrying its queued
+    // notifications can only send message text to a pushkey that is no longer
+    // anybody's.
+    auto del = prepare(db_, "DELETE FROM push_queue WHERE pushkey = ?");
+    sqlite3_bind_text(del.get(), 1, pushkey.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(del.get());
+    return removed;
 }
 
 std::vector<SqliteStore::Pusher>
@@ -2923,13 +3049,38 @@ void SqliteStore::set_room_notify_level(const std::string& user_id, const std::s
     sqlite3_step(stmt.get());
 }
 
+bool SqliteStore::is_event_redacted_locked(const std::string& event_id) {
+    if (event_id.empty()) return false;
+    auto stmt = prepare(db_, "SELECT redacted_by FROM events WHERE event_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return false;
+    return sqlite3_column_type(stmt.get(), 0) != SQLITE_NULL;
+}
+
+void SqliteStore::delete_queued_pushes_for_events_locked(const std::vector<std::string>& event_ids) {
+    auto del = prepare(db_, "DELETE FROM push_queue WHERE event_id = ?");
+    for (const auto& id : event_ids) {
+        if (id.empty()) continue;
+        sqlite3_reset(del.get());
+        sqlite3_bind_text(del.get(), 1, id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(del.get());
+    }
+}
+
 void SqliteStore::enqueue_pushes(const std::vector<QueuedPush>& pushes) {
     if (pushes.empty()) return;
     std::lock_guard lock(mutex_);
     auto stmt = prepare(db_,
-        "INSERT INTO push_queue (user_id, app_id, pushkey, url, payload, next_attempt_at) "
-        "VALUES (?, ?, ?, ?, ?, 0)");
+        "INSERT INTO push_queue (user_id, app_id, pushkey, url, payload, event_id, next_attempt_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0)");
     for (const auto& p : pushes) {
+        // The ordering this guards: the event is inserted, /sync hands it to a
+        // moderator, the moderator redacts it — all before this call, which is
+        // the last thing the send path does. The redaction found no queue rows
+        // because there were none yet. Without this check the notification is
+        // queued after the message it describes has been deleted.
+        if (is_event_redacted_locked(p.event_id)) continue;
+
         sqlite3_reset(stmt.get());
         sqlite3_clear_bindings(stmt.get());
         sqlite3_bind_text(stmt.get(), 1, p.user_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -2937,6 +3088,11 @@ void SqliteStore::enqueue_pushes(const std::vector<QueuedPush>& pushes) {
         sqlite3_bind_text(stmt.get(), 3, p.pushkey.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt.get(), 4, p.url.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt.get(), 5, p.payload.c_str(), -1, SQLITE_TRANSIENT);
+        if (p.event_id.empty()) {
+            sqlite3_bind_null(stmt.get(), 6);
+        } else {
+            sqlite3_bind_text(stmt.get(), 6, p.event_id.c_str(), -1, SQLITE_TRANSIENT);
+        }
         if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
             throw std::runtime_error(std::string("Failed to enqueue push: ") +
                                      sqlite3_errmsg(db_));
@@ -2949,9 +3105,10 @@ SqliteStore::claim_due_pushes(int64_t now_ms, int limit, int64_t lease_ms) {
     std::lock_guard lock(mutex_);
 
     std::vector<QueuedPush> out;
+    std::vector<int64_t> redacted_rows;
     {
         auto stmt = prepare(db_,
-            "SELECT id, user_id, app_id, pushkey, url, payload, attempts FROM push_queue "
+            "SELECT id, user_id, app_id, pushkey, url, payload, attempts, event_id FROM push_queue "
             "WHERE next_attempt_at <= ? ORDER BY id ASC LIMIT ?");
         sqlite3_bind_int64(stmt.get(), 1, now_ms);
         sqlite3_bind_int(stmt.get(), 2, limit);
@@ -2964,8 +3121,31 @@ SqliteStore::claim_due_pushes(int64_t now_ms, int limit, int64_t lease_ms) {
             q.url = column_text_or_empty(stmt.get(), 4);
             q.payload = column_text_or_empty(stmt.get(), 5);
             q.attempts = sqlite3_column_int(stmt.get(), 6);
+            q.event_id = column_text_or_empty(stmt.get(), 7);
+            // Dispatch-time gate. Redaction already deletes these rows, so
+            // reaching one here means the redaction landed while the row was
+            // leased to a worker whose gateway was slow — the exact window the
+            // queue exists to create. An event that has merely been deleted
+            // along with its room is NOT treated as redacted: the row is gone,
+            // not tombstoned, and a missing event id is how the test harness
+            // and any future non-event notification look.
+            if (is_event_redacted_locked(q.event_id)) {
+                redacted_rows.push_back(q.id);
+                continue;
+            }
             out.push_back(std::move(q));
         }
+    }
+    if (!redacted_rows.empty()) {
+        auto del = prepare(db_, "DELETE FROM push_queue WHERE id = ?");
+        for (int64_t id : redacted_rows) {
+            sqlite3_reset(del.get());
+            sqlite3_bind_int64(del.get(), 1, id);
+            sqlite3_step(del.get());
+        }
+        get_logger()->info(
+            "Push: dropped {} queued notification(s) for redacted message(s) before delivery",
+            redacted_rows.size());
     }
     if (out.empty()) return out;
 
