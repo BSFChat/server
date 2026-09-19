@@ -140,14 +140,20 @@ jfield_of() { python3 -c 'import json,sys
 try: print(json.load(open(sys.argv[1])).get(sys.argv[2],""))
 except Exception: print("")' "$1" "$2"; }
 
+# One literal for every account, as the sibling e2e scripts do. It must not
+# contain the username, must not be on the common-password denylist, and must
+# not contain the product name — password_policy_error() refuses all three, so a
+# per-user password built from $1 is rejected at registration.
+E2E_PW="e2e-correct-horse-7"
+
 register() {
   curl -s -o "$WORK/last-body.json" -X POST "${BASE}/register" -H 'Content-Type: application/json' \
-    -d "{\"username\":\"$1\",\"password\":\"pw-$1-12345\"}" >/dev/null
+    -d "{\"username\":\"$1\",\"password\":\"${E2E_PW}\"}" >/dev/null
   jfield access_token
 }
 login() {
   curl -s -o "$WORK/last-body.json" -X POST "${BASE}/login" -H 'Content-Type: application/json' \
-    -d "{\"type\":\"m.login.password\",\"identifier\":{\"type\":\"m.id.user\",\"user\":\"$1\"},\"password\":\"pw-$1-12345\"}" >/dev/null
+    -d "{\"type\":\"m.login.password\",\"identifier\":{\"type\":\"m.id.user\",\"user\":\"$1\"},\"password\":\"${E2E_PW}\"}" >/dev/null
   jfield access_token
 }
 
@@ -250,10 +256,19 @@ check "bot token authenticates (whoami)"        200 "$(req GET "/account/whoami"
 check "whoami returns the bot's id"             "$BOT_ID" "$(jfield user_id)"
 
 # The credential is the token. There is no password to guess.
-check "bot cannot password-login"               403 "$(req POST "/login" "" \
-  '{"type":"m.login.password","identifier":{"type":"m.id.user","user":"bot_e2e"},"password":"pw-bot_e2e-12345"}')"
+BOT_LOGIN_BODY=$(python3 -c 'import json,sys
+print(json.dumps({"type":"m.login.password",
+                  "identifier":{"type":"m.id.user","user":"bot_e2e"},
+                  "password":sys.argv[1]}))' "$E2E_PW")
+check "bot cannot password-login"               403 "$(req POST "/login" "" "$BOT_LOGIN_BODY")"
 
-check "profile marks it as a bot"               200 "$(req GET "/profile/${BOT_ID}" "")"
+# Profile reads are AUTHENTICATED now — they were the last unauthenticated read
+# endpoints and made a user-enumeration oracle. A bot must present its token to
+# read any profile, including its own.
+check "unauthenticated profile read is 401"     401 "$(req GET "/profile/${BOT_ID}" "")"
+check "  with M_MISSING_TOKEN"                  "M_MISSING_TOKEN" "$(jfield errcode)"
+
+check "profile marks it as a bot"               200 "$(req GET "/profile/${BOT_ID}" "$BOT_TOKEN")"
 check "  bsfchat.bot is true"                   "True" "$(python3 -c 'import json,sys
 print(json.load(open(sys.argv[1])).get("bsfchat.bot"))' "$WORK/last-body.json")"
 
@@ -263,26 +278,23 @@ req GET "/account/whoami" "$BOT_TOKEN" >/dev/null
 check "  whoami carries bsfchat.bot"            "True" "$(python3 -c 'import json,sys
 print(json.load(open(sys.argv[1])).get("bsfchat.bot"))' "$WORK/last-body.json")"
 
-# For a human the key is ABSENT, not false.
-#
-# Note the body may be the literal JSON `null` rather than `{}`: the handler
-# builds a default-constructed json and only ever assigns keys, so a user with
-# no displayname, avatar or nickname who is not a bot serialises as null. That
-# is a real wire-shape quirk a bot parsing profiles has to survive, so assert
-# the property a bot actually depends on — "not flagged as a bot" — over both
-# shapes, rather than pretending only one occurs.
-req GET "/profile/@alice:e2e" "" >/dev/null
+# For a human the key is ABSENT, not false. The response must also be an OBJECT:
+# this handler used to serialise as the literal `null` for an account with no
+# displayname, avatar or nickname, which broke the idiomatic
+# .get("bsfchat.bot", False) with a TypeError.
+req GET "/profile/@alice:e2e" "$BOT_TOKEN" >/dev/null
 if python3 - "$WORK/last-body.json" <<'PY'
 import json, sys
 doc = json.load(open(sys.argv[1]))
-if doc is None:                       # the null-profile shape
-    sys.exit(0)
+if not isinstance(doc, dict):
+    print("not an object:", repr(doc), file=sys.stderr)
+    sys.exit(1)
 sys.exit(0 if doc.get("bsfchat.bot") is None else 1)
 PY
 then
-  note "human profile OMITS the key" "$(cat "$WORK/last-body.json")"
+  note "human profile: object, key omitted" "$(cat "$WORK/last-body.json")"
 else
-  fail "human profile OMITS the key" "body=$(cat "$WORK/last-body.json")"
+  fail "human profile: object, key omitted" "body=$(cat "$WORK/last-body.json")"
 fi
 
 # ── phase 3: auto-join exclusion ─────────────────────────────────────────
@@ -412,6 +424,39 @@ RX_BODY=$(python3 -c 'import json,sys
 print(json.dumps({"m.relates_to":{"rel_type":"m.annotation",
                                   "event_id":sys.argv[1],"key":"\U0001F44D"}}))' "$CMD_EVENT")
 check "bot can react"                           200 "$(req PUT "/rooms/${ROOM}/send/m.reaction/rx1" "$BOT_TOKEN" "$RX_BODY")"
+RX_EVENT=$(jfield event_id)
+
+# Reacting again with the same (sender, target, key) is IDEMPOTENT — the same
+# event id back, not an error and not a second event. A fresh txnId, so this
+# exercises the reaction dedup rather than the transaction replay.
+check "duplicate reaction is idempotent"        200 "$(req PUT "/rooms/${ROOM}/send/m.reaction/rx2" "$BOT_TOKEN" "$RX_BODY")"
+check "  returns the original reaction id"      "$RX_EVENT" "$(jfield event_id)"
+
+# Reaction content is validated now.
+check "reaction needs m.annotation rel_type"    400 "$(req PUT "/rooms/${ROOM}/send/m.reaction/rx3" "$BOT_TOKEN" \
+  "{\"m.relates_to\":{\"rel_type\":\"m.replace\",\"event_id\":\"${CMD_EVENT}\",\"key\":\"x\"}}")"
+check "reaction needs a key"                    400 "$(req PUT "/rooms/${ROOM}/send/m.reaction/rx4" "$BOT_TOKEN" \
+  "{\"m.relates_to\":{\"rel_type\":\"m.annotation\",\"event_id\":\"${CMD_EVENT}\"}}")"
+check "reaction key is length-bounded"          400 "$(req PUT "/rooms/${ROOM}/send/m.reaction/rx5" "$BOT_TOKEN" \
+  "$(python3 -c 'import json,sys
+print(json.dumps({"m.relates_to":{"rel_type":"m.annotation",
+                                  "event_id":sys.argv[1],"key":"x"*200}}))' "$CMD_EVENT")")"
+check "reaction target must exist"              404 "$(req PUT "/rooms/${ROOM}/send/m.reaction/rx6" "$BOT_TOKEN" \
+  '{"m.relates_to":{"rel_type":"m.annotation","event_id":"$nope:e2e","key":"x"}}')"
+
+# The send endpoint is deny-by-default: an unrecognised type is refused rather
+# than stored. This is the check that catches a regression back to the old
+# allow-everything shape, which let a muted member write arbitrary events.
+check "custom event types are REFUSED"          403 "$(req PUT "/rooms/${ROOM}/send/com.example.botstate/cs1" "$BOT_TOKEN" \
+  '{"hello":"world"}')"
+
+# /redact is idempotent on its txn id, in a namespace separate from sends.
+REDACT_ME=$(req PUT "/rooms/${ROOM}/send/m.room.message/tmp1" "$BOT_TOKEN" \
+  '{"msgtype":"m.notice","body":"delete me"}' >/dev/null; jfield event_id)
+check "bot redacts its own message"             200 "$(req PUT "/rooms/${ROOM}/redact/${REDACT_ME}/rd1" "$BOT_TOKEN" '{"reason":"e2e"}')"
+REDACTION_EVENT=$(jfield event_id)
+check "retrying the redaction is idempotent"    200 "$(req PUT "/rooms/${ROOM}/redact/${REDACT_ME}/rd1" "$BOT_TOKEN" '{"reason":"e2e"}')"
+check "  returns the original redaction id"     "$REDACTION_EVENT" "$(jfield event_id)"
 
 # ── phase 5: invite auto-joins a bot ─────────────────────────────────────
 echo

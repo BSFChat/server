@@ -153,22 +153,18 @@ bot accounts:
 `profile.get("bsfchat.bot", False)` and never test for the key's presence
 expecting a boolean either way.
 
-This endpoint is **unauthenticated** — it takes no token and checks none. That
-is deliberate: bot-ness is a label meant to be shown to everyone who sees the
-account, not a secret. But do not treat a profile lookup as proof of anything
-privileged.
+**Profile reads require authentication.** `GET /profile/{userId}` and its
+`/displayname`, `/avatar_url` and `/nickname` variants all need a bearer token —
+including when your bot reads *its own* profile. Without one you get
+`401 M_MISSING_TOKEN`.
 
-> **Watch out:** this endpoint can return the literal JSON `null` with a `200`,
-> not `{}`. The response is built by assigning keys to an empty value, so an
-> account with no displayname, no avatar, no nickname and no bot flag — a
-> freshly registered user — serialises as `null`. Code like
-> `requests.get(...).json()["displayname"]` or `.get("bsfchat.bot", False)` will
-> raise a `TypeError` on such a user. Guard it:
->
-> ```python
-> profile = resp.json() or {}
-> is_bot = profile.get("bsfchat.bot", False)
-> ```
+These four were previously the only unauthenticated read endpoints in the
+server, which made them a user-existence oracle (404 vs 200) over the whole
+account namespace, plus every account's display name and avatar, at line rate.
+They now gate on being signed in — nothing more, since reading another user's
+profile is perfectly legitimate and is what a member list does.
+
+The response is always a JSON object.
 
 `GET /_matrix/client/v3/account/whoami` carries the same key, for the **caller**:
 
@@ -481,29 +477,48 @@ Content-Type: application/json
 Note `PUT`, not `POST`, and note that the response is `200` with only an
 `event_id`.
 
-### Transaction ids and idempotency — read carefully
+### Which event types you may send
 
-Idempotency **is** implemented, and its scope is narrower than you would guess.
-The server keys the transaction record on **`(sender_user_id, txn_id)` only** —
-*not* on the room, and *not* on the event type.
+The send endpoint is **deny-by-default**. Only these types are accepted:
 
-Consequences:
+| Type | Extra permission |
+| --- | --- |
+| `m.room.message` | `SEND_MESSAGES` |
+| `m.reaction` | `ADD_REACTIONS` |
+| `m.call.invite`, `m.call.answer`, `m.call.candidates`, `m.call.hangup`, `m.call.member`, `bsfchat.call.negotiate` | none beyond `VIEW_CHANNEL` |
+
+Anything else is `403 M_FORBIDDEN` — *"Events of type 'x' cannot be sent to a
+room"*. **If your bot stores custom event types in the timeline, it is now
+broken.** There is no opt-in and no config switch; adding a sendable type is a
+deliberate edit to the server's table. Keep bot-specific data in your own
+storage, or express it as an `m.room.message` your bot can recognise.
+
+State events are not on this endpoint at all. They go to
+`PUT /rooms/{id}/state/{type}/{key}`, which has its own per-type authorisation.
+
+### Transaction ids and idempotency
+
+The server keys the transaction record on
+**`(user_id, device_id, room_id, txn_id)`**. A `device_id` is bound to the
+access token, so for a bot it is stable for the life of a token and changes when
+the token is rotated.
 
 - **Retrying a send with the same `txnId` is safe.** You get `200` with the
-  original `event_id` and no duplicate message. This is the behaviour you want
-  on a timeout or a dropped connection: retry with the *same* id.
-- **Reusing a `txnId` across rooms silently drops the second send.** If you send
-  `txnId=1` to `!a` and then `txnId=1` to `!b`, the second call returns `200`
-  with the *first* message's `event_id` and **nothing is posted to `!b`**. It
-  looks like success. Your `txnId` must be globally unique per bot, not per room.
-- **A counter that resets on restart is a bug.** If your bot restarts and starts
-  again at `txn-1`, its first few sends after every restart vanish into the
-  idempotency table. Use a timestamp-plus-counter (`f"{time.time_ns()}-{n}"`) or
-  a UUID.
-- **Redaction is not idempotent.** `PUT /rooms/{id}/redact/{eventId}/{txnId}`
-  parses the `txnId` out of the path and then never uses it. Retrying a redact
-  creates a second `m.room.redaction` event. It is harmless (the target is
-  already stripped) but it is noise in the timeline.
+  original `event_id` and no duplicate. That is exactly what you want on a
+  timeout or a dropped connection: retry with the *same* id, do not invent a new
+  one.
+- **The same `txnId` in a different room is a different request**, and posts
+  normally. The room is part of the key.
+- **A counter that resets on restart is still a bug.** A restarting bot reuses
+  its token, so it keeps the same `device_id`; starting again at `txn-1` in the
+  same room means its first sends after every restart are answered with old
+  event ids and never posted. Use a timestamp-plus-counter
+  (`f"{time.time_ns()}-{n}"`) or a UUID.
+- **Redaction is idempotent too**, in its own separate namespace keyed on
+  `(user, device, room, target_event, txn)`. Retrying a redaction returns the
+  original redaction event rather than appending a second one. The target is
+  part of that key, so reusing an id for a *different* target in the same room
+  still deletes what you asked it to.
 
 ### Message shapes
 
@@ -572,9 +587,23 @@ Rules the server applies, which differ from plain Matrix:
 PUT .../send/m.reaction/{txn}
 {"m.relates_to": {"rel_type": "m.annotation", "event_id": "$target", "key": "👍"}}
 ```
-There is no `body`. No server-side validation of any kind: the target is not
-checked for existence, room membership or visibility, and duplicates are not
-deduplicated. Remove a reaction by redacting the reaction event.
+There is no `body`. Requires the `ADD_REACTIONS` permission (§8), and the
+content is validated:
+
+- `m.relates_to` must be present with `rel_type` exactly `m.annotation`, else
+  `400`.
+- `event_id` and `key` must both be non-empty, else `400`.
+- `key` is capped at **64 bytes** — generous for a ZWJ sequence with modifiers,
+  but it is a storage bound, not an emoji validator.
+- The target must **exist and be in the same room**, else `404`. A target in
+  another room gets the same "does not exist" answer on purpose, so the endpoint
+  cannot be used to probe for event ids elsewhere.
+- A **redacted** target cannot acquire new reactions (`404`).
+
+**Reacting twice with the same `(sender, target, key)` is idempotent**: you get
+`200` with the existing reaction's `event_id`, not an error and not a second
+event. Remove a reaction by redacting the reaction event; a redacted reaction no
+longer counts as a duplicate, so react → unreact → react works.
 
 **Redaction** (deleting a message):
 ```http
@@ -669,7 +698,8 @@ lowercase hex string (`"0x0f"`) because JSON cannot hold 64-bit integers safely.
 | 10 | `MANAGE_SERVER` | Server settings, audit log, ban list. |
 | 11 | `CHANGE_NICKNAME` | Own per-server nickname. |
 | 12 | `MANAGE_NICKNAMES` | Others' nicknames. |
-| 13 | `MANAGE_BOTS` | Create/list/rotate/delete bot accounts. *(new — see §11)* |
+| 13 | `MANAGE_BOTS` | Create/list/rotate/deactivate bot accounts. |
+| 14 | `ADD_REACTIONS` | Send `m.reaction`. In the default `@everyone` set. |
 | 15 | `ADMINISTRATOR` | Everything, bypassing all overrides. |
 
 Effective permissions are computed as: OR of the user's roles → short-circuit to
@@ -691,10 +721,15 @@ These fire on `m.room.message` sends and reject with `403`:
    the message. Either hold the permission, or strip those tokens before echoing.
 3. **`ATTACH_FILES` is checked on msgtype, not on content.** See §7.
 
-Also note: the per-type gates in the send handler apply **only to
-`m.room.message`**. An `m.reaction` send is gated on `VIEW_CHANNEL` alone — a bot
-denied `SEND_MESSAGES` can still react. Do not rely on denying `SEND_MESSAGES` to
-make a bot silent.
+Note that **reactions have their own permission**, `ADD_REACTIONS`, rather than
+riding on `SEND_MESSAGES`. That is what makes "everyone may react, only a few may
+post" expressible — an ordinary read-mostly announcement channel. The practical
+consequence for you: denying a bot `SEND_MESSAGES` no longer makes it silent,
+because it can still react. Deny both if that is what you mean.
+
+`ADD_REACTIONS` is in the default `@everyone` set and was backfilled onto every
+role that already had `SEND_MESSAGES`, so nothing changed on upgrade. But a bot
+given a deliberately narrow allow-mask needs the bit set explicitly.
 
 ### Granting permission to a bot
 
@@ -707,8 +742,9 @@ PUT /_matrix/client/v3/rooms/{roomId}/state/bsfchat.channel.permissions/user:@bo
 ```
 
 That grants exactly `VIEW_CHANNEL | SEND_MESSAGES` in that one channel. Add
-`0x08` if it posts links. Prefer this to putting a bot in the `mod` or `admin`
-role: a channel override is scoped and auditable, a role is not.
+`0x4000` for `ADD_REACTIONS`, `0x08` for `EMBED_LINKS`, `0x04` for
+`ATTACH_FILES`. Prefer this to putting a bot in the `mod` or `admin` role: a
+channel override is scoped and auditable, a role is not.
 
 To assign a server-wide role instead (`MANAGE_ROLES` also required):
 
@@ -723,26 +759,39 @@ A bot that only reads and replies in one channel does **not** need a role.
 
 ## 9. Rate limits, backoff, and error handling
 
-### What is actually rate-limited *today*
+### What is rate-limited
 
-Only the **credential endpoints** — `/login`, `/register`, `/refresh`,
-`/account/password` — carry a rate limiter: 30 attempts per client address per
-60 s by default, plus a failure lockout tracked per address and per target
-username. **A bot touches none of these**, so in practice none of it applies to
-you.
+**The write endpoints are limited, per account.** The limiter keys on your
+identity, not on the connection or the address — so opening ten connections does
+not buy ten budgets, and you are never sharing a bucket with whoever else is
+behind your NAT. Three independent buckets, so exhausting one does not starve
+the others:
 
-Everything else — `/sync`, `/send`, `/messages`, `/upload` — is **currently
-ungated**. Do not read that as a licence. The limit you will actually hit is the
-thread pool, not a `429`, and the failure mode there is degraded service for
-every human on the server rather than a clean error for you.
+| Bucket | Endpoint | Default |
+| --- | --- | --- |
+| send | `PUT /rooms/{id}/send/{type}/{txn}` | 120 / 60 s |
+| redact | `PUT /rooms/{id}/redact/{event}/{txn}` | 60 / 60 s |
+| media | `POST /_matrix/media/v3/upload` | 30 / 60 s |
 
-> **Send-side rate limiting is coming.** A per-account limiter on the send path
-> is in progress. Write your bot as though it were already there: use the
-> backoff table below, honour `retry_after_ms`, and do not assume an
-> unrestricted send rate is a durable property of the server. A bot that is
-> well-behaved today needs no changes when it lands.
+These are set to stop a loop, not to pace a conversation — 120 events a minute
+is two a second sustained, which nothing reaches by typing. If your bot trips
+one, that is a bug or a runaway, and the right response is to back off and fix
+it, not to raise the limit.
 
-The one 429 a bot meets today is **slowmode**:
+Exceeding a bucket is `429 M_LIMIT_EXCEEDED` with **both** a `Retry-After`
+header (whole seconds) and `retry_after_ms` in the body. Honour whichever you
+read; they describe the same wait.
+
+The **credential endpoints** — `/login`, `/register`, `/refresh`,
+`/account/password` — have their own separate limiter, keyed on client address
+(30 attempts / 60 s by default, plus a failure lockout). A bot touches none of
+these.
+
+`/sync` is not rate-limited. The constraint there is the worker pool (§4), not a
+counter.
+
+The other 429 is **slowmode**, which is per-channel and per-user rather than
+per-account:
 
 ```json
 429 {"errcode": "M_LIMIT_EXCEEDED",
@@ -750,8 +799,9 @@ The one 429 a bot meets today is **slowmode**:
      "retry_after_ms": 4200}
 ```
 
-Slowmode is per-channel and per-user. Honour `retry_after_ms` exactly — it is the
-real remaining window, not an estimate. `MANAGE_MESSAGES` bypasses slowmode.
+Honour `retry_after_ms` exactly — it is the real remaining window, not an
+estimate. `MANAGE_MESSAGES` bypasses slowmode; it does not bypass the rate
+limiter above.
 
 ### The error envelope
 
@@ -763,7 +813,7 @@ meet: `M_FORBIDDEN`, `M_UNKNOWN_TOKEN`, `M_MISSING_TOKEN`, `M_NOT_FOUND`,
 
 | Situation | What to do |
 | --- | --- |
-| `429` | Sleep `retry_after_ms`, then retry once. |
+| `429` | Sleep for `Retry-After` (seconds) or `retry_after_ms`, then retry once. If you are hitting it repeatedly, you have a loop — fix the bot, do not tighten the sleep. |
 | `5xx`, connection refused, DNS failure | Exponential backoff with jitter: 1, 2, 4, 8 … capped at 60 s. Reset the delay after any success. |
 | Read timeout on `/sync` | **Not an error.** Your client's socket timeout must exceed `timeout` + margin (e.g. `timeout=300000` → socket timeout 330 s). Reconnect immediately with the *same* `since`. |
 | `401 M_UNKNOWN_TOKEN` | **Stop.** Do not retry, do not back off. The token was rotated or the bot deleted. Exit non-zero and let your supervisor restart you with fresh credentials. |
@@ -820,25 +870,27 @@ notices. That is the extent of it.
 
 Honest list, as of this writing:
 
-- **`MANAGE_BOTS` (bit 13) is new**, added alongside the bot account endpoints.
-  On a server predating it, only `ADMINISTRATOR` can manage bots.
+- **You cannot send custom event types** (§6). The send endpoint is
+  deny-by-default and the allowlist is short. Bot-specific data goes in your own
+  storage, not in the room timeline.
 - **There is no hard delete for a bot account.** `DELETE` deactivates (§1). That
   is the right default, but it means a typo'd localpart is burned permanently.
-- **`/sync` has no `rooms.invite` or `rooms.leave` section.** This does not
-  affect bots — inviting a bot joins it outright, so the invite arrives as an
-  ordinary join in the timeline (§3). It does mean a *human* account's pending
-  invites are not visible in `/sync`, which is a separate, open issue.
 - **No way to fetch one event by id.** If you hold an `event_id` from a relation
   and want its content, you must page `/messages` backwards until you find it.
 - **No `/relations`.** Aggregating reactions, threads and replies is your job.
-- **Reactions are unvalidated and ungated** beyond `VIEW_CHANNEL` (§8).
+- **`/sync` has no `rooms.leave` section.** Being kicked or leaving is not
+  reported as such; the room simply stops appearing.
 - **`formatted_body` is passed through verbatim** and rendered by the desktop
   client as Qt RichText. Emit only the tag subset in §6.
-- **`GET /profile/{userId}` can answer the literal `null`** instead of `{}` for
-  an account with no profile fields set (§1). Parse defensively.
 - **No structured command framework.** No slash-command registration, no
   autocomplete, no interaction model. A command is a message body your bot
   chooses to match on.
+
+Closed since earlier drafts of this guide, noted because you may have read
+around them: `/sync` now has a real `rooms.invite` section (irrelevant to bots —
+inviting a bot still joins it outright, so you still write no invite-handling
+code, see §3); reactions are validated and permissioned (§6, §8); `/redact` is
+idempotent (§6); profile reads return an object and require auth (§1).
 
 ---
 
@@ -858,7 +910,7 @@ GET    /_matrix/client/v3/rooms/{room}/members               who is here
 GET    /_matrix/client/v3/rooms/{room}/state                 channel state
 POST   /_matrix/media/v3/upload?filename=                    upload (raw body)
 GET    /_matrix/media/v3/download/{server}/{id}              download
-GET    /_matrix/client/v3/profile/{user}                     profile (no auth)
+GET    /_matrix/client/v3/profile/{user}                     profile
 POST   /_matrix/client/v3/rooms/{room}/kick|ban|unban        moderation
 POST   /_matrix/client/v3/bsfchat/bots                       create a bot (admin)
 GET    /_matrix/client/v3/bsfchat/bots                       list bots (admin)

@@ -63,7 +63,8 @@ curl -X PUT "$HOMESERVER/_matrix/client/v3/rooms/$ROOM/state/bsfchat.channel.per
   -d '{"allow":"0x03","deny":"0x00"}'   # VIEW_CHANNEL | SEND_MESSAGES
 ```
 
-Add `0x08` (`EMBED_LINKS`) if it posts URLs, `0x04` (`ATTACH_FILES`) if it posts
+Add `0x4000` (`ADD_REACTIONS`) — `bot.py`'s `!ping` reacts, so it needs this —
+`0x08` (`EMBED_LINKS`) if it posts URLs, and `0x04` (`ATTACH_FILES`) if it posts
 images or files. Prefer a per-channel override to a server role.
 
 **3. Run it.**
@@ -117,10 +118,10 @@ The methods you have:
 | --- | --- |
 | `send_text(room, body, notice=False)` | Plain message. `notice=True` is the convention for bot output. |
 | `send_html(room, body, formatted_body, reply_to=None, notice=False)` | Rich text, optionally as a reply. |
-| `react(room, event_id, "👍")` | Emoji reaction. |
+| `react(room, event_id, "👍")` | Emoji reaction. Needs `ADD_REACTIONS`; idempotent per `(target, key)`. |
 | `redact(room, event_id, reason=None)` | Delete a message. Own always; others' need `MANAGE_MESSAGES`. |
 | `upload(data, filename, mimetype)` | Returns an `mxc://` URI to reference from an `m.image`/`m.file` message. |
-| `send_event(room, type, content)` | The escape hatch — any event type, any content. |
+| `send_event(room, type, content)` | The escape hatch — but only allowlisted types (`m.room.message`, `m.reaction`, `m.call.*`); anything else is 403. |
 | `join(room_id)` / `joined_rooms()` | Membership. |
 
 `@bot.on_joined` registers a callback for "this bot was added to a channel",
@@ -144,11 +145,12 @@ These are in the code with long comments, but worth stating plainly:
    filtering, editing a typo re-runs the command — and anyone can re-trigger
    your bot by editing an old message.
 
-3. **Transaction ids must be globally unique per bot**, not per room and not per
-   process. The server keys idempotency on `(sender, txn_id)` only, so reusing
-   an id in a different room returns `200` with the *first* message's event id
-   and posts nothing. It looks like success. The client here uses
-   `nanosecond-epoch + counter`; do not replace it with a bare counter.
+3. **Transaction ids must survive restarts.** The server keys idempotency on
+   `(user, device, room, txn_id)`, and the device comes from the access token —
+   so a bot that restarts with the same token and begins counting again at 1
+   has its first sends answered with old event ids and never posted. It looks
+   like success. The client here uses `nanosecond-epoch + counter`; do not
+   replace it with a bare counter.
 
 4. **Use a long sync timeout.** `timeout` is the idle ceiling, not a polling
    interval — the server wakes a parked `/sync` within microseconds of a commit
@@ -164,8 +166,13 @@ media packet. A music bot is not possible. You can read the voice roster and
 post about it.
 
 **No invite *acceptance* flow** — and you do not need one. Inviting a bot joins
-it outright, so it arrives as a normal join event (`@bot.on_joined`). `/sync`
-still has no `rooms.invite` section, which matters only for human accounts.
+it outright, so it arrives as a normal join event (`@bot.on_joined`). The
+`rooms.invite` section in `/sync` exists for human accounts; a bot never has a
+pending invite to find there.
+
+**No custom event types.** The send endpoint is deny-by-default: only
+`m.room.message`, `m.reaction` and the `m.call.*` signalling types are accepted.
+Keep bot state in your own storage, not in the room timeline.
 
 **No single-event fetch, no `/relations`, no filters, no account data, no
 E2EE.** See [`../../docs/bots.md` §0 and §11](../../docs/bots.md).

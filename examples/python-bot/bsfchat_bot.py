@@ -98,17 +98,15 @@ class BSFChatBot:
         self._handlers: list[tuple[str, Callable[[dict, dict], None]]] = []
         self._joined_handlers: list[Callable[[str, dict], None]] = []
 
-        # Transaction ids must be globally unique per bot, for the lifetime of
-        # the account — NOT just per room and NOT just per process.
+        # Transaction ids must be unique across RESTARTS, not just within a run.
         #
-        # The server keys idempotency on (sender, txn_id) alone: not the room,
-        # not the event type. So reusing an id in a different room returns 200
-        # with the FIRST message's event_id and posts nothing to the second
-        # room. It looks exactly like success. A counter that restarts at 1 on
-        # every process start has the same failure: the first few sends after
-        # each restart silently vanish.
+        # The server keys idempotency on (user, device, room, txn_id). The
+        # device comes from the access token, so a bot that restarts with the
+        # same token keeps the same device — and a counter that begins again at
+        # 1 has its first sends answered with the event ids of old messages and
+        # never posted. It looks exactly like success.
         #
-        # Nanosecond timestamp + process-lifetime counter gets both properties.
+        # Nanosecond epoch + process-lifetime counter gets that for free.
         self._txn_counter = itertools.count()
         self._txn_epoch = time.time_ns()
 
@@ -143,15 +141,9 @@ class BSFChatBot:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 payload = resp.read()
-                if not payload:
-                    return {}
-                # `or {}` is load-bearing, not defensive noise: GET
-                # /profile/{userId} answers the literal JSON `null` (not `{}`)
-                # for an account with no displayname, avatar, nickname or bot
-                # flag, because the handler only ever assigns keys to an empty
-                # value. Without this, a profile lookup for a freshly
-                # registered user raises TypeError on the caller's .get().
-                return json.loads(payload) or {}
+                # `or {}` so a caller can always .get() the result, whatever a
+                # given endpoint chooses to send for "nothing".
+                return (json.loads(payload) or {}) if payload else {}
         except urllib.error.HTTPError as exc:
             payload = exc.read()
             try:
@@ -168,10 +160,19 @@ class BSFChatBot:
                 raise TokenRevoked(exc.code, errcode, message) from exc
 
             if exc.code == 429:
-                # Slowmode is the one 429 a bot realistically meets. The value
-                # is the real remaining window, not an estimate, so sleeping it
-                # exactly and retrying once is correct.
-                delay = (retry_after or 1000) / 1000
+                # Two sources of a 429: the per-account send/redact/upload rate
+                # limiter, and per-channel slowmode. Both carry an honest wait
+                # in `retry_after_ms`; the limiter also sets a Retry-After
+                # header in whole seconds. Prefer the millisecond value, fall
+                # back to the header, and only then to a guess.
+                header = exc.headers.get("Retry-After") if exc.headers else None
+                if retry_after is not None:
+                    delay = retry_after / 1000
+                elif header and header.isdigit():
+                    delay = float(header)
+                else:
+                    delay = 1.0
+                # Repeatedly hitting this means a loop, not a pacing problem.
                 log.warning("rate limited, sleeping %.1fs (%s)", delay, message)
                 time.sleep(delay)
                 raise BotError(exc.code, errcode, message) from exc
@@ -215,7 +216,13 @@ class BSFChatBot:
         return f"{self._txn_epoch}-{next(self._txn_counter)}"
 
     def send_event(self, room_id: str, event_type: str, content: dict) -> str:
-        """PUT an event. Returns its event_id."""
+        """PUT an event. Returns its event_id.
+
+        The server allowlists what may be sent here: m.room.message, m.reaction
+        and the m.call.* signalling types. Anything else is 403 — you cannot
+        park custom event types in the timeline, so bot-specific state belongs
+        in your own storage.
+        """
         path = (
             f"/_matrix/client/v3/rooms/{urllib.parse.quote(room_id)}"
             f"/send/{urllib.parse.quote(event_type)}/{self._next_txn()}"
@@ -262,7 +269,14 @@ class BSFChatBot:
         return self.send_event(room_id, "m.room.message", content)
 
     def react(self, room_id: str, event_id: str, key: str) -> str:
-        """Add an emoji reaction. Note: no `body` field, and a distinct type."""
+        """Add an emoji reaction. No `body` field, and a distinct event type.
+
+        Needs the ADD_REACTIONS permission — its own bit, not SEND_MESSAGES, so
+        "everyone may react, only a few may post" is expressible. The target
+        must exist in THIS room and not be redacted, and `key` is capped at 64
+        bytes. Reacting twice with the same key is idempotent: you get the
+        existing reaction's event id back. Un-react by redacting that id.
+        """
         return self.send_event(
             room_id,
             "m.reaction",
@@ -273,9 +287,9 @@ class BSFChatBot:
     def redact(self, room_id: str, event_id: str, reason: str | None = None) -> str:
         """Delete an event. Own events always; others' need MANAGE_MESSAGES.
 
-        NOT idempotent: the server parses the txnId out of the path and never
-        uses it, so a retry appends a second redaction event. Harmless, but do
-        not retry casually.
+        Idempotent on the transaction id, in a namespace separate from sends:
+        retrying returns the original redaction rather than appending a second.
+        Has its own rate-limit bucket, tighter than sends.
         """
         path = (
             f"/_matrix/client/v3/rooms/{urllib.parse.quote(room_id)}"
