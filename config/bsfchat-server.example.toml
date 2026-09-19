@@ -282,19 +282,82 @@ allow_peer_to_peer = true
 # `{"rejected": ["<pushkey>", ...]}`, give it your FCM service-account JSON
 # and/or APNs .p8 key, and point allowed_gateway_prefixes at it. Without a
 # gateway, mobile push simply does not happen; everything else keeps working.
+#
+# WHAT THE SERVER REFUSES TO TRUST: the gateway. It is a third-party HTTP
+# endpoint, so its reply may only retire the one pusher the notification was
+# addressed to. A gateway naming other pushkeys in its `rejected` list is
+# ignored and logged — it used to be obeyed, which let one gateway delete
+# pushers for every account on the server.
 [push]
 enabled = true
 
-# URL prefixes clients may register as a push gateway. LEAVE THIS SET.
+# URL prefixes clients may register as a push gateway. REQUIRED when push is on.
+#
+# Empty means NO gateway is permitted — not "any gateway". If push.enabled is
+# true and this list is empty, the server logs an error at startup and turns
+# push off. That is deliberate: there is no safe open value for this setting.
 #
 # /pushers/set is the only endpoint where an ordinary user names a URL that the
-# SERVER then requests, which makes it a server-side request forgery primitive:
-# with no restriction, any account can aim it at cloud metadata endpoints
-# (169.254.169.254), at your database's admin port, or at anything else reachable
-# from this host, and use notification behaviour as the oracle. An empty list
-# accepts any absolute http(s) URL and logs a warning at startup — only
-# acceptable on an instance where every account is trusted.
+# SERVER then requests, and it requests it carrying notification data. An
+# unrestricted list is therefore two holes at once:
+#
+#   * EXFILTRATION. Any account can register a pusher pointing at a collector it
+#     controls and have this server deliver message content there, forever, with
+#     the client closed. Nothing in any moderator surface shows it.
+#   * SSRF. The same URL can be aimed at cloud metadata (169.254.169.254), at
+#     your database's admin port, or at anything else reachable from this host,
+#     using notification behaviour as the oracle.
+#
+# Entries are matched on scheme + host + port and then on a path-segment
+# boundary — never as a raw string prefix. "https://push.example.com" therefore
+# authorises "https://push.example.com/anything" but NOT
+# "https://push.example.com.evil.tld/", and not http:// or a different port.
+# "https://push.example.com/_matrix/push/v1/" narrows it to that path and below.
+#
+# Prefer https://. A cleartext entry is accepted (and warned about at startup)
+# because a gateway on this host is a real deployment shape, but over a network
+# it exposes payloads and pushkeys and lets an on-path attacker forge the
+# gateway's reply.
 allowed_gateway_prefixes = ["https://push.example.com/"]
+
+# Whether an allowlisted gateway may be on an internal address: loopback,
+# RFC1918, CGNAT, link-local/metadata, an IPv6 ULA, or a bare compose service
+# name. Off by default, so an allowlist entry typo'd onto an internal host fails
+# closed instead of becoming an SSRF aperture.
+#
+# Turn it ON if your gateway runs beside this server — sygnal in the same
+# compose file, reached as http://sygnal:5000/ or http://127.0.0.1:5000/ — which
+# is the usual self-hosted shape. It does not widen the allowlist; both gates
+# still apply.
+#
+# Note the one thing neither gate covers: a public NAME that resolves to an
+# internal address. With a mandatory allowlist the only names in play are ones
+# you wrote here, so this is a trade rather than a gap — but do not allowlist a
+# hostname you do not control.
+# allow_internal_gateway = false
+
+# What a pusher that does not ask for a specific format gets.
+#
+#   "event_id_only" (default) — the gateway is told that something happened in a
+#     room and is given the event id to fetch it with. No message body, no
+#     sender, no display name, no event type.
+#   "full" — the Matrix default: verbatim event content (body, formatted_body,
+#     attachment mxc:// and filename), the sender and their display name.
+#
+# event_id_only is the default because the party behind the gateway — Google,
+# Apple, or whoever runs sygnal — is exactly the party this product exists not
+# to trust, and because a pusher that omits `format` has consented to nothing.
+# The payload is also held in push_queue in the clear until it is delivered.
+#
+# UPGRADING: deployments from before this setting existed behaved as "full". If
+# your users expect message text on the lock screen and you accept sending it to
+# your gateway, set "full" explicitly. A client that asks for
+# `format: "event_id_only"` always gets it, whatever this says.
+#
+# Even in event_id_only mode the gateway still learns the room id, the unread
+# count and whether the message was a mention or a DM (`prio`) — enough to build
+# a coarse social graph over time. There is no mode that discloses nothing.
+# default_payload = "event_id_only"
 
 # Delivery worker. The worker is woken immediately when a notification is
 # queued, so worker_poll_ms is only the ceiling on noticing a retry falling due.

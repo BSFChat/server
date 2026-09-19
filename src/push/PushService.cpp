@@ -134,17 +134,38 @@ int PushService::evaluate_message(const MessageNotification& n, PermissionsEngin
         json notification = {
             {"event_id", n.event_id},
             {"room_id", n.room_id},
-            {"type", n.event_type},
-            {"sender", n.sender},
             {"prio", (n.room_wide_mention || mentioned.count(pusher.user_id) > 0 || is_dm)
                          ? "high" : "low"},
             {"counts", {{"unread", store_.count_unread(pusher.user_id, n.room_id)}}},
             {"devices", json::array({std::move(device)})},
         };
-        // `event_id_only` is the spec's privacy mode: the gateway (and whatever
-        // third-party provider sits behind it) is told only that something
-        // happened, never what was said. Honour it.
-        if (pusher.format != "event_id_only") {
+        // What leaves this server, to a third party, by default.
+        //
+        // `event_id_only` is the spec's privacy mode: the gateway — and
+        // whatever provider sits behind it — is told that something happened in
+        // a room, never what was said or by whom. It is the DEFAULT here, not
+        // an opt-in, because a pusher that simply omits `format` has expressed
+        // no consent to shipping message bodies to a third party, and because
+        // the payload is also stored in push_queue in the clear until delivery.
+        // An operator who runs their own gateway and wants rich notifications
+        // sets push.default_payload = "full" deliberately.
+        //
+        // An explicit `format: event_id_only` always wins: a client asking for
+        // privacy outranks the deployment default.
+        //
+        // `sender` and `type` are withheld in the privacy mode too. They used to
+        // be sent unconditionally, which handed a gateway operator a per-message
+        // social graph while the mode's whole claim was that it discloses
+        // nothing about the message. `prio` and `counts.unread` do remain: they
+        // are what the device needs to rank the alert and draw a badge, and
+        // dropping them would break the feature rather than tighten it. They
+        // still tell a gateway "this one was a mention or a DM" — there is no
+        // mode here that discloses nothing at all.
+        const bool send_content =
+            pusher.format.empty() && config_.push.default_payload == "full";
+        if (send_content) {
+            notification["type"] = n.event_type;
+            notification["sender"] = n.sender;
             notification["content"] = n.content;
             if (auto name = store_.get_display_name(n.sender)) {
                 notification["sender_display_name"] = *name;
@@ -189,7 +210,10 @@ PushService::GatewayResponse PushService::post_to_gateway(const std::string& url
     std::string origin;
     std::string path;
     if (!split_url(url, origin, path)) {
-        get_logger()->warn("Push: pusher URL is not a valid absolute URL, dropping: {}", url);
+        // log_safe: rows written by an older build predate the URL validation
+        // in PushHandler, so this string has never been checked.
+        get_logger()->warn("Push: pusher URL is not a valid absolute URL, dropping: {}",
+                           log_safe(url));
         // Treat as a permanent failure by reporting a 4xx: retrying a malformed
         // URL forever accomplishes nothing.
         out.transport_ok = true;
@@ -238,19 +262,35 @@ PushService::DrainResult PushService::drain_once() {
     for (const auto& item : batch) {
         auto response = transport_(item.url, item.payload);
 
-        if (!response.rejected.empty()) {
-            for (const auto& pushkey : response.rejected) {
-                int removed = store_.delete_pushers_by_pushkey(pushkey);
-                if (removed > 0) {
-                    get_logger()->info(
-                        "Push: gateway rejected pushkey; removed {} pusher(s) for it", removed);
-                }
-            }
-        }
-
+        // The gateway is a third-party HTTP endpoint, so its response is
+        // untrusted input and may only affect the pusher this request was
+        // actually about.
+        //
+        // This used to honour the whole `rejected` list with
+        // DELETE FROM pushers WHERE pushkey = ? — unscoped by user and never
+        // checked against the pushkeys the request carried. Any gateway could
+        // therefore answer one notification with a list of pushkeys and delete
+        // those rows for every account on the server. One notify carries
+        // exactly one device, so exactly one pushkey can be rejected by it, and
+        // the row it belongs to is the one named by the queue entry rather than
+        // the one named by the gateway.
         const bool rejected_this =
             std::find(response.rejected.begin(), response.rejected.end(), item.pushkey) !=
             response.rejected.end();
+
+        if (rejected_this) {
+            // A rejection means the device is gone for good (app uninstalled,
+            // token revoked), so the pusher is removed rather than retried.
+            store_.delete_pusher(item.user_id, item.app_id, item.pushkey);
+        }
+        if (response.rejected.size() > (rejected_this ? 1u : 0u)) {
+            // Not fatal, but a gateway naming devices it was never given is
+            // either broken or probing, and an operator should see it.
+            get_logger()->warn(
+                "Push: gateway at {} rejected {} pushkey(s) for a notification that carried "
+                "one; ignoring the ones it was not sent",
+                log_safe(item.url), response.rejected.size());
+        }
 
         // A 2xx (or an explicit rejection, which is a definitive answer) retires
         // the row. Anything else is retried with backoff: 5xx and transport
@@ -270,7 +310,7 @@ PushService::DrainResult PushService::drain_once() {
         if (!store_.reschedule_queued_push(item.id, config_.push.max_attempts, next_at)) {
             get_logger()->warn(
                 "Push: giving up on notification for {} after {} attempts (last status {})",
-                item.user_id, config_.push.max_attempts, response.status);
+                log_safe(item.user_id), config_.push.max_attempts, response.status);
         }
     }
     return result;

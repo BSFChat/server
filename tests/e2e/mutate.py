@@ -88,14 +88,50 @@ MUTATIONS = [
 
  ("F2 rejected pusher no longer removed",
   "src/push/PushService.cpp",
-  "                int removed = store_.delete_pushers_by_pushkey(pushkey);",
-  "                int removed = 0; (void)pushkey;",
+  "            store_.delete_pusher(item.user_id, item.app_id, item.pushkey);",
+  "            (void)item;",
   "PushDelivery.RejectedPushkeyRemovesThePusher", 120),
+
+ ("P4/B7 gateway rejection trusted for pushkeys it was never sent",
+  "src/push/PushService.cpp",
+  "        if (rejected_this) {",
+  "        for (const auto& rk : response.rejected) store_.delete_pusher(item.user_id, item.app_id, rk);\n        if (rejected_this) {",
+  "PushGatewayTrust.RejectionOnlyAppliesToThePushkeyThatWasSent", 120),
+
+ ("P4/B6 allowlist back to a raw string prefix",
+  "src/api/PushHandler.cpp",
+  "        if (entry.scheme != target.scheme || entry.host != target.host\n            || entry.port != target.port)\n            continue;\n        if (!path_is_within(entry.path, target.path)) continue;",
+  "        if (url.rfind(prefix, 0) != 0) continue;",
+  "PushAllowlist.MatchesOnOriginNotRawStringPrefix:PushAllowlist.PathScopingHonoursSegmentBoundaries", 120),
+
+ ("P4/B6 empty allowlist back to default-open",
+  "src/api/PushHandler.cpp",
+  "    if (cfg.allowed_gateway_prefixes.empty()) {\n        why = \"this server has no push.allowed_gateway_prefixes configured, so no push \"\n              \"gateway may be registered\";\n        return false;\n    }",
+  "    if (cfg.allowed_gateway_prefixes.empty()) return true;",
+  "PushAllowlist.EmptyAllowlistPermitsNoGatewayAtAll", 120),
+
+ ("P4/B17 payload default back to full plaintext",
+  "src/push/PushService.cpp",
+  "            pusher.format.empty() && config_.push.default_payload == \"full\";",
+  "            pusher.format.empty();",
+  "PushPayload.DefaultsToEventIdOnly", 120),
+
+ ("P4/A17 rejected gateway URL logged verbatim again",
+  "src/api/PushHandler.cpp",
+  "                           log_safe(*user_id), log_safe(url), why);",
+  "                           *user_id, url, why);",
+  "PushLogging.RejectedGatewayUrlCannotForgeLogLines", 120),
+
+ ("P4/SSRF alternate IPv4 encodings no longer recognised",
+  "src/api/PushHandler.cpp",
+  "    uint32_t v4 = 0;\n    if (parse_ipv4(host, v4)) return ipv4_is_internal(v4);",
+  "    uint32_t v4 = 0;\n    if (parse_ipv4(host, v4)) return false;",
+  "PushSsrf.ObfuscatedLoopbackFormsAreRecognised", 120),
 
  ("F2 event_id_only privacy mode ignored",
   "src/push/PushService.cpp",
-  '        if (pusher.format != "event_id_only") {',
-  "        if (true) {",
+  "        const bool send_content =\n            pusher.format.empty() && config_.push.default_payload == \"full\";",
+  "        const bool send_content = true;",
   "PushEvaluation.EventIdOnlyPushersDoNotLeakMessageContent", 120),
 
  ("F2 gateway URL validation removed (SSRF)",
@@ -112,9 +148,15 @@ MUTATIONS = [
 
  ("F2 pushkey reassignment no longer evicts old owner",
   "src/api/PushHandler.cpp",
-  "        int removed = store_.delete_pushers_by_pushkey_except(pushkey, *user_id, app_id);",
+  "        int removed = store_.delete_pushers_by_pushkey_except(pushkey, app_id, *user_id);",
   "        int removed = 0;",
   "Pushers.RegisteringAPushkeyTakesItFromWhoeverHadItBefore", 120),
+
+ ("P4/A14 pushkey takeover unscoped from app_id again",
+  "src/store/SqliteStore.cpp",
+  "        \"DELETE FROM pushers WHERE pushkey = ? AND app_id = ? AND user_id != ?\");",
+  "        \"DELETE FROM pushers WHERE pushkey = ? AND (app_id = ? OR 1) AND user_id != ?\");",
+  "PushGatewayTrust.PushkeyTakeoverIsScopedToTheSameAppId", 120),
 
  ("v9 backfill of `replaces` removed",
   "src/store/Migrations.cpp",
