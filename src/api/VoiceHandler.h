@@ -69,6 +69,25 @@ public:
     //
     // This is the ONLY way to revoke a departed member's ability to decrypt.
     // See LiveKitConfig::room_encryption for why the ratchet cannot do it.
+    //
+    // WHAT A ROTATION DOES, EXACTLY. Bumping the generation changes two
+    // things at once, because both are derived from it: the media key, and
+    // the SFU room name. So from the next token request onwards the channel
+    // lives in a different LiveKit room, encrypted with an unrelated key, and
+    // an already-issued token — which this server cannot recall, being a
+    // signed JWT the SFU admits on by itself — grants entry only to the room
+    // everyone has left. That covers entering the room, not just decrypting:
+    // no media, no participant list, no presence.
+    //
+    // WHAT IT DOES NOT DO. It cannot reach a client that is already
+    // connected. Each participant moves when they next fetch a token, which
+    // is on reconnect or at the end of their token's TTL (livekit.token_ttl,
+    // 600s by default, 6h ceiling). Until then they stay in the old room on
+    // the old key — and so can a departed member holding an unexpired token,
+    // because both are simply "clients that have not re-fetched yet". Nothing
+    // that only mints tokens can shorten that window: the server would have
+    // to push, and there is no channel today by which it could tell a
+    // connected client to re-fetch.
     void handle_livekit_rekey(const httplib::Request& req, httplib::Response& res);
 
     // Per-room media key, derived rather than stored.
@@ -100,7 +119,8 @@ public:
                                                        const std::string& room_id,
                                                        uint64_t generation);
 
-    // Maps a Matrix room id to the LiveKit room name.
+    // Maps a Matrix room id AND its current key generation to the LiveKit room
+    // name.
     //
     // Hashed rather than sanitised on purpose. Room ids contain characters
     // ('!', ':') whose safety in a LiveKit room name is not guaranteed, and any
@@ -109,9 +129,25 @@ public:
     // leak. SHA-256 cannot collide by accident. server_name is mixed in so the
     // mapping differs between deployments sharing one LiveKit instance.
     //
+    // THE GENERATION IS IN HERE FOR A REASON, and it is not key separation —
+    // that is livekit_room_key's job. A join token is a stateless JWT: this
+    // server signs it, the SFU admits on it, and nothing we hold is consulted
+    // in between, so there is no registry we could revoke an issued token
+    // from. What a token DOES name is one room, in its `video.room` grant.
+    // Moving the channel to a new room name on every rotation is therefore the
+    // revocation: a token minted before the rotation still verifies, but it
+    // grants entry to a room the conversation has left. The check costs
+    // nothing, keeps no state and is enforced by LiveKit rather than promised
+    // by us.
+    //
+    // No default for `generation`. A defaulted 0 is exactly how the generation
+    // came to be lost in the first place (audit A finding 4); every caller
+    // states which generation it means.
+    //
     // Exposed (and static) so tests can assert determinism and separation.
     static std::string livekit_room_name(const std::string& server_name,
-                                         const std::string& room_id);
+                                         const std::string& room_id,
+                                         uint64_t generation);
 
     // Ghost-participant reaper. Clients in voice heartbeat via GET
     // voice/members (and voice/join / voice/state); a background thread

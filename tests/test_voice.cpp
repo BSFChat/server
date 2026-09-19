@@ -1290,6 +1290,12 @@ protected:
         return body["encryption"].value("key", "");
     }
 
+    // The SFU room name from a token response. This is the string the token's
+    // own `video.room` grant is signed over, so it is what LiveKit admits on.
+    static std::string room_of(const httplib::Response& res) {
+        return json::parse(res.body).value("room", "");
+    }
+
     // The key generation from a token response, or 0 when absent.
     static uint64_t generation_of(const httplib::Response& res) {
         auto body = json::parse(res.body);
@@ -1449,8 +1455,12 @@ TEST_F(LiveKitTokenTest, RekeyAdvancesGenerationMonotonically) {
 TEST_F(LiveKitTokenTest, RekeyIsScopedToOneChannel) {
     auto other = add_voice_channel(alice);
     const auto other_before = key_of(request(other, "token-alice"));
+    const auto other_room_before = room_of(request(other, "token-alice"));
     ASSERT_EQ(status_of(rekey(room, "token-mod")), 200);
     EXPECT_EQ(key_of(request(other, "token-alice")), other_before);
+    // Rotating one channel must not move a bystanding channel's call to a new
+    // SFU room and drop everyone in it.
+    EXPECT_EQ(room_of(request(other, "token-alice")), other_room_before);
 }
 
 // Rotation interrupts everyone still holding the old key, so it is a
@@ -1501,6 +1511,43 @@ TEST_F(LiveKitTokenTest, RekeyResponseCarriesNoKeyMaterial) {
     EXPECT_FALSE(body.contains("encryption"));
     EXPECT_EQ(res.body.find(kLkSecret), std::string::npos);
 }
+
+// ---- rotation retires tokens already in circulation ----
+//
+// A join token is a signed JWT: this server mints it, the SFU admits on it,
+// and nothing we hold is consulted in between. There is no registry to revoke
+// it from, so a departed member holding an unexpired one could walk into the
+// channel's SFU room — unable to decrypt after a rotation, but present, on the
+// participant list, for up to token_ttl. What a token does name is one room,
+// so a rotation moves the channel to a new one and leaves the old token
+// pointing at a room the conversation has left.
+
+TEST_F(LiveKitTokenTest, RekeyMovesTheChannelToADifferentSfuRoom) {
+    const auto before = room_of(request(room, "token-alice"));
+    ASSERT_FALSE(before.empty());
+    ASSERT_EQ(status_of(rekey(room, "token-mod")), 200);
+    EXPECT_NE(room_of(request(room, "token-alice")), before);
+}
+
+// The enforcement point is the token's own grant, which LiveKit checks — not
+// any bookkeeping of ours. So the assertion is on the signed claim.
+TEST_F(LiveKitTokenTest, TokenMintedBeforeARotationGrantsOnlyTheAbandonedRoom) {
+    auto kept = request(room, "token-alice"); // the token a departing member keeps
+    ASSERT_EQ(status_of(kept), 200);
+    const auto kept_grant =
+        lk_payload(json::parse(kept.body)["token"])["video"].value("room", "");
+    ASSERT_EQ(kept_grant, room_of(kept));
+
+    ASSERT_EQ(status_of(rekey(room, "token-mod")), 200);
+
+    // The kept token still verifies — nothing can un-sign it — but the room it
+    // admits to is no longer the one the channel is in.
+    EXPECT_NE(kept_grant, room_of(request(room, "token-alice")));
+}
+
+// The guard against this going too far — an unrotated channel's members must
+// still land in ONE room, and re-fetching must not move anyone — is
+// SfuRoomNameIsStableAndPerChannel below, which predates this and still holds.
 
 // A rotation is a moderation action with a durable consequence, so it must
 // leave a durable record. Without one, an operator who restores a backup has
@@ -1681,6 +1728,30 @@ TEST_F(LiveKitRekeyDurabilityTest, UnrotatedRoomKeepsItsKeyAcrossARestart) {
     EXPECT_EQ(key_of(request(room, "token-alice")), before);
 }
 
+// Same guard for the SFU room, which is derived from the same generation: a
+// deploy must not scatter a live call across two LiveKit rooms.
+TEST_F(LiveKitRekeyDurabilityTest, UnrotatedRoomKeepsItsSfuRoomAcrossARestart) {
+    const auto before = room_of(request(room, "token-alice"));
+    restart();
+    EXPECT_EQ(room_of(request(room, "token-alice")), before);
+}
+
+// The two halves of this package meeting: a rotation retires outstanding
+// tokens by moving the channel, and a restart must not move it back.
+TEST_F(LiveKitRekeyDurabilityTest, TheAbandonedSfuRoomIsNotReoccupiedAfterARestart) {
+    const auto abandoned = room_of(request(room, "token-alice"));
+    ASSERT_EQ(status_of(rekey(room, "token-mod")), 200);
+    const auto rotated = room_of(request(room, "token-alice"));
+    ASSERT_NE(rotated, abandoned);
+
+    restart();
+
+    EXPECT_EQ(room_of(request(room, "token-alice")), rotated);
+    EXPECT_NE(room_of(request(room, "token-alice")), abandoned)
+        << "a restart moved the channel back into the room a departed member's "
+           "token still grants entry to";
+}
+
 // Upgrading a deployment that rotated keys in memory. Those generations are
 // lost — they were never written down — so the migration must land every
 // existing channel somewhere the old counter could never have reached, or the
@@ -1730,7 +1801,8 @@ TEST_F(LiveKitTokenTest, IssuesTokenForPermittedMember) {
 
     auto body = json::parse(res.body);
     EXPECT_EQ(body.value("url", ""), "wss://sfu.test");
-    EXPECT_EQ(body.value("room", ""), VoiceHandler::livekit_room_name("test", room));
+    EXPECT_EQ(body.value("room", ""),
+              VoiceHandler::livekit_room_name("test", room, store->get_voice_key_generation(room)));
     EXPECT_EQ(body.value("identity", ""), "@alice:test");
     EXPECT_EQ(body.value("ttl", int64_t{0}), 600);
     ASSERT_TRUE(body.contains("token"));
@@ -1869,6 +1941,9 @@ TEST_F(LiveKitTokenTest, MalformedBodyIsToleratedAsNoDeviceId) {
 
 // Distinct channels must never share one SFU room, and the mapping must be
 // stable across calls or participants would land in different rooms.
+// Also the guard on rotation-derived room names: without a rotation in
+// between, two members and two requests must agree on one room, or a token
+// refresh would scatter a live call across LiveKit rooms.
 TEST_F(LiveKitTokenTest, SfuRoomNameIsStableAndPerChannel) {
     auto second = add_voice_channel(alice);
 
@@ -1884,11 +1959,15 @@ TEST_F(LiveKitTokenTest, SfuRoomNameIsStableAndPerChannel) {
 }
 
 TEST_F(LiveKitTokenTest, SfuRoomNameIsScopedToTheServerName) {
-    EXPECT_NE(VoiceHandler::livekit_room_name("a.example", "!r:a.example"),
-              VoiceHandler::livekit_room_name("b.example", "!r:a.example"));
-    // And the two fields cannot be confused for one another.
-    EXPECT_NE(VoiceHandler::livekit_room_name("a", "b!c"),
-              VoiceHandler::livekit_room_name("a!b", "c"));
+    EXPECT_NE(VoiceHandler::livekit_room_name("a.example", "!r:a.example", 0),
+              VoiceHandler::livekit_room_name("b.example", "!r:a.example", 0));
+    // And the three fields cannot be confused for one another.
+    EXPECT_NE(VoiceHandler::livekit_room_name("a", "b!c", 0),
+              VoiceHandler::livekit_room_name("a!b", "c", 0));
+    // Including the generation, which is rendered as digits and so would run
+    // into a room id ending in digits under a plain join.
+    EXPECT_NE(VoiceHandler::livekit_room_name("a", "b", 12),
+              VoiceHandler::livekit_room_name("a", "b1", 2));
 }
 
 TEST_F(LiveKitTokenTest, ApiSecretNeverReachesTheClient) {

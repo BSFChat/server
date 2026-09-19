@@ -75,6 +75,13 @@ struct LiveKitConfig {
     // durable: the generation lives in the database (schema v19), not in the
     // handler, so it survives a restart. The one thing that can undo it is
     // restoring a database snapshot taken before it.
+    //
+    // A rotation also moves the channel to a new SFU room, because the room
+    // name is derived from the same generation. That is what retires tokens
+    // already in circulation: they are signed JWTs the server cannot recall,
+    // so instead they are left naming a room nobody is in. It takes effect
+    // per participant at their next token fetch — reconnect, or token_ttl
+    // below — and cannot reach a client that is already connected.
     bool room_encryption = true;
 
     // Key-derivation secret for room keys. Optional: when empty, api_secret
