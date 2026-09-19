@@ -43,6 +43,12 @@ constexpr const char* kRoleAssign = "role.assign";
 
 constexpr const char* kChannelDelete = "channel.delete";
 constexpr const char* kCategoryDelete = "category.delete";
+// A change to what KIND of room this is (bsfchat.room.type): text, voice or
+// category. Recorded because converting a channel into a category changes who
+// may see it — the sidebar exemption in SyncEngine applies to categories — so
+// without a record it is a visibility change disguised as a tidy-up, and the
+// only symptom is an icon changing in the sidebar.
+constexpr const char* kRoomTypeSet = "room.type.set";
 // A per-channel allow/deny override for a role or user
 // (bsfchat.channel.permissions).
 constexpr const char* kChannelPermissionsSet = "channel.permissions.set";
@@ -81,6 +87,13 @@ void audit_nickname_change(SqliteStore& store, const std::string& actor,
 // only names a room id nothing else in the database still mentions.
 void audit_room_deletion(SqliteStore& store, const std::string& actor,
                          const std::string& room_id);
+
+// Records a change to a room's kind (bsfchat.room.type). `before` is the type
+// this write supersedes, or empty for a room that carried no type event.
+// Writes nothing when the type is unchanged, matching the other audit writers.
+void audit_room_type_change(SqliteStore& store, const std::string& actor,
+                            const std::string& room_id, const std::string& before,
+                            const std::string& after);
 
 // Records a per-channel permission override change. `before_json` is the content
 // of the override event this write supersedes (nullopt when the target had none).

@@ -9,15 +9,11 @@
 
 namespace bsfchat {
 
-namespace {
-
 bool is_category_room(SqliteStore& store, const std::string& room_id) {
     auto ev = store.get_state_event(room_id, std::string(event_type::kRoomType), "");
     if (!ev) return false;
     return ev->content.data.value("type", "") == "category";
 }
-
-} // namespace
 
 bool can_view_room(SqliteStore& store, PermissionsEngine& perms,
                    const std::string& user_id, const std::string& room_id) {

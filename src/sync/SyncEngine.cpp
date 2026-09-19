@@ -20,6 +20,72 @@ bool is_category_room(SqliteStore& store, const std::string& room_id) {
     return ev->content.data.value("type", "") == "category";
 }
 
+// How much of a room a user may be shown. Three answers, not two, because a
+// category is genuinely a third case and collapsing it into `true` is what
+// made it a hole: `is_category_room(...) || perms.can(..., kViewChannel)`
+// exempted a category from VIEW_CHANNEL ENTIRELY, so its full state, member
+// list and timeline went to every joined user regardless of any deny override.
+// Every account is force-joined into every channel on this data model (see
+// auth/AutoJoin.cpp and the membership-vs-visibility audit), so "joined" is
+// not a filter, and one MANAGE_CHANNELS write retyping a private channel as a
+// category published its history to the whole server.
+//
+// `kCategoryStub` is the exemption the sidebar actually needs, and nothing
+// more. /messages and /search never carried the exemption at all, which is the
+// tell that the blanket version was an accident rather than a policy.
+enum class RoomView {
+    kNone,          // not shown at all
+    kCategoryStub,  // named and ordered in the sidebar; no contents
+    kFull,          // ordinary VIEW_CHANNEL access
+};
+
+// The only state a category contributes to a viewer without VIEW_CHANNEL.
+//
+// Derived from what the client actually consumes for a category node, not from
+// what seemed safe: RoomListModel::getCategoriesWithChannels() reads exactly
+// roomId, displayName, roomType and sortOrder, which come from m.room.name,
+// bsfchat.room.type and bsfchat.room.category (parent_id + order). It reads no
+// topic, no members, no timeline and no unread counts for a category header,
+// so none of those are sent. Adding a type here widens the exemption — do it
+// only with a client change that needs it.
+bool is_category_stub_state(const RoomEvent& event) {
+    if (!event.state_key.has_value() || !event.state_key->empty()) return false;
+    return event.type == event_type::kRoomName ||
+           event.type == event_type::kRoomType ||
+           event.type == event_type::kRoomCategory;
+}
+
+RoomView room_view(SqliteStore& store, PermissionsEngine& perms, const std::string& user_id,
+                   const std::string& room_id) {
+    if (perms.can(user_id, room_id, permission::kViewChannel)) return RoomView::kFull;
+    // A category the user cannot view is still named to them: the sidebar has
+    // to render the container node even when every channel inside it is
+    // hidden, and a category that vanished would re-file its visible children
+    // under "Uncategorized".
+    //
+    // Judgement call recorded deliberately: the stub is emitted whether or not
+    // the user can see any child. Making it conditional would need a
+    // VIEW_CHANNEL evaluation per child, which build_incremental_sync — which
+    // walks events, not rooms — cannot do without a full room walk on every
+    // poll. The two sync paths would then disagree and the node would flicker
+    // in and out of the sidebar. What the stub discloses is a name and a sort
+    // order; the history, roster and state that made this a HIGH finding are
+    // gone either way.
+    if (is_category_room(store, room_id)) return RoomView::kCategoryStub;
+    return RoomView::kNone;
+}
+
+// The sidebar node, and only the sidebar node. No timeline, so no prev_batch
+// and no `limited`; no member list; no unread or highlight counts (a count is
+// a message-volume oracle on a channel you cannot read).
+JoinedRoom category_stub(SqliteStore& store, const std::string& room_id) {
+    JoinedRoom stub;
+    for (auto& event : store.get_state_events(room_id)) {
+        if (is_category_stub_state(event)) stub.state.events.push_back(std::move(event));
+    }
+    return stub;
+}
+
 // m.direct for `user_id`, derived from rooms.is_direct. It is a full
 // replacement by Matrix convention, so it always lists every DM, never a delta
 // — which is what makes restating it on a delivered response harmless.
@@ -243,11 +309,18 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
 
     // Stands in for an event committing while the walk below is in progress.
     if (post_scan_hook_for_test_) post_scan_hook_for_test_();
+    // Rooms present in the response as a sidebar node only. Tracked so the
+    // counts pass below skips them: it walks response.rooms.join, so a stub
+    // left in that map would be handed an unread and a highlight count for a
+    // channel its viewer is not allowed to read.
+    std::set<std::string> stubbed;
+
     for (const auto& room_id : rooms) {
-        // Categories bypass VIEW_CHANNEL so the sidebar can still show the
-        // container node even when individual child channels are hidden.
-        if (!is_category_room(store_, room_id) &&
-            !perms.can(user_id, room_id, permission::kViewChannel)) {
+        const RoomView view = room_view(store_, perms, user_id, room_id);
+        if (view == RoomView::kNone) continue;
+        if (view == RoomView::kCategoryStub) {
+            response.rooms.join[room_id] = category_stub(store_, room_id);
+            stubbed.insert(room_id);
             continue;
         }
 
@@ -284,6 +357,7 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
     // single global mutex, and an initial sync visits every joined channel.
     auto mentions = store_.get_unread_mention_counts(user_id);
     for (auto& [room_id, joined] : response.rooms.join) {
+        if (stubbed.count(room_id)) continue;
         joined.unread_count = store_.count_unread(user_id, room_id);
         auto it = mentions.find(room_id);
         joined.highlight_count = it == mentions.end() ? 0 : it->second;
@@ -335,20 +409,33 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
     }
 
     std::set<std::string> newly_joined_rooms;
-    // Cache VIEW_CHANNEL decisions so we don't recompute for every event in
+    // Cache visibility decisions so we don't recompute for every event in
     // the same room (hot path during bursts).
-    std::unordered_map<std::string, bool> view_cache;
-    auto can_view = [&](const std::string& room_id) -> bool {
+    std::unordered_map<std::string, RoomView> view_cache;
+    auto view_of = [&](const std::string& room_id) -> RoomView {
         auto it = view_cache.find(room_id);
         if (it != view_cache.end()) return it->second;
-        bool ok = is_category_room(store_, room_id) ||
-                  perms.can(user_id, room_id, permission::kViewChannel);
-        view_cache.emplace(room_id, ok);
-        return ok;
+        RoomView view = room_view(store_, perms, user_id, room_id);
+        view_cache.emplace(room_id, view);
+        return view;
     };
 
     for (auto& event : events) {
-        if (!can_view(event.room_id)) continue;
+        const RoomView view = view_of(event.room_id);
+        if (view == RoomView::kNone) continue;
+
+        if (view == RoomView::kCategoryStub) {
+            // Name and ordering changes keep the sidebar node correct. Nothing
+            // else: in particular the event never reaches `timeline`, so a
+            // message sent into a category — which EventHandler permits, it
+            // has no notion of categories at all — is not delivered to anyone
+            // who lacks VIEW_CHANNEL on it. That is the incremental half of
+            // the same rule build_initial_sync applies with category_stub().
+            if (!is_category_stub_state(event)) continue;
+            auto& joined = response.rooms.join[event.room_id];
+            joined.state.events.push_back(std::move(event));
+            continue;
+        }
 
         if (event.type == std::string(event_type::kRoomMember)
             && event.state_key.has_value()
@@ -368,7 +455,11 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
 
     bool joined_direct_room = false;
     for (const auto& room_id : newly_joined_rooms) {
-        if (!can_view(room_id)) continue;
+        // Re-checked rather than assumed: only kFull gets the whole state
+        // dump. `newly_joined_rooms` is only populated on the kFull path, so
+        // this cannot currently be a stub — the guard is here so that stays
+        // true if the population above ever moves.
+        if (view_of(room_id) != RoomView::kFull) continue;
         auto state = store_.get_state_events(room_id);
         auto& joined = response.rooms.join[room_id];
         joined.state.events = std::move(state);
@@ -380,6 +471,8 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
 
     auto mentions = store_.get_unread_mention_counts(user_id);
     for (auto& [room_id, joined] : response.rooms.join) {
+        // A sidebar stub carries no counts — see category_stub().
+        if (view_of(room_id) != RoomView::kFull) continue;
         joined.unread_count = store_.count_unread(user_id, room_id);
         auto it = mentions.find(room_id);
         joined.highlight_count = it == mentions.end() ? 0 : it->second;

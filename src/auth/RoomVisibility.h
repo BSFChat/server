@@ -41,6 +41,14 @@ class PermissionsEngine;
 // only kViewChannel, and it should be asked directly, as the voice and typing
 // handlers do. Granting a category the benefit of the doubt in a sidebar is
 // right; granting it to a request that acts is how an exemption becomes a hole.
+// Is this room a category (a sidebar container) rather than a channel?
+//
+// Exposed rather than restated per call site: it was hand-rolled in three
+// places before, and the conversion gate in handle_set_state, the parent check
+// in handle_move_channel and the listing exemption below must agree about what
+// a category is or the gate protects a different set than the exemption opens.
+bool is_category_room(SqliteStore& store, const std::string& room_id);
+
 bool can_view_room(SqliteStore& store, PermissionsEngine& perms,
                    const std::string& user_id, const std::string& room_id);
 

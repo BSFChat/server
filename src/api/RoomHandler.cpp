@@ -68,13 +68,31 @@ bool refuse_on_direct_room(SqliteStore& store, httplib::Response& res,
 // Membership alone is NOT authorization here: everyone is force-joined into
 // every public room, so a user whose VIEW_CHANNEL was explicitly denied for a
 // channel was still a joined member and could read its name, topic and full
-// member list. Categories bypass the check to match SyncEngine, which lets the
-// sidebar render the container node even when its children are hidden.
+// member list.
+//
+// There is NO category exemption here, and there deliberately is one in
+// SyncEngine. The exemption exists to let the sidebar draw a container node,
+// which /sync serves as a three-event stub (name, type, ordering). These three
+// endpoints — GET /rooms/{id}/state, /state/{type} and /members — answer with
+// the room's WHOLE state and its complete member list, which is not a sidebar
+// requirement and is not something a stub can express. The client never calls
+// them for a node it cannot open, so they simply refuse. Reinstating the
+// exemption here would hand back everything /sync stopped disclosing.
 bool can_read_room(SqliteStore& store, const Config& config,
                    const std::string& user_id, const std::string& room_id) {
     if (!store.is_room_member(room_id, user_id)) return false;
     PermissionsEngine perms(store, config);
-    return can_view_room(store, perms, user_id, room_id);
+    // NOT can_view_room(): that one is the LISTING rule and deliberately exempts
+    // categories so the sidebar can render a container whose children are all
+    // hidden. This is the READING rule, and the comment above spells out why the
+    // two must differ — /state, /state/{type} and /members answer with whole
+    // state and whole member lists, which a category stub cannot express and
+    // which the exemption would hand back wholesale.
+    //
+    // Merging the joined-rooms-leak and category-visibility branches wired this
+    // to can_view_room and silently restored the bypass; CategoryVisibility
+    // .StateAndMembersRefuseOnAHiddenCategory is what caught it. Keep them apart.
+    return perms.can(user_id, room_id, permission::kViewChannel);
 }
 
 // What a membership transition IS, and therefore what gates it.
@@ -1275,6 +1293,23 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         evt_type == std::string(event_type::kServerRoles) ||
         evt_type == std::string(event_type::kMemberRoles);
 
+    // Changing an existing room's KIND is an act on the server's channel tree,
+    // not an edit inside one channel, and it is the lever that made the
+    // category exemption a privilege escalation: at room scope, an allow
+    // override on a single channel — the natural way to give someone their own
+    // channel — was enough to retype any channel as a category and inherit the
+    // exemption. `may_edit_role_definitions` already states the principle for
+    // MANAGE_ROLES ("must not be a one-request path to owning the server"); it
+    // is the same sentence about MANAGE_CHANNELS and reading every channel.
+    //
+    // Only the permission SCOPE moves. Unlike the two types above, the event
+    // still belongs to the room and is still written as ordinary room state,
+    // which is why this is a separate flag and not folded into
+    // `is_server_scoped`. Room CREATION is unaffected: handle_create_room
+    // writes the initial type itself, behind its own server-scope
+    // MANAGE_CHANNELS check, on a room that is empty by construction.
+    const bool is_room_type_change = evt_type == std::string(event_type::kRoomType);
+
     // Moderation-by-membership-write. This route will happily set another user's
     // m.room.member to "ban", which makes it a second route to the same act as
     // POST /rooms/{id}/ban — and Matrix clients legitimately use it, so it cannot
@@ -1307,7 +1342,8 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     PermissionsEngine perms(store_, config_);
     // `is_server_scoped` also decides WHERE the write lands (server_state vs room
     // state), which is why it is not folded into the scope expression below.
-    const std::string perm_scope = is_server_scoped ? kServerScope : room_id;
+    const std::string perm_scope =
+        (is_server_scoped || is_room_type_change) ? kServerScope : room_id;
 
     json content;
     try {
@@ -1388,6 +1424,75 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         res.status = 403;
         res.set_content(MatrixError::forbidden("Insufficient permissions for this state event").to_json().dump(), "application/json");
         return;
+    }
+
+    // ── bsfchat.room.type: the conversion gate ────────────────────────────
+    //
+    // Retyping an existing channel as a category used to be a silent,
+    // reversible, one-request publication of that channel: membership rows
+    // survive the change (everyone is force-joined into every channel), so the
+    // room simply reappeared in every user's /sync with the exemption applied.
+    // Narrowing the exemption — see SyncEngine's room_view() — bounds the
+    // damage to a name and a sort order. This bounds the act itself.
+    //
+    // Three rules, deliberately overlapping, because each fails differently:
+    // the scope check above stops a per-channel grant being a server-wide
+    // lever, the refusals below stop the conversion being a disclosure at all,
+    // and the audit record below stops it being silent even when it is allowed.
+    std::string previous_room_type;
+    if (is_room_type_change) {
+        auto existing = store_.get_state_event(room_id, evt_type, state_key);
+        previous_room_type = existing ? existing->content.data.value("type", "") : "";
+        const std::string new_room_type = content.value("type", "");
+
+        // You may not restructure a channel you are not allowed to open. A
+        // server-wide MANAGE_CHANNELS holder is a builder, not an
+        // administrator, and a channel that denies them VIEW_CHANNEL is a
+        // channel they have been told is not theirs. (Administrators
+        // short-circuit every flag, as everywhere.)
+        if (!perms.can(*user_id, room_id, permission::kViewChannel)) {
+            res.status = 403;
+            res.set_content(MatrixError::forbidden(
+                "No access to this channel").to_json().dump(), "application/json");
+            return;
+        }
+
+        if (new_room_type == "category" && previous_room_type != "category") {
+            // A category is a container, so an empty room can become one
+            // freely. A room with a conversation in it is a channel, and
+            // turning a channel into a container is not a reorganisation —
+            // it is a decision about who may read that conversation, taken
+            // through a request that says nothing about reading. The operator
+            // who genuinely wants this deletes the channel or moves the
+            // messages; there is no honest one-click version.
+            if (store_.room_has_messages(room_id)) {
+                res.status = 403;
+                res.set_content(MatrixError::forbidden(
+                    "A channel with message history cannot be converted into a category")
+                        .to_json().dump(), "application/json");
+                return;
+            }
+            // And the override case, which is the one the audits actually
+            // exploited: a room that denies VIEW_CHANNEL to anyone is a room
+            // whose visibility somebody configured on purpose. Converting it
+            // would hand that decision to a rule about sidebars. Refuse even
+            // when the room is empty — the override outlives the emptiness.
+            for (const auto& ev : store_.get_state_events(room_id)) {
+                if (ev.type != event_type::kChannelPermissions) continue;
+                ChannelPermissionOverride override;
+                try {
+                    from_json(ev.content.data, override);
+                } catch (const std::exception&) {
+                    continue;
+                }
+                if (!permission::has(override.deny, permission::kViewChannel)) continue;
+                res.status = 403;
+                res.set_content(MatrixError::forbidden(
+                    "A channel with a VIEW_CHANNEL restriction cannot be converted into a "
+                    "category").to_json().dump(), "application/json");
+                return;
+            }
+        }
     }
 
     if (is_server_scoped) {
@@ -1472,6 +1577,15 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         audit_channel_override_change(store_, *user_id, room_id, state_key, previous_state,
                                       content.dump());
     }
+    if (is_room_type_change) {
+        // Recorded in BOTH directions. Category → channel is the tightening
+        // half, but it is also the second step of the attack the audits
+        // described: convert, read the sync, convert back. A record of only
+        // the outbound leg would leave the log showing a channel that had
+        // always been a channel.
+        audit_room_type_change(store_, *user_id, room_id, previous_room_type,
+                               content.value("type", ""));
+    }
 
     res.set_content(json{{"event_id", event_id}}.dump(), "application/json");
 }
@@ -1543,9 +1657,11 @@ void RoomHandler::handle_move_channel(const httplib::Request& req, httplib::Resp
         return;
     }
 
-    // Validate parent is a category type
-    auto type_event = store_.get_state_event(parent_id, std::string(event_type::kRoomType), "");
-    if (!type_event || type_event->content.data.value("type", "") != "category") {
+    // Validate parent is a category type. Through the shared predicate, so the
+    // one definition of "is a category" governs both this and the conversion
+    // gate in handle_set_state — a second hand-rolled copy of the same test is
+    // how the two would drift.
+    if (!is_category_room(store_, parent_id)) {
         res.status = 400;
         res.set_content(MatrixError::bad_json("Parent room is not a category").to_json().dump(), "application/json");
         return;

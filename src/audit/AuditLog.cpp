@@ -279,6 +279,29 @@ void audit_room_deletion(SqliteStore& store, const std::string& actor,
     store.append_audit_record(record);
 }
 
+void audit_room_type_change(SqliteStore& store, const std::string& actor,
+                            const std::string& room_id, const std::string& before,
+                            const std::string& after) {
+    if (before == after) return;
+
+    std::string name;
+    if (auto name_content = room_state_content(store, room_id, event_type::kRoomName)) {
+        name = name_content->value("name", "");
+    }
+
+    SqliteStore::AuditRecord record;
+    record.actor = actor;
+    record.action = audit_action::kRoomTypeSet;
+    record.target_room = room_id;
+    // The name rides along on both sides: an operator reading this back wants
+    // "#staff-only became a category", not a room id. It is the same reasoning
+    // as audit_room_deletion, for the same reason — by the time anyone reads
+    // the record the room may have been renamed or deleted.
+    record.before_json = json{{"type", before}, {"name", name}}.dump();
+    record.after_json = json{{"type", after}, {"name", name}}.dump();
+    store.append_audit_record(record);
+}
+
 void audit_channel_override_change(SqliteStore& store, const std::string& actor,
                                    const std::string& room_id, const std::string& state_key,
                                    const std::optional<std::string>& before_json,
