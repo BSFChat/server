@@ -2,9 +2,11 @@
 #include "store/CallSignalling.h"
 #include "auth/LocalAuth.h"
 #include "core/Logger.h"
+#include "identity/Localpart.h"
 #include "store/Migrations.h"
 
 #include <bsfchat/Constants.h>
+#include <bsfchat/Identifiers.h>
 
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -292,11 +294,63 @@ void SqliteStore::initialize() {
 // Users
 
 bool SqliteStore::create_user(const std::string& user_id, const std::string& password_hash) {
+    // The skeleton is derived HERE rather than passed in, so that no caller can
+    // create an account that is invisible to the lookalike check by forgetting
+    // to compute one. A row with a stale or empty skeleton is not a cosmetic
+    // defect: it is an account nobody can be warned about.
+    //
+    // A user id that will not parse falls back to folding the whole string. It
+    // cannot then collide with a real localpart's skeleton — `@` and `:` are
+    // outside the registration charset — which is the right failure: unparseable
+    // in, unmatchable out.
+    auto parsed = UserId::parse(user_id);
+    const std::string skeleton = localpart_skeleton(parsed ? parsed->localpart : user_id);
+
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "INSERT OR IGNORE INTO users (user_id, password_hash) VALUES (?, ?)");
+    auto stmt = prepare(db_, "INSERT OR IGNORE INTO users (user_id, password_hash, "
+                             "localpart_skeleton) VALUES (?, ?, ?)");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, password_hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, skeleton.c_str(), -1, SQLITE_TRANSIENT);
     return sqlite3_step(stmt.get()) == SQLITE_DONE && sqlite3_changes(db_) > 0;
+}
+
+std::optional<std::string>
+SqliteStore::find_user_by_localpart_skeleton(const std::string& skeleton) {
+    // An empty skeleton would match every row the column's default left behind,
+    // so it is never a question worth asking. handle_register refuses a
+    // username that folds to nothing before it gets here.
+    if (skeleton.empty()) return std::nullopt;
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT user_id FROM users WHERE localpart_skeleton = ? LIMIT 1");
+    sqlite3_bind_text(stmt.get(), 1, skeleton.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        return column_text_or_empty(stmt.get(), 0);
+    }
+    return std::nullopt;
+}
+
+SqliteStore::SkeletonCollisions SqliteStore::count_localpart_skeleton_collisions() {
+    std::lock_guard lock(mutex_);
+    SkeletonCollisions out;
+    {
+        auto stmt = prepare(db_,
+            "SELECT COUNT(*) FROM (SELECT 1 FROM users WHERE localpart_skeleton <> '' "
+            "                       GROUP BY localpart_skeleton HAVING COUNT(*) > 1)");
+        if (sqlite3_step(stmt.get()) == SQLITE_ROW) out.groups = sqlite3_column_int(stmt.get(), 0);
+    }
+    {
+        auto stmt = prepare(db_,
+            "SELECT COUNT(*) FROM users WHERE localpart_skeleton <> '' "
+            "   AND localpart_skeleton IN (SELECT localpart_skeleton FROM users "
+            "                               WHERE localpart_skeleton <> '' "
+            "                               GROUP BY localpart_skeleton HAVING COUNT(*) > 1)");
+        if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+            out.accounts = sqlite3_column_int(stmt.get(), 0);
+        }
+    }
+    return out;
 }
 
 void SqliteStore::update_password_hash(const std::string& user_id, const std::string& password_hash) {

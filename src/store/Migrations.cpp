@@ -1,9 +1,11 @@
 #include "store/Migrations.h"
 #include "auth/LocalAuth.h"
 #include "core/Logger.h"
+#include "identity/Localpart.h"
 #include "store/CallSignalling.h"
 
 #include <bsfchat/Constants.h>
+#include <bsfchat/Identifiers.h>
 
 #include <nlohmann/json.hpp>
 
@@ -1175,6 +1177,86 @@ void migrate_v19(sqlite3* db, bool /*fresh_database*/) {
                        "no longer appends a second redaction event");
 }
 
+void migrate_v20(sqlite3* db, bool /*fresh_database*/) {
+    // Lookalike-username policy: store each account's confusable SKELETON so a
+    // new registration can be checked against it. See identity/Localpart.h for
+    // what the folding does and why it is a five-rule ASCII table rather than
+    // the Unicode confusables data.
+    if (!column_exists(db, "users", "localpart_skeleton")) {
+        exec(db, "ALTER TABLE users ADD COLUMN localpart_skeleton TEXT NOT NULL DEFAULT ''");
+    }
+
+    // NOT a unique index, and that is the whole upgrade story. Accounts created
+    // before this rule existed may well collide under it — two people who
+    // registered `josh` and `j0sh` in 2026 both did nothing wrong — and a
+    // UNIQUE index would refuse to build, taking the server down on upgrade.
+    // Worse, anything that enforced uniqueness on existing rows would have to
+    // resolve the collision by evicting somebody. The rule is applied at
+    // registration and nowhere else; nobody is ever locked out of an account
+    // they already have.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_users_localpart_skeleton "
+             "ON users(localpart_skeleton)");
+
+    // The backfill has to run here in C++ rather than as an UPDATE: the folding
+    // includes `rn`/`m` and `vv`/`w`, which SQLite's string functions cannot
+    // express without a tower of nested replace() calls that would then be a
+    // second, divergent copy of the rule.
+    std::vector<std::pair<std::string, std::string>> rows; // user_id, skeleton
+    {
+        auto sel = prepare(db, "SELECT user_id FROM users");
+        while (sqlite3_step(sel.get()) == SQLITE_ROW) {
+            const auto* text = sqlite3_column_text(sel.get(), 0);
+            std::string user_id = text ? reinterpret_cast<const char*>(text) : "";
+            auto parsed = UserId::parse(user_id);
+            rows.emplace_back(user_id,
+                              localpart_skeleton(parsed ? parsed->localpart : user_id));
+        }
+    }
+    {
+        auto upd = prepare(db, "UPDATE users SET localpart_skeleton = ? WHERE user_id = ?");
+        for (const auto& [user_id, skeleton] : rows) {
+            sqlite3_reset(upd.get());
+            sqlite3_bind_text(upd.get(), 1, skeleton.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(upd.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(upd.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("localpart skeleton backfill failed: ") +
+                                         sqlite3_errmsg(db));
+            }
+        }
+    }
+
+    // What the rule would have cost if it had always been in force. This is the
+    // number an operator needs in order to know whether their server already
+    // contains an impersonation they have not noticed, and it is reported
+    // rather than acted on for the reason above.
+    //
+    // An empty skeleton (a localpart of nothing but separators) is excluded: it
+    // is also the column's default, so counting it would turn any future row
+    // that failed to write a skeleton into a phantom collision.
+    const char* kCollidingGroups =
+        "SELECT COUNT(*) FROM (SELECT 1 FROM users WHERE localpart_skeleton <> '' "
+        "                       GROUP BY localpart_skeleton HAVING COUNT(*) > 1)";
+    const char* kCollidingAccounts =
+        "SELECT COUNT(*) FROM users WHERE localpart_skeleton <> '' "
+        "   AND localpart_skeleton IN (SELECT localpart_skeleton FROM users "
+        "                               WHERE localpart_skeleton <> '' "
+        "                               GROUP BY localpart_skeleton HAVING COUNT(*) > 1)";
+    const int groups = scalar_int(db, kCollidingGroups);
+    const int accounts = scalar_int(db, kCollidingAccounts);
+
+    if (groups > 0) {
+        get_logger()->warn(
+            "Schema v20: {} existing account(s) in {} lookalike group(s) would collide under "
+            "the new registration policy. They are untouched and can still sign in — the rule "
+            "applies to NEW registrations only. Review them if impersonation is a concern.",
+            accounts, groups);
+    } else {
+        get_logger()->info(
+            "Schema v20: usernames are now checked against a confusable skeleton at "
+            "registration; no existing account collides under it");
+    }
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1198,6 +1280,7 @@ const std::vector<Step>& steps() {
         migrate_v17,
         migrate_v18,
         migrate_v19,
+        migrate_v20,
     };
     return kMigrations;
 }

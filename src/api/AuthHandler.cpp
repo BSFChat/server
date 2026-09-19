@@ -7,6 +7,7 @@
 #include "core/Logger.h"
 #include "core/Version.h"
 #include "http/Middleware.h"
+#include "identity/Localpart.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
 
@@ -353,6 +354,25 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
         // Create user if they don't exist (OIDC-only user with empty password hash)
         bool newly_created = !store_.user_exists(user_id);
         if (newly_created) {
+            // The lookalike rule is NOT applied here, and must never be. This
+            // is a login: the identity provider has already said who this is,
+            // and refusing to create their account — or, once created, refusing
+            // to let them back in — because the name resembles a local one
+            // would lock a legitimate user out of a server on the strength of a
+            // heuristic. Local registration refuses the `oidc_` prefix outright
+            // and refuses any name colliding with an account that already
+            // exists, which is where this is defended. If one slipped in before
+            // the rule existed, say so once, loudly, so an operator can act.
+            //
+            // Asked BEFORE create_user, so the row about to be inserted cannot
+            // be the one the lookup finds and hide a real twin behind itself.
+            auto parsed = UserId::parse(user_id);
+            if (auto twin = store_.find_user_by_localpart_skeleton(
+                    localpart_skeleton(parsed ? parsed->localpart : user_id))) {
+                get_logger()->warn("Identity account {} resembles existing account {}; "
+                                   "creating it anyway, because refusing a login is worse "
+                                   "than the resemblance", user_id, *twin);
+            }
             store_.create_user(user_id, ""); // empty hash — cannot log in with password
         }
 
@@ -469,11 +489,38 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
         return;
     }
 
+    // The confusable skeleton of the requested name, used twice below: once
+    // against the reserved names and once against every existing account.
+    // identity/Localpart.h says what the folding is and why it is small.
+    const std::string skeleton = localpart_skeleton(username);
+    if (skeleton.empty()) {
+        // Nothing but separators. Refused so that "" stays a value no CANDIDATE
+        // ever has — it is also the column's default, and a candidate that
+        // folds to nothing would otherwise be compared against every row that
+        // had never been backfilled.
+        res.status = 400;
+        res.set_content(MatrixError::invalid_username(
+            "Username must contain at least one letter or digit").to_json().dump(),
+            "application/json");
+        return;
+    }
+
     // "server" is the synthetic actor PermissionsEngine grants ADMINISTRATOR
     // to unconditionally (@server:<server_name>), so registering it would hand
     // that account god mode. "oidc_*" is the namespace identity logins map
     // into, so a local account must not be able to squat an identity user.
-    if (username == "server" || username.rfind("oidc_", 0) == 0) {
+    //
+    // The word is matched on its SKELETON, so `serv.er` and `s0erver` are
+    // reserved too — a reservation that only covered the literal spelling was
+    // a reservation of one spelling out of many that read the same.
+    //
+    // The PREFIX deliberately stays a literal match. Comparing prefixes under
+    // the skeleton would fold `oidc_` to `oldc` (separators go) and then refuse
+    // every innocent name beginning with those four letters — `oldcoolguy`
+    // among them. The case that actually matters, squatting a name that looks
+    // like a REAL identity account, is caught below by the collision check
+    // against existing users, which sees `oidc_josh` and refuses `o1dc_josh`.
+    if (skeleton == localpart_skeleton("server") || username.rfind("oidc_", 0) == 0) {
         res.status = 400;
         res.set_content(MatrixError::invalid_username("That username is reserved").to_json().dump(),
                         "application/json");
@@ -514,6 +561,31 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
     if (store_.user_exists(user_id)) {
         res.status = 400;
         res.set_content(MatrixError::user_in_use().to_json().dump(), "application/json");
+        return;
+    }
+
+    // Lookalike accounts. `@josh` and `@j0sh` are different accounts that read
+    // the same in a member list, which is an impersonation primitive that costs
+    // an attacker one keystroke. Refused at the point the name is chosen.
+    //
+    // Checked AFTER user_exists so an exactly-taken name still answers
+    // M_USER_IN_USE: the skeleton check would also fire on it, and "that name
+    // is taken" is the true and more useful of the two answers.
+    //
+    // This leaks no more than the line above it already does. Probing `j0sh` to
+    // learn that `josh` exists tells an enumerator nothing they could not learn
+    // by probing `josh`, and the per-address attempt limiter at the top of this
+    // handler counts both. The message deliberately does not NAME the account
+    // it resembles — the user does not need it to pick another name, and there
+    // is no reason to volunteer which account someone was trying to imitate.
+    if (auto lookalike = store_.find_user_by_localpart_skeleton(skeleton)) {
+        get_logger()->info("Refused registration of {}: too similar to existing account {}",
+                           user_id, *lookalike);
+        res.status = 400;
+        res.set_content(MatrixError::invalid_username(
+            "That username is too similar to an existing account. Choose one that differs "
+            "by more than punctuation or lookalike characters.").to_json().dump(),
+            "application/json");
         return;
     }
 

@@ -202,9 +202,10 @@ TEST(MigrationV11, PreExistingV8DatabaseUpgradesAndKeepsItsData) {
     // stored call signalling that used to publish everyone's IP addresses;
     // 17 -> 18 stamped is_direct into the membership state of DMs that predate
     // the server writing it; 18 -> 19 added redaction_transactions, so a
-    // retried /redact stops appending a second tombstone. A v8 database still
-    // upgrades all the way in one go.
-    EXPECT_EQ(kTargetSchemaVersion, 19);
+    // retried /redact stops appending a second tombstone; 19 -> 20 added
+    // users.localpart_skeleton and backfilled it for the lookalike-username
+    // policy. A v8 database still upgrades all the way in one go.
+    EXPECT_EQ(kTargetSchemaVersion, 20);
     std::filesystem::remove(path);
 }
 

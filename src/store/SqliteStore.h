@@ -49,6 +49,25 @@ public:
     // generated with a weaker cost factor at the next successful login).
     void update_password_hash(const std::string& user_id, const std::string& password_hash);
     bool user_exists(const std::string& user_id);
+
+    // Lookalike-username policy. The user id of an account whose localpart
+    // folds to the same confusable skeleton (identity/Localpart.h), or nullopt.
+    //
+    // Registration consults this; login never does. The rule is enforced at the
+    // point a name is CHOSEN, because an account that already exists under a
+    // colliding name predates the rule and refusing its owner a login would be
+    // a far worse outcome than the impersonation the rule prevents.
+    std::optional<std::string> find_user_by_localpart_skeleton(const std::string& skeleton);
+
+    // How many existing accounts would collide if the rule were applied
+    // retroactively, and how many distinct lookalike groups they form. Reported
+    // by the v20 migration so an operator can see what their server already
+    // contains; never acted on.
+    struct SkeletonCollisions {
+        int groups = 0;
+        int accounts = 0;
+    };
+    SkeletonCollisions count_localpart_skeleton_collisions();
     bool username_exists(const std::string& localpart);
 
     // Access tokens
