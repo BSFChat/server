@@ -125,12 +125,12 @@ jfield() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get(sy
 
 register() {
   curl -s -o "$WORK/last-body.json" -X POST "${BASE}/register" -H 'Content-Type: application/json' \
-    -d "{\"username\":\"$1\",\"password\":\"pw-$1-12345\",\"auth\":{\"type\":\"m.login.dummy\"}}" >/dev/null
+    -d "{\"username\":\"$1\",\"password\":\"e2e-invites-pw-7Kq2\",\"auth\":{\"type\":\"m.login.dummy\"}}" >/dev/null
   jfield access_token
 }
 login() {
   curl -s -o "$WORK/last-body.json" -X POST "${BASE}/login" -H 'Content-Type: application/json' \
-    -d "{\"type\":\"m.login.password\",\"identifier\":{\"type\":\"m.id.user\",\"user\":\"$1\"},\"password\":\"pw-$1-12345\"}" >/dev/null
+    -d "{\"type\":\"m.login.password\",\"identifier\":{\"type\":\"m.id.user\",\"user\":\"$1\"},\"password\":\"e2e-invites-pw-7Kq2\"}" >/dev/null
   jfield access_token
 }
 create_private_room() { # create_private_room TOKEN NAME -> room id

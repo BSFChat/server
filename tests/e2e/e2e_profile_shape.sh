@@ -119,7 +119,7 @@ register() {
     local user=$1
     local out
     out=$(api POST /_matrix/client/v3/register "" \
-        "{\"username\":\"$user\",\"password\":\"password123\",\"auth\":{\"type\":\"m.login.dummy\"}}")
+        "{\"username\":\"$user\",\"password\":\"e2e-profile-pw-7Kq2\",\"auth\":{\"type\":\"m.login.dummy\"}}")
     [ "$(status "$out")" = "200" ] || { echo "$out" >&2; fail "register $user failed"; }
     body "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
 }
@@ -189,12 +189,23 @@ RAW=$(body "$OUT")
 assert_object "GET avatar_url (unset)" "$RAW"
 pass "GET avatar_url with none set is an object, not null"
 
-# 3. Unauthenticated reads are the same shape — the profile endpoints are
-#    public, and an anonymous client is exactly the one with no fallback.
+# 3. Unauthenticated reads are REFUSED.
+#
+#    This assertion is inverted from how it was first written. The endpoints
+#    were public when this script landed, and that was the bug: all four GET
+#    handlers never called authenticate(), so anyone who could reach the port
+#    could walk the account namespace (404 vs 200) and harvest display names,
+#    avatars and nicknames, unthrottled. fix/profile-auth closed it.
+#
+#    The shape guarantee this file exists for is unchanged and still checked
+#    above, with a token. What changed is who may ask.
 OUT=$(api GET "/_matrix/client/v3/profile/$ALICE_ENC" "")
-[ "$(status "$OUT")" = "200" ] || { echo "$OUT"; fail "unauthenticated GET profile returned $(status "$OUT")"; }
-assert_object "GET profile (unauthenticated)" "$(body "$OUT")"
-pass "unauthenticated GET profile is an object too"
+[ "$(status "$OUT")" = "401" ] || { echo "$OUT"; fail "unauthenticated GET profile returned $(status "$OUT"), expected 401"; }
+case "$(body "$OUT")" in
+    *M_MISSING_TOKEN*) ;;
+    *) echo "$OUT"; fail "no token supplied should be M_MISSING_TOKEN, not $(body "$OUT")" ;;
+esac
+pass "unauthenticated GET profile is refused with M_MISSING_TOKEN"
 
 # 4. Setting a field still populates it — the fix must not have flattened the
 #    response to a permanent {}.

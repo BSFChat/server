@@ -1514,7 +1514,7 @@ void migrate_v25(sqlite3* db, bool /*fresh_database*/) {
              "ON event_transactions(event_id)");
 
     get_logger()->info(
-        "Schema v20: transaction ids are now scoped per (user, device, room); previous "
+        "Schema v25: transaction ids are now scoped per (user, device, room); previous "
         "retry-dedup records dropped");
 }
 
@@ -1566,7 +1566,7 @@ void migrate_v26(sqlite3* db, bool /*fresh_database*/) {
     // weight. Like event_transactions, these rows simply accumulate — one short
     // row per redaction, on an endpoint a rate limiter already bounds.
 
-    get_logger()->info("Schema v19: /redact now records its transaction ids, so a retry "
+    get_logger()->info("Schema v26: /redact now records its transaction ids, so a retry "
                        "no longer appends a second redaction event");
 }
 
@@ -1645,7 +1645,7 @@ void migrate_v27(sqlite3* db, bool /*fresh_database*/) {
             accounts, groups);
     } else {
         get_logger()->info(
-            "Schema v20: usernames are now checked against a confusable skeleton at "
+            "Schema v27: usernames are now checked against a confusable skeleton at "
             "registration; no existing account collides under it");
     }
 }
