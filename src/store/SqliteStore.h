@@ -25,6 +25,18 @@ namespace bsfchat {
 // `auth.access_token_lifetime_days`.
 inline constexpr int64_t kDefaultAccessTokenLifetimeMs = 90LL * 24 * 60 * 60 * 1000;
 
+// How stale a bot token's `last_used_at` is allowed to get before a request
+// refreshes it.
+//
+// A bot token never expires and therefore never slides, so the expiry-renewal
+// write that keeps `last_used_at` current for a human session never fires for
+// one. Without a timer of its own, a bot's "last seen" would read as never, and
+// the question it answers — which of these integrations is still alive, and
+// which has been dead for months — has no other source. A minute is far finer
+// than anyone inspecting a bot list needs, and coarse enough that a bot making
+// hundreds of requests a second costs one write, not hundreds.
+inline constexpr int64_t kBotLastSeenIntervalMs = 60LL * 1000;
+
 // Sentinel "user id" a room-wide (`@room`) mention is stored under. Safe as a
 // sentinel because every real Matrix user id is "@localpart:server" and so
 // always contains a colon — no account can ever collide with it, which means a
@@ -44,6 +56,21 @@ public:
 
     // Users
     bool create_user(const std::string& user_id, const std::string& password_hash);
+    // The stored password hash for a HUMAN account, or nullopt.
+    //
+    // The query filters on `users.kind = 'user'`, and that filter is the entire
+    // mechanism by which a bot cannot log in with a password. It is deliberately
+    // here, in the one place every password path already funnels through
+    // (m.login.password, and the re-authentication stage of the password-change
+    // endpoint), rather than as an `if (is_bot(...))` at each of those call sites.
+    //
+    // The difference is what happens to the NEXT password path somebody writes.
+    // A check at the call site is a thing to remember; a WHERE clause here is a
+    // thing you cannot get past — a future handler that asks this store for a
+    // bot's hash in order to verify something against it is handed nullopt, and
+    // every existing caller already treats nullopt as "this account cannot
+    // authenticate that way" and refuses. "Bots have an empty password_hash" is
+    // then a second, independent line of defence rather than the only one.
     std::optional<std::string> get_password_hash(const std::string& user_id);
     // Replaces the stored hash (used to transparently upgrade a hash that was
     // generated with a weaker cost factor at the next successful login).
@@ -106,7 +133,101 @@ public:
     std::optional<int64_t> get_token_expiry(const std::string& token);
 
     // Users
+    //
+    // Bots ARE users and are included here, deliberately. RoleBootstrap walks
+    // this list to give every account a bsfchat.member.roles row, and a bot that
+    // is skipped would hold no role assignment at all — which is the opposite of
+    // the contract that a bot goes through the ordinary roles machinery. The
+    // place bots are excluded is auto-join, and that exclusion lives in
+    // AutoJoin's own funnel where it can be read next to its reasoning, not in a
+    // filter here that every unrelated caller would silently inherit.
     std::vector<std::string> list_all_users();
+
+    // ── Bot accounts ────────────────────────────────────────────────────────
+    //
+    // A bot is a row in `users` with kind = 'bot' plus a row here holding the
+    // metadata that has no home on `users`. See migrate_v19 for why each piece
+    // is shaped the way it is.
+
+    struct BotRecord {
+        std::string user_id;
+        std::string display_name;
+        std::string description;
+        // ADVISORY. Who to go and ask about this bot — nothing more.
+        //
+        // It participates in NO authorization decision, deliberately, and this
+        // comment exists so nobody has to read BotHandler to find that out. A
+        // field that looks like access control but is not is worse than no field,
+        // because a reviewer sees "owner" in a listing and assumes something is
+        // enforcing it.
+        //
+        // Why rank and not ownership is the control: the danger in handing out a
+        // bot's credential is acquiring the bot's ROLES, which is a question
+        // about the actor's rank relative to the bot, not about who filled in a
+        // form. Owner-as-a-bypass would reintroduce the escalation outright — a
+        // low-ranked owner could rotate a bot that was later granted
+        // Administrator. Owner-as-an-extra-restriction would add no security the
+        // rank check does not already provide, and would strand every bot whose
+        // owner has left the company, unless admins bypassed it, at which point
+        // it would be decorative anyway.
+        std::string owner_id;
+        int64_t created_at = 0;
+        std::string created_by;
+        // Set once, when the bot is deactivated. A timestamp rather than a flag:
+        // "when did this stop being live" is the question an incident actually
+        // asks, and a boolean cannot answer it.
+        std::optional<int64_t> deactivated_at;
+        // Newest last_used_at across the bot's live tokens, or nullopt when it
+        // has never authenticated. Only meaningful for a bot, because ordinary
+        // access tokens write last_used_at only when the expiry slides (see
+        // get_user_by_token) whereas bot tokens refresh it on a coarse timer.
+        std::optional<int64_t> last_seen_at;
+    };
+
+    // Creates the users row (kind = 'bot', EMPTY password hash) and the bots row
+    // in ONE transaction. Both or neither: a users row without its bots row would
+    // be an account nobody can list, rotate or deactivate, and a bots row without
+    // its users row cannot exist at all (the foreign key forbids it). Returns
+    // false when the user id is already taken.
+    //
+    // No token is minted here — the caller does that with rotate_bot_token(), so
+    // there is exactly one code path that issues bot credentials.
+    bool create_bot(const BotRecord& bot);
+
+    // True when `user_id` names an existing account with kind = 'bot'. False for
+    // a human and for an id that does not exist.
+    bool is_bot(const std::string& user_id);
+
+    std::optional<BotRecord> get_bot(const std::string& user_id);
+    // Every bot, newest first. Unpaginated: the list is bounded by how many bots
+    // an operator has deliberately created, not by traffic, and the endpoint that
+    // serves it already requires MANAGE_BOTS.
+    std::vector<BotRecord> list_bots();
+
+    // Issues `token` as the bot's credential and invalidates every token it had,
+    // in ONE transaction.
+    //
+    // Delete-then-insert under a single lock and a single transaction, rather
+    // than two calls, because a rotation that is not atomic has a window in which
+    // the old token and the new one are both live — and the reason an operator
+    // rotates is usually that the old one leaked. Returns false when `user_id` is
+    // not a bot, so this can never mint a non-expiring credential for a person.
+    //
+    // The row is written with lifetime_ms = 0 and token_kind = 'bot': never
+    // expires, never slides. Only the hash is stored; the caller shows the
+    // plaintext to the operator exactly once and then forgets it.
+    bool rotate_bot_token(const std::string& user_id, const std::string& token,
+                          const std::string& device_id);
+
+    // Marks the bot deactivated and revokes every token it holds, in one
+    // transaction. Returns true when this call is what deactivated it, false when
+    // it was already deactivated or is not a bot — so the caller can be
+    // idempotent without racing a second deactivation.
+    //
+    // Does NOT delete the account. The user id stays taken (its messages keep
+    // resolving to a name) and stays unavailable for reuse, and the record of who
+    // created it and when survives — which is the point of an audited lifecycle.
+    bool deactivate_bot(const std::string& user_id, int64_t when_ms);
 
     // Rooms
     // `is_direct` marks a Matrix DM. Direct rooms are permanently excluded

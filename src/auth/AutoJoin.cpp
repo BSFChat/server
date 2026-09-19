@@ -52,6 +52,32 @@ void join_user_to_room(SqliteStore& store, SyncEngine& sync_engine,
     // next channel anybody made — and the moderator had no way to know.
     if (store.is_server_banned(user_id)) return;
 
+    // Bots are never auto-joined to anything.
+    //
+    // Placed HERE for the same reason the ban check above is: this is the single
+    // function all three sweeps funnel through (auto_join_public_rooms when an
+    // account is created, auto_join_all_users when a channel is created,
+    // backfill_auto_join at every boot), so one check covers all three and no
+    // fourth sweep added later can miss it. A check in the bot-creation handler
+    // alone would have covered exactly one of them — and not the one that
+    // matters, because backfill_auto_join runs unconditionally at EVERY start.
+    // A bot excluded at creation and then force-joined by the next deploy is
+    // worse than never excluding it, because the operator has been told it was.
+    //
+    // Why it must not happen at all: auto-join exists because a person joining a
+    // Discord-like server expects to see the channels. A bot has no such
+    // expectation and the opposite blast radius — force-joining it to every
+    // public channel puts a non-human reader in every conversation on the
+    // instance, silently, including channels created long after anyone thought
+    // about that bot. It also makes the bot's membership list meaningless as a
+    // statement of what it has been given access to. A bot joins on an explicit
+    // invite or an explicit join, and nothing else.
+    //
+    // This is deliberately NOT a filter inside list_all_users(): bots must stay
+    // in that list so RoleBootstrap gives them a role assignment like anyone
+    // else, and a filter there would silently change every unrelated caller.
+    if (store.is_bot(user_id)) return;
+
     // Snapshot current max position BEFORE writing the join event — this is the
     // point up to which we consider everything "already read" for this user.
     int64_t mark_pos = store.get_room_max_stream_position(room_id);

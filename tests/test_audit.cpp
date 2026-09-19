@@ -478,12 +478,13 @@ void create_v15_database_with_audit_history(const std::string& path) {
 TEST(AuditMigration, FreshDatabaseGetsV13WithAnAppendOnlySchema) {
     Fixture f("fresh-v13");
     EXPECT_EQ(schema_version_of(f.db_path), kTargetSchemaVersion);
-    // v13 is the audit log; the pin tracks the latest schema, now 18 (v14
+    // v13 is the audit log; the pin tracks the latest schema, now 19 (v14
     // users.nickname, v15 server_bans, v16 the audit_log filter indexes, v17
     // events.signal_to and the call-signalling sweep, v18 the is_direct
-    // backfill onto pre-existing DMs' membership state). This test's subject
-    // remains the v13 audit_log shape below.
-    EXPECT_EQ(kTargetSchemaVersion, 18);
+    // backfill onto pre-existing DMs' membership state, v19 users.kind plus the
+    // bots table and access_tokens.token_kind). This test's subject remains the
+    // v13 audit_log shape below.
+    EXPECT_EQ(kTargetSchemaVersion, 19);
 
     // AUTOINCREMENT, not a bare INTEGER PRIMARY KEY. Without it SQLite reuses
     // max(rowid) + 1, which is exactly the position-reuse defect v4 fixed for

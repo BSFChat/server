@@ -862,10 +862,23 @@ void RoomHandler::handle_room_members(const httplib::Request& req, httplib::Resp
     auto members = store_.get_room_members(room_id);
     json chunk = json::array();
     for (const auto& [member_id, member_membership] : members) {
+        json content = {{"membership", member_membership}};
+        // This endpoint synthesises member content from the membership table
+        // rather than serving the stored events, so it does NOT go through
+        // read_event_row and does not inherit the bot flag from there. Derived
+        // the same way and from the same helper, so the roster a client loads
+        // here agrees with the one it gets from /sync.
+        //
+        // Without this the badge would depend on how the client happened to
+        // learn about a user — present on a live join, absent in the roster
+        // fetched at startup — which is worse than not having the flag at all.
+        if (bot::is_bot_user_id(member_id)) {
+            content[std::string(bot::kProfileKey)] = true;
+        }
         chunk.push_back({
             {"type", event_type::kRoomMember},
             {"state_key", member_id},
-            {"content", {{"membership", member_membership}}},
+            {"content", std::move(content)},
             {"sender", member_id},
             {"room_id", room_id},
         });
@@ -1240,6 +1253,90 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
         res.status = 403;
         res.set_content(MatrixError::forbidden("User is banned from this server").to_json().dump(),
                         "application/json");
+        return;
+    }
+
+    // Inviting a BOT joins it immediately, rather than leaving an invite nobody
+    // will ever accept.
+    //
+    // A bot has no human to accept an invite, and — as things stand — cannot even
+    // see one: SyncResponse::rooms carries a `join` map and has no `invite`
+    // section at all, and get_joined_rooms filters on membership = 'join'. So an
+    // invite row for a bot is invisible to the bot and indistinguishable from a
+    // no-op to the operator who sent it. The operator's gesture means "this bot
+    // should be in this channel"; honouring it is the only reading that is not a
+    // silent failure. (A real rooms.invite section is a separate piece of work
+    // for HUMAN invites; this does not pre-empt it, because a bot would still
+    // have nothing to do with an invite it could see.)
+    //
+    // WHY THIS DOES NOT CONTRADICT THE AUTO-JOIN EXCLUSION. It will look like it
+    // does, so: AutoJoin::join_user_to_room refuses bots, and must keep refusing
+    // them. That exclusion is about the three UNTARGETED sweeps — every public
+    // channel at account creation, every user when a channel is created, and
+    // every (user, room) pair on every single boot via backfill_auto_join. Those
+    // are automatic, server-wide, and repeat forever; a bot caught by them lands
+    // in all 50 channels including ones created years later, silently, with
+    // nobody having decided anything. THIS is the opposite in every respect: one
+    // named bot, one named channel, requested explicitly by a person who just
+    // passed the room's MANAGE_CHANNELS check, once. "A bot joins only on an
+    // explicit invite or join" is the rule, and this is the explicit invite —
+    // removing this would not strengthen the exclusion, it would just make the
+    // invite path the thing that silently does nothing.
+    //
+    // Reached only AFTER every check above has passed: the inviter's membership,
+    // the DM refusal, MANAGE_CHANNELS, the per-room ban and the server-wide ban.
+    // Nothing here bypasses any of them — this changes what happens once they
+    // pass, and only for a bot. Human invite semantics are untouched.
+    if (store_.is_bot(target_user)) {
+        auto bot = store_.get_bot(target_user);
+
+        // A deactivated bot holds no tokens and cannot act, so joining it to a
+        // channel would put a permanently silent member in the room and imply to
+        // everyone else that something is listening. Consistent with the refusal
+        // on rotating a deactivated bot: deactivation is final.
+        if (bot && bot->deactivated_at) {
+            res.status = 403;
+            res.set_content(MatrixError::forbidden(
+                "That bot is deactivated and cannot be added to a channel").to_json().dump(),
+                "application/json");
+            return;
+        }
+
+        // Idempotent. A second invite is a success that writes nothing: no
+        // duplicate join event for other clients to render as the bot arriving
+        // twice, and no second audit record for an event that happened once.
+        if (store_.is_room_member(room_id, target_user)) {
+            res.set_content("{}", "application/json");
+            return;
+        }
+
+        const auto before = store_.get_membership(room_id, target_user);
+
+        store_.set_membership(room_id, target_user, std::string(membership::kJoin));
+        // A real join event, sent BY the bot, exactly as the self-join path emits
+        // one — so every other member sees the bot arrive through the ordinary
+        // membership machinery rather than appearing out of nowhere at the next
+        // full sync. member_event_content carries the bot's display name (and
+        // nickname, if it has one), so it renders with a name from the first sync.
+        emit_state_event(room_id, target_user, std::string(event_type::kRoomMember),
+                         target_user,
+                         member_event_content(store_, target_user,
+                                              std::string(membership::kJoin)));
+
+        // Audited at the action site, per AuditLog's contract. The ACTOR is the
+        // inviter, not the bot: a bot in a channel is the result of a person
+        // putting it there, and "who gave this bot access to that channel" is the
+        // question the record exists to answer. Recorded as the membership
+        // transition it is, through the existing vocabulary, so a filter by room
+        // or by user finds it alongside every other membership change rather than
+        // in a bot-specific dialect of its own.
+        audit_membership_change(store_, *user_id, room_id, target_user, before,
+                                std::string(membership::kJoin), "invite (bot auto-join)");
+
+        res.set_content("{}", "application/json");
+        get_logger()->info("User {} invited bot {} to room {}; joined immediately "
+                           "(a bot has no human to accept an invite)",
+                           *user_id, target_user, room_id);
         return;
     }
 

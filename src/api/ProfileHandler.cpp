@@ -92,6 +92,20 @@ void ProfileHandler::handle_get_profile(const httplib::Request& req, httplib::Re
     // save back over it. The nickname is reported separately so a client can show
     // both and render the nickname in preference where it renders people.
     if (auto nick = store_.get_nickname(user_id)) resp[kNicknameContentKey] = *nick;
+    // Bot-ness, so a client can badge the account wherever it renders a person.
+    //
+    // On the PROFILE rather than in new membership state, which was the other
+    // option. Bot-ness is a property of the account, not of a membership: state
+    // would have to be written into every room the bot is in, backfilled into
+    // rooms it joined before this existed, and would still be absent in any room
+    // the client has not synced — so "is this a bot" would have a different
+    // answer depending on where you asked. The profile is one fact in one place,
+    // and a client already fetches it to render a name and an avatar.
+    //
+    // Unauthenticated-readable, like the rest of this endpoint. That is fine:
+    // bot-ness is not a secret, it is a label the whole point of which is to be
+    // shown to everyone who sees the account.
+    if (store_.is_bot(user_id)) resp[std::string(bot::kProfileKey)] = true;
 
     res.set_content(resp.dump(), "application/json");
 }
