@@ -26,12 +26,25 @@
 //      channel.
 //   6. One PermissionsEngine services the whole list, and caching role data
 //      across rooms does not leak one user's answers into another's.
+//
+// Then the same mistake in three more places, each of which admitted a denied
+// user because "is a member" is not a question worth asking on this server.
+// Every one is asserted in BOTH directions: a user who holds VIEW_CHANNEL must
+// still be able to join a call, read its roster and type. Breaking that would
+// be a worse day than the bug.
+//   7. POST /rooms/{id}/voice/join — put a denied user into the mesh call, and
+//      thereby into handle_voice_state, which authorises on "is an active call
+//      member".
+//   8. GET /rooms/{id}/voice/members — handed a denied user the live roster.
+//   9. PUT /rooms/{id}/typing/{user} — let a denied user publish a typing
+//      indicator to the people who CAN see the channel.
 
 #include <gtest/gtest.h>
 
 #include "api/RoomHandler.h"
 #include "api/SyncHandler.h"
 #include "api/TypingHandler.h"
+#include "api/VoiceHandler.h"
 #include "auth/LocalAuth.h"
 #include "auth/Permissions.h"
 #include "auth/RoomVisibility.h"
@@ -170,6 +183,17 @@ struct Fixture {
         to_json(j, ov);
         store->insert_event(generate_event_id("test"), room_id, "@server:test",
                             std::string(event_type::kChannelPermissions), target, j.dump(), 1004);
+    }
+
+    // A voice-enabled channel. handle_voice_join refuses a room without this
+    // state event, so the permission check is only reached on a real one.
+    void enable_voice(const std::string& room_id) {
+        VoiceChannelContent v;
+        v.enabled = true;
+        json j;
+        to_json(j, v);
+        store->insert_event(generate_event_id("test"), room_id, "@server:test",
+                            std::string(event_type::kRoomVoice), std::string(""), j.dump(), 1005);
     }
 
     void make_private(const std::string& room_id) {
@@ -387,4 +411,191 @@ TEST(RoomVisibility, OneEngineServesManyRoomsAndManyUsers) {
         EXPECT_FALSE(contains(bobs, room));
         EXPECT_TRUE(contains(alices, room)) << "the engine reused bob's cached roles for alice";
     }
+}
+
+// ── The three endpoints that gated on membership alone ──────────────────────
+//
+// Each asserts the denial AND the permitted case. A VIEW_CHANNEL check that is
+// wrong in the denying direction stops legitimate users joining calls, which is
+// a worse failure than the one being fixed — so the positive case is not a
+// courtesy here, it is half the test.
+
+namespace {
+
+struct VoiceFixture {
+    Fixture f;
+    std::string alice;
+    std::string bob;
+    std::string room;
+    std::unique_ptr<VoiceHandler> voice;
+
+    explicit VoiceFixture(const std::string& name) : f(name) {
+        alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+        bob = f.add_user("bob");
+        room = f.add_channel(alice, "staff-voice");
+        f.join(room, bob);
+        f.enable_voice(room);
+        voice = std::make_unique<VoiceHandler>(*f.store, *f.sync, f.config);
+    }
+};
+
+httplib::Response voice_call(VoiceHandler& handler,
+                             void (VoiceHandler::*method)(const httplib::Request&,
+                                                          httplib::Response&),
+                             const std::string& path, const std::string& token) {
+    auto req = make_request(path, token);
+    httplib::Response res;
+    (handler.*method)(req, res);
+    return res;
+}
+
+std::string voice_join_path(const std::string& room) {
+    return "/_matrix/client/v3/rooms/" + room + "/voice/join";
+}
+std::string voice_members_path(const std::string& room) {
+    return "/_matrix/client/v3/rooms/" + room + "/voice/members";
+}
+
+::testing::AssertionResult IsOk(const httplib::Response& res) {
+    if (res.status == -1 || res.status == 200) return ::testing::AssertionSuccess();
+    return ::testing::AssertionFailure() << "expected success, got status " << res.status
+                                         << ", body: " << res.body;
+}
+
+::testing::AssertionResult IsForbidden(const httplib::Response& res) {
+    if (res.status == 403) return ::testing::AssertionSuccess();
+    return ::testing::AssertionFailure() << "expected 403, got status " << res.status
+                                         << ", body: " << res.body;
+}
+
+} // namespace
+
+// Participation, not disclosure: the mesh path let a denied user into the call
+// itself. The LiveKit endpoints beside it always checked this.
+TEST(RoomVisibility, VoiceJoinRefusesADeniedUser) {
+    VoiceFixture v("voicejoin");
+    v.f.make_private(v.room);
+
+    // The precondition: bob is a joined member, as every user is of every
+    // channel. That is exactly why membership was not a gate.
+    ASSERT_TRUE(v.f.store->is_room_member(v.room, v.bob));
+
+    EXPECT_TRUE(IsForbidden(voice_call(*v.voice, &VoiceHandler::handle_voice_join,
+                                       voice_join_path(v.room), "token-bob")));
+
+    // And bob is not in the call, so handle_voice_state — which authorises on
+    // "is an active call member" rather than on any permission — has nothing to
+    // let him do. That is the second half of this gate's job.
+    auto member = v.f.store->get_state_event(v.room, std::string(event_type::kCallMember), v.bob);
+    EXPECT_FALSE(member && member->content.data.value("active", false));
+}
+
+// The direction that matters more. A user who holds VIEW_CHANNEL joins calls
+// exactly as before, on a private channel and a public one alike.
+TEST(RoomVisibility, VoiceJoinStillWorksForAPermittedUser) {
+    VoiceFixture v("voicejoinok");
+
+    // Public channel, ordinary member: the overwhelmingly common case.
+    EXPECT_TRUE(IsOk(voice_call(*v.voice, &VoiceHandler::handle_voice_join,
+                                voice_join_path(v.room), "token-bob")));
+
+    // Private channel, member let in by a per-user ALLOW over the @everyone
+    // DENY — the case a check that tested for the deny bit would break.
+    auto carol = v.f.add_user("carol");
+    auto priv = v.f.add_channel(v.alice, "staff-voice-2");
+    v.f.join(priv, carol);
+    v.f.enable_voice(priv);
+    v.f.make_private(priv);
+    v.f.set_override(priv, "user:" + carol, permission::kViewChannel, 0);
+
+    EXPECT_TRUE(IsOk(voice_call(*v.voice, &VoiceHandler::handle_voice_join,
+                                voice_join_path(priv), "token-carol")));
+    // And the admin who owns the channel, who reaches it through the
+    // ADMINISTRATOR short-circuit rather than through an override.
+    EXPECT_TRUE(IsOk(voice_call(*v.voice, &VoiceHandler::handle_voice_join,
+                                voice_join_path(priv), "token-alice")));
+}
+
+// The roster is a live activity feed — who is connected, muted, deafened,
+// sharing a screen, on what device. /rooms/{id}/members already refused a
+// denied user; this did not.
+//
+// The permitted user here is BOB, an ordinary member holding nothing but
+// kEveryoneDefault. Asserting this with the admin instead would pass against a
+// gate mistakenly demanding kManageChannels — ADMINISTRATOR short-circuits
+// every flag, so an admin cannot demonstrate that an ordinary member still
+// gets in. That is the failure this endpoint most needs ruled out.
+TEST(RoomVisibility, VoiceMembersRefusesADeniedUserAndServesAPermittedOne) {
+    VoiceFixture v("voicemembers");
+    ASSERT_TRUE(IsOk(voice_call(*v.voice, &VoiceHandler::handle_voice_join,
+                                voice_join_path(v.room), "token-alice")));
+
+    // Public channel, ordinary member: still served, and served the real
+    // roster. A gate that returned an empty list would pass a status check.
+    auto permitted = voice_call(*v.voice, &VoiceHandler::handle_voice_members,
+                                voice_members_path(v.room), "token-bob");
+    ASSERT_TRUE(IsOk(permitted));
+    auto members = json::parse(permitted.body).at("members");
+    ASSERT_EQ(members.size(), 1u);
+    EXPECT_EQ(members[0].at("user_id").get<std::string>(), v.alice);
+
+    // Same user, same room, one override later.
+    v.f.make_private(v.room);
+    EXPECT_TRUE(IsForbidden(voice_call(*v.voice, &VoiceHandler::handle_voice_members,
+                                       voice_members_path(v.room), "token-bob")));
+    // And the channel's own members are unaffected by the denial.
+    EXPECT_TRUE(IsOk(voice_call(*v.voice, &VoiceHandler::handle_voice_members,
+                                voice_members_path(v.room), "token-alice")));
+}
+
+// A typing indicator is a WRITE into the channel, and it reaches exactly the
+// people who can see the channel — so the /sync filter cannot contain it. An
+// outsider could make their name appear inside a channel they cannot open.
+//
+// Bob drives both halves: he is an ordinary member with kEveryoneDefault, he
+// types successfully while the channel is public, and he is refused once it is
+// private. Same user, same room, one override apart — so neither direction can
+// be explained by anything except the permission.
+TEST(RoomVisibility, TypingRefusesADeniedUserAndServesAPermittedOne) {
+    Fixture f("typinggate");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto room = f.add_channel(alice, "staff-only");
+    f.join(room, bob);
+
+    TypingHandler typing(*f.store, *f.sync, f.config);
+
+    static const std::regex re(R"(/_matrix/client/v3/rooms/([^/]+)/typing/(.+))");
+    auto send_typing = [&](const std::string& user, const std::string& token) {
+        auto req = make_request("/_matrix/client/v3/rooms/" + room + "/typing/" + user, token,
+                                json{{"typing", true}, {"timeout", 30000}}.dump());
+        EXPECT_TRUE(std::regex_match(req.path, req.matches, re));
+        httplib::Response res;
+        typing.handle_typing(req, res);
+        return res;
+    };
+
+    // Ordinary member, public channel: works, and actually registers.
+    EXPECT_TRUE(IsOk(send_typing(bob, "token-bob")));
+    EXPECT_EQ(typing.get_typing_users(room), std::vector<std::string>{bob});
+
+    auto private_room = f.add_channel(alice, "staff-private");
+    f.join(private_room, bob);
+    f.make_private(private_room);
+    auto send_typing_private = [&](const std::string& user, const std::string& token) {
+        auto req = make_request("/_matrix/client/v3/rooms/" + private_room + "/typing/" + user,
+                                token, json{{"typing", true}, {"timeout", 30000}}.dump());
+        EXPECT_TRUE(std::regex_match(req.path, req.matches, re));
+        httplib::Response res;
+        typing.handle_typing(req, res);
+        return res;
+    };
+
+    EXPECT_TRUE(IsForbidden(send_typing_private(bob, "token-bob")));
+    EXPECT_TRUE(typing.get_typing_users(private_room).empty())
+        << "a user denied VIEW_CHANNEL published a typing indicator into the channel";
+
+    // The people the channel belongs to are unaffected.
+    EXPECT_TRUE(IsOk(send_typing_private(alice, "token-alice")));
+    EXPECT_EQ(typing.get_typing_users(private_room), std::vector<std::string>{alice});
 }

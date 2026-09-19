@@ -34,6 +34,13 @@ class PermissionsEngine;
 // Categories are exempt: the sidebar has to render the container node even when
 // every channel inside it is hidden, so a category the user cannot "view" is
 // still named to them. This matches SyncEngine, which has always done the same.
+//
+// That exemption makes this a rule about LISTING a room, not about acting
+// inside one. Somewhere an endpoint lets a user DO something in a channel —
+// join its call, publish a typing indicator, read its roster — the question is
+// only kViewChannel, and it should be asked directly, as the voice and typing
+// handlers do. Granting a category the benefit of the doubt in a sidebar is
+// right; granting it to a request that acts is how an exemption becomes a hole.
 bool can_view_room(SqliteStore& store, PermissionsEngine& perms,
                    const std::string& user_id, const std::string& room_id);
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include "auth/Permissions.h"
 #include "http/Middleware.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
@@ -48,6 +49,29 @@ void TypingHandler::handle_typing(const httplib::Request& req, httplib::Response
         res.status = 403;
         res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(),
                         "application/json");
+        return;
+    }
+
+    // ...which on this server means almost nothing: everyone is force-joined
+    // into every channel, so the check above passes for users who have been
+    // denied kViewChannel here (auth/RoomVisibility.h). A typing indicator is
+    // published INTO the channel, so this is a write, not a read — and the
+    // people it reaches are precisely the ones who CAN see the channel. The
+    // /sync filter cannot help with that: it correctly hides this room from
+    // other denied users, while still showing the indicator to everyone the
+    // channel belongs to. So an outsider could surface their own name inside a
+    // channel they have no access to.
+    //
+    // Same gate and same shape as the voice endpoints and
+    // handle_livekit_token; kViewChannel is checked directly rather than
+    // through can_view_room because that helper's category exemption is a rule
+    // about LISTING a room, not about acting inside one.
+    PermissionsEngine perms(store_, config_);
+    if (!permission::has(perms.compute(*user_id, room_id), permission::kViewChannel)) {
+        res.status = 403;
+        res.set_content(
+            MatrixError::forbidden("You do not have permission to view this channel").to_json().dump(),
+            "application/json");
         return;
     }
 

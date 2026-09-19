@@ -255,6 +255,34 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
         return;
     }
 
+    // Membership is not visibility. Everyone on this server is force-joined
+    // into every channel — that is how a private channel is built, see
+    // auth/RoomVisibility.h — so the check above admits a user who has been
+    // denied kViewChannel on this very channel, and this endpoint put them
+    // into the call.
+    //
+    // The mesh path was the outlier, and that is the evidence it was an
+    // oversight rather than a decision: handle_livekit_token and
+    // handle_livekit_rekey sit directly below this function and both check
+    // kViewChannel, with comments saying that a user who cannot see a channel
+    // must not be able to get into its call. The SFU path was gated and the
+    // mesh path — the one that actually ships today — was not.
+    //
+    // This is also the gate that closes handle_voice_state, which authorises on
+    // "is an active call member": this is the only endpoint that makes someone
+    // one.
+    //
+    // PermissionsEngine memoises per instance and is documented as
+    // request-scoped — construct it here, do not cache it on the handler.
+    PermissionsEngine perms(store_, config_);
+    if (!permission::has(perms.compute(*user_id, room_id), permission::kViewChannel)) {
+        res.status = 403;
+        res.set_content(
+            MatrixError::forbidden("You do not have permission to view this channel").to_json().dump(),
+            "application/json");
+        return;
+    }
+
     // Parse optional device_id from body
     std::string device_id;
     if (!req.body.empty()) {
@@ -490,6 +518,22 @@ void VoiceHandler::handle_voice_members(const httplib::Request& req, httplib::Re
     if (!store_.is_room_member(room_id, *user_id)) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(), "application/json");
+        return;
+    }
+
+    // The same gate handle_voice_join now applies, for the same reason: on this
+    // data model the membership check above passes for every user on the
+    // server. What this returns is not a static roster but a live activity feed
+    // for the channel — who is connected right now, who is muted or deafened,
+    // who is sharing a screen or has a camera on, and their device and session
+    // ids. GET /rooms/{id}/members already refuses a user denied kViewChannel;
+    // the voice roster was the louder of the two and did not.
+    PermissionsEngine perms(store_, config_);
+    if (!permission::has(perms.compute(*user_id, room_id), permission::kViewChannel)) {
+        res.status = 403;
+        res.set_content(
+            MatrixError::forbidden("You do not have permission to view this channel").to_json().dump(),
+            "application/json");
         return;
     }
 

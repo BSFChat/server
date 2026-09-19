@@ -3,8 +3,9 @@
 Audit accompanying the `/joined_rooms` disclosure fix (`fix/joined-rooms-leak`),
 and a design recommendation on the thing that caused it.
 
-Status: the fix is in this branch. **Nothing else here is fixed** — the findings
-below are reported for triage, and the recommendation is not started.
+Status: findings 1–3 and the two `/joined_rooms` disclosures are fixed in this
+branch. Findings 4–6 are reported for triage and deliberately left. The design
+recommendation at the end is **not started**.
 
 ## The shape of the bug
 
@@ -35,6 +36,23 @@ its own merits.
 |---|---|
 | `GET /joined_rooms` | Returned `get_joined_rooms()` verbatim — a complete index of every private channel on the server, to any authenticated user. |
 | `GET /sync` (typing pass) | `SyncEngine` filters `rooms.join` by VIEW_CHANNEL; `SyncHandler` then walked the **raw** joined-room list and created a `rooms.join` entry for any room with a typist. One person typing in a private channel put its id in front of everyone it is hidden from. |
+| `POST /rooms/{id}/voice/join` | Membership plus "is the room voice-capable", and nothing else — so a user denied VIEW_CHANNEL could join the **mesh** call. Participation, not disclosure. It also fed `handle_voice_state`, which authorises on "is an active call member"; this is the only endpoint that makes someone one, so gating it closes that path too. |
+| `GET /rooms/{id}/voice/members` | Membership only, returning the live roster: who is connected, muted, deafened, screen-sharing, on what device and session. `/rooms/{id}/members` already refused a denied user; the louder of the two did not. |
+| `PUT /rooms/{id}/typing/{user}` | Membership only. A typing indicator is a **write into** the channel and reaches exactly the people who can see it, so the `/sync` filter cannot contain it — an outsider could surface their name inside a channel they cannot open. |
+
+All three match `handle_livekit_token`: `PermissionsEngine::compute()` then
+`has(flags, kViewChannel)`. They check `kViewChannel` directly rather than going
+through `can_view_room()`, because that helper exempts categories — which is a
+rule about *listing* a room in a sidebar, not about acting inside one. The
+distinction is now recorded in `auth/RoomVisibility.h`.
+
+Both directions are tested, and both were confirmed by mutation: removing the
+gates fails the denial tests, and tightening them to demand `kManageChannels`
+fails the permitted-user tests. The permitted user in each is an **ordinary
+member holding only `kEveryoneDefault`** — asserting it with an admin proves
+nothing, because ADMINISTRATOR short-circuits every flag. `e2e_voice`, which
+drives two ordinary users through repeated real voice joins over HTTP against
+the real binary, passes unchanged.
 
 ### Correct already
 
@@ -70,28 +88,9 @@ its own merits.
 - **`list_public_rooms()`** — used only by auto-join. It is not reachable from
   any HTTP route; there is no public-rooms directory endpoint.
 
-### Membership-only, not fixed — worth a decision before the RC ships
+### Membership-only, not fixed
 
-1. **`POST /rooms/{id}/voice/join` — no VIEW_CHANNEL check.** The gate is
-   `is_room_member` plus "is the room voice-capable". Since everyone is a member
-   of every channel, **a user denied VIEW_CHANNEL can join the mesh voice
-   session of a private voice channel**, and `handle_voice_state` then accepts
-   their state updates because it gates on "is an active call member", which
-   they now are. This is not disclosure — it is participation. The LiveKit paths
-   right next to it (`livekit_token`, `livekit_rekey`) both check `kViewChannel`
-   and say so in comments, so the mesh path reads as an oversight rather than a
-   decision. *Highest-severity finding here.*
-
-2. **`GET /rooms/{id}/voice/members` — no VIEW_CHANNEL check.** Membership only,
-   and it returns the live roster of a channel: user ids, mute/deafen state,
-   screen-share and camera flags, device ids and session ids. A user denied
-   VIEW_CHANNEL can watch who is talking in a private voice channel.
-
-3. **`PUT /rooms/{id}/typing/{user}` — no VIEW_CHANNEL check.** A denied user
-   can inject a typing indicator into a private channel. After the `/sync` fix
-   other denied users no longer see it, but **users who can view the channel
-   do** — so an outsider can make their name appear as "typing…" inside a
-   channel they have no access to.
+Numbering follows the original audit; 1–3 are in the table above.
 
 4. **`POST /rooms/{id}/read_marker` — no VIEW_CHANNEL check.** A denied user can
    write a read position into a channel they cannot read. Harmless in itself;
@@ -111,8 +110,19 @@ its own merits.
    the DM from `/joined_rooms` and `/sync` while it still appears in `m.direct`
    — a pre-existing inconsistency this change makes symmetric rather than worse.
 
-Items 1–3 all have the same character as the bug that was fixed: a check that
-reads as an access check but, on this data model, is not one.
+### Deliberately left alone
+
+- **`POST /rooms/{id}/voice/leave`** is membership-only and stays that way.
+  Hanging up must never be refused — gating it would strand a user in a call
+  they had just lost permission to be in.
+- **`PUT /rooms/{id}/voice/state`** authorises on "is an active call member"
+  rather than on a permission. It is now closed at the entrance, since
+  `voice/join` is the only endpoint that makes someone an active member. One
+  narrow window remains: a user whose VIEW_CHANNEL is revoked **while already in
+  a call** keeps updating mute/deafen/screen-share until the heartbeat reaper
+  expires them. Adding a check there is a one-liner, but it is a live-call path
+  on the least-settled part of the codebase, and getting it wrong drops people
+  mid-call — worth doing deliberately rather than alongside this fix.
 
 ## Recommendation: stop modelling private channels as public-rooms-plus-override
 
