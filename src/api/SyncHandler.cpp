@@ -9,11 +9,13 @@
 #include "sync/SyncEngine.h"
 
 #include <algorithm>
+#include <optional>
 #include <set>
 
 #include <bsfchat/Constants.h>
 #include <bsfchat/ErrorCodes.h>
 #include <bsfchat/MatrixTypes.h>
+#include <bsfchat/Permissions.h>
 
 #include <nlohmann/json.hpp>
 
@@ -64,15 +66,34 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
     // auth/RoomVisibility.h for why per-room construction is the expensive way
     // to write this.
     std::vector<std::string> joined_rooms;
+    std::optional<PermissionsEngine> perms;
     if (typing_handler_ || presence_handler_) {
-        PermissionsEngine perms(store_, config_);
-        joined_rooms = visible_joined_rooms(store_, perms, *user_id);
+        perms.emplace(store_, config_);
+        joined_rooms = visible_joined_rooms(store_, *perms, *user_id);
     }
 
     // Inject typing indicators into joined rooms
     if (typing_handler_) {
         // Add typing info to rooms already in the response
         for (auto& [room_id, joined] : response.rooms.join) {
+            // Being IN rooms.join is not the same as being allowed to see what
+            // happens inside. SyncEngine exempts categories from VIEW_CHANNEL
+            // so the sidebar can still render the container node, so a room the
+            // caller is denied can legitimately be sitting in this map — and a
+            // denied category is meant to be a name-and-ordering stub, nothing
+            // more. Attaching "X is typing" to it hands the caller live
+            // activity from inside a room whose contents are the thing being
+            // withheld, which is precisely what the stub exists to prevent.
+            //
+            // kViewChannel is asked directly rather than through can_view_room,
+            // for the reason that helper's own header gives: its category
+            // exemption is a rule about LISTING a room, not about acting or
+            // observing inside one, and a typing indicator is activity inside
+            // one. Same gate and same shape as PUT /rooms/{id}/typing/{user},
+            // which refuses to let a denied user publish the indicator in the
+            // first place; this is the read half of that write.
+            if (!perms->can(*user_id, room_id, permission::kViewChannel)) continue;
+
             auto typing_users = typing_handler_->get_typing_users(room_id);
             if (!typing_users.empty()) {
                 RoomEvent typing_event;

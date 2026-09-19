@@ -24,6 +24,12 @@
 //      same map from the caller's joined-room list — so the leak reappeared
 //      there, through a different endpoint, whenever anyone typed in a private
 //      channel.
+//   5b. The other half of that pass: it also walks rooms.join as SyncEngine
+//      built it and attaches typing to every entry, on the assumption that
+//      everything in that map may be seen. Categories are exempt from
+//      VIEW_CHANNEL so the sidebar keeps its structure, so a denied category is
+//      in the map — and the pass reported the activity inside it to the very
+//      user it is hidden from.
 //   6. One PermissionsEngine services the whole list, and caching role data
 //      across rooms does not leak one user's answers into another's.
 //
@@ -258,6 +264,28 @@ std::vector<std::string> sync_room_ids(SyncHandler& handler, const std::string& 
     return ids;
 }
 
+// The typists /sync reports INSIDE one room: rooms.join[room].ephemeral, which
+// is what the client renders as "X is typing". Empty covers all three shapes
+// that mean "nothing was said" — no such room, no ephemeral block, no typing
+// event — because the caller only ever cares that nothing leaked.
+std::vector<std::string> sync_typing_users(SyncHandler& handler, const std::string& token,
+                                           const std::string& room_id) {
+    auto req = make_request("/_matrix/client/v3/sync", token);
+    req.params.emplace("timeout", "0");
+    httplib::Response res;
+    handler.handle_sync(req, res);
+    EXPECT_TRUE(res.status == -1 || res.status == 200) << "status " << res.status;
+    auto body = json::parse(res.body);
+    auto room = body.value("rooms", json::object()).value("join", json::object());
+    auto it = room.find(room_id);
+    if (it == room.end()) return {};
+    for (const auto& ev : it->value("ephemeral", json::object()).value("events", json::array())) {
+        if (ev.value("type", "") != std::string(event_type::kTyping)) continue;
+        return ev.value("content", json::object()).value("user_ids", std::vector<std::string>{});
+    }
+    return {};
+}
+
 } // namespace
 
 // The leak. `bob` is a joined member of the private channel — he has to be,
@@ -368,6 +396,62 @@ TEST(RoomVisibility, TypingDoesNotResurrectAHiddenRoomInSync) {
     EXPECT_FALSE(contains(sync_room_ids(sync_handler, "token-bob"), private_room))
         << "private channel id disclosed through the /sync typing pass";
     EXPECT_TRUE(contains(sync_room_ids(sync_handler, "token-alice"), private_room));
+}
+
+// The other half of the same pass, and the one the category exemption makes
+// reachable. The loop above walks rooms.join as SyncEngine built it and
+// attaches a typing ephemeral to every entry with a typist — no permission
+// check, on the assumption that everything in that map is something the caller
+// may see. Categories break the assumption: SyncEngine deliberately exempts
+// them from VIEW_CHANNEL so the sidebar keeps its structure, so a denied
+// category IS in the map, and the typing pass then narrated what the people
+// inside it were doing to the user it is hidden from.
+//
+// A category is supposed to be a name and a position to a user who cannot view
+// it. "Alice is typing" is not a name or a position; it is live activity from
+// inside the room, which is the half being withheld. The exemption buys a
+// container node in a sidebar, not a window into the channel.
+TEST(RoomVisibility, TypingDoesNotLeakIntoARoomTheCallerCannotView) {
+    Fixture f("typingview");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+
+    auto category = f.add_channel(alice, "Staff", "category");
+    f.join(category, bob);
+    f.join(category, carol);
+    f.make_private(category);
+    // Carol is an ORDINARY member — @everyone only — reinstated by a
+    // user-scope override, not an admin. The distinction decides whether the
+    // second half of this test is worth anything: ADMINISTRATOR short-circuits
+    // every flag, so an admin keeps seeing the indicator no matter which
+    // permission the gate demands, and tightening it to kManageChannels would
+    // sail straight through. Carol holds kViewChannel and nothing else, so she
+    // fails any gate stricter than the right one.
+    f.set_override(category, "user:" + carol, permission::kViewChannel, 0);
+
+    TypingHandler typing(*f.store, *f.sync, f.config);
+    SyncHandler sync_handler(*f.store, *f.sync, f.config);
+    sync_handler.set_typing_handler(&typing);
+
+    set_typing(typing, category, alice, "token-alice");
+    ASSERT_FALSE(typing.get_typing_users(category).empty())
+        << "fixture failed to register a typist, so the test proves nothing";
+
+    // The exemption itself still holds: bob keeps the sidebar node. It is the
+    // activity inside it he must not get. Asserting this first means a later
+    // over-tightening that drops the category outright fails HERE, with its own
+    // message, rather than passing the leak assertion for the wrong reason.
+    ASSERT_TRUE(contains(sync_room_ids(sync_handler, "token-bob"), category))
+        << "category stub vanished from the sidebar; this test no longer covers the leak";
+
+    EXPECT_TRUE(sync_typing_users(sync_handler, "token-bob", category).empty())
+        << "typing activity from inside a room the caller is denied VIEW_CHANNEL on";
+
+    // And the gate is a real permission check, not a blanket mute on
+    // categories: carol may view this one, so she still gets the indicator.
+    EXPECT_EQ(sync_typing_users(sync_handler, "token-carol", category),
+              std::vector<std::string>{alice});
 }
 
 // Cost, and the correctness risk the cost fix introduces.

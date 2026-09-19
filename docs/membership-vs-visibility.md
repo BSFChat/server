@@ -36,11 +36,12 @@ its own merits.
 |---|---|
 | `GET /joined_rooms` | Returned `get_joined_rooms()` verbatim — a complete index of every private channel on the server, to any authenticated user. |
 | `GET /sync` (typing pass) | `SyncEngine` filters `rooms.join` by VIEW_CHANNEL; `SyncHandler` then walked the **raw** joined-room list and created a `rooms.join` entry for any room with a typist. One person typing in a private channel put its id in front of everyone it is hidden from. |
+| `GET /sync` (typing pass, second half) | The same pass also walks `rooms.join` **as SyncEngine built it** and attaches a typing ephemeral to every entry with a typist, unchecked — on the assumption that everything in that map is something the caller may see. Categories break the assumption: they are deliberately exempt from VIEW_CHANNEL so the sidebar keeps its structure, so a denied category *is* in the map, and the pass narrated the activity inside it to the user it is hidden from. A category is meant to be a name and a position to that user; `"Alice is typing"` is neither. This matters more under `security/category-visibility`, which turns a denied category into an explicit name-and-ordering stub — attaching live activity to a stub contradicts the whole point of it. |
 | `POST /rooms/{id}/voice/join` | Membership plus "is the room voice-capable", and nothing else — so a user denied VIEW_CHANNEL could join the **mesh** call. Participation, not disclosure. It also fed `handle_voice_state`, which authorises on "is an active call member"; this is the only endpoint that makes someone one, so gating it closes that path too. |
 | `GET /rooms/{id}/voice/members` | Membership only, returning the live roster: who is connected, muted, deafened, screen-sharing, on what device and session. `/rooms/{id}/members` already refused a denied user; the louder of the two did not. |
 | `PUT /rooms/{id}/typing/{user}` | Membership only. A typing indicator is a **write into** the channel and reaches exactly the people who can see it, so the `/sync` filter cannot contain it — an outsider could surface their name inside a channel they cannot open. |
 
-All three match `handle_livekit_token`: `PermissionsEngine::compute()` then
+All of these match `handle_livekit_token`: `PermissionsEngine::compute()` then
 `has(flags, kViewChannel)`. They check `kViewChannel` directly rather than going
 through `can_view_room()`, because that helper exempts categories — which is a
 rule about *listing* a room in a sidebar, not about acting inside one. The
