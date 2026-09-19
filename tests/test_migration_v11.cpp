@@ -212,7 +212,7 @@ TEST(MigrationV11, PreExistingV8DatabaseUpgradesAndKeepsItsData) {
     // the LiveKit media-key generation, which until then lived in memory and
     // reverted on every restart. A v8 database still upgrades all the way in
     // one go.
-    EXPECT_EQ(kTargetSchemaVersion, 25);
+    EXPECT_EQ(kTargetSchemaVersion, 27);
     std::filesystem::remove(path);
 }
 

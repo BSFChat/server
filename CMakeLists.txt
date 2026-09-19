@@ -36,6 +36,7 @@ add_executable(bsfchat-server
     src/auth/RoleBootstrap.cpp
     src/auth/RoomVisibility.cpp
     src/audit/AuditLog.cpp
+    src/identity/Localpart.cpp
     src/identity/Nickname.cpp
     src/api/AuditHandler.cpp
     src/api/AuthHandler.cpp

@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include "auth/LocalAuth.h"
 #include "auth/OidcAuth.h"
+#include "identity/Localpart.h"
 #include "store/SqliteStore.h"
 
 #include <bsfchat/Identifiers.h>
@@ -194,6 +195,115 @@ TEST_F(AuthHandlerTest, RegisterAcceptsValidLocalpart) {
     EXPECT_EQ(body["user_id"], "@new.user_1-ok:test");
 }
 
+
+// --- Lookalike usernames (audit finding 20) -------------------------------
+//
+// A REGISTRATION policy. The line these tests draw is that it refuses names at
+// the point they are chosen and touches nothing else: not logins, not accounts
+// that predate it, and not names that merely happen to contain a digit.
+//
+// The passwords here are not this file's usual "password1" on purpose: the
+// password policy on harden/auth refuses it as one of the most common in use,
+// and a registration test that fails on the PASSWORD proves nothing about the
+// username rule it is supposed to be exercising.
+
+TEST_F(AuthHandlerTest, RegisterRefusesALookalikeOfAnExistingAccount) {
+    // @alice:test exists (SetUp). `a1ice` reads the same in a member list.
+    auto res = do_register("a1ice", "tr0mbone-seven");
+    EXPECT_EQ(res.status, 400);
+    EXPECT_EQ(nlohmann::json::parse(res.body)["errcode"], "M_INVALID_USERNAME");
+    EXPECT_FALSE(store->user_exists("@a1ice:test"));
+
+    // The message does not name the account it resembles: the user does not
+    // need it to choose another name.
+    EXPECT_EQ(nlohmann::json::parse(res.body)["error"].get<std::string>().find("alice"),
+              std::string::npos);
+
+    // Punctuation alone is not a difference either.
+    EXPECT_EQ(do_register("a.l.i.c.e", "tr0mbone-seven").status, 400);
+    EXPECT_FALSE(store->user_exists("@a.l.i.c.e:test"));
+}
+
+TEST_F(AuthHandlerTest, RegisterStillReportsUserInUseForAnExactMatch) {
+    // The skeleton check would fire on a taken name too. "That name is taken"
+    // is the truer and more useful of the two answers, so it has to come first.
+    auto res = do_register("alice", "tr0mbone-seven");
+    EXPECT_EQ(res.status, 400);
+    EXPECT_EQ(nlohmann::json::parse(res.body)["errcode"], "M_USER_IN_USE");
+}
+
+TEST_F(AuthHandlerTest, RegisterReservesTheServerNameUnderItsSkeletonToo) {
+    // @server:<server_name> is granted ADMINISTRATOR unconditionally. Reserving
+    // only the literal spelling reserved one spelling out of many that read the
+    // same.
+    for (const char* attempt : {"server", "serv.er", "s_e_r_v_e_r", "server."}) {
+        auto res = do_register(attempt, "tr0mbone-seven");
+        EXPECT_EQ(res.status, 400) << attempt;
+        EXPECT_EQ(nlohmann::json::parse(res.body)["error"], "That username is reserved")
+            << attempt;
+    }
+}
+
+TEST_F(AuthHandlerTest, RegisterDoesNotReserveNamesThatMerelyStartLikeAPrefix) {
+    // Why the `oidc_` reservation stays a LITERAL prefix match. Under the
+    // skeleton the prefix folds to `oldc` (separators go), and comparing
+    // prefixes that way would refuse every innocent name starting with those
+    // four letters.
+    auto res = do_register("oldcoolguy", "tr0mbone-seven");
+    EXPECT_EQ(res.status, 200) << res.body;
+    EXPECT_TRUE(store->user_exists("@oldcoolguy:test"));
+
+    // The literal prefix is still refused.
+    EXPECT_EQ(do_register("oidc_josh", "tr0mbone-seven").status, 400);
+}
+
+TEST_F(AuthHandlerTest, RegisterRefusesANameMadeOnlyOfSeparators) {
+    // Such a name folds to an empty skeleton, which is also the column's
+    // default. Refusing it keeps "" a value no candidate ever has.
+    for (const char* attempt : {".", "-", "..--__"}) {
+        auto res = do_register(attempt, "tr0mbone-seven");
+        EXPECT_EQ(res.status, 400) << attempt;
+        EXPECT_EQ(nlohmann::json::parse(res.body)["errcode"], "M_INVALID_USERNAME") << attempt;
+    }
+}
+
+TEST_F(AuthHandlerTest, RegisterAcceptsADigitThatIsNotImitatingAnybody) {
+    // The rule must not become "no digits". Nobody is called `alice2` here.
+    EXPECT_EQ(do_register("alice2", "tr0mbone-seven").status, 200);
+    EXPECT_TRUE(store->user_exists("@alice2:test"));
+}
+
+TEST_F(AuthHandlerTest, AccountsThatAlreadyCollideCanStillLogIn) {
+    // The upgrade case, and the one outcome that would be unacceptable. Two
+    // accounts that predate the rule collide under it; both owners must keep
+    // getting in. Created through the store directly, exactly as a database
+    // written before the rule presents them.
+    ASSERT_TRUE(store->create_user("@josh:test", hash_password("tr0mbone-seven", 10)));
+    ASSERT_TRUE(store->create_user("@j0sh:test", hash_password("tr0mbone-eight", 10)));
+
+    auto login = [&](const std::string& user, const std::string& password) {
+        httplib::Request req;
+        req.body = nlohmann::json{{"type", "m.login.password"},
+                                  {"identifier", {{"type", "m.id.user"}, {"user", user}}},
+                                  {"password", password}}.dump();
+        httplib::Response res;
+        handler->handle_login(req, res);
+        if (res.status == -1) res.status = 200;
+        return res;
+    };
+
+    EXPECT_EQ(login("josh", "tr0mbone-seven").status, 200);
+    EXPECT_EQ(login("j0sh", "tr0mbone-eight").status, 200);
+
+    // The collision is visible to an operator, and cost nobody anything.
+    auto c = store->count_localpart_skeleton_collisions();
+    EXPECT_EQ(c.groups, 1);
+    EXPECT_EQ(c.accounts, 2);
+
+    // A THIRD lookalike is still refused — the rule is live, it just does not
+    // reach backwards.
+    EXPECT_EQ(do_register("j.0sh", "tr0mbone-seven").status, 400);
+}
 
 // --- Identity (m.login.token) account creation ---------------------------
 //

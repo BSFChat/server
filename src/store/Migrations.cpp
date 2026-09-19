@@ -1,9 +1,11 @@
 #include "store/Migrations.h"
 #include "auth/LocalAuth.h"
 #include "core/Logger.h"
+#include "identity/Localpart.h"
 #include "store/CallSignalling.h"
 
 #include <bsfchat/Constants.h>
+#include <bsfchat/Identifiers.h>
 
 #include <nlohmann/json.hpp>
 
@@ -1516,6 +1518,138 @@ void migrate_v25(sqlite3* db, bool /*fresh_database*/) {
         "retry-dedup records dropped");
 }
 
+void migrate_v26(sqlite3* db, bool /*fresh_database*/) {
+    // Retry-dedup records for /redact, in a table of their own.
+    //
+    // handle_redact parsed a txnId out of its path and then ignored it, so a
+    // client retry after a timeout applied the redaction a second time and put
+    // a second m.room.redaction event in the timeline. The end state was
+    // correct (the target stays redacted) but the room history was not.
+    //
+    // WHY A SEPARATE TABLE, and not a row in event_transactions alongside
+    // /send. Matrix scopes a transaction id to the access token across the
+    // whole client-server API, which reads like an argument for one shared
+    // namespace. It is not: that sentence is an obligation on CLIENTS not to
+    // reuse an id, and a server that treats the namespace as shared is trusting
+    // clients to have honoured it. A client that keeps a separate counter per
+    // endpoint — an ordinary thing to do — would then have its redaction with
+    // txn "7" answered with the event id of the MESSAGE it sent as txn "7",
+    // with nothing redacted and a 200 to say so. That is precisely the defect
+    // the send path is being fixed for on harden/auth, where a key wider than
+    // the request it identifies returned the wrong event id and silently did
+    // nothing. Narrowing is safe in the other direction: a genuine retry is the
+    // same PUT to the same path, so it still lands on the same key.
+    //
+    // The key is (user, device, room, target, txn) — the whole request. The
+    // target event id is here for the same reason the room is: without it, a
+    // client that reused txn "7" for a different message in the same room would
+    // be told its second deletion succeeded, and get back the first
+    // redaction's event id, while the second message stayed up. Matrix scopes
+    // the id to the access token, i.e. the device; the rest is what makes the
+    // key match the request being retried rather than merely its sender.
+    exec(db, R"(
+        CREATE TABLE IF NOT EXISTS redaction_transactions (
+            user_id         TEXT NOT NULL,
+            device_id       TEXT NOT NULL,
+            room_id         TEXT NOT NULL,
+            target_event_id TEXT NOT NULL,
+            txn_id          TEXT NOT NULL,
+            event_id        TEXT NOT NULL,
+            created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+            PRIMARY KEY (user_id, device_id, room_id, target_event_id, txn_id)
+        )
+    )");
+    // No index on event_id and no prune, deliberately. event_transactions
+    // carries one because the call-signalling prune deletes its rows by the
+    // event they recorded; a redaction event is never call signalling, so
+    // nothing here is ever deleted by event_id and an index would be dead
+    // weight. Like event_transactions, these rows simply accumulate — one short
+    // row per redaction, on an endpoint a rate limiter already bounds.
+
+    get_logger()->info("Schema v19: /redact now records its transaction ids, so a retry "
+                       "no longer appends a second redaction event");
+}
+
+void migrate_v27(sqlite3* db, bool /*fresh_database*/) {
+    // Lookalike-username policy: store each account's confusable SKELETON so a
+    // new registration can be checked against it. See identity/Localpart.h for
+    // what the folding does and why it is a five-rule ASCII table rather than
+    // the Unicode confusables data.
+    if (!column_exists(db, "users", "localpart_skeleton")) {
+        exec(db, "ALTER TABLE users ADD COLUMN localpart_skeleton TEXT NOT NULL DEFAULT ''");
+    }
+
+    // NOT a unique index, and that is the whole upgrade story. Accounts created
+    // before this rule existed may well collide under it — two people who
+    // registered `josh` and `j0sh` in 2026 both did nothing wrong — and a
+    // UNIQUE index would refuse to build, taking the server down on upgrade.
+    // Worse, anything that enforced uniqueness on existing rows would have to
+    // resolve the collision by evicting somebody. The rule is applied at
+    // registration and nowhere else; nobody is ever locked out of an account
+    // they already have.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_users_localpart_skeleton "
+             "ON users(localpart_skeleton)");
+
+    // The backfill has to run here in C++ rather than as an UPDATE: the folding
+    // includes `rn`/`m` and `vv`/`w`, which SQLite's string functions cannot
+    // express without a tower of nested replace() calls that would then be a
+    // second, divergent copy of the rule.
+    std::vector<std::pair<std::string, std::string>> rows; // user_id, skeleton
+    {
+        auto sel = prepare(db, "SELECT user_id FROM users");
+        while (sqlite3_step(sel.get()) == SQLITE_ROW) {
+            const auto* text = sqlite3_column_text(sel.get(), 0);
+            std::string user_id = text ? reinterpret_cast<const char*>(text) : "";
+            auto parsed = UserId::parse(user_id);
+            rows.emplace_back(user_id,
+                              localpart_skeleton(parsed ? parsed->localpart : user_id));
+        }
+    }
+    {
+        auto upd = prepare(db, "UPDATE users SET localpart_skeleton = ? WHERE user_id = ?");
+        for (const auto& [user_id, skeleton] : rows) {
+            sqlite3_reset(upd.get());
+            sqlite3_bind_text(upd.get(), 1, skeleton.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(upd.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(upd.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("localpart skeleton backfill failed: ") +
+                                         sqlite3_errmsg(db));
+            }
+        }
+    }
+
+    // What the rule would have cost if it had always been in force. This is the
+    // number an operator needs in order to know whether their server already
+    // contains an impersonation they have not noticed, and it is reported
+    // rather than acted on for the reason above.
+    //
+    // An empty skeleton (a localpart of nothing but separators) is excluded: it
+    // is also the column's default, so counting it would turn any future row
+    // that failed to write a skeleton into a phantom collision.
+    const char* kCollidingGroups =
+        "SELECT COUNT(*) FROM (SELECT 1 FROM users WHERE localpart_skeleton <> '' "
+        "                       GROUP BY localpart_skeleton HAVING COUNT(*) > 1)";
+    const char* kCollidingAccounts =
+        "SELECT COUNT(*) FROM users WHERE localpart_skeleton <> '' "
+        "   AND localpart_skeleton IN (SELECT localpart_skeleton FROM users "
+        "                               WHERE localpart_skeleton <> '' "
+        "                               GROUP BY localpart_skeleton HAVING COUNT(*) > 1)";
+    const int groups = scalar_int(db, kCollidingGroups);
+    const int accounts = scalar_int(db, kCollidingAccounts);
+
+    if (groups > 0) {
+        get_logger()->warn(
+            "Schema v20: {} existing account(s) in {} lookalike group(s) would collide under "
+            "the new registration policy. They are untouched and can still sign in — the rule "
+            "applies to NEW registrations only. Review them if impersonation is a concern.",
+            accounts, groups);
+    } else {
+        get_logger()->info(
+            "Schema v20: usernames are now checked against a confusable skeleton at "
+            "registration; no existing account collides under it");
+    }
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1545,6 +1679,8 @@ const std::vector<Step>& steps() {
         migrate_v23,
         migrate_v24,
         migrate_v25,
+        migrate_v26,
+        migrate_v27,
     };
     return kMigrations;
 }
