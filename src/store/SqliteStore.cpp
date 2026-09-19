@@ -1344,6 +1344,40 @@ void SqliteStore::record_transaction(const std::string& user_id, const std::stri
     sqlite3_step(stmt.get());
 }
 
+std::optional<std::string>
+SqliteStore::get_redaction_transaction_event(const RedactionKey& key) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT event_id FROM redaction_transactions "
+        " WHERE user_id = ? AND device_id = ? AND room_id = ? AND target_event_id = ? "
+        "   AND txn_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, key.user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, key.device_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, key.room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, key.target_event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 5, key.txn_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        return column_text_or_empty(stmt.get(), 0);
+    }
+    return std::nullopt;
+}
+
+void SqliteStore::record_redaction_transaction(const RedactionKey& key,
+                                                const std::string& event_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "INSERT OR IGNORE INTO redaction_transactions "
+        "  (user_id, device_id, room_id, target_event_id, txn_id, event_id) "
+        "  VALUES (?, ?, ?, ?, ?, ?)");
+    sqlite3_bind_text(stmt.get(), 1, key.user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, key.device_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, key.room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, key.target_event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 5, key.txn_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 6, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+}
+
 std::optional<std::string> SqliteStore::set_server_state(const std::string& event_type,
                                                           const std::string& state_key,
                                                           const std::string& sender,

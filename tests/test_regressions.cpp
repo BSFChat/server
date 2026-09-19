@@ -360,7 +360,11 @@ TEST(LegacyUpgrade, DirectMarkerBackfillTouchesOnlyCurrentStateAndIsIdempotent) 
                            json{{"membership", "join"}}.dump(), now_ms());
     }
 
-    set_user_version(kTargetSchemaVersion - 1);
+    // 17, not kTargetSchemaVersion - 1. This test is about migration v18, so it
+    // has to rewind to the version v18 runs FROM; expressing that relative to
+    // the latest schema quietly stopped exercising v18 the moment v19 was
+    // added, and the test then failed on a backfill that had simply never run.
+    set_user_version(17);
     { SqliteStore store(path); store.initialize(); }
 
     EXPECT_EQ(json::parse(content_of("$new")).value("is_direct", false), true);
@@ -372,7 +376,7 @@ TEST(LegacyUpgrade, DirectMarkerBackfillTouchesOnlyCurrentStateAndIsIdempotent) 
 
     // Re-running it is a no-op, not a second rewrite.
     const auto after_first = content_of("$new");
-    set_user_version(kTargetSchemaVersion - 1);
+    set_user_version(17);
     { SqliteStore store(path); store.initialize(); }
     EXPECT_EQ(content_of("$new"), after_first);
 
@@ -1519,6 +1523,217 @@ TEST(SendEvent, RetryWithSameTransactionIdDoesNotDuplicate) {
         if (ev.type == std::string(event_type::kRoomMessage)) ++messages;
     }
     EXPECT_EQ(messages, 1) << "a client retry duplicated the message";
+}
+
+// The /redact endpoint matched {txnId} out of its path and then ignored it, so
+// every retry applied the redaction again and appended another tombstone.
+// These four pin down the KEY as much as the dedup: the whole point is that a
+// hit means "this exact request, again", and never "some other request by the
+// same person".
+
+namespace {
+
+// Number of m.room.redaction events currently in `room`.
+int count_redactions(Fixture& f, const std::string& room) {
+    auto [events, _] = f.store->get_room_events_paginated(room, 200, "b");
+    int n = 0;
+    for (const auto& ev : events) {
+        if (ev.type == std::string(event_type::kRoomRedaction)) ++n;
+    }
+    return n;
+}
+
+// Posts a message by `sender` into `room` and returns its event id.
+std::string post_message(Fixture& f, const std::string& room, const std::string& sender,
+                         const std::string& body) {
+    auto id = generate_event_id("test");
+    f.store->insert_event(id, room, sender, std::string(event_type::kRoomMessage),
+                          std::nullopt, json{{"msgtype", "m.text"}, {"body", body}}.dump(),
+                          now_ms());
+    return id;
+}
+
+} // namespace
+
+TEST(RedactionIdempotency, RetryWithTheSameTransactionIdAppendsNoSecondTombstone) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+    auto target = post_message(f, room, alice, "please delete me");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    const std::string path =
+        "/_matrix/client/v3/rooms/" + room + "/redact/" + target + "/txn-7";
+
+    httplib::Response res1;
+    auto req1 = make_request(path, "token-alice");
+    handler.handle_redact(req1, res1);
+    ASSERT_TRUE(IsOk(res1));
+
+    // The retry a flaky connection produces: byte-for-byte the same request.
+    httplib::Response res2;
+    auto req2 = make_request(path, "token-alice");
+    handler.handle_redact(req2, res2);
+    ASSERT_TRUE(IsOk(res2));
+
+    EXPECT_EQ(json::parse(res1.body).at("event_id"), json::parse(res2.body).at("event_id"))
+        << "the retry was treated as a new redaction";
+    EXPECT_EQ(count_redactions(f, room), 1) << "a client retry duplicated the redaction";
+}
+
+TEST(RedactionIdempotency, ReusingATransactionIdOnAnotherTargetStillRedactsIt) {
+    // The defect redaction must not inherit from the send path: keying on
+    // (sender, txn_id) alone answered 200 with the FIRST event's id and did
+    // nothing at all the second time. Here that would leave a message the user
+    // asked to delete still standing, while telling them it was gone.
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+    auto first = post_message(f, room, alice, "first");
+    auto second = post_message(f, room, alice, "second");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+
+    httplib::Response res1;
+    auto req1 = make_request(
+        "/_matrix/client/v3/rooms/" + room + "/redact/" + first + "/txn-1", "token-alice");
+    handler.handle_redact(req1, res1);
+    ASSERT_TRUE(IsOk(res1));
+
+    httplib::Response res2;
+    auto req2 = make_request(
+        "/_matrix/client/v3/rooms/" + room + "/redact/" + second + "/txn-1", "token-alice");
+    handler.handle_redact(req2, res2);
+    ASSERT_TRUE(IsOk(res2));
+
+    EXPECT_NE(json::parse(res1.body).at("event_id"), json::parse(res2.body).at("event_id"));
+    EXPECT_EQ(count_redactions(f, room), 2);
+
+    auto stored = f.store->get_event_by_id(second);
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->content.data.value("body", ""), "")
+        << "the second message was reported deleted but is still readable";
+}
+
+TEST(RedactionIdempotency, ARedactionDoesNotAnswerWithASendSharingItsTransactionId) {
+    // The namespace decision. Matrix asks CLIENTS to keep transaction ids
+    // unique per access token; a server that assumes they did would hand this
+    // redaction the message's event id and redact nothing.
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+    auto target = post_message(f, room, alice, "please delete me");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+
+    httplib::Response sent;
+    auto send_req = make_request(
+        "/_matrix/client/v3/rooms/" + room + "/send/m.room.message/txn-9", "token-alice",
+        json{{"msgtype", "m.text"}, {"body", "hi"}}.dump());
+    handler.handle_send_event(send_req, sent);
+    ASSERT_TRUE(IsOk(sent));
+
+    httplib::Response redacted;
+    auto redact_req = make_request(
+        "/_matrix/client/v3/rooms/" + room + "/redact/" + target + "/txn-9", "token-alice");
+    handler.handle_redact(redact_req, redacted);
+    ASSERT_TRUE(IsOk(redacted));
+
+    EXPECT_NE(json::parse(sent.body).at("event_id"), json::parse(redacted.body).at("event_id"))
+        << "the redaction was answered with the message's event id";
+    EXPECT_EQ(count_redactions(f, room), 1);
+    auto stored = f.store->get_event_by_id(target);
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->content.data.value("body", ""), "");
+
+    // And the reverse direction: the send's own record is untouched, so its
+    // retry still dedups against the message rather than the redaction.
+    httplib::Response resent;
+    auto resend_req = make_request(
+        "/_matrix/client/v3/rooms/" + room + "/send/m.room.message/txn-9", "token-alice",
+        json{{"msgtype", "m.text"}, {"body", "hi"}}.dump());
+    handler.handle_send_event(resend_req, resent);
+    ASSERT_TRUE(IsOk(resent));
+    EXPECT_EQ(json::parse(sent.body).at("event_id"), json::parse(resent.body).at("event_id"));
+}
+
+TEST(RedactionIdempotency, TheRecordIsScopedToTheDeviceThatSentIt) {
+    // A txn id is scoped to the access token, so two clients signed in as the
+    // same user are two independent streams — both starting at 1. This is the
+    // one case where including device_id in the key is visible, and it is in
+    // the key for the same reason /send has it there.
+    Fixture f;
+    auto alice = f.add_user("alice"); // token-alice, device "dev"
+    f.store->store_access_token("token-alice-phone", alice, "phone");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+    auto first = post_message(f, room, alice, "first");
+    auto second = post_message(f, room, alice, "second");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+
+    httplib::Response desktop;
+    auto desktop_req = make_request(
+        "/_matrix/client/v3/rooms/" + room + "/redact/" + first + "/txn-1", "token-alice");
+    handler.handle_redact(desktop_req, desktop);
+    ASSERT_TRUE(IsOk(desktop));
+
+    // Same id, second device, different message. If device_id were missing
+    // from the key this would still be distinguished by the target — so the
+    // assertion that matters is that the phone's OWN retry dedups against the
+    // phone's record and not the desktop's.
+    httplib::Response phone;
+    auto phone_req = make_request(
+        "/_matrix/client/v3/rooms/" + room + "/redact/" + second + "/txn-1",
+        "token-alice-phone");
+    handler.handle_redact(phone_req, phone);
+    ASSERT_TRUE(IsOk(phone));
+    EXPECT_NE(json::parse(desktop.body).at("event_id"), json::parse(phone.body).at("event_id"));
+
+    httplib::Response phone_retry;
+    auto phone_retry_req = make_request(
+        "/_matrix/client/v3/rooms/" + room + "/redact/" + second + "/txn-1",
+        "token-alice-phone");
+    handler.handle_redact(phone_retry_req, phone_retry);
+    ASSERT_TRUE(IsOk(phone_retry));
+    EXPECT_EQ(json::parse(phone.body).at("event_id"),
+              json::parse(phone_retry.body).at("event_id"));
+    EXPECT_EQ(count_redactions(f, room), 2);
+}
+
+TEST(RedactionIdempotency, ARequestWithNoTransactionIdIsRefusedOutright) {
+    // Load-bearing for the dedup: the record is only written when a txn id is
+    // present, so if a request could arrive WITHOUT one it would be a redaction
+    // that no retry could ever match. It cannot — match_route drops empty
+    // segments, so a trailing slash changes the segment count and the route
+    // simply does not match. Every redaction that reaches the handler carries
+    // an id and is therefore recorded.
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = generate_room_id("test");
+    f.store->create_room(room, alice);
+    f.store->set_membership(room, alice, "join");
+    auto target = post_message(f, room, alice, "first");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request("/_matrix/client/v3/rooms/" + room + "/redact/" + target + "/",
+                            "token-alice");
+    handler.handle_redact(req, res);
+    EXPECT_EQ(res.status, 404);
+    EXPECT_EQ(count_redactions(f, room), 0);
+
+    auto stored = f.store->get_event_by_id(target);
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->content.data.value("body", ""), "first")
+        << "an unrecordable redaction was applied anyway";
 }
 
 // ── S10: auth hardening ───────────────────────────────────────────────────

@@ -1123,6 +1123,58 @@ void migrate_v18(sqlite3* db, bool fresh_database) {
         after - before);
 }
 
+void migrate_v19(sqlite3* db, bool /*fresh_database*/) {
+    // Retry-dedup records for /redact, in a table of their own.
+    //
+    // handle_redact parsed a txnId out of its path and then ignored it, so a
+    // client retry after a timeout applied the redaction a second time and put
+    // a second m.room.redaction event in the timeline. The end state was
+    // correct (the target stays redacted) but the room history was not.
+    //
+    // WHY A SEPARATE TABLE, and not a row in event_transactions alongside
+    // /send. Matrix scopes a transaction id to the access token across the
+    // whole client-server API, which reads like an argument for one shared
+    // namespace. It is not: that sentence is an obligation on CLIENTS not to
+    // reuse an id, and a server that treats the namespace as shared is trusting
+    // clients to have honoured it. A client that keeps a separate counter per
+    // endpoint — an ordinary thing to do — would then have its redaction with
+    // txn "7" answered with the event id of the MESSAGE it sent as txn "7",
+    // with nothing redacted and a 200 to say so. That is precisely the defect
+    // the send path is being fixed for on harden/auth, where a key wider than
+    // the request it identifies returned the wrong event id and silently did
+    // nothing. Narrowing is safe in the other direction: a genuine retry is the
+    // same PUT to the same path, so it still lands on the same key.
+    //
+    // The key is (user, device, room, target, txn) — the whole request. The
+    // target event id is here for the same reason the room is: without it, a
+    // client that reused txn "7" for a different message in the same room would
+    // be told its second deletion succeeded, and get back the first
+    // redaction's event id, while the second message stayed up. Matrix scopes
+    // the id to the access token, i.e. the device; the rest is what makes the
+    // key match the request being retried rather than merely its sender.
+    exec(db, R"(
+        CREATE TABLE IF NOT EXISTS redaction_transactions (
+            user_id         TEXT NOT NULL,
+            device_id       TEXT NOT NULL,
+            room_id         TEXT NOT NULL,
+            target_event_id TEXT NOT NULL,
+            txn_id          TEXT NOT NULL,
+            event_id        TEXT NOT NULL,
+            created_at      INTEGER NOT NULL DEFAULT (strftime('%s','now') * 1000),
+            PRIMARY KEY (user_id, device_id, room_id, target_event_id, txn_id)
+        )
+    )");
+    // No index on event_id and no prune, deliberately. event_transactions
+    // carries one because the call-signalling prune deletes its rows by the
+    // event they recorded; a redaction event is never call signalling, so
+    // nothing here is ever deleted by event_id and an index would be dead
+    // weight. Like event_transactions, these rows simply accumulate — one short
+    // row per redaction, on an endpoint a rate limiter already bounds.
+
+    get_logger()->info("Schema v19: /redact now records its transaction ids, so a retry "
+                       "no longer appends a second redaction event");
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1145,6 +1197,7 @@ const std::vector<Step>& steps() {
         migrate_v16,
         migrate_v17,
         migrate_v18,
+        migrate_v19,
     };
     return kMigrations;
 }

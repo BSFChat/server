@@ -494,9 +494,19 @@ void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Resp
 }
 
 void EventHandler::handle_redact(const httplib::Request& req, httplib::Response& res) {
-    auto user_id = authenticate(store_, req.get_header_value("Authorization"));
+    const auto auth_header = req.get_header_value("Authorization");
+    auto user_id = authenticate(store_, auth_header);
     if (!user_id) {
-        return send_error(res, 401, auth_error(req.get_header_value("Authorization")));
+        return send_error(res, 401, auth_error(auth_header));
+    }
+    // The DEVICE, not just the identity: it is part of the transaction-id key
+    // below, because a txn id is scoped to the access token and two clients
+    // signed in as the same user each start their counters at 1. authenticate()
+    // above is what validated the token; this is a second read of the same
+    // indexed row for the device it belongs to.
+    std::string device_id;
+    if (auto token = extract_access_token(auth_header)) {
+        if (auto session = store_.get_session_by_token(*token)) device_id = session->device_id;
     }
 
     auto match = match_route("/_matrix/client/v3/rooms/{roomId}/redact/{eventId}/{txnId}", req.path);
@@ -506,9 +516,34 @@ void EventHandler::handle_redact(const httplib::Request& req, httplib::Response&
 
     auto& room_id = match.params["roomId"];
     auto& target_event_id = match.params["eventId"];
+    auto& txn_id = match.params["txnId"];
 
     if (!store_.is_room_member(room_id, *user_id)) {
         return send_error(res, 403, MatrixError::forbidden("Not a member of this room"));
+    }
+
+    // Transaction-id idempotency. This endpoint matched {txnId} out of its path
+    // and then ignored it, so a retry after a timeout redacted the target a
+    // second time and appended a second m.room.redaction to the timeline. The
+    // end state was right and the history was not.
+    //
+    // The key is the whole request, not just the sender — see
+    // SqliteStore::RedactionKey for why the room and the target are in it, and
+    // migrate_v19 for why this is a different namespace from /send's.
+    //
+    // Checked before the rate limiter on purpose: a retry is the same request,
+    // and charging a client for the network's failure to deliver the first
+    // answer would make a flaky connection look like abuse.
+    //
+    // The empty-id guard mirrors /send. It cannot fire here — match_route drops
+    // empty path segments, so a trailing slash fails the route outright — which
+    // is what makes "every redaction is recorded" true rather than hopeful.
+    const SqliteStore::RedactionKey txn_key{*user_id, device_id, room_id, target_event_id, txn_id};
+    if (!txn_id.empty()) {
+        if (auto existing = store_.get_redaction_transaction_event(txn_key)) {
+            res.set_content(json{{"event_id", *existing}}.dump(), "application/json");
+            return;
+        }
     }
 
     PermissionsEngine perms(store_, config_);
@@ -553,6 +588,9 @@ void EventHandler::handle_redact(const httplib::Request& req, httplib::Response&
     store_.insert_event(event_id, room_id, *user_id,
                         std::string(event_type::kRoomRedaction),
                         std::nullopt, content.dump(), now_ms());
+    if (!txn_id.empty()) {
+        store_.record_redaction_transaction(txn_key, event_id);
+    }
     sync_engine_.notify_new_event();
 
     res.set_content(json{{"event_id", event_id}}.dump(), "application/json");

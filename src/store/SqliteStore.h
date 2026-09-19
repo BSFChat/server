@@ -294,6 +294,40 @@ public:
     void record_transaction(const std::string& user_id, const std::string& txn_id,
                             const std::string& event_id);
 
+    // Transaction-id idempotency for /redact, which is a SEPARATE namespace
+    // from the one above and not an oversight. See migrate_v19: a shared
+    // namespace would let a client that keeps one counter per endpoint have its
+    // redaction answered with the event id of a message, having redacted
+    // nothing.
+    //
+    // Every part of the key is load-bearing. A txn id is scoped to the access
+    // token, which is the DEVICE; the room and the TARGET are what make the key
+    // identify the request being retried rather than merely its sender. Without
+    // the target, a client reusing an id for a second deletion in the same room
+    // is told it succeeded and handed the first redaction's event id, while the
+    // second message stays up — the same silent no-op that made the send path's
+    // (sender, txn_id) key wrong.
+    //
+    // device_id is the one part that could be argued either way, and it is in
+    // because it is in /send's key. Dropping it would fold together the only
+    // case where it matters — two clients of the SAME user redacting the SAME
+    // target with the SAME id, which happens because both counters start at 1 —
+    // and that fold would even be harmless here, since (room, target) fully
+    // determines the effect of a redaction. It is not worth having redaction's
+    // key differ in shape from /send's for it: the cost of keeping it is a
+    // second tombstone in that one case, which is exactly what those two
+    // clients already produce today whenever their ids do not happen to
+    // coincide.
+    struct RedactionKey {
+        std::string user_id;
+        std::string device_id;
+        std::string room_id;
+        std::string target_event_id;
+        std::string txn_id;
+    };
+    std::optional<std::string> get_redaction_transaction_event(const RedactionKey& key);
+    void record_redaction_transaction(const RedactionKey& key, const std::string& event_id);
+
     // Sync
     // Returns events strictly after `since_position` that the user can see.
     // `out_max_position` receives the highest stream position actually
