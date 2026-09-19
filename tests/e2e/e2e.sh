@@ -239,13 +239,23 @@ fi
 echo
 echo "== schema =="
 SV=$(sqlite3 "$RUN/data/bsfchat.db" "PRAGMA user_version" 2>/dev/null || echo "?")
-# Pinned on purpose, so bumping the schema is a conscious edit rather than
-# something that slides past review — the same convention the C++ migration tests
-# use (kTargetSchemaVersion in server/src/store/Migrations.h). This pin had gone
-# stale at 12 while the schema moved to 15, so the check was failing for its own
-# reasons rather than reporting anything: 13 added the moderation audit log, 14
-# users.nickname, 15 server_bans, 16 the audit_log filter indexes.
-check "database is at schema v16" "^16$" "$SV"
+# Derived from the build's own source of truth, not restated here. This used to
+# be a literal pinned "so bumping the schema is a conscious edit", but in
+# practice the pin just went stale on every migration (it sat at 12 while the
+# schema was 15, then at 16 while it was 18) and a permanently-red check teaches
+# people to ignore the whole suite. The conscious-edit tripwire still exists
+# where it costs nothing to keep current: EXPECT_EQ(kTargetSchemaVersion, N) in
+# tests/test_audit.cpp. What this check is really for is that the server
+# actually ran its migrations up to the version this checkout expects.
+EXPECT_SV=$(sed -n \
+  's/^inline constexpr int kTargetSchemaVersion = \([0-9][0-9]*\);.*/\1/p' \
+  "$SRV/src/store/Migrations.h" 2>/dev/null)
+if [ -n "$EXPECT_SV" ]; then
+  check "database is at schema v$EXPECT_SV (kTargetSchemaVersion)" "^$EXPECT_SV\$" "$SV"
+else
+  echo "  FAIL  could not read kTargetSchemaVersion from $SRV/src/store/Migrations.h"
+  FAIL=$((FAIL+1))
+fi
 TB=$(sqlite3 "$RUN/data/bsfchat.db" ".tables" 2>/dev/null | tr -s ' \n' ' ')
 check "event_mentions exists" "event_mentions" "$TB"
 check "pushers exists" "pushers" "$TB"
