@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
+#include <set>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -1945,15 +1946,33 @@ std::vector<RoomEvent> SqliteStore::get_room_events(const std::string& room_id, 
 std::vector<RoomEvent> SqliteStore::get_state_events(const std::string& room_id) {
     std::lock_guard lock(mutex_);
 
-    // Get the latest state event for each (event_type, state_key) pair
+    // Get the latest state event for each (event_type, state_key) pair.
+    //
+    // `signal_to IS NULL` is the addressee rule, and this read is where it was
+    // missing. Every other read of `events` carries it; this one did not, and
+    // its result goes to every joined member through /sync and out whole from
+    // GET /rooms/{id}/state. A signalling event written WITH a state_key —
+    // reachable through PUT /rooms/{id}/state/m.call.candidates/{key}, which
+    // needs kManageChannels — therefore broadcast the sender's LAN and public
+    // address to the room despite being addressed to one peer.
+    //
+    // The clause is on signal_to rather than on event type, so the voice
+    // roster (m.call.member, which carries no address and which the UI cannot
+    // work without) and unaddressed legacy signalling both keep today's
+    // behaviour. It is inside the subquery as well as the outer WHERE so a
+    // filtered row cannot win the MAX(stream_position) race and suppress the
+    // legitimate state event underneath it.
+    //
+    // See store/CallSignalling.h for what the rule is and why.
     auto stmt = prepare(db_,
         "SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content, e.origin_server_ts "
         "FROM events e "
         "INNER JOIN (SELECT event_type, state_key, MAX(stream_position) as max_pos "
         "            FROM events WHERE room_id = ? AND state_key IS NOT NULL "
+        "                          AND signal_to IS NULL "
         "            GROUP BY event_type, state_key) latest "
         "ON e.event_type = latest.event_type AND e.state_key = latest.state_key AND e.stream_position = latest.max_pos "
-        "WHERE e.room_id = ?");
+        "WHERE e.room_id = ? AND e.signal_to IS NULL");
     sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
 
@@ -3876,6 +3895,62 @@ bool SqliteStore::is_avatar_media(const std::string& mxc_uri) {
     auto stmt = prepare(db_, "SELECT 1 FROM users WHERE avatar_url = ? LIMIT 1");
     sqlite3_bind_text(stmt.get(), 1, mxc_uri.c_str(), -1, SQLITE_TRANSIENT);
     return sqlite3_step(stmt.get()) == SQLITE_ROW;
+}
+
+std::vector<SqliteStore::MediaMeta> SqliteStore::find_orphaned_media(
+    const std::string& server_name, int64_t created_before_ms, int limit) {
+    std::lock_guard lock(mutex_);
+
+    // server_state first, in C++. It holds server-scoped documents that are
+    // NOT events (bsfchat.server.roles, bsfchat.member.roles) and therefore
+    // never reach media_refs, so an mxc named in one of them would look
+    // unreferenced to the SQL below. The table holds a handful of rows on any
+    // deployment, and using media_uris_in_content() rather than a second
+    // extraction rule is what stops this drifting from what insert_event
+    // indexes.
+    std::set<std::string> server_state_uris;
+    {
+        auto stmt = prepare(db_, "SELECT content FROM server_state");
+        while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+            for (auto& uri : media_uris_in_content(column_text_or_empty(stmt.get(), 0))) {
+                server_state_uris.insert(std::move(uri));
+            }
+        }
+    }
+
+    const std::string prefix = "mxc://" + server_name + "/";
+
+    // The two NOT EXISTS clauses are correlated subqueries over indexed
+    // columns: media_refs' primary key leads with mxc_uri, and users.avatar_url
+    // is compared whole. `limit` bounds the work per sweep so a deployment with
+    // a large backlog pays for it over several passes instead of holding the
+    // store's global mutex for the whole of one.
+    auto stmt = prepare(db_,
+        "SELECT m.media_id, m.uploader, m.content_type, m.filename, m.file_size, m.file_path "
+        "FROM media m "
+        "WHERE m.created_at < ? "
+        "  AND NOT EXISTS (SELECT 1 FROM media_refs r WHERE r.mxc_uri = ? || m.media_id) "
+        "  AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_url = ? || m.media_id) "
+        "ORDER BY m.created_at "
+        "LIMIT ?");
+    sqlite3_bind_int64(stmt.get(), 1, created_before_ms);
+    sqlite3_bind_text(stmt.get(), 2, prefix.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, prefix.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt.get(), 4, limit);
+
+    std::vector<MediaMeta> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        MediaMeta meta;
+        meta.media_id = column_text_or_empty(stmt.get(), 0);
+        if (server_state_uris.count(prefix + meta.media_id)) continue;
+        meta.uploader = column_text_or_empty(stmt.get(), 1);
+        meta.content_type = column_text_or_empty(stmt.get(), 2);
+        meta.filename = column_text_or_empty(stmt.get(), 3);
+        meta.file_size = sqlite3_column_int64(stmt.get(), 4);
+        meta.file_path = column_text_or_empty(stmt.get(), 5);
+        out.push_back(std::move(meta));
+    }
+    return out;
 }
 
 bool SqliteStore::delete_media(const std::string& media_id) {

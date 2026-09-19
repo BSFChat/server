@@ -31,6 +31,7 @@
 #include "auth/LocalAuth.h"
 #include "core/Config.h"
 #include "storage/LocalStorage.h"
+#include "storage/MediaReaper.h"
 #include "store/SqliteStore.h"
 
 #include <bsfchat/Constants.h>
@@ -45,6 +46,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <regex>
@@ -741,4 +743,247 @@ TEST(MediaAclMigration, ExistingEventsAreBackfilledIntoTheReferenceIndex) {
     }
 
     for (auto suffix : {"", "-wal", "-shm"}) std::filesystem::remove(path + suffix);
+}
+
+// ══ 7. The media reaper — audit data-path finding 11 ══════════════════════
+//
+// Media had no erasure path. SqliteStore::delete_media and MediaStorage::remove
+// both existed with zero callers in src/. redact_event() strips the mxc from
+// the event content and drops the ACL row — so the object stops being
+// REACHABLE — but the bytes stayed on disk and stayed served to anyone who had
+// noted the id first. Deleting the whole channel did not help. The product's
+// only "make it go away" control did not make the bytes go away.
+//
+// Every test below fails on `main`, where nothing ever deletes a blob.
+//
+// The sweep is driven directly with an injected `now_ms` rather than through
+// the thread: the grace period is a day and a test must not sleep one out.
+
+namespace {
+
+// Far enough past every fixture object's created_at that the grace period is
+// satisfied, without touching the clock.
+int64_t past_grace(const Config& config) {
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    return now + static_cast<int64_t>(config.media_orphan_grace_hours) * 3600 * 1000 + 60000;
+}
+
+struct ReaperFixture : AclFixture {
+    std::unique_ptr<MediaReaper> reaper;
+
+    ReaperFixture() {
+        // Armed. The shipped default is dry run (see Config.h); the tests that
+        // care about that assert it explicitly.
+        config.media_reaper_dry_run = false;
+        reaper = std::make_unique<MediaReaper>(*store, config, storage);
+    }
+
+    size_t sweep() { return reaper->sweep_once(past_grace(config)); }
+
+    bool blob_exists(const std::string& id) const {
+        return std::filesystem::exists(dir / id);
+    }
+    bool row_exists(const std::string& id) {
+        return store->get_media(id).has_value();
+    }
+};
+
+} // namespace
+
+TEST(MediaReaperTest, RedactingTheOnlyMessageThatNamedAnObjectDeletesTheBytes) {
+    ReaperFixture f;
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto room = f.add_channel(alice);
+    f.join(room, bob);
+
+    auto id = f.upload(alice);
+    auto event_id = f.post(room, alice, f.mxc(id));
+
+    // Bob noted the id while he could still see the message. This is the whole
+    // attack: everything after this point is Alice believing she deleted it.
+    ASSERT_EQ(f.download_status(id, "bob"), 200);
+    ASSERT_TRUE(f.blob_exists(id));
+
+    f.store->redact_event(event_id, alice);
+
+    // Before the reaper, this is exactly where it stopped: the grant is gone,
+    // so Bob gets a 404 through the ACL — and the bytes are still on disk,
+    // still recoverable by anyone with filesystem access or a backup, and
+    // still served the instant any future code path stops consulting the ACL.
+    EXPECT_EQ(f.download_status(id, "bob"), 404);
+    // ...and this is the state `main` stops in, asserted so the test says out
+    // loud what it is fixing: redaction alone leaves the object on disk.
+    EXPECT_TRUE(f.blob_exists(id));
+
+    EXPECT_EQ(f.sweep(), 1u);
+    EXPECT_FALSE(f.blob_exists(id)) << "the bytes survived a redaction";
+    EXPECT_FALSE(f.row_exists(id));
+    EXPECT_EQ(f.download_status(id, "bob"), 404);
+}
+
+TEST(MediaReaperTest, AnObjectStillNamedByALiveMessageIsNeverTouched) {
+    // The control that makes every other test in this block mean something.
+    ReaperFixture f;
+    auto alice = f.add_user("alice");
+    auto room = f.add_channel(alice);
+
+    auto id = f.upload(alice);
+    f.post(room, alice, f.mxc(id));
+
+    EXPECT_EQ(f.sweep(), 0u);
+    EXPECT_TRUE(f.blob_exists(id));
+    EXPECT_TRUE(f.row_exists(id));
+    EXPECT_EQ(f.download_status(id, "alice"), 200);
+}
+
+TEST(MediaReaperTest, DeletingAChannelDeletesItsAttachmentsBytes) {
+    ReaperFixture f;
+    auto alice = f.add_user("alice");
+    auto room = f.add_channel(alice);
+
+    auto id = f.upload(alice);
+    f.post(room, alice, f.mxc(id));
+    ASSERT_TRUE(f.blob_exists(id));
+
+    f.store->delete_room(room);
+
+    EXPECT_EQ(f.sweep(), 1u);
+    EXPECT_FALSE(f.blob_exists(id));
+    EXPECT_FALSE(f.row_exists(id));
+}
+
+TEST(MediaReaperTest, AnObjectStillReferencedFromAnotherRoomSurvives) {
+    // The reason this is a sweep over the whole reference table rather than a
+    // delete at the redaction site: one object can be named by events in
+    // several rooms — a forward, a repost — so "this event was redacted" is
+    // not "this object is unreferenced". A per-site delete gets this wrong and
+    // destroys an image that is still on screen in another channel.
+    ReaperFixture f;
+    auto alice = f.add_user("alice");
+    auto room_a = f.add_channel(alice);
+    auto room_b = f.add_channel(alice);
+
+    auto id = f.upload(alice);
+    auto in_a = f.post(room_a, alice, f.mxc(id));
+    f.post(room_b, alice, f.mxc(id));
+
+    f.store->redact_event(in_a, alice);
+
+    EXPECT_EQ(f.sweep(), 0u) << "an object still posted in another channel was collected";
+    EXPECT_TRUE(f.blob_exists(id));
+    EXPECT_EQ(f.download_status(id, "alice"), 200);
+
+    // Once the last reference goes, it is collected.
+    f.store->delete_room(room_b);
+    EXPECT_EQ(f.sweep(), 1u);
+    EXPECT_FALSE(f.blob_exists(id));
+}
+
+TEST(MediaReaperTest, AProfileAvatarIsNeverCollected) {
+    // Avatars are the one legitimately room-less media class: no event names
+    // them, so they look exactly like an orphan to a query that only consults
+    // media_refs. Getting this wrong deletes every avatar on the server on the
+    // first sweep.
+    ReaperFixture f;
+    auto alice = f.add_user("alice");
+
+    auto id = f.upload(alice);
+    f.store->set_avatar_url(alice, f.mxc(id));
+
+    EXPECT_EQ(f.sweep(), 0u);
+    EXPECT_TRUE(f.blob_exists(id));
+
+    // And when it stops being the avatar, it becomes collectable.
+    f.store->set_avatar_url(alice, "");
+    EXPECT_EQ(f.sweep(), 1u);
+    EXPECT_FALSE(f.blob_exists(id));
+}
+
+TEST(MediaReaperTest, AnObjectNamedOnlyByServerScopedStateIsNotCollected) {
+    // server_state holds documents that are NOT events — they never pass
+    // through insert_event, so they are never in media_refs. An mxc named in
+    // one is invisible to the reference query, and this is the case a reader
+    // of find_orphaned_media would most plausibly not think of.
+    ReaperFixture f;
+    auto alice = f.add_user("alice");
+    auto id = f.upload(alice);
+
+    f.store->set_server_state("bsfchat.server.info", "", "@server:test",
+                              json{{"icon_url", f.mxc(id)}}.dump());
+
+    EXPECT_EQ(f.sweep(), 0u) << "the server's own icon was collected as an orphan";
+    EXPECT_TRUE(f.blob_exists(id));
+}
+
+TEST(MediaReaperTest, AFreshUploadInsideTheGracePeriodIsNotCollected) {
+    // POST /upload and the PUT /send that names the object are two requests.
+    // In between, the object is indistinguishable from an orphan — so without
+    // a grace period the reaper deletes attachments out from under people who
+    // are still composing.
+    ReaperFixture f;
+    auto alice = f.add_user("alice");
+    auto id = f.upload(alice);
+
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    EXPECT_EQ(f.reaper->sweep_once(now), 0u);
+    EXPECT_TRUE(f.blob_exists(id));
+
+    // Past the window, with nothing ever having referenced it, it goes. This
+    // is the orphan class neither redaction nor room deletion can see.
+    EXPECT_EQ(f.sweep(), 1u);
+    EXPECT_FALSE(f.blob_exists(id));
+    EXPECT_FALSE(f.row_exists(id));
+}
+
+TEST(MediaReaperTest, DryRunReportsTheSameWorkAndDoesNone) {
+    ReaperFixture f;
+    f.config.media_reaper_dry_run = true;
+    auto alice = f.add_user("alice");
+    auto id = f.upload(alice);
+
+    EXPECT_EQ(f.sweep(), 1u) << "dry run must report what it would have done";
+    EXPECT_TRUE(f.blob_exists(id)) << "dry run deleted a blob";
+    EXPECT_TRUE(f.row_exists(id)) << "dry run deleted a row";
+
+    // Repeatable: a dry run changes nothing, so the next one finds the same
+    // work. This is what makes "read a night of logs first" a usable process.
+    EXPECT_EQ(f.sweep(), 1u);
+}
+
+TEST(MediaReaperTest, ARowWhoseBlobIsAlreadyGoneIsStillCollected) {
+    // The crash case. The sweep removes the blob before the row, so an
+    // interruption between the two leaves a row with no bytes behind it. That
+    // row must not become permanently uncollectable, or every crash leaks one.
+    ReaperFixture f;
+    auto alice = f.add_user("alice");
+    auto id = f.upload(alice);
+    ASSERT_TRUE(f.blob_exists(id));
+
+    f.storage->remove(id);
+    ASSERT_FALSE(f.blob_exists(id));
+
+    EXPECT_EQ(f.sweep(), 1u);
+    EXPECT_FALSE(f.row_exists(id));
+}
+
+TEST(MediaReaperTest, TheSweepIsIdempotent) {
+    ReaperFixture f;
+    auto alice = f.add_user("alice");
+    f.upload(alice);
+
+    EXPECT_EQ(f.sweep(), 1u);
+    EXPECT_EQ(f.sweep(), 0u);
+}
+
+TEST(MediaReaperTest, TheShippedDefaultIsDryRunAndEnabled) {
+    // Config.h argues for both at length. Asserted here because the defaults
+    // are the whole safety story for a feature that deletes user data on a
+    // timer, and a one-character change to either is otherwise silent.
+    auto defaults = Config::defaults();
+    EXPECT_TRUE(defaults.media_reaper_enabled);
+    EXPECT_TRUE(defaults.media_reaper_dry_run);
+    EXPECT_GE(defaults.media_orphan_grace_hours, 1);
 }

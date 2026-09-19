@@ -103,6 +103,7 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/auth/OidcAuth.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/RoleBootstrap.cpp
     ${CMAKE_SOURCE_DIR}/src/storage/LocalStorage.cpp
+    ${CMAKE_SOURCE_DIR}/src/storage/MediaReaper.cpp
     ${CMAKE_SOURCE_DIR}/src/storage/S3Client.cpp
     ${CMAKE_SOURCE_DIR}/src/storage/S3Storage.cpp
 )

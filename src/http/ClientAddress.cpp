@@ -104,6 +104,29 @@ bool IpNetwork::contains(const Bytes16& ip) const {
     return (addr[full] & mask) == (ip[full] & mask);
 }
 
+std::string redact_ip_for_log(const std::string& address) {
+    auto ip = parse_ip(address);
+    if (!ip) return "unparseable";
+
+    char buf[INET6_ADDRSTRLEN] = {};
+    if (is_v4_mapped(*ip)) {
+        // Zero the last octet and say so with the prefix length, rather than
+        // printing "203.0.113.x": the /24 form is unambiguous about how much
+        // was dropped, and it is what an operator greps or feeds to a CIDR
+        // tool.
+        (*ip)[15] = 0;
+        inet_ntop(AF_INET, ip->data() + 12, buf, sizeof(buf));
+        return std::string(buf) + "/24";
+    }
+    // /64 for IPv6, matching what resolve() already collapses to for rate
+    // limiting: a single subscriber routinely controls a whole /64, so it is
+    // the smallest unit that identifies a customer rather than a device, and
+    // going narrower would gain the log nothing it can act on.
+    std::fill(ip->begin() + 8, ip->end(), uint8_t{0});
+    inet_ntop(AF_INET6, ip->data(), buf, sizeof(buf));
+    return std::string(buf) + "/64";
+}
+
 bool is_private_or_loopback_network(const IpNetwork& net) {
     // A shorter prefix means a WIDER network, so a candidate is only fully
     // contained when the private range's prefix is no longer than its own and

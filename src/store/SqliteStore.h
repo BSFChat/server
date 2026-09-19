@@ -1063,6 +1063,42 @@ public:
     /// any authenticated caller, matching what /profile already discloses.
     bool is_avatar_media(const std::string& mxc_uri);
 
+    /// Objects nothing references any more: no surviving event names them, no
+    /// account wears them as an avatar, no server-scoped document mentions
+    /// them, and they are older than `created_before_ms`.
+    ///
+    /// This is the ONLY erasure path media has, and it is deliberately a sweep
+    /// rather than a delete at the redaction and room-deletion sites. Three
+    /// reasons, in order of how badly each alternative fails:
+    ///
+    ///   1. A blob is a file and a media row is a transaction. redact_event()
+    ///      and delete_room() do their work inside BEGIN IMMEDIATE, and there
+    ///      is no unlink() that a ROLLBACK can undo. Deleting the file in there
+    ///      means a rolled-back redaction has already destroyed the image.
+    ///   2. Neither site knows the answer on its own. One object can be named
+    ///      by events in several rooms (a forward, a repost), so "this event
+    ///      was redacted" is not "this object is unreferenced" — the question
+    ///      is about the whole table, and it is cheapest to ask it once.
+    ///   3. Only a sweep collects the orphan class those sites cannot see at
+    ///      all: an upload that was never attached to anything. That is the
+    ///      case handle_upload's failure path already apologises for.
+    ///
+    /// `created_before_ms` is the grace period and it is load-bearing, not a
+    /// tuning knob. POST /upload and the PUT /send that names the object are
+    /// two requests, and between them the object is indistinguishable from an
+    /// orphan. A grace period shorter than the longest plausible compose-and-
+    /// send deletes attachments out from under people who are still typing.
+    ///
+    /// Reference sources, and why these three are all of them: media_refs
+    /// (every event that names an object, maintained by insert_event and
+    /// shrunk by redact_event and delete_room), users.avatar_url (the one
+    /// legitimately room-less class, see is_avatar_media), and server_state,
+    /// which holds server-scoped documents that are NOT events and so are not
+    /// in media_refs. The last is scanned in C++ with media_uris_in_content(),
+    /// the same extractor insert_event indexes with, so the two cannot drift.
+    std::vector<MediaMeta> find_orphaned_media(const std::string& server_name,
+                                               int64_t created_before_ms, int limit);
+
 private:
     // Drops spent refresh-token records once no live session could still
     // belong to their family. Called with mutex_ already held.

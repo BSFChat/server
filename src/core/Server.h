@@ -10,6 +10,7 @@
 
 namespace bsfchat {
 
+class MediaReaper;
 class MediaStorage;
 class VoiceHandler;
 class PushService;
@@ -38,6 +39,9 @@ private:
     std::unique_ptr<OidcAuth> oidc_auth_;
     std::unique_ptr<HttpServer> http_server_;
     std::shared_ptr<MediaStorage> media_storage_;
+    // Collects media nothing references any more. Like the voice reaper and
+    // the push worker, it is a member so start()/stop() can own its thread.
+    std::unique_ptr<MediaReaper> media_reaper_;
     std::shared_ptr<VoiceHandler> voice_handler_;
 };
 

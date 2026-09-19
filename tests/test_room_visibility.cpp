@@ -48,6 +48,7 @@
 #include <gtest/gtest.h>
 
 #include "api/RoomHandler.h"
+#include "api/PresenceHandler.h"
 #include "api/SyncHandler.h"
 #include "api/TypingHandler.h"
 #include "api/VoiceHandler.h"
@@ -682,4 +683,98 @@ TEST(RoomVisibility, TypingRefusesADeniedUserAndServesAPermittedOne) {
     // The people the channel belongs to are unaffected.
     EXPECT_TRUE(IsOk(send_typing_private(alice, "token-alice")));
     EXPECT_EQ(typing.get_typing_users(private_room), std::vector<std::string>{alice});
+}
+
+// ── Audit data-path finding 18: presence for people who are not there ───────
+//
+// The presence pass unions store_.get_room_members() over the caller's joined
+// rooms, and that query has no membership predicate — it returns every row in
+// room_members, 'leave' and 'ban' included. So /sync hands out m.presence,
+// with last_active_ago, for accounts that left, were kicked, or are
+// SERVER-banned. The last of those directly contradicts the ban projection,
+// which goes out of its way to blank a banned user's own sync.
+//
+// The co-membership scoping this sits inside is separately meaningless while
+// auto-join force-joins everyone into everything — but it is the mechanism the
+// day per-channel-visible user lists exist, and a filter that is wrong now
+// stays wrong then.
+namespace {
+
+// The user ids /sync reports presence for.
+std::vector<std::string> sync_presence_users(SyncHandler& handler, const std::string& token) {
+    auto req = make_request("/_matrix/client/v3/sync", token);
+    req.params.emplace("timeout", "0");
+    httplib::Response res;
+    handler.handle_sync(req, res);
+    EXPECT_TRUE(res.status == -1 || res.status == 200) << "status " << res.status;
+    auto body = json::parse(res.body);
+    std::vector<std::string> out;
+    for (const auto& ev : body.value("presence", json::object()).value("events", json::array())) {
+        out.push_back(ev.value("sender", ""));
+    }
+    return out;
+}
+
+} // namespace
+
+TEST(RoomVisibility, PresenceOmitsAMemberWhoLeftTheRoom) {
+    Fixture f("presleave");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+
+    auto room = f.add_channel(alice, "general");
+    f.join(room, bob);
+
+    PresenceHandler presence(*f.store, *f.sync, f.config);
+    SyncHandler sync_handler(*f.store, *f.sync, f.config);
+    sync_handler.set_presence_handler(&presence);
+
+    presence.touch(bob);
+    ASSERT_TRUE(contains(sync_presence_users(sync_handler, "token-alice"), bob))
+        << "fixture failed to register bob's presence, so the test proves nothing";
+
+    f.store->set_membership(room, bob, std::string(membership::kLeave));
+    EXPECT_FALSE(contains(sync_presence_users(sync_handler, "token-alice"), bob))
+        << "presence reported for a user who has left every room the caller shares";
+}
+
+TEST(RoomVisibility, PresenceOmitsAServerBannedUser) {
+    Fixture f("presban");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+
+    auto room = f.add_channel(alice, "general");
+    f.join(room, bob);
+
+    PresenceHandler presence(*f.store, *f.sync, f.config);
+    SyncHandler sync_handler(*f.store, *f.sync, f.config);
+    sync_handler.set_presence_handler(&presence);
+
+    presence.touch(bob);
+    ASSERT_TRUE(contains(sync_presence_users(sync_handler, "token-alice"), bob));
+
+    // A server ban, with the membership row left as 'join' on purpose: the ban
+    // projection normally rewrites it, and the point of the second half of the
+    // filter is that it fails closed when the projection is missed.
+    f.store->set_server_ban(bob, alice, "spam", 0);
+    EXPECT_FALSE(contains(sync_presence_users(sync_handler, "token-alice"), bob))
+        << "presence reported for a server-banned account";
+}
+
+// The control. A live peer must still be reported, or both tests above pass
+// against a pass that emits nothing.
+TEST(RoomVisibility, PresenceStillReportsALiveJoinedPeer) {
+    Fixture f("preslive");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+
+    auto room = f.add_channel(alice, "general");
+    f.join(room, bob);
+
+    PresenceHandler presence(*f.store, *f.sync, f.config);
+    SyncHandler sync_handler(*f.store, *f.sync, f.config);
+    sync_handler.set_presence_handler(&presence);
+
+    presence.touch(bob);
+    EXPECT_TRUE(contains(sync_presence_users(sync_handler, "token-alice"), bob));
 }

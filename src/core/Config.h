@@ -366,6 +366,40 @@ struct Config {
     // readable by anyone who learns its id.
     bool require_media_auth = true;
 
+    // ── Collecting media nothing references any more ──────────────────────
+    //
+    // See storage/MediaReaper.h. Before this existed there was no erasure path
+    // for media at all: redaction dropped the reference and left the bytes
+    // served, and data/media/ only ever grew.
+    bool media_reaper_enabled = true;
+
+    // Log what would be deleted; delete nothing. Defaults TRUE, and should
+    // stay true for one release.
+    //
+    // This is the only thing in the server that destroys user data from disk
+    // on a timer, and the consequence of a wrong reference query is silent and
+    // unrecoverable. An operator should read a night of "would delete" lines
+    // against their own corpus and satisfy themselves it names nothing they
+    // recognise, and only then arm it. The cost of the default is that disk
+    // keeps growing for one more release; the cost of the other default, if
+    // the query is wrong anywhere, is somebody's attachments.
+    bool media_reaper_dry_run = true;
+
+    // How long an object may exist unreferenced before it is collected.
+    //
+    // Load-bearing, not a tuning knob: POST /upload and the PUT /send that
+    // names the object are two separate requests, and in between the object is
+    // indistinguishable from an orphan. This has to comfortably exceed the
+    // longest plausible gap between attaching a file and sending the message —
+    // someone attaches a screenshot, writes three paragraphs, gets pulled into
+    // a meeting, comes back. A day is generous on purpose; the disk saving
+    // from making it an hour is not worth the class of bug it opens.
+    int media_orphan_grace_hours = 24;
+
+    // How often to sweep. Cheap (two indexed NOT EXISTS over the media table)
+    // and nothing depends on collection being prompt.
+    int media_reaper_interval_minutes = 60;
+
     // Storage
     StorageConfig storage;
 

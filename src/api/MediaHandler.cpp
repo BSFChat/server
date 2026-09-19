@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <iomanip>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -123,8 +124,25 @@ MediaHandler::MediaHandler(SqliteStore& store, const Config& config,
 }
 
 std::string MediaHandler::generate_media_id() const {
+    // Throw rather than degrade, the same way Identifiers.cpp's random_base64
+    // and VoiceHandler's session-id minting do. This was the one CSPRNG call
+    // site left ignoring its return code, and the consequence was specific:
+    // on failure `bytes` is uninitialised stack memory, which within a worker
+    // thread plausibly repeats. handle_upload writes the blob before it
+    // inserts the row, and LocalStorage::upload truncates, so a repeat
+    // silently overwrites an existing object's bytes while that object stays
+    // served under its original id and its original metadata — a media id is
+    // a capability when require_auth is off, and the collision would look like
+    // corruption, not like an attack.
+    //
+    // A server that cannot produce 128 secure bits cannot mint an id, and
+    // handle_upload turns the throw into a 500. That is the correct answer;
+    // there is no safe fallback here.
     unsigned char bytes[16];
-    RAND_bytes(bytes, sizeof(bytes));
+    if (RAND_bytes(bytes, sizeof(bytes)) != 1) {
+        throw std::runtime_error("RAND_bytes failed minting a media id: "
+                                 "no secure randomness available");
+    }
     std::ostringstream oss;
     for (int i = 0; i < 16; ++i) {
         oss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(bytes[i]);
@@ -217,10 +235,11 @@ void MediaHandler::handle_upload(const httplib::Request& req, httplib::Response&
         filename = req.get_param_value("filename");
     }
 
-    // Generate media ID and store
-    auto media_id = generate_media_id();
-
+    // Inside the try: generate_media_id() now throws when the CSPRNG fails,
+    // and an exception escaping a request handler is a dropped connection
+    // rather than the 500 the caller should get.
     try {
+        auto media_id = generate_media_id();
         auto file_path = storage_->upload(media_id, body, content_type, filename);
 
         // Store metadata in database.

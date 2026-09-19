@@ -131,11 +131,36 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
         // ever went "online" online forever, until the process restarted.
         presence_handler_->sweep_expired();
 
+        // Only people who are actually there.
+        //
+        // get_room_members() returns every row in room_members with no
+        // membership predicate — that is correct for GET /rooms/{id}/members,
+        // which is a roster endpoint and is supposed to report 'leave' and
+        // 'ban' as memberships. It is wrong here: presence is a statement that
+        // a person is around, and this pass was making it about accounts that
+        // had left, been kicked, or been SERVER-BANNED, complete with
+        // last_active_ago. The last of those contradicts the ban projection
+        // outright, which goes out of its way to blank a banned user's own
+        // sync (SyncEngine::handle_sync).
+        //
+        // Both halves are needed and neither is redundant. The membership
+        // filter is the ordinary case. is_server_banned() is the backstop for
+        // the same reason SyncEngine keeps its own copy of that check: the ban
+        // projection rewrites the membership rows, so a crash between the
+        // ban-list write and the projection leaves a 'join' row behind, and
+        // this should fail closed on it.
+        //
+        // The co-membership scoping around this is separately meaningless
+        // while auto-join force-joins everyone into every channel, so nothing
+        // here is a live disclosure today. It is the mechanism that per-
+        // channel-visible user lists would be built on, and a filter that is
+        // wrong now would be a bypass then.
         std::set<std::string> seen;
         for (const auto& room_id : joined_rooms) {
             auto members = store_.get_room_members(room_id);
-            for (const auto& [m_uid, _state] : members) {
+            for (const auto& [m_uid, m_state] : members) {
                 if (m_uid == *user_id) continue;
+                if (m_state != membership::kJoin) continue;
                 seen.insert(m_uid);
             }
         }
@@ -148,6 +173,12 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
         for (const auto& uid : seen) {
             auto entry = presence_handler_->get_for(uid);
             if (!entry) continue;
+            // After get_for(), not before, and not up in the membership loop.
+            // This is a per-user store read on the endpoint every client polls
+            // continuously: up there it would run once per (user, room) pair,
+            // here it runs at most once per peer who is actually online, which
+            // on any real deployment is a small fraction of the member set.
+            if (store_.is_server_banned(uid)) continue;
             RoomEvent ev;
             ev.type = std::string(event_type::kPresence);
             ev.sender = uid;

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "api/VoiceHandler.h"
+#include "store/CallSignalling.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
 #include "auth/LocalAuth.h"
@@ -2018,4 +2019,162 @@ TEST_F(LiveKitTokenTest, TokenTtlIsClampedAndReportedConsistently) {
     // The advertised ttl must match the token's actual lifetime, or a client
     // renewing on schedule would still be refused at reconnect.
     EXPECT_EQ(p.value("exp", int64_t{0}) - p.value("nbf", int64_t{0}), kLiveKitMinTtl);
+}
+
+// --- Audit data-path finding 19: PUT /rooms/{id}/voice/state is a write path
+// --- with no membership and no VIEW_CHANNEL check.
+//
+// The gate on voice/join was argued to cover this endpoint transitively: join
+// is "the only endpoint that makes someone an active call member", so an
+// active row implies the join gate was passed. That reasoning holds only at
+// the instant of the join. Authorization here is evaluated once and then
+// cached in a row, and both of its inputs can change afterwards — a user can
+// be removed from the room, and VIEW_CHANNEL can be revoked.
+//
+// The reaper does not close the window either, and that is the part the audit
+// under-stated: handle_voice_state calls record_heartbeat() on its way out, so
+// each PUT refreshes the very liveness the reaper expires on. A revoked user
+// who keeps announcing screen_sharing every few seconds holds an active roster
+// entry, visible to everyone in the channel, indefinitely rather than for one
+// reap interval.
+TEST_F(LiveKitTokenTest, VoiceStateRefusedAfterViewChannelIsRevoked) {
+    mark_in_voice(room, alice);
+    deny(room, "user:" + alice, permission::kViewChannel);
+
+    httplib::Request req;
+    req.method = "PUT";
+    req.path = "/_matrix/client/v3/rooms/" + room + "/voice/state";
+    req.set_header("Authorization", "Bearer token-alice");
+    req.body = json{{"screen_sharing", true}}.dump();
+    httplib::Response res;
+    handler->handle_voice_state(req, res);
+
+    EXPECT_EQ(status_of(res), 403);
+    // The flag must not have been written on the way to the refusal.
+    auto ev = store->get_state_event(room, std::string(event_type::kCallMember), alice);
+    ASSERT_TRUE(ev.has_value());
+    EXPECT_FALSE(ev->content.data.value("screen_sharing", false));
+}
+
+// The refusal must be specific to VIEW_CHANNEL, not "any deny at all", or the
+// test above would pass against a gate that refuses everybody.
+TEST_F(LiveKitTokenTest, VoiceStateStillAcceptedWhenAnUnrelatedPermissionIsRevoked) {
+    mark_in_voice(room, alice);
+    deny(room, "user:" + alice, permission::kSendMessages | permission::kAttachFiles);
+
+    httplib::Request req;
+    req.method = "PUT";
+    req.path = "/_matrix/client/v3/rooms/" + room + "/voice/state";
+    req.set_header("Authorization", "Bearer token-alice");
+    req.body = json{{"screen_sharing", true}}.dump();
+    httplib::Response res;
+    handler->handle_voice_state(req, res);
+
+    EXPECT_EQ(status_of(res), 200) << res.body;
+    auto ev = store->get_state_event(room, std::string(event_type::kCallMember), alice);
+    ASSERT_TRUE(ev.has_value());
+    EXPECT_TRUE(ev->content.data.value("screen_sharing", false));
+}
+
+// A user who left the room entirely. `outsider` has a 'leave' row, so this is
+// the plain membership half of the same gap.
+TEST_F(LiveKitTokenTest, VoiceStateRefusedForANonMemberOfTheRoom) {
+    mark_in_voice(room, outsider);
+
+    httplib::Request req;
+    req.method = "PUT";
+    req.path = "/_matrix/client/v3/rooms/" + room + "/voice/state";
+    req.set_header("Authorization", "Bearer token-outsider");
+    req.body = json{{"camera_on", true}}.dump();
+    httplib::Response res;
+    handler->handle_voice_state(req, res);
+
+    EXPECT_EQ(status_of(res), 403);
+    auto ev = store->get_state_event(room, std::string(event_type::kCallMember), outsider);
+    ASSERT_TRUE(ev.has_value());
+    EXPECT_FALSE(ev->content.data.value("camera_on", false));
+}
+
+// The heartbeat is the reason the window is unbounded rather than one reap
+// interval, so the refusal has to stop short of record_heartbeat() too. If it
+// did not, a revoked user could still keep their ghost alive by PUTting into
+// a 403.
+TEST_F(LiveKitTokenTest, RefusedVoiceStateDoesNotRefreshTheHeartbeat) {
+    mark_in_voice(room, alice);
+    handler->record_heartbeat(room, alice, stale_heartbeat_time());
+    deny(room, "user:" + alice, permission::kViewChannel);
+
+    httplib::Request req;
+    req.method = "PUT";
+    req.path = "/_matrix/client/v3/rooms/" + room + "/voice/state";
+    req.set_header("Authorization", "Bearer token-alice");
+    req.body = json{{"muted", true}}.dump();
+    httplib::Response res;
+    handler->handle_voice_state(req, res);
+    ASSERT_EQ(status_of(res), 403);
+
+    EXPECT_EQ(handler->reap_stale_members(), 1u);
+    EXPECT_FALSE(is_active(room, alice));
+}
+
+// --- Audit data-path finding 23: the startup sweep that never ran ---
+//
+// CallSignalling.h says the two-minute retention "deliberately does NOT
+// survive a restart in any useful sense — the sweep runs at startup as well".
+// It did not. The prune rides the voice reaper thread, and that loop waits out
+// a full kReapInterval before its first pass, so every restart left whatever
+// was in the table at shutdown readable for another ten seconds.
+//
+// Small in wall-clock terms, and the reason to fix it is not the ten seconds:
+// it is that a header comment describing a retention guarantee was false, and
+// the cheapest way to make it true is to run the pass the comment promises.
+TEST_F(VoiceHandlerTest, ReaperPrunesExpiredSignallingImmediatelyAtStartup) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto expired = generate_event_id("test");
+    store->insert_event(expired, room_id, "@alice:test",
+                        std::string(event_type::kCallCandidates), std::nullopt,
+                        json{{"to", "@bob:test"},
+                             {"candidate", "10.0.0.7 51000 typ host"}}.dump(),
+                        now - limits::kCallSignallingTtlMs - 1000);
+    ASSERT_TRUE(store->get_event_by_id(expired).has_value());
+
+    handler->start_reaper();
+    // Well inside kReapInterval (10 s): if the sweep only happens on the
+    // timer, nothing has been removed by the time this gives up.
+    bool gone = false;
+    for (int i = 0; i < 40 && !gone; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        gone = !store->get_event_by_id(expired).has_value();
+    }
+    handler->stop_reaper();
+
+    EXPECT_TRUE(gone) << "expired signalling survived server startup for a full reap interval";
+}
+
+// The startup pass must not be a licence to delete anything else: fresh
+// signalling is still inside its TTL and has to survive the restart, which is
+// the case the retention window exists for.
+TEST_F(VoiceHandlerTest, StartupSweepLeavesFreshSignallingAlone) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto fresh = generate_event_id("test");
+    store->insert_event(fresh, room_id, "@alice:test",
+                        std::string(event_type::kCallCandidates), std::nullopt,
+                        json{{"to", "@bob:test"},
+                             {"candidate", "10.0.0.8 51001 typ host"}}.dump(), now);
+
+    handler->start_reaper();
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    handler->stop_reaper();
+
+    EXPECT_TRUE(store->get_event_by_id(fresh).has_value());
 }
