@@ -37,6 +37,7 @@ add_executable(server_tests
     test_bots.cpp
     test_localpart.cpp
     test_request_hardening.cpp
+    test_kick_enforcement.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
