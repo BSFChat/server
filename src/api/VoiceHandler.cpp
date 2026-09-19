@@ -178,9 +178,27 @@ void VoiceHandler::start_reaper() {
     }
     reaper_thread_ = std::thread([this] {
         std::unique_lock<std::mutex> lock(reaper_mutex_);
+        // First pass runs immediately, before the first wait.
+        //
+        // CallSignalling.h states the two-minute retention "deliberately does
+        // NOT survive a restart in any useful sense — the sweep runs at
+        // startup as well". It did not: wait_for() came first, so every
+        // restart left whatever signalling was in the table at shutdown
+        // readable for another full kReapInterval. Ten seconds is not the
+        // point; a retention guarantee written into a header and not
+        // implemented is.
+        //
+        // Cheap on a cold server (two indexed deletes over an empty table) and
+        // it costs the ghost reaper nothing to ride along: a process that has
+        // just started has no stale heartbeats, so its first pass is a no-op
+        // by construction.
+        bool first_pass = true;
         while (!reaper_stop_) {
-            reaper_cv_.wait_for(lock, kReapInterval, [this] { return reaper_stop_; });
-            if (reaper_stop_) break;
+            if (!first_pass) {
+                reaper_cv_.wait_for(lock, kReapInterval, [this] { return reaper_stop_; });
+                if (reaper_stop_) break;
+            }
+            first_pass = false;
             lock.unlock();
             try {
                 reap_stale_members();
@@ -584,6 +602,43 @@ void VoiceHandler::handle_voice_state(const httplib::Request& req, httplib::Resp
     }
 
     auto& room_id = match.params["roomId"];
+
+    // Authorize this request, not the join that preceded it.
+    //
+    // handle_voice_join's comment claims this endpoint is covered because join
+    // is the only thing that makes someone an active call member. That is true
+    // and it is not enough: the active row records that the gate was passed
+    // ONCE, and both of the gate's inputs change afterwards. A moderator
+    // revokes VIEW_CHANNEL, or the user is removed from the room, and the row
+    // keeps answering "yes" to a question that was asked before either
+    // happened. Authorization cached in a row is not authorization.
+    //
+    // The heartbeat is what makes the window unbounded rather than one reap
+    // interval: this handler ends in record_heartbeat(), so every PUT
+    // refreshes the liveness the reaper expires on. A revoked user announcing
+    // screen_sharing every few seconds stays on the roster of a channel they
+    // can no longer see, for as long as they care to keep PUTting. Both
+    // refusals below therefore return BEFORE that call.
+    //
+    // Same pair and same order as voice/join and voice/leave: membership
+    // first, because it is one indexed lookup, then kViewChannel, because
+    // membership means nothing about access on this data model
+    // (auth/RoomVisibility.h).
+    if (!store_.is_room_member(room_id, *user_id)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(),
+                        "application/json");
+        return;
+    }
+
+    PermissionsEngine perms(store_, config_);
+    if (!permission::has(perms.compute(*user_id, room_id), permission::kViewChannel)) {
+        res.status = 403;
+        res.set_content(
+            MatrixError::forbidden("You do not have permission to view this channel").to_json().dump(),
+            "application/json");
+        return;
+    }
 
     json body;
     try {

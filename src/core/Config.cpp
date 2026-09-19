@@ -47,6 +47,15 @@ Config Config::load(const std::string& path) {
                     v->value_or(static_cast<int64_t>(cfg.max_upload_size_mb)));
             if (auto v = media->get("require_auth"))
                 cfg.require_media_auth = v->value_or(cfg.require_media_auth);
+            if (auto v = media->get("reaper_enabled"))
+                cfg.media_reaper_enabled = v->value_or(cfg.media_reaper_enabled);
+            if (auto v = media->get("reaper_dry_run"))
+                cfg.media_reaper_dry_run = v->value_or(cfg.media_reaper_dry_run);
+            if (auto v = media->get("orphan_grace_hours"))
+                cfg.media_orphan_grace_hours = v->value_or(cfg.media_orphan_grace_hours);
+            if (auto v = media->get("reaper_interval_minutes"))
+                cfg.media_reaper_interval_minutes =
+                    v->value_or(cfg.media_reaper_interval_minutes);
         }
 
         // [auth]

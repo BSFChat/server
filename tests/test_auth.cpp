@@ -1314,3 +1314,53 @@ TEST(RefreshReuse, AnUnknownRefreshTokenRevokesNothing) {
     EXPECT_EQ(f.store->revoke_family_for_replayed_refresh_token("not-a-token-anyone-issued"), 0);
     EXPECT_TRUE(f.store->get_user_by_token(session.at("access_token")).has_value());
 }
+
+// ── Audit data-path finding 16: client IPs in the operator log ──────────────
+//
+// No client address is ever written to this server's database — that was
+// verified separately and it holds. The operator log is the whole remaining
+// exposure surface, and two lines in AuthHandler put a full address into it at
+// `warn`, on a server whose log level is hardcoded to `info`.
+//
+// redact_ip_for_log() is the fix for those lines. It is landed and tested here
+// on its own because the two call sites are in AuthHandler.cpp, which the
+// request-path hardening branch owns — see docs/audit-data-2026-09.md under
+// finding 16 for the hand-off. Everything about whether the redaction is
+// CORRECT is testable without them, and is tested here.
+TEST(ClientAddress, RedactedIpv4KeepsTheNetworkAndDropsTheHost) {
+    EXPECT_EQ(redact_ip_for_log("203.0.113.42"), "203.0.113.0/24");
+    EXPECT_EQ(redact_ip_for_log("10.1.2.3"), "10.1.2.0/24");
+    // Two addresses in one /24 must become the same string — that is the whole
+    // property. If they did not, the log would still identify individuals.
+    EXPECT_EQ(redact_ip_for_log("198.51.100.1"), redact_ip_for_log("198.51.100.254"));
+    // ...and two in different /24s must not.
+    EXPECT_NE(redact_ip_for_log("198.51.100.1"), redact_ip_for_log("198.51.101.1"));
+}
+
+TEST(ClientAddress, RedactedIpv6CollapsesToTheSubscriberPrefix) {
+    EXPECT_EQ(redact_ip_for_log("2001:db8::1:2:3:4"), "2001:db8::/64");
+    EXPECT_EQ(redact_ip_for_log("2001:db8:0:1::99"), "2001:db8:0:1::/64");
+    EXPECT_EQ(redact_ip_for_log("2001:db8:0:1::1"), redact_ip_for_log("2001:db8:0:1::2"));
+    EXPECT_NE(redact_ip_for_log("2001:db8:0:1::1"), redact_ip_for_log("2001:db8:0:2::1"));
+}
+
+TEST(ClientAddress, RedactionTolerantOfTheFormsAnXffLineActuallyCarries) {
+    // A log call site passes whatever it was handed. Ports, brackets and zone
+    // suffixes all turn up in X-Forwarded-For, and each must still redact
+    // rather than fall through to the unparseable branch and lose the line.
+    EXPECT_EQ(redact_ip_for_log("203.0.113.42:51234"), "203.0.113.0/24");
+    EXPECT_EQ(redact_ip_for_log("[2001:db8::1]:443"), "2001:db8::/64");
+    EXPECT_EQ(redact_ip_for_log("  203.0.113.42  "), "203.0.113.0/24");
+    EXPECT_EQ(redact_ip_for_log("fe80::1%eth0"), "fe80::/64");
+}
+
+TEST(ClientAddress, RedactionNeverEchoesSomethingItDidNotUnderstand) {
+    // The failure mode that would matter: a call site hands this a string it
+    // cannot parse, and it returns the string. Then a malformed header value —
+    // attacker-chosen, and possibly a full address in a form the parser missed
+    // — lands in the log verbatim. It must fail to a constant.
+    for (const char* junk : {"", "not-an-ip", "999.999.999.999", "203.0.113.42; DROP",
+                             "1.2.3.4 5.6.7.8"}) {
+        EXPECT_EQ(redact_ip_for_log(junk), "unparseable") << junk;
+    }
+}

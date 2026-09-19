@@ -86,6 +86,40 @@ on `main` — see "Must land before the RC".
 
 ---
 
+## Status of findings 10–28, as of 19 September 2026
+
+Branch `harden/audit-data-path`, off `main` @ `ad993a2`. Each finding below
+carries a **RESOLUTION** block with the reasoning; this is the index.
+
+| # | Status | Note |
+|---|--------|------|
+| 10 | **Blocked** | Design recorded. Needs a migration number for the token key — ask before taking one. |
+| 11 | **Fixed** | New media reaper. Ships in **dry run**; arm it after a release. |
+| 12 | Already fixed | Merge train (v22 + redaction drains the queue). |
+| 13 | Already fixed | `deploy` repo. |
+| 14 | Already fixed (server) | nginx half is in the `deploy` repo, still commented out. |
+| 15 | Already fixed | `deploy/setup.sh`. |
+| 16 | **Partly fixed** | `redact_ip_for_log()` landed + tested; 2 call sites in `AuthHandler` handed to `harden/audit-request-path`. |
+| 17 | Already fixed | Merge train. |
+| 18 | **Fixed** | Presence filtered to joined, non-server-banned. |
+| 19 | **Fixed** | And the finding **understated it** — see its block. |
+| 20 | Already fixed | `deploy/backup.sh`. |
+| 21 | **Fixed** | Subquery too, not just the outer WHERE. |
+| 22 | Handed off | Enforcement point is `EventHandler`'s send path, out of this branch. |
+| 23 | **Fixed** | Sweep now runs at startup, as its header always claimed. |
+| 24 | **Fixed** | No test; reason given. |
+| 25 | Out of scope | `EventHandler`, owned elsewhere. |
+| 26 | **Declined — finding is wrong** | The recommended change deletes the DM from `m.direct` entirely. |
+| 27 | **Documented, not filtered** | Recommendation taken exactly. Member-count nit fixed. |
+| 28 | **Decision for Josh** | Three options written up; no code change. |
+
+Two corrections to this document are argued in place: **19** (the reaper cannot
+catch the offender, because the endpoint refreshes its own heartbeat, so the
+window is unbounded rather than 10–60 s) and **26** (the suggested one-line fix
+is a regression, not a cosmetic improvement).
+
+---
+
 # MUST FIX BEFORE THIS RC
 
 ## 1. Redacting an edited message leaves the edit's text fully readable — HIGH
@@ -550,6 +584,59 @@ regress that.**
 global counter: HMAC or authenticated-encrypt `{user_id, position}` with a server key
 so the client can round-trip it without reading it. Stateless, and a small change.
 
+> ### RESOLUTION — NOT FIXED. Design below; blocked on a migration number.
+> `harden/audit-data-path`, 19 Sep 2026.
+>
+> **Confirmed still live** and confirmed fixable without touching the client:
+> `SyncLoop.cpp:98` stores `next_batch` as an opaque `QString` and only ever
+> compares it for equality, and `MatrixClient` round-trips it verbatim. Nothing
+> on either side of the wire reads the number.
+>
+> **The constraint the obvious fixes all miss.** The oracle is the *delta*, not
+> the value. So every order- or delta-preserving encoding fails, including the
+> two that look cheapest: `pos + k` preserves deltas exactly, and `pos XOR k`
+> leaks them almost as badly, because consecutive tokens give `p1^p2` and the
+> increments are small, so the low bits of the difference fall straight out.
+> The fix has to be a keyed pseudorandom permutation, and that means a key.
+>
+> **Construction.** One AES-256 block, which is exactly "apply the PRP once":
+>
+>   * plaintext block = 8 bytes big-endian stream position ‖ 8 bytes of
+>     `HMAC-SHA256(key, user_id)`, truncated;
+>   * token = `"t_"` + 32 hex characters of the ciphertext;
+>   * inbound: decrypt, check the 8-byte tag against the caller, reject on
+>     mismatch — which also stops a token being replayed as another user.
+>
+> Deterministic, and that property is load-bearing: the same `(user, position)`
+> always yields the same string, so `SyncBackoff`'s `tokenAdvanced` signal keeps
+> meaning what it means today. An always-changing token would be the mirror-image
+> regression — it disables the guard against an endpoint answering 200
+> unconditionally, which is a deliberate protection with its own long comment.
+>
+> **Compatibility.** Keep parsing legacy `s<N>` on the way in — clients hold
+> persisted tokens — and emit only the new form. `prev_batch` stays `s<N>` and
+> `/messages?from=` is untouched: that is a room-scoped position of an event the
+> caller can already see, not the global head, so it is not this oracle.
+>
+> **What actually blocks it: where the key lives.** It has to survive a restart,
+> or every client on the deployment is forced into a full initial sync on every
+> upgrade. There is no general-purpose server secret today — the only secrets in
+> `Config` are voice-specific and optional, so a mesh-only deployment has none to
+> derive from. Two options:
+>
+>   * a one-row `server_secrets` table, generated on first use. Correct, and it
+>     needs a migration number, which is reserved for Josh to allocate;
+>   * a row in the existing `server_state` table under a private `event_type`.
+>     This needs no migration and is safe *today* — nothing serves `server_state`
+>     generically, the write path allowlists exactly two event types
+>     (`RoomHandler.cpp:1399`) and every read is by explicit type. But it puts a
+>     secret in a table whose other occupants are all client-visible documents,
+>     which is a trap set for whoever next writes a generic reader over it.
+>
+> The first is right and the second is a shortcut that would be wrong within a
+> year. Not taken unilaterally: **this needs a migration number**. Roughly a
+> day's work once it has one, mostly tests.
+
 ## 11. Media blobs are never deleted — MEDIUM
 
 `SqliteStore::delete_media` (`:2617`) and `MediaStorage::remove` have **zero callers in
@@ -570,6 +657,66 @@ and if no surviving event references that mxc, call `delete_media` +
 `storage_->remove`. Same in `delete_room`. Add a TTL reaper. Shares the
 reference-tracking work with finding 3 — do them together.
 
+> ### RESOLUTION — FIXED, shipping in dry run.
+> `harden/audit-data-path`, 19 Sep 2026. New: `src/storage/MediaReaper.{h,cpp}`,
+> `SqliteStore::find_orphaned_media`, four `[media]` config keys, 11 tests in
+> `tests/test_media_security.cpp`.
+>
+> **Built as a sweep, not as a delete at the redaction site.** The audit
+> recommends the latter; it is the wrong shape for three reasons, all of which
+> are now argued in `find_orphaned_media`'s header:
+>
+>   1. a blob is a file and a redaction is a transaction. `redact_event` and
+>      `delete_room` work inside `BEGIN IMMEDIATE`, and no `unlink()` can be
+>      rolled back — so a rolled-back redaction would have already destroyed the
+>      image;
+>   2. neither site can answer the question. One object can be named by events
+>      in several rooms, so "this event was redacted" is not "this object is
+>      unreferenced". Getting this wrong deletes a picture that is still on
+>      screen in another channel, and there is a test for exactly that;
+>   3. only a sweep collects the orphan class those sites cannot see at all —
+>      an upload that was never attached to anything, which is the case
+>      `handle_upload`'s failure path already apologises for in a comment.
+>
+> One mechanism therefore covers redaction, room deletion and abandoned uploads,
+> and it is idempotent, which the per-site version would not have been.
+>
+> **Reference sources are three, not one.** `media_refs` is the obvious one.
+> `users.avatar_url` is the second and omitting it would delete every avatar on
+> the server on the first sweep — avatars are room-less by design, so they look
+> exactly like orphans. The third is `server_state`, which holds server-scoped
+> documents that never pass through `insert_event` and so are never in
+> `media_refs`; it is scanned in C++ with `media_uris_in_content()`, the same
+> extractor `insert_event` indexes with, so the two cannot drift. All three have
+> a test.
+>
+> **Ordering is blob-then-row, deliberately.** Interrupted that way leaves a row
+> with no bytes: the object 404s and the next sweep finishes the job. The other
+> order leaves bytes with nothing pointing at them, which is permanent — the
+> sweep's own input is the media table — and it is a permanent leak of precisely
+> the data the sweep exists to destroy. Tested.
+>
+> **`media_orphan_grace_hours` is not a tuning knob.** `POST /upload` and the
+> `PUT /send` that names the object are two requests, and in between the object
+> is indistinguishable from an orphan. Default 24 h.
+>
+> **`media_reaper_dry_run` defaults to TRUE and should stay true for one
+> release.** This is the only code in the server that deletes user data from
+> disk on a timer, and a wrong reference query fails silently and
+> unrecoverably. In dry run every candidate is logged at `info` with its size,
+> uploader and content type — filename deliberately withheld, it is user content
+> — so an operator can read a night of it against their own corpus and satisfy
+> themselves it names nothing they recognise before setting
+> `media.reaper_dry_run = false`. The startup line says loudly which mode it is
+> in. `TheShippedDefaultIsDryRunAndEnabled` pins both defaults, because a
+> one-character change to either would otherwise be silent.
+>
+> **Known residue, deliberately not chased:** an object uploaded before this
+> lands and orphaned before v21's backfill ran is collected on the first armed
+> sweep, which is the intent; and the reaper does not touch the free pages the
+> deleted `media` rows leave behind — that is finding 8's `secure_delete`, not
+> this.
+
 ## 12. `push_queue` delivers pre-redaction plaintext after a redaction — MEDIUM
 
 Nothing in `handle_redact` touches `push_queue`; the payload is snapshotted at enqueue
@@ -582,6 +729,14 @@ plaintext** long after the message was deleted for everyone — and the plaintex
 **Fix.** Add an `event_id` column to `push_queue` and delete matching rows inside the
 redaction transaction; delete queued rows when their pusher is deleted. (A push already
 *delivered* cannot be recalled — document that.)
+
+> ### RESOLUTION — already fixed by the merge train.
+> Verified on `main` @ `ad993a2`. Migration **v22** added `push_queue.event_id`
+> exactly as recommended, `SqliteStore.cpp:2281` calls
+> `delete_queued_pushes_for_events_locked()` from inside the redaction
+> transaction, `delete_room` drains the queue for the room's events
+> (`:1093`), and deleting a pusher now deletes its queued rows (`:3377`,
+> `:3399`). Nothing further to do here.
 
 ## 13. TURN static auth secret is passed on the command line — MEDIUM
 
@@ -600,6 +755,14 @@ your IP, not internal access.
 `config/turnserver.conf` — which `setup.sh` already renders and `.gitignore` already
 excludes — with mode `0640`, and drop it from argv. That keeps the "no placeholder to
 leave unchanged" property while removing it from every process listing.
+
+> ### RESOLUTION — already fixed, in the `deploy` repo.
+> `deploy/docker-compose.yml:77` now carries the comment "static-auth-secret is
+> NOT passed here. It used to be…"; the secret is rendered into
+> `config/turnserver.conf`, and `setup.sh`'s `harden_config()` puts it at 0640
+> owned by the coturn uid, failing closed to 0600 rather than widening to 0644.
+> Note for the record that `deploy` is a **separate git repository** from
+> `server`, so nothing in this branch could have touched it either way.
 
 ## 14. No security headers + attacker-controlled `Content-Type` served inline — MEDIUM
 
@@ -622,6 +785,21 @@ image/video/audio allowlist; normalise non-allowlisted upload content-types to
 `application/octet-stream` server-side; drop `ACAO: *` on media. Ideally serve media
 from a separate origin.
 
+> ### RESOLUTION — server half already fixed; nginx half is in another repo.
+> The chain the audit describes is broken at the server. `handle_upload` no
+> longer stores the client's `Content-Type`
+> (`media_policy::normalise_content_type`), and `handle_download` now sets
+> `X-Content-Type-Options: nosniff`, a restrictive `Content-Security-Policy` and
+> `Cross-Origin-Resource-Policy: same-origin`, always emits a
+> `Content-Disposition`, and **erases** the blanket
+> `Access-Control-Allow-Origin: *` that `Server.cpp:91` puts on everything
+> (`MediaHandler.cpp:465-499`).
+>
+> The nginx half is unchanged: `deploy/nginx/bsfchat.conf.template` still has its
+> security headers only inside the commented-out TLS blocks (`:299`, `:341`).
+> That is now defence in depth rather than the only defence, and it lives in the
+> `deploy` repository, outside this branch. Left for whoever owns that repo.
+
 ## 15. No encryption at rest and no file mode ever set on the DB — MEDIUM
 
 No SQLCipher, no `PRAGMA key` — `sqlite3_open` on a plain path
@@ -639,6 +817,13 @@ on any other install every message on the server is world-readable to local user
 **Fix.** `chmod 750 data/server && chmod 640 data/server/*.db*` in `setup.sh`, and/or
 `chmod(db_path, 0600)` after open in `SqliteStore`.
 
+> ### RESOLUTION — already fixed, in the `deploy` repo.
+> `deploy/setup.sh:293` does `chmod 750 data data/server data/identity` and
+> `:301` does `chmod 600` over `data/server/bsfchat.db*`, which covers the WAL
+> and shm siblings the audit called out. Encryption at rest (SQLCipher) is not
+> done and is a much larger decision; it is not what this finding's Fix asked
+> for, and it belongs with finding 8.
+
 ## 16. Client IP addresses reach the operator log stream — MEDIUM
 
 `src/api/AuthHandler.cpp:103-108` logs `req.remote_addr` at `warn` when an untrusted
@@ -654,6 +839,51 @@ hardcoded at `src/main.cpp:18` and not configurable at all, so both fire in prod
 **Fix.** Hash or truncate the address (`/24`, `/64`) in the lockout line; log a count
 rather than the address in the XFF warning.
 
+> ### RESOLUTION — helper landed and tested; the two call sites are handed off.
+> `harden/audit-data-path`, 19 Sep 2026. New:
+> `bsfchat::redact_ip_for_log()` in `src/http/ClientAddress.{h,cpp}`, four tests
+> in `tests/test_auth.cpp`.
+>
+> `203.0.113.42` → `203.0.113.0/24`; `2001:db8::1:2:3` → `2001:db8::/64`;
+> anything it cannot parse → the constant `"unparseable"`. The /64 matches what
+> `ClientAddressResolver::resolve` already collapses IPv6 to for rate limiting,
+> for the same reason: a subscriber routinely controls a whole /64, so it is the
+> smallest unit that names a customer rather than a device.
+>
+> The last of those four behaviours is the one worth stating. It **never echoes
+> its input**. A call site hands this whatever it was given, and if a malformed
+> header value fell through to a pass-through branch, an attacker-chosen string
+> — possibly a full address in a form the parser missed — would land in the log
+> verbatim, which is the bug this function exists to prevent. Tested against
+> empty, junk, an out-of-range quad, an injection-shaped string and two addresses
+> in one field.
+>
+> **What is NOT done:** the two call sites. `AuthHandler.cpp` is owned by
+> `harden/audit-request-path` and this branch was scoped out of it.
+>
+> That branch has since merged (`main` @ `c0aecdd`) and it **did not fix this**.
+> It wrapped both lockout lines in a new `log_safe()`, which is a log-INJECTION
+> guard for a different finding — the submitted login identifier is arbitrary
+> unauthenticated bytes and could forge whole log records. Worth having, and
+> orthogonal: the address is still printed in full.
+>
+> So, against `main` as it now stands:
+>
+>   * `AuthHandler.cpp:124` — the untrusted-`X-Forwarded-For` warning prints
+>     `req.remote_addr` twice, at `warn`, rate-limited to once a minute. It
+>     should name the redacted network, or log a count.
+>   * `AuthHandler.cpp:177`/`:180` — `log_safe(key_a)` / `log_safe(key_b)`
+>     should become `log_safe(redact_ip_for_log(...))` **for the `ip:` key
+>     only**. This is the trap: the two keys are not the same kind of thing.
+>     `key_a` is `"ip:" + address`; `key_b` is `"user:" + the login identifier
+>     exactly as submitted`, which is not an address at all and which
+>     `redact_ip_for_log` would flatten to `"unparseable"`, destroying the only
+>     useful half of the lockout line. Redact the address key, leave the user
+>     key to `log_safe`.
+>
+> A few lines and one include, against a helper that is already tested.
+> **Hand-off item.**
+
 ## 17. Push payloads default to full plaintext rather than `event_id_only` — MEDIUM
 
 `PushService.cpp:144-148` includes `content` and `sender_display_name` unless the
@@ -667,6 +897,15 @@ default configurable and ship `event_id_only` in the deploy template. Note that 
 `event_id_only` still discloses `sender`, `room_id`, `prio` (which encodes "you were
 mentioned" / "this is a DM") and `counts.unread` — enough for a gateway operator to
 reconstruct a social graph. Consider omitting those too in that mode.
+
+> ### RESOLUTION — already fixed by the merge train.
+> `PushService.cpp:144-172`. The privacy mode is now the default rather than an
+> opt-in: content is sent only when the pusher set no `format` **and** the
+> operator has deliberately set `push.default_payload = "full"`. The audit's
+> follow-on point was taken too — `sender` and `type` are withheld in the
+> privacy mode as well, where they used to go unconditionally and hand a gateway
+> a per-message social graph. `prio` and `counts.unread` remain, with a comment
+> saying why and admitting the mode discloses something.
 
 ## 18. Presence includes users who left or were server-banned — LOW-MEDIUM
 
@@ -685,6 +924,26 @@ someone builds per-channel-visible user lists, it becomes the bypass.
 
 **Fix.** Filter to `membership == 'join'` and skip `is_server_banned(uid)`.
 
+> ### RESOLUTION — FIXED.
+> `harden/audit-data-path`, 19 Sep 2026. `SyncHandler.cpp`, three tests in
+> `tests/test_room_visibility.cpp`.
+>
+> Filtered at the presence pass rather than in `get_room_members()`, which is
+> the part the Fix line gets slightly wrong. That query has two other callers
+> and for one of them the unfiltered answer is correct: `GET /rooms/{id}/members`
+> is a roster endpoint and is *supposed* to report `leave` and `ban` as
+> memberships. Narrowing the shared helper would have quietly changed it.
+>
+> Both halves of the filter are there and neither is redundant: `membership ==
+> join` is the ordinary case, and `is_server_banned()` is the backstop, for the
+> same reason `SyncEngine::handle_sync` keeps its own copy of that check — the
+> ban projection rewrites the membership rows, so a crash between the ban-list
+> write and the projection leaves a `join` row behind and this has to fail closed
+> on it. The test for that half deliberately leaves the membership row at `join`.
+>
+> The third test is a live-peer control, so the other two cannot pass against a
+> pass that emits nothing.
+
 ## 19. `PUT /rooms/{id}/voice/state` has no membership check at all — LOW-MEDIUM
 
 `VoiceHandler.cpp:526-602`: between the route match (`:534`) and the body parse (`:543`)
@@ -697,6 +956,34 @@ session-token check at `:575-584` is sound), but a user who joined voice and the
 the room entirely can keep publishing `screen_sharing`/`camera_on`/`muted` into it until
 the reaper catches them 10–60 s later. It is a missing gate sitting between two handlers
 that do gate (`handle_livekit_token` `:809-810`, `handle_livekit_rekey` `:996-997`).
+
+> ### RESOLUTION — FIXED. The audit understated it.
+> `harden/audit-data-path`, 19 Sep 2026. `VoiceHandler::handle_voice_state`, four
+> tests in `tests/test_voice.cpp`.
+>
+> `is_room_member` then `kViewChannel`, the same pair and the same order as
+> `voice/join` and `voice/leave`, placed before the body parse.
+>
+> **Correction to this finding: the impact is not bounded by the reaper.** The
+> audit says a revoked user "can keep publishing … until the reaper catches them
+> 10–60 s later". They cannot be caught: `handle_voice_state` ends in
+> `record_heartbeat()`, so every PUT refreshes the exact liveness the reaper
+> expires on. A user who has left the room, or had `VIEW_CHANNEL` revoked, holds
+> a live entry on the voice roster of a channel they cannot see — visible to
+> everyone in it, with their screen-share and camera flags — for as long as they
+> care to keep sending. It is unbounded, not one reap interval.
+>
+> That is why both refusals return *before* `record_heartbeat()`, and why there
+> is a test (`RefusedVoiceStateDoesNotRefreshTheHeartbeat`) asserting that a
+> refused PUT leaves the member reapable. Without it the gate would still let a
+> revoked user keep their ghost alive by PUTting into a 403.
+>
+> **Also corrected: the comment in `handle_voice_join` that claimed this endpoint
+> was covered.** It argued that join is "the only endpoint that makes someone an
+> active call member", which is true and is not enough — the active row records
+> that the gate was passed *once*, and both of the gate's inputs change
+> afterwards. Authorization cached in a row is not authorization. The comment has
+> been rewritten to say so.
 
 ## 20. No backup script exists; WAL makes naive backups torn as well as unencrypted — LOW-MEDIUM
 
@@ -713,6 +1000,12 @@ message in plaintext.
 
 ---
 
+> ### RESOLUTION — already fixed, in the `deploy` repo.
+> `deploy/backup.sh` exists, uses `sqlite3 .backup` (with a long header
+> explaining why `cp` of a WAL database is torn twice over), has a `--verify`
+> mode that proves an archive restores, and a `--no-media` mode. Separate
+> repository; nothing to do here.
+
 # NOTED
 
 ## 21. `get_state_events` is the one read of `events` with no `signal_to` filter — LOW
@@ -724,6 +1017,27 @@ therefore be broadcast despite a non-NULL `signal_to`. Reaching it requires
 `PUT /rooms/{id}/state/m.call.candidates/{key}` (`kManageChannels`), it exposes only the
 sender's own address, and the prune removes it within two minutes. **Fix:** add
 `AND e.signal_to IS NULL` so the rule is uniform across every read of the table.
+
+> ### RESOLUTION — FIXED.
+> `harden/audit-data-path`, 19 Sep 2026. `SqliteStore::get_state_events`, three
+> tests in `tests/test_call_privacy.cpp`.
+>
+> `AND signal_to IS NULL` in **both** places, not just the outer `WHERE`: also
+> inside the `MAX(stream_position)` subquery, so a filtered row cannot win the
+> latest-per-`(type, state_key)` race and suppress the legitimate state event
+> underneath it. That is a bug the one-line version of this fix would have
+> introduced.
+>
+> The clause is on `signal_to`, not on event type, which is what keeps the voice
+> roster (`m.call.member`, no address, and the UI cannot work without it) and
+> unaddressed legacy signalling behaving exactly as before. There is a control
+> test for each.
+>
+> Agreed with the audit's ranking: reaching this needs `kManageChannels` and the
+> prune clears it within two minutes. Fixed anyway because the value of the rule
+> is that it is uniform — a reader asking "can signalling reach a bystander"
+> should be able to answer from the table's read paths without having to know
+> which one was the exception.
 
 ## 22. Signalling privacy depends on the client setting `content.to`; unenforced — LOW
 
@@ -737,12 +1051,47 @@ ICE candidates to every member, which on this server is everyone.
 shipped client addresses its signalling, reject the five types with 400 when `to` is
 absent, behind a config flag defaulting to reject after one release.
 
+> ### RESOLUTION — NOT fixed here; the enforcement point is out of this branch.
+> Reviewed and agreed on the merits. The change belongs in the send path in
+> `EventHandler`, which `harden/audit-request-path` owns and this branch was
+> scoped out of. It cannot go anywhere else: `insert_event` is the wrong layer —
+> it is also the path bots, the migration and internal writers use, and a refusal
+> there surfaces as a 500 rather than the 400 this wants.
+>
+> Recording the shape so it is not re-derived. Reject `m.call.invite`,
+> `m.call.answer`, `m.call.candidates`, `m.call.hangup` and
+> `bsfchat.call.negotiate` with 400 when `content.to` is absent or not a
+> non-empty string, behind a config flag defaulting to **permit** for one release
+> and **reject** after. The flag is not ceremony: `call_signal_addressee`
+> deliberately fails open for every doubtful case, and
+> `CallSignalling.h:34-38` argues that an unaddressed event keeps today's
+> behaviour because the server cannot guess a recipient without parsing SDP.
+> Flipping that to a hard refusal turns "an old client leaks its own address" into
+> "an old client cannot make calls at all", and a deployment deserves one release
+> with a log line before that lands.
+>
+> Worth doing. The product's pitch is IP privacy, and today that property is a
+> client-cooperation guarantee, not a server-enforced one. **Hand-off item.**
+
 ## 23. The signalling prune does not run at startup, contrary to its comment — LOW
 
 `CallSignalling.h:99-100` claims "the sweep runs at startup as well". It does not: the
 prune rides the voice reaper thread, whose loop does `reaper_cv_.wait_for(...)` **before**
 its first pass (`VoiceHandler.cpp:172-174`). There is a `kReapInterval` gap after every
 restart. Harmless in practice; the comment is wrong.
+
+> ### RESOLUTION — FIXED.
+> `harden/audit-data-path`, 19 Sep 2026. `VoiceHandler::start_reaper`, two tests
+> in `tests/test_voice.cpp`.
+>
+> The loop now runs its first pass before the first `wait_for`, so
+> `CallSignalling.h`'s claim that "the sweep runs at startup as well" is true.
+> Free for the ghost reaper it rides with: a process that has just started has no
+> stale heartbeats, so its own first pass is a no-op by construction.
+>
+> The ten seconds were never the point. A retention guarantee written into a
+> header and not implemented is, because the next person to reason about the
+> signalling TTL will reason from that comment.
 
 ## 24. `RAND_bytes` return value discarded when minting media ids — LOW
 
@@ -754,6 +1103,31 @@ id. Note the inconsistency: the protocol RNG fix landed today deliberately *thro
 `RAND_bytes` failure. Check the return, and claim the id in the DB before writing the
 blob.
 
+> ### RESOLUTION — FIXED. No test, and that is deliberate.
+> `harden/audit-data-path`, 19 Sep 2026. `MediaHandler::generate_media_id`.
+>
+> Throws on `RAND_bytes != 1`, matching `Identifiers.cpp`'s `random_base64` and
+> `VoiceHandler`'s session-id minting. This was the last CSPRNG call site in the
+> server still ignoring its return code.
+>
+> `generate_media_id()` also moved **inside** `handle_upload`'s `try`, so the
+> throw becomes the 500 the caller should get rather than an exception escaping a
+> request handler and dropping the connection.
+>
+> The audit's second suggestion — claim the id in the DB before writing the blob
+> — was **not** taken, because the hazard it addresses is already covered from
+> the other side: `handle_upload` removes the blob when `insert_media` throws
+> (`MediaHandler.cpp:227-244`), so a failed insert no longer orphans bytes.
+> Reordering would buy nothing and would mean a row briefly existing for an
+> object with no bytes behind it, which is the state the new media reaper is
+> specifically designed to clean up rather than to create.
+>
+> **No test.** Forcing this branch needs an entropy-source failure, and the only
+> way to get one in a test is an injection seam in the RNG — a new indirection on
+> a hot path, in production code, to cover three lines that match an established
+> convention and are read the same way at two other sites. Not worth it. Saying
+> so here rather than leaving a gap for someone to find.
+
 ## 25. Event-existence oracle via edit-target error codes — LOW
 
 `EventHandler.cpp:258-292` resolves an edit target **before** checking the room, and the
@@ -763,12 +1137,40 @@ ids are 256-bit post-`671e803`, so there is nothing to enumerate, and existence
 discloses no content. Worth collapsing the first two into one response shape next time
 the file is touched.
 
+> ### RESOLUTION — out of scope for this branch.
+> `EventHandler`'s send and edit path is owned by `harden/audit-request-path`.
+> The finding's own recommendation is to collapse the two refusals "next time the
+> file is touched", which is that branch. Flagging it here so it is not lost.
+
 ## 26. `m.direct` peer side not filtered by membership — LOW
 
 `SqliteStore.cpp:518-537` filters `me.membership = 'join'` but not `peer`, so a peer
 whose row is `leave`/`ban` still comes back as the DM's counterparty. Cosmetic — the room
 is the caller's own either way — but `m.direct` is not a truthful statement of the
 current participant set. Add `AND peer.membership = 'join'`.
+
+> ### RESOLUTION — DECLINED. **This finding is wrong**, and the recommended
+> change would be a regression.
+> `harden/audit-data-path`, 19 Sep 2026. Two pinning tests added in
+> `tests/test_rooms.cpp`; no production change.
+>
+> The finding calls the fix cosmetic. It is not. `get_direct_rooms` is the only
+> thing that tells `/sync` a room is a DM: `attach_direct_rooms`
+> (`SyncEngine.cpp:97-103`) turns each `(room, peer)` pair into
+> `m.direct[peer] = [room]`, so a pair filtered out by
+> `AND peer.membership = 'join'` does not produce a DM with a missing name — the
+> room stops being a DM at all, and the client files the conversation under
+> channels.
+>
+> So the recommended one-line change makes a conversation whose other side left
+> or was banned **vanish from the DM list**, taking its history with it as far as
+> the sidebar is concerned. A conversation you had with someone who has since
+> left is still your conversation. `SqliteStore.h:283-287` has said exactly this
+> about the function since it was written; the audit did not see the comment.
+>
+> The caller's *own* side is filtered and stays filtered — a DM the caller left
+> is not theirs to be shown. Both properties now have a test, so a later reader
+> cannot re-derive the "fix" from this finding's Fix line alone.
 
 ## 27. The audit log bypasses VIEW_CHANNEL by design, undocumented — LOW
 
@@ -789,6 +1191,28 @@ document it in `AuditLog.h` as a decided position; do not filter.** (Minor nit: 
 recorded member count uses `get_room_members().size()`, which includes `leave`/`ban` rows
 and so overstates.)
 
+> ### RESOLUTION — recommendation taken exactly: documented, not filtered. Plus
+> the nit.
+> `harden/audit-data-path`, 19 Sep 2026. `src/audit/AuditLog.h`,
+> `src/audit/AuditLog.cpp`.
+>
+> The decided position is now a section at the top of `AuditLog.h`: the
+> server-scope check and why it holds, what the records contain, and why they are
+> not filtered against the reader's `VIEW_CHANNEL`. The argument, stated there so
+> it survives: the holder of `kManageServer` can grant themselves `VIEW_CHANNEL`
+> on any channel in one request, so filtering withholds nothing they cannot
+> trivially take — it only makes the record incomplete, and an incomplete record
+> of who deleted what is worse than no record, because it still reads as
+> authoritative. It ends with "Do not add per-record VIEW_CHANNEL filtering",
+> which is the sentence this finding existed to produce.
+>
+> **The minor nit is fixed.** `audit_room_deletion`'s member count used
+> `get_room_members().size()`, which includes `leave` and `ban` rows; on this
+> server, where auto-join force-joins everyone into everything, it overstated by
+> the whole set of people who ever left. It now counts `join` rows only. The
+> number exists so a later reader can judge how consequential a deletion was, so
+> it has to mean what it says.
+
 ## 28. No history-visibility horizon — LOW, by design, worth a decision
 
 Access is evaluated **now**, over **all** history. A user newly granted VIEW_CHANNEL can
@@ -801,6 +1225,39 @@ because it means **granting someone access for five minutes grants them the enti
 archive**. If the product ever wants "history from when you joined", the hook is a
 per-(user, room) floor in `get_room_events_paginated` and a `stream_position >=` clause
 in `search_messages`.
+
+> ### RESOLUTION — no change. Decision left to Josh, options below.
+> Reviewed, agreed it is not a bug, and deliberately not touched. Writing the
+> options down so the decision can be made once rather than re-argued.
+>
+> The behaviour, restated plainly: **granting someone access to a channel for
+> five minutes grants them its entire archive.** That is the Discord model and
+> most people expect it. It is also the thing that surprises somebody who adds a
+> contractor to `#eng` for one thread.
+>
+> Three positions, in increasing cost:
+>
+> 1. **Keep it, and say so in the UI.** Cheapest, and it is the honest version of
+>    the status quo: the permission dialog for granting `VIEW_CHANNEL` says "and
+>    all of this channel's history". No server change. This is the one to take if
+>    nobody has asked for anything else.
+>
+> 2. **A per-(user, room) floor, opt-in per channel.** A `history_from` stream
+>    position written when access is granted, honoured by a `stream_position >=`
+>    clause in `get_room_events_paginated` and in `search_messages`. Both hooks
+>    are named correctly in the finding. This is a schema change, and it has a
+>    sharp edge the finding does not mention: a floor is *per user*, so it has to
+>    survive a re-grant, and if it is rewritten on every grant then revoking and
+>    re-granting becomes a way to *hide* history from someone rather than only to
+>    show it. The floor must be a minimum over grants, never a replacement.
+>
+> 3. **Server-wide "history from when you joined".** Position 2 with the default
+>    flipped. Do not do this without the UI from position 1, or every existing
+>    member of every channel silently loses their scrollback on upgrade.
+>
+> My recommendation is 1 now, and 2 only when a customer asks — it is a
+> schema change and a permanent complication of the two hottest read paths in the
+> product, in exchange for a property nobody has yet asked for.
 
 ## 29. Assorted values logged at `info` — LOW
 

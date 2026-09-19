@@ -78,6 +78,42 @@ max_upload_size_mb = 500
 # because the image/video widgets cannot set request headers.
 # Turn this off only to serve clients older than token-bearing media URLs.
 require_auth = true
+
+# ── Collecting media nothing references any more ────────────────────────────
+#
+# Before this existed there was no erasure path for media at all. Redacting a
+# message stripped the mxc from its content and revoked the per-room grant, but
+# the bytes stayed on disk and stayed fetchable by anyone who had noted the id;
+# deleting the whole channel did not help; and every upload that was never
+# actually sent stayed forever. data/media/ only grew.
+#
+# The reaper deletes objects that nothing references any more: no surviving
+# event names them, no account wears them as an avatar, no server-scoped
+# document mentions them, and they are older than orphan_grace_hours.
+reaper_enabled = true
+
+# Log what WOULD be deleted, and delete nothing. Ships as `true`.
+#
+# This is the only thing in the server that destroys user data from disk on a
+# timer, and a wrong reference query fails silently and unrecoverably. Leave it
+# on for a release: every candidate is logged at info with its size, uploader
+# and content type, so you can read a night of it against your own corpus,
+# satisfy yourself it names nothing you recognise, and only then set this to
+# false. The startup line says which mode it is in.
+reaper_dry_run = true
+
+# How long an object may sit unreferenced before it is collected.
+#
+# Not a tuning knob. Uploading a file and sending the message that names it are
+# two separate requests, and in between the object is indistinguishable from an
+# orphan — so this has to comfortably exceed the longest gap between someone
+# attaching a screenshot and actually hitting send. Lowering it to save disk
+# will eventually delete an attachment out from under someone who was still
+# typing.
+orphan_grace_hours = 24
+
+# How often to sweep. Cheap, and nothing depends on collection being prompt.
+reaper_interval_minutes = 60
 #
 # NOT CONFIGURABLE, but worth knowing about because it is a deliberate deviation
 # from what an operator migrating off Apache or nginx will expect:

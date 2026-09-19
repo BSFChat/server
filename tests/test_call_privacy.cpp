@@ -608,3 +608,64 @@ TEST(CallSignallingMigration, V17BackfillsThenPurgesWhatIsAlreadyStored) {
 
     std::filesystem::remove(path);
 }
+
+// ── Audit data-path finding 21: the one read of `events` that forgot the rule ──
+//
+// Every other read of the table carries the addressee clause. get_state_events
+// does not, and its result is broadcast to every joined member through /sync
+// and served whole by GET /rooms/{id}/state. A signalling event written WITH a
+// state_key therefore escapes the filter that the rest of the table obeys.
+//
+// Writing one needs kManageChannels (PUT /rooms/{id}/state/...), so this is
+// not a plain-member leak, and the prune removes the row within two minutes.
+// It is fixed anyway because the value of the rule is that it is uniform: a
+// reader checking "can signalling reach a bystander" should be able to answer
+// from the table's read paths without having to know which of them is the
+// exception.
+TEST_F(CallPrivacyTest, AddressedSignallingWithAStateKeyIsNotInRoomState) {
+    auto id = generate_event_id("test");
+    store->insert_event(id, room_id, "@alice:test", std::string(event_type::kCallCandidates),
+                        std::string("somekey"),
+                        json{{"to", "@bob:test"}, {"candidate", "192.168.1.50 54321 typ host"}}.dump(),
+                        now_ms());
+
+    auto state = store->get_state_events(room_id);
+    for (const auto& ev : state) {
+        EXPECT_NE(ev.event_id, id)
+            << "addressed signalling reached room state, where every member reads it";
+        EXPECT_EQ(ev.content.data.dump().find("192.168.1.50"), std::string::npos)
+            << "an ICE candidate address reached room state";
+    }
+}
+
+// The control. Unaddressed signalling keeps today's behaviour everywhere else
+// (see UnaddressedSignallingRemainsInHistory), so it must keep it here too —
+// otherwise the fix is "drop all signalling from state", which is a different
+// and larger change than the one being made.
+TEST_F(CallPrivacyTest, UnaddressedSignallingWithAStateKeyStaysInRoomState) {
+    auto id = generate_event_id("test");
+    store->insert_event(id, room_id, "@alice:test", std::string(event_type::kCallCandidates),
+                        std::string("somekey"),
+                        json{{"candidate", "192.168.1.50 54321 typ host"}}.dump(), now_ms());
+
+    bool found = false;
+    for (const auto& ev : store->get_state_events(room_id)) {
+        if (ev.event_id == id) found = true;
+    }
+    EXPECT_TRUE(found);
+}
+
+// And the roster must survive, because it is a state event whose whole job is
+// to reach the room. If the filter were written against event TYPE rather than
+// against signal_to this test would fail.
+TEST_F(CallPrivacyTest, TheRosterStateEventSurvivesTheStateFilter) {
+    auto id = generate_event_id("test");
+    store->insert_event(id, room_id, "@alice:test", std::string(event_type::kCallMember),
+                        std::string("@alice:test"), json{{"active", true}}.dump(), now_ms());
+
+    bool found = false;
+    for (const auto& ev : store->get_state_events(room_id)) {
+        if (ev.event_id == id) found = true;
+    }
+    EXPECT_TRUE(found) << "the voice roster was filtered out of room state";
+}

@@ -20,6 +20,37 @@ class SqliteStore;
 // Storage lives outside room events for the same reason server-wide roles do
 // (SqliteStore::set_server_state): a record has to survive the deletion of the
 // room, category and account it describes.
+//
+// ── Reading the log deliberately bypasses VIEW_CHANNEL ──────────────────
+//
+// This is a decided position, recorded here because it is the kind of thing a
+// later reader finds and files as a bug. It is not one.
+//
+// GET /_matrix/client/v3/admin/audit requires kManageServer at SERVER scope,
+// and that scope genuinely holds: PermissionsEngine::compute returns the base
+// mask before per-channel overrides are consulted, so an ALLOW MANAGE_SERVER
+// override on one channel cannot unlock the log. The check is the first thing
+// the handler does, ahead of every filter and the pagination cursor, so
+// narrowing by actor, target_user, target_room or action cannot reach around
+// it. There is no write endpoint, and a room-scoped moderator reads nothing.
+//
+// What the records then contain is NOT filtered against the reader's
+// VIEW_CHANNEL. A record carries target_room, and audit_room_deletion stores
+// the deleted channel's name, type, parent_id and member count. A server
+// administrator reading the log therefore learns that "#staff-only" existed
+// and was deleted, whether or not they could see it while it lived.
+//
+// That is the point of an audit log. The holder of kManageServer can grant
+// themselves VIEW_CHANNEL on any channel on the server in one request, so
+// filtering the log against it withholds nothing they cannot trivially take —
+// it only makes the record incomplete, and an incomplete record of who deleted
+// what is worse than no record, because it reads as authoritative. An admin
+// who cannot audit hidden channels cannot audit; the deletion of a private
+// channel is precisely the event somebody asks about six months later.
+//
+// The boundary that IS load-bearing is the one above: server scope, checked
+// once, before anything else. Do not add per-record VIEW_CHANNEL filtering.
+// (Audit data-path finding 27, September 2026 — examined and declined.)
 namespace audit_action {
 
 // Action names are a stable part of the read API — an operator greps these, and a

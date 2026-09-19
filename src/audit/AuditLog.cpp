@@ -16,6 +16,27 @@
 
 namespace bsfchat {
 
+namespace {
+
+// get_room_members() reports every row in room_members, 'leave' and 'ban'
+// included, which is right for the roster endpoint and wrong for a count
+// recorded as "how many people were in this channel when it was deleted".
+// Unfiltered it overstates — on this server, where auto-join force-joins
+// everyone into everything, it overstates by the whole set of people who ever
+// left. The number exists so somebody reading the record later can judge how
+// consequential the deletion was, so it has to mean what it says.
+size_t joined_member_count(SqliteStore& store, const std::string& room_id) {
+    size_t n = 0;
+    for (const auto& [uid, state] : store.get_room_members(room_id)) {
+        (void)uid;
+        if (state == membership::kJoin) ++n;
+    }
+    return n;
+}
+
+} // namespace
+
+
 using json = nlohmann::json;
 
 namespace {
@@ -293,7 +314,7 @@ void audit_room_deletion(SqliteStore& store, const std::string& actor,
         {"type", room_type},
         {"parent_id", parent_id},
         {"is_direct", store.is_direct_room(room_id)},
-        {"members", store.get_room_members(room_id).size()},
+        {"members", joined_member_count(store, room_id)},
     }.dump();
     // No after: the room is about to stop existing.
     store.append_audit_record(record);

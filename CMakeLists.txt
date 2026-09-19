@@ -54,6 +54,7 @@ add_executable(bsfchat-server
     src/api/SearchHandler.cpp
     src/push/PushService.cpp
     src/storage/LocalStorage.cpp
+    src/storage/MediaReaper.cpp
     src/storage/S3Client.cpp
     src/storage/S3Storage.cpp
     src/store/SqliteStore.cpp

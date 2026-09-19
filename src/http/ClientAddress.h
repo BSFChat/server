@@ -34,6 +34,34 @@ struct IpNetwork {
 // both include private space and neither is safe to trust.
 bool is_private_or_loopback_network(const IpNetwork& net);
 
+// An address in a form that is safe to put in a log line.
+//
+// ── Why this exists ───────────────────────────────────────────────────────
+// This server writes no client IP address to the database — verified, and it
+// is the load-bearing claim behind a product whose pitch is IP privacy. The
+// operator LOG is the entire remaining exposure surface: two lines in
+// AuthHandler (the untrusted-X-Forwarded-For warning and the lockout notice)
+// put a full client address into a stream that is shipped off the host,
+// retained by whatever collects it, and read by people who are not the
+// operator. The default log level is `info` and is not configurable, so both
+// fire on every production deployment.
+//
+// Those lines are defensible as a security log and should keep existing. What
+// they do not need is the last octet. A /24 (or /64 for IPv6) answers every
+// question an operator actually asks of them — is this one source or a spread,
+// is it the office range, is it a datacentre — while no longer being a record
+// of which individual subscriber tried to log in and when.
+//
+// ── The shape ─────────────────────────────────────────────────────────────
+//   "203.0.113.42"     -> "203.0.113.0/24"
+//   "2001:db8::1:2:3"  -> "2001:db8::/64"
+//   anything unparseable, or empty -> "unparseable"
+//
+// Never returns the input unchanged, and never returns an empty string: a log
+// call site must not be able to leak a full address by passing something this
+// function did not recognise.
+std::string redact_ip_for_log(const std::string& address);
+
 // Works out which address a request should be attributed to for rate limiting.
 //
 // This server is documented as running behind a reverse proxy, where the

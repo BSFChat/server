@@ -18,6 +18,7 @@
 #include "push/PushService.h"
 #include "http/Router.h"
 #include "storage/LocalStorage.h"
+#include "storage/MediaReaper.h"
 #include "storage/S3Storage.h"
 
 #include <bsfchat/Constants.h>
@@ -225,6 +226,9 @@ void Server::register_routes() {
 
     // Media routes
     auto media_handler = std::make_shared<MediaHandler>(*store_, config_, media_storage_);
+    // Same storage object the upload and download paths use, so the reaper can
+    // never be pointed at a different backend than the one holding the bytes.
+    media_reaper_ = std::make_unique<MediaReaper>(*store_, config_, media_storage_);
 
     svr.Post(std::string(api_path::kMediaUpload),
              [h = media_handler](const httplib::Request& req, httplib::Response& res) { h->handle_upload(req, res); });
@@ -361,6 +365,7 @@ void Server::start() {
     bootstrap_roles(*store_, *sync_engine_, config_);
 
     voice_handler_->start_reaper();
+    media_reaper_->start();
     push_service_->start();
 
     http_server_->start();
@@ -368,6 +373,7 @@ void Server::start() {
 
 void Server::stop() {
     if (voice_handler_) voice_handler_->stop_reaper();
+    if (media_reaper_) media_reaper_->stop();
     if (push_service_) push_service_->stop();
     if (http_server_) http_server_->stop();
 }
