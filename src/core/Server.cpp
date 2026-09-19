@@ -232,6 +232,15 @@ void Server::register_routes() {
 
     svr.Post(std::string(api_path::kMediaUpload),
              [h = media_handler](const httplib::Request& req, httplib::Response& res) { h->handle_upload(req, res); });
+    // Mints a short-lived signed ticket for one object, so the client no longer
+    // has to put the viewer's session token in a media URL. Authorization
+    // header only, and the same may_download() check the download path runs.
+    // Path literal rather than api_path:: because adding a constant would move
+    // this change into the protocol repo, which has to merge first; fold it in
+    // the next time protocol changes for another reason. The client's mirror of
+    // this string is in client/src/util/MediaUrl.h.
+    svr.Post("/_matrix/media/v3/ticket",
+             [h = media_handler](const httplib::Request& req, httplib::Response& res) { h->handle_ticket(req, res); });
     svr.Get(R"(/_matrix/media/v3/download/([^/]+)/([^/]+)/([^/]+))",
             [h = media_handler](const httplib::Request& req, httplib::Response& res) { h->handle_download(req, res); });
     svr.Get(R"(/_matrix/media/v3/download/([^/]+)/([^/]+))",

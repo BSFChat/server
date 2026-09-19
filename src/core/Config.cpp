@@ -56,6 +56,9 @@ Config Config::load(const std::string& path) {
             if (auto v = media->get("reaper_interval_minutes"))
                 cfg.media_reaper_interval_minutes =
                     v->value_or(cfg.media_reaper_interval_minutes);
+            if (auto v = media->get("ticket_ttl_seconds"))
+                cfg.media_ticket_ttl_seconds = static_cast<int>(
+                    v->value_or(static_cast<int64_t>(cfg.media_ticket_ttl_seconds)));
         }
 
         // [auth]
