@@ -22,6 +22,7 @@ add_executable(bsfchat-server
     src/core/Server.cpp
     src/core/Config.cpp
     src/core/Logger.cpp
+    src/core/InstanceSecret.cpp
     src/core/RateLimiter.cpp
     src/core/SendLimiter.cpp
     src/http/HttpServer.cpp
@@ -61,6 +62,7 @@ add_executable(bsfchat-server
     src/store/SqliteStore.cpp
     src/store/Migrations.cpp
     src/sync/SyncEngine.cpp
+    src/sync/SyncToken.cpp
 )
 
 target_include_directories(bsfchat-server PRIVATE src)

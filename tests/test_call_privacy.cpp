@@ -20,9 +20,11 @@
 
 #include "auth/LocalAuth.h"
 #include "core/Config.h"
+#include "core/InstanceSecret.h"
 #include "store/CallSignalling.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
+#include "sync/SyncToken.h"
 
 #include <bsfchat/Constants.h>
 #include <bsfchat/Identifiers.h>
@@ -133,6 +135,22 @@ protected:
             if (e.content.data.dump().find(needle) != std::string::npos) return true;
         }
         return false;
+    }
+
+    // The stream position inside an opaque next_batch.
+    //
+    // next_batch stopped being "s<N>" because that integer was the global
+    // stream head and therefore an activity oracle over every room on the
+    // server (finding 10, docs/audit-data-2026-09.md). The token-monotonicity
+    // assertions below are still about the POSITION, so they re-open the token
+    // with the same key the engine used rather than being weakened into
+    // string comparisons. Nothing outside a test may do this.
+    int64_t token_pos(const std::string& user_id, const std::string& token) {
+        auto key = sync_token::derive_key(get_or_create_instance_secret(*store),
+                                          config.server_name);
+        auto pos = sync_token::parse(key, user_id, token);
+        EXPECT_TRUE(pos.has_value()) << "not a token this server minted: " << token;
+        return pos.value_or(-1);
     }
 
     std::unique_ptr<SqliteStore> store;
@@ -419,13 +437,16 @@ TEST_F(CallPrivacyTest, SweepingDoesNotRewindTheStreamHead) {
                 now - limits::kCallSignallingTtlMs - 1000);
     const int64_t head = store->get_current_stream_position();
 
+    // Minted BEFORE the sweep — that is the token whose survival is the point.
+    const std::string since = sync->handle_sync("@bob:test", "", 0).next_batch;
+    ASSERT_EQ(token_pos("@bob:test", since), head);
+
     ASSERT_EQ(store->prune_expired_call_signalling(now), 1);
     EXPECT_EQ(store->get_current_stream_position(), head);
 
-    // And a token issued before the sweep still works afterwards.
-    const std::string since = "s" + std::to_string(head);
     auto resp = sync->handle_sync("@bob:test", since, 0);
-    EXPECT_EQ(resp.next_batch, "s" + std::to_string(head));
+    EXPECT_EQ(resp.next_batch, since);
+    EXPECT_EQ(token_pos("@bob:test", resp.next_batch), head);
 }
 
 // ── Sync-token and long-poll semantics ───────────────────────────────────
@@ -447,14 +468,15 @@ TEST_F(CallPrivacyTest, ABystandersTokenStillAdvancesPastFilteredSignalling) {
     EXPECT_NE(resp.next_batch, before)
         << "Carol's sync token stalled on events she cannot see; the desktop "
            "client treats an unmoved next_batch as no progress and backs off";
-    EXPECT_GT(std::stoll(resp.next_batch.substr(1)), std::stoll(before.substr(1)));
+    EXPECT_GT(token_pos("@carol:test", resp.next_batch),
+              token_pos("@carol:test", before));
 }
 
 // Monotonic, and never past an event the scan did not offer. This is the
 // invariant c40ef93 restored; the filter must not chip at it.
 TEST_F(CallPrivacyTest, TheAddresseesTokenNeverPassesAnUndeliveredEvent) {
     std::string since = sync->handle_sync("@bob:test", "", 0).next_batch;
-    int64_t last = std::stoll(since.substr(1));
+    int64_t last = token_pos("@bob:test", since);
 
     for (int i = 0; i < 4; ++i) {
         send_signal("@alice:test", std::string(event_type::kCallCandidates),
@@ -462,7 +484,7 @@ TEST_F(CallPrivacyTest, TheAddresseesTokenNeverPassesAnUndeliveredEvent) {
         send_message("@alice:test", "chat " + std::to_string(i));
 
         auto resp = sync->handle_sync("@bob:test", since, 0);
-        const int64_t pos = std::stoll(resp.next_batch.substr(1));
+        const int64_t pos = token_pos("@bob:test", resp.next_batch);
         EXPECT_GE(pos, last) << "next_batch went backwards";
         last = pos;
         since = resp.next_batch;

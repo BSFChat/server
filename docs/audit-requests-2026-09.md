@@ -46,9 +46,12 @@ Where I disagree with either, it is called out explicitly under
 | 18 | `PUT /voice/state`, `/typing/{u}`, `/presence/{u}/status`, `/notify_level`, `/createRoom`, `/category` | Unguarded nlohmann type conversions → bare 500. No disclosure; robustness only | Low | Noted |
 | 19 | client `bsfchat.log` | libdatachannel's own log stream is mirrored to disk, so ICE candidate lines put the user's LAN and public IP in a plaintext file | Low | Noted |
 | 20 | `POST /_matrix/client/v3/login` | **Unauthenticated** server-log forgery: the lockout line logs the submitted login identifier verbatim | Medium | **Fixed** (found by 17's sweep) |
+| 21 | `PUT /rooms/{id}/state/bsfchat.server.screenshare` | A server-wide screen-share cap gated on MANAGE_CHANNELS at ROOM scope, so a per-channel override confers it | Low | **Fixed** |
 
-20 findings. Four must-fix before the RC (1–4), one must-fix before `feat/bots`
-merges (12). Finding 20 was found by the sweep finding 17 asked for.
+21 findings. Four must-fix before the RC (1–4), one must-fix before `feat/bots`
+merges (12). Finding 20 was found by the sweep finding 17 asked for; finding 21
+was noticed while writing the finding-11 allowlist and deliberately left for its
+own commit.
 
 ---
 
@@ -923,7 +926,7 @@ records from one log call.
 
 ---
 
-### 21. `bsfchat.server.screenshare` is server-wide on a per-channel permission — Low
+### 21. `bsfchat.server.screenshare` is server-wide on a per-channel permission — Low — FIXED
 
 Noticed while writing the allowlist for finding 11, not fixed there.
 
@@ -941,6 +944,42 @@ reverted — which is why it is listed rather than folded into the finding-11 co
 Changing it means moving it into `is_server_scoped` (which also moves where the
 write lands) or giving it the `is_room_type_change` treatment (scope only), and
 deciding which is a deliberate call, not a drive-by.
+
+> ### RESOLUTION — FIXED. `harden/audit-final`, 19 Sep 2026.
+>
+> **The `is_room_type_change` treatment: the permission scope moves to the
+> server, the event stays ordinary room state.** `handle_set_state` gains
+> `is_server_wide_media_setting`, and the two scope-only flags are now joined in
+> one `is_scope_only_server_act` expression next to `is_server_scoped`.
+>
+> **Why not `is_server_scoped`**, having read both precedents. That flag does
+> not mean "this setting is server-wide" — it means "the AUTHORITATIVE copy
+> lives in `server_state`, and `write_server_scoped_state` owns the write". Its
+> two members are role documents, and the branch behind it parses the request
+> body as one to run `may_assign_roles` / `may_edit_role_definitions` before
+> writing. A screen-share ceiling is neither. Nothing in the server reads it at
+> all: the only reader in the system is the client, off the room-state copy that
+> reaches it through `/sync`. Routing it through `is_server_scoped` would
+> therefore write an authoritative row no read path consults, audit a quality
+> cap as a role change, need an `else` branch to skip the rank logic, and leave
+> the copy clients actually obey exactly where it is today — a half-migration
+> that looks like durability without providing any. Scope-only is the whole of
+> the defect and the whole of the fix: one flag, one expression, no storage
+> change, no client change, no migration.
+>
+> **Both directions, not just the allow.** A per-channel DENY of
+> MANAGE_CHANNELS must not block a server-wide holder from setting a
+> server-wide cap either; the setting is not about that channel. Checking only
+> the allow direction would have left half the bug in place, and both are
+> asserted.
+>
+> **Tests.** `ServerScopedSettings.PerChannelManageChannelsDoesNotSetTheScreenShareCap`
+> and `...ServerWideManageChannelsStillSetsTheScreenShareCap` in
+> `tests/test_request_hardening.cpp`, next to the allowlist test whose comment
+> deferred this. The second pins where the write lands — room state, not
+> `server_state` — so a later "tidy-up" into `is_server_scoped` fails loudly.
+> Both confirmed failing first: the per-channel override returned 200, and the
+> per-channel deny returned 403.
 
 ---
 
