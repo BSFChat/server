@@ -15,6 +15,7 @@ add_executable(server_tests
     test_rooms.cpp
     test_sync.cpp
     test_sync_latency.cpp
+    test_sync_token.cpp
     test_sync_invites.cpp
     test_call_privacy.cpp
     test_permissions.cpp
@@ -64,6 +65,7 @@ target_link_libraries(server_tests PRIVATE
 # We need to compile the server sources for testing (except main.cpp)
 target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/core/Logger.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/InstanceSecret.cpp
     ${CMAKE_SOURCE_DIR}/src/core/Config.cpp
     ${CMAKE_SOURCE_DIR}/src/core/RateLimiter.cpp
     ${CMAKE_SOURCE_DIR}/src/core/SendLimiter.cpp
@@ -75,6 +77,7 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/store/SqliteStore.cpp
     ${CMAKE_SOURCE_DIR}/src/store/Migrations.cpp
     ${CMAKE_SOURCE_DIR}/src/sync/SyncEngine.cpp
+    ${CMAKE_SOURCE_DIR}/src/sync/SyncToken.cpp
     ${CMAKE_SOURCE_DIR}/src/http/Router.cpp
     # For the worker-pool regression test: the defect was in how this
     # constructs httplib's ThreadPool, so the test must build the real thing.

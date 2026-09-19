@@ -1506,6 +1506,32 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     // MANAGE_CHANNELS check, on a room that is empty by construction.
     const bool is_room_type_change = evt_type == std::string(event_type::kRoomType);
 
+    // The server-wide screen-share ceiling, which gets the same scope-only
+    // treatment for the same reason.
+    //
+    // `bsfchat.server.screenshare` is the maximum screen-share quality FOR THE
+    // DEPLOYMENT. The client writes it into whichever room happens to be active
+    // — ServerConnection::setScreenSharePolicy takes m_activeRoomId and falls
+    // back to the first room in the list — and every client applies whichever
+    // copy reaches it through /sync, whatever room it arrived in. Nothing
+    // scopes it to a channel. Gating it on MANAGE_CHANNELS at ROOM scope
+    // therefore meant an allow override in one unimportant channel was a lever
+    // on a server-wide media setting: the same shape as the bsfchat.room.type
+    // bug above, and the same sentence may_edit_role_definitions already
+    // writes down. Finding 21 of docs/audit-requests-2026-09.md.
+    //
+    // NOT folded into `is_server_scoped`, deliberately. That flag means more
+    // than "server-wide": it moves the AUTHORITATIVE copy into server_state and
+    // routes the write through write_server_scoped_state, whose rank checks
+    // parse the body as a role document. Nothing reads a screen-share cap from
+    // server_state — the only reader in the system is the client, off the sync
+    // mirror — so taking that branch would write a row no read path consults,
+    // audit it as a role change, and leave the copy clients actually obey
+    // exactly where it is now. Scope-only is the whole of the defect and the
+    // whole of the fix.
+    const bool is_server_wide_media_setting =
+        evt_type == std::string(event_type::kServerScreenShare);
+
     // Moderation-by-membership-write. This route will happily set another user's
     // m.room.member to "ban", which makes it a second route to the same act as
     // POST /rooms/{id}/ban — and Matrix clients legitimately use it, so it cannot
@@ -1582,12 +1608,9 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         if (type == event_type::kServerInfo) {
             return {true, permission::kManageServer};
         }
-        // The server-wide screen-share ceiling. MANAGE_CHANNELS and room scope,
-        // which is what it has always had — deliberately unchanged here so this
-        // commit is an allowlist and not a silent re-gating. It is a server-wide
-        // setting reachable on a per-channel permission, which is worth its own
-        // look; noted in docs/audit-requests-2026-09.md rather than fixed in
-        // passing.
+        // The server-wide screen-share ceiling. MANAGE_CHANNELS, evaluated at
+        // SERVER scope — see is_server_wide_media_setting above for why, and
+        // for why it is not in is_server_scoped.
         if (type == event_type::kServerScreenShare) {
             return {true, permission::kManageChannels};
         }
@@ -1601,8 +1624,15 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     PermissionsEngine perms(store_, config_);
     // `is_server_scoped` also decides WHERE the write lands (server_state vs room
     // state), which is why it is not folded into the scope expression below.
+    //
+    // The other two move the permission SCOPE and nothing else: the event stays
+    // ordinary room state and is delivered exactly as it was. Both are acts on
+    // the server rather than edits inside one channel, so a per-channel
+    // override — allow OR deny — must have no say over them in either
+    // direction.
+    const bool is_scope_only_server_act = is_room_type_change || is_server_wide_media_setting;
     const std::string perm_scope =
-        (is_server_scoped || is_room_type_change) ? kServerScope : room_id;
+        (is_server_scoped || is_scope_only_server_act) ? kServerScope : room_id;
 
     json content;
     try {

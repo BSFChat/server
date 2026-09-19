@@ -1,8 +1,10 @@
 #include "sync/SyncEngine.h"
 #include "auth/Permissions.h"
 #include "core/Config.h"
+#include "core/InstanceSecret.h"
 #include "core/Logger.h"
 #include "store/SqliteStore.h"
+#include "sync/SyncToken.h"
 
 #include <bsfchat/Constants.h>
 #include <bsfchat/Permissions.h>
@@ -163,6 +165,30 @@ SyncEngine::SyncEngine(SqliteStore& store, const Config& config)
     current_position_ = store_.get_current_stream_position();
 }
 
+const std::vector<unsigned char>& SyncEngine::token_key() {
+    // If the derivation throws — an empty secret, an OpenSSL failure, a CSPRNG
+    // that will not produce 256 bits — call_once leaves the flag clear, so the
+    // next request retries rather than caching a broken key. It also means
+    // /sync answers 500 while the condition lasts, which is correct: there is
+    // no safe degraded token, and handing out a predictable one would restore
+    // the oracle silently.
+    std::call_once(token_key_once_, [this] {
+        token_key_ = sync_token::derive_key(get_or_create_instance_secret(store_),
+                                            config_.server_name);
+    });
+    return token_key_;
+}
+
+std::string SyncEngine::mint_token(const std::string& user_id, int64_t position) {
+    return sync_token::mint(token_key(), user_id, position);
+}
+
+int64_t SyncEngine::parse_token(const std::string& user_id, const std::string& token) {
+    auto pos = sync_token::parse(token_key(), user_id, token);
+    if (!pos || *pos < 0) return 0;
+    return *pos;
+}
+
 void SyncEngine::notify_new_event() {
     auto pos = store_.get_current_stream_position();
     {
@@ -211,7 +237,7 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
     // request thread open.
     if (store_.is_server_banned(user_id)) {
         SyncResponse response;
-        response.next_batch = "s" + std::to_string(store_.get_current_stream_position());
+        response.next_batch = mint_token(user_id, store_.get_current_stream_position());
         return response;
     }
 
@@ -264,17 +290,16 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
         return !r.rooms.join.empty() || !r.rooms.invite.empty();
     };
 
-    int64_t since_pos = 0;
-    if (since_token.size() > 1 && since_token[0] == 's') {
-        // A malformed token used to throw std::invalid_argument /
-        // std::out_of_range straight out of the handler.
-        try {
-            since_pos = std::stoll(since_token.substr(1));
-        } catch (const std::exception&) {
-            since_pos = 0;
-        }
-        if (since_pos < 0) since_pos = 0;
-    }
+    // Opaque on the way out, opaque or legacy-numeric on the way in — see
+    // sync/SyncToken.h. Anything unrecognised is position 0, which is a full
+    // replay of what THIS caller may see and never anyone else's events: the
+    // scan below is membership-joined to `user_id` in SQL and re-filtered
+    // through VIEW_CHANNEL per event. That is also why the token only has to be
+    // opaque and not unforgeable — a forged position buys nothing.
+    //
+    // A malformed token used to throw std::invalid_argument / std::out_of_range
+    // straight out of the handler; the parser is strict and total instead.
+    const int64_t since_pos = parse_token(user_id, since_token);
 
     // Snapshot the ephemeral counter BEFORE building, so typing/presence
     // changes that land while we're querying still count as "something
@@ -439,7 +464,7 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
     // told again on every delivered incremental response (see deliver()).
     attach_pending_invites(store_, config_, user_id, response);
 
-    response.next_batch = "s" + std::to_string(head_before_scan);
+    response.next_batch = mint_token(user_id, head_before_scan);
     return response;
 }
 
@@ -596,10 +621,13 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
         joined.highlight_count = it == mentions.end() ? 0 : it->second;
     }
 
-    response.next_batch = "s" + std::to_string(delivered_max);
-    // Same value as next_batch by construction, and that is the point: what the
-    // client is told it has seen and what a wait treats as seen must be the one
-    // number, or one of the two is wrong.
+    response.next_batch = mint_token(user_id, delivered_max);
+    // Same POSITION as next_batch by construction, and that is the point: what
+    // the client is told it has seen and what a wait treats as seen must be the
+    // one number, or one of the two is wrong. next_batch is now that number put
+    // through a keyed permutation — the wait keeps the raw value, because it is
+    // internal and is compared as an ordering, which the token deliberately is
+    // not.
     if (out_covered_pos) *out_covered_pos = delivered_max;
     return response;
 }

@@ -102,11 +102,23 @@ TEST_F(SyncTest, LongPollWakeUp) {
     EXPECT_EQ(resp.rooms.join[room_id].timeline.events.size(), 1u);
 }
 
+// Was "the token parses as s<N> and N > 0". It no longer does, and that is the
+// point: next_batch is opaque, because the integer it used to be was the global
+// stream head and therefore a volume-and-timing oracle over every room on the
+// server (finding 10, docs/audit-data-2026-09.md). What survives from the old
+// test is the behaviour it was really checking — the token is non-empty, it
+// round-trips, and it names a real position. See test_sync_token.cpp for the
+// opacity properties themselves.
 TEST_F(SyncTest, StreamPositionToken) {
     auto resp1 = sync->handle_sync("@alice:test", "", 0);
-    EXPECT_TRUE(resp1.next_batch.starts_with("s"));
+    EXPECT_FALSE(resp1.next_batch.empty());
+    EXPECT_FALSE(resp1.next_batch.starts_with("s"))
+        << "next_batch is still the raw stream position: " << resp1.next_batch;
 
-    // Parse the position
-    int64_t pos = std::stoll(resp1.next_batch.substr(1));
-    EXPECT_GT(pos, 0);
+    // It round-trips: polling with it returns nothing new and hands back the
+    // identical string, which is what "it names the position we are at" means
+    // once the number is no longer readable.
+    auto resp2 = sync->handle_sync("@alice:test", resp1.next_batch, 0);
+    EXPECT_TRUE(resp2.rooms.join.empty());
+    EXPECT_EQ(resp2.next_batch, resp1.next_batch);
 }

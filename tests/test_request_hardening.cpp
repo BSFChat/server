@@ -126,6 +126,21 @@ struct Fixture {
                                 j.dump());
     }
 
+    // A per-channel permission override — the natural way to give somebody
+    // their own channel, and the lever every scope bug in this codebase has
+    // turned out to be. `target` is "user:<mxid>" or "role:<id>".
+    void set_override(const std::string& room_id, const std::string& target,
+                      permission::Flags allow, permission::Flags deny = 0) {
+        ChannelPermissionOverride ov;
+        ov.allow = allow;
+        ov.deny = deny;
+        json j;
+        to_json(j, ov);
+        store->insert_event(generate_event_id("test"), room_id, "@server:test",
+                            std::string(event_type::kChannelPermissions), target, j.dump(),
+                            now_ms());
+    }
+
     std::string post_message(const std::string& room, const std::string& sender,
                              const std::string& text) {
         auto id = generate_event_id("test");
@@ -625,6 +640,82 @@ TEST(StateGate, EveryTypeTheClientWritesIsStillAccepted) {
         handler.handle_set_state(req, res);
         EXPECT_TRUE(IsOk(res)) << type << " was refused: " << res.body;
     }
+}
+
+// ══ 21. bsfchat.server.screenshare is server-wide, so its gate is too ═════
+//
+// The setting is the maximum screen-share quality FOR THE DEPLOYMENT: the
+// client writes it into whichever room happens to be active
+// (ServerConnection::setScreenSharePolicy picks m_activeRoomId, falling back to
+// the first room in the list) and every client applies whichever copy reaches
+// it through /sync, whatever room it arrived in. Nothing scopes it to a
+// channel. It was nevertheless gated on MANAGE_CHANNELS evaluated at ROOM
+// scope, so an allow override in one unimportant channel — the natural way to
+// give somebody their own channel — was a lever on a server-wide media
+// setting.
+//
+// Same shape as bsfchat.room.type, and it gets the same treatment: the
+// PERMISSION moves to server scope, the event stays ordinary room state. It is
+// deliberately NOT folded into is_server_scoped, which additionally moves the
+// authoritative copy into server_state — nothing reads a screen-share cap from
+// there, so that would write a row no read path consults while leaving the copy
+// clients actually obey exactly where it is now. See the comment on the flag in
+// RoomHandler::handle_set_state.
+
+TEST(ServerScopedSettings, PerChannelManageChannelsDoesNotSetTheScreenShareCap) {
+    Fixture f;
+    auto admin = f.add_user("admin");
+    auto mallory = f.add_user("mallory");
+    // Nobody holds MANAGE_CHANNELS server-wide.
+    f.set_everyone(permission::kEveryoneDefault);
+    auto room = f.add_room(admin);
+    f.join(room, mallory);
+    f.set_override(room, "user:" + mallory, permission::kManageChannels);
+
+    PermissionsEngine perms(*f.store, f.config);
+    ASSERT_TRUE(perms.can(mallory, room, permission::kManageChannels))
+        << "the override did not apply at channel scope; the test proves nothing";
+    ASSERT_FALSE(perms.can(mallory, std::string(), permission::kManageChannels));
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request(state_path(room, std::string(event_type::kServerScreenShare)),
+                            "token-mallory", json{{"max_quality", 0}}.dump());
+    handler.handle_set_state(req, res);
+
+    EXPECT_TRUE(HasStatus(res, 403)) << res.body;
+    EXPECT_FALSE(f.store->get_state_event(room, std::string(event_type::kServerScreenShare), "")
+                     .has_value())
+        << "the cap was written anyway";
+}
+
+// The ordinary case must still work, or the fix is a denial of service on an
+// admin feature. A channel-scoped DENY must not block it either: the setting is
+// not about that channel, so a per-channel rule has no say over it in either
+// direction. That is what "server scope" means, and checking only the allow
+// direction would leave half the bug in place.
+TEST(ServerScopedSettings, ServerWideManageChannelsStillSetsTheScreenShareCap) {
+    Fixture f;
+    auto admin = f.add_user("admin");
+    f.set_everyone(permission::kEveryoneDefault | permission::kManageChannels);
+    auto room = f.add_room(admin);
+    f.set_override(room, "user:" + admin, 0, permission::kManageChannels);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request(state_path(room, std::string(event_type::kServerScreenShare)),
+                            "token-admin", json{{"max_quality", 1}}.dump());
+    handler.handle_set_state(req, res);
+    EXPECT_TRUE(IsOk(res)) << res.body;
+
+    // Written as ORDINARY ROOM STATE, which is how every client learns it —
+    // this is the half of is_server_scoped that deliberately did NOT move.
+    auto stored = f.store->get_state_event(room, std::string(event_type::kServerScreenShare), "");
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_EQ(stored->content.data.value("max_quality", -1), 1);
+    EXPECT_FALSE(
+        f.store->get_server_state(std::string(event_type::kServerScreenShare), "").has_value())
+        << "the write moved into server_state, where nothing reads it";
 }
 
 // ══ 17 (extension). The auth lockout line is the one an attacker forges ═══

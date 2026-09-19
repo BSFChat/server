@@ -348,8 +348,14 @@ that will actually hurt a server, and it buys nothing.
 
 ### Handling `since` correctly
 
-The token format is `s<integer>`, e.g. `s4711`. Treat it as opaque; just store
-and echo it.
+The token is **opaque**: store it and echo it back, and do not parse, compare or
+do arithmetic on it. The current format is `t_` followed by 32 hex characters,
+e.g. `t_9f3c1a...`; servers before September 2026 emitted `s<integer>` instead,
+and an upgraded server still accepts that older spelling from a token you
+persisted (for one release — after that it will read as "from the beginning").
+Neither spelling means anything you can use. In particular the number in the old
+form was the server's global stream position, and a bot that subtracted two of
+them was counting activity in rooms it could not see; that is why it is gone.
 
 ```
 1. First ever sync:   GET /sync?timeout=0            (no `since`)
@@ -359,7 +365,7 @@ and echo it.
                       -> process timeline, save the new next_batch, repeat
 ```
 
-Three things that will bite you:
+Four things that will bite you:
 
 - **The initial sync replays history.** With no `since`, you get the last 20
   events in every room you are in. A naive bot processes all of them as if they
@@ -367,8 +373,13 @@ Three things that will bite you:
   `next_batch` from the initial sync and throw the events away, unless you are
   deliberately implementing catch-up.
 - **A malformed `since` silently means "from the beginning".** An unparseable
-  token is coerced to position 0, which replays *the entire server history* into
-  your bot. If you persist your token, validate it matches `^s\d+$` before use.
+  token is coerced to position 0, which replays *everything your bot is allowed
+  to see* into it. Persist the token exactly as the server sent it — byte for
+  byte, no trimming, no case folding, no re-encoding — and if you want a sanity
+  check before use, check it is non-empty and matches `^(t_[0-9a-f]{32}|s\d+)$`
+  rather than assuming either shape.
+- **A token is bound to the account it was issued to.** Do not share one between
+  two bot identities; the second will be treated as having no token at all.
 - **`next_batch` can come back unchanged** on an idle timeout. That is normal and
   means "nothing happened". It is not an error and must not trigger backoff.
 

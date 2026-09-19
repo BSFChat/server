@@ -57,6 +57,12 @@ MUTATIONS = [
      'if (false) {',
      'StatePutBypass.CannotModerateAUserOfHigherRankThroughStatePut'),
 
+    ("T1 server-wide screenshare cap back to channel scope (finding 21)",
+     'src/api/RoomHandler.cpp', 'api/RoomHandler.cpp.o',
+     '        (is_server_scoped || is_scope_only_server_act) ? kServerScope : room_id;',
+     '        (is_server_scoped || is_room_type_change) ? kServerScope : room_id;',
+     'ServerScopedSettings.PerChannelManageChannelsDoesNotSetTheScreenShareCap'),
+
     ("T2 own-nickname gate uses a flag everyone has",
      'src/api/ProfileHandler.cpp', 'api/ProfileHandler.cpp.o',
      'if (!perms.can(*user_id, kServerScope, permission::kChangeNickname)) {',

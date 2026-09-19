@@ -3,6 +3,7 @@
 #include "api/MediaTicket.h"
 #include "auth/Permissions.h"
 #include "core/Config.h"
+#include "core/InstanceSecret.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
 #include "http/RateLimitResponse.h"
@@ -116,20 +117,6 @@ bool ranges_unsatisfiable(const httplib::Ranges& ranges, size_t content_length) 
 
     return false;
 }
-
-// server_meta key holding this deployment's own signing secret.
-//
-// Not a config knob on purpose. The alternative designs were an operator-set
-// secret (one more thing to generate, distribute and forget, and one more
-// "media stopped working after the redeploy" support call) or a process-local
-// random key (every restart invalidates every outstanding ticket AND every
-// in-flight image, for nothing). This is generated once, by the server, for
-// itself, and survives a restart because it is a row.
-//
-// Deliberately generic in name: it is a SERVER instance secret, not a media
-// one. Anything else that later needs a signing key derives from it under its
-// own HKDF salt, the way media tickets do — see MediaTicket.h.
-constexpr char kInstanceSecretMetaKey[] = "server.instance_secret";
 
 int64_t now_unix_seconds() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -320,30 +307,15 @@ void MediaHandler::handle_upload(const httplib::Request& req, httplib::Response&
 }
 
 const std::vector<unsigned char>& MediaHandler::ticket_key() {
+    // The instance secret is no longer generated here. It is a SERVER secret,
+    // not a media one, and sync tokens now derive from it too under their own
+    // salt — two subsystems generating it independently would race, and the
+    // loser's keys would stop verifying the tickets it had already issued. One
+    // owner: core/InstanceSecret.h, which serialises the first-use generation
+    // and explains why it is neither a config value nor a migration.
     std::call_once(ticket_key_once_, [this] {
-        auto secret = store_.get_meta(kInstanceSecretMetaKey);
-
-        // Generated on first use rather than in a migration: a migration that
-        // writes a secret puts it in every operator's backup of the schema
-        // step, and this needs no schema change at all (server_meta has existed
-        // since v1). One process, one database — the SQLite store is not shared
-        // between servers — so there is no writer to race with here.
-        if (!secret || secret->size() < 32) {
-            unsigned char buf[32];
-            if (RAND_bytes(buf, sizeof(buf)) != 1) {
-                throw std::runtime_error("media tickets: RAND_bytes failed generating the "
-                                         "server instance secret");
-            }
-            std::ostringstream oss;
-            for (unsigned char b : buf) {
-                oss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(b);
-            }
-            secret = oss.str();
-            store_.set_meta(kInstanceSecretMetaKey, *secret);
-            get_logger()->info("Generated this server's instance secret (media tickets are "
-                               "signed with a key derived from it)");
-        }
-        ticket_key_ = media_ticket::derive_key(*secret, config_.server_name);
+        ticket_key_ = media_ticket::derive_key(get_or_create_instance_secret(store_),
+                                               config_.server_name);
     });
     return ticket_key_;
 }

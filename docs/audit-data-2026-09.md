@@ -55,7 +55,7 @@ predicate is `PermissionsEngine::can(user, room, permission::kViewChannel)`.
 
 | # | Finding | Severity |
 |---|---|---|
-| 10 | `next_batch` is the raw global stream head — an activity oracle | Medium |
+| 10 | `next_batch` is the raw global stream head — an activity oracle | Medium — **fixed** |
 | 11 | Media blobs are never deleted, by redaction or by room deletion | Medium |
 | 12 | `push_queue` delivers pre-redaction plaintext after a redaction | Medium |
 | 13 | TURN static auth secret is passed on the command line | Medium |
@@ -78,7 +78,7 @@ predicate is `PermissionsEngine::can(user, room, permission::kViewChannel)`.
 | 25 | Event-existence oracle via edit-target error codes | Low |
 | 26 | `m.direct` peer side not filtered by membership | Low |
 | 27 | Audit log bypasses VIEW_CHANNEL by design — undocumented | Low |
-| 28 | No history-visibility horizon: access granted = all history | Low |
+| 28 | No history-visibility horizon: access granted = all history | Low — **accepted, by design** |
 | 29 | Assorted values at `info`: media ids, OIDC subjects, nicknames, gateway URLs | Low |
 
 Plus **cross-reference items** already fixed on `fix/joined-rooms-leak` but still live
@@ -88,12 +88,13 @@ on `main` — see "Must land before the RC".
 
 ## Status of findings 10–28, as of 19 September 2026
 
-Branch `harden/audit-data-path`, off `main` @ `ad993a2`. Each finding below
-carries a **RESOLUTION** block with the reasoning; this is the index.
+Branch `harden/audit-data-path`, off `main` @ `ad993a2`, plus `harden/audit-final`
+(findings 10 and 28). Each finding below carries a **RESOLUTION** or **DECISION**
+block with the reasoning; this is the index.
 
 | # | Status | Note |
 |---|--------|------|
-| 10 | **Blocked** | Design recorded. Needs a migration number for the token key — ask before taking one. |
+| 10 | **Fixed** | Opaque `t_` token, keyed off the instance secret `security/media-tickets` added. No migration; v28 still free. |
 | 11 | **Fixed** | New media reaper. Ships in **dry run**; arm it after a release. |
 | 12 | Already fixed | Merge train (v22 + redaction drains the queue). |
 | 13 | Already fixed | `deploy` repo. |
@@ -111,7 +112,11 @@ carries a **RESOLUTION** block with the reasoning; this is the index.
 | 25 | Out of scope | `EventHandler`, owned elsewhere. |
 | 26 | **Declined — finding is wrong** | The recommended change deletes the DM from `m.direct` entirely. |
 | 27 | **Documented, not filtered** | Recommendation taken exactly. Member-count nit fixed. |
-| 28 | **Decision for Josh** | Three options written up; no code change. |
+| 28 | **Accepted risk, by design** | Decided 19 Sep: leave it, document it. Closed, not deferred. |
+
+Findings 10 and 28 were the last two open items and are closed on
+`harden/audit-final`: 10 by an opaque sync token, 28 by an explicit decision to
+keep the behaviour. Nothing in 10–28 is now outstanding.
 
 Two corrections to this document are argued in place: **19** (the reaper cannot
 catch the offender, because the endpoint refreshes its own heartbeat, so the
@@ -584,58 +589,87 @@ regress that.**
 global counter: HMAC or authenticated-encrypt `{user_id, position}` with a server key
 so the client can round-trip it without reading it. Stateless, and a small change.
 
-> ### RESOLUTION — NOT FIXED. Design below; blocked on a migration number.
-> `harden/audit-data-path`, 19 Sep 2026.
+> ### RESOLUTION — FIXED. `harden/audit-final`, 19 Sep 2026.
 >
-> **Confirmed still live** and confirmed fixable without touching the client:
-> `SyncLoop.cpp:98` stores `next_batch` as an opaque `QString` and only ever
-> compares it for equality, and `MatrixClient` round-trips it verbatim. Nothing
-> on either side of the wire reads the number.
+> Supersedes the earlier "NOT FIXED — blocked on a migration number" block,
+> whose construction is the one implemented here. What unblocked it is that
+> `security/media-tickets` has since landed a **server instance secret** —
+> 32 random bytes the server generates for itself into `server_meta` under
+> `server.instance_secret`, with per-subsystem keys derived from it by HKDF. So
+> there is a key that survives a restart, and **no migration was needed**: v28
+> is still free.
 >
-> **The constraint the obvious fixes all miss.** The oracle is the *delta*, not
-> the value. So every order- or delta-preserving encoding fails, including the
-> two that look cheapest: `pos + k` preserves deltas exactly, and `pos XOR k`
-> leaks them almost as badly, because consecutive tokens give `p1^p2` and the
-> increments are small, so the low bits of the difference fall straight out.
-> The fix has to be a keyed pseudorandom permutation, and that means a key.
+> **What was implemented.** `src/sync/SyncToken.{h,cpp}`. A token is one
+> AES-256 block over `u64be(position) ‖ trunc8(HMAC(key, user_id))`, rendered as
+> `"t_"` plus 32 lowercase hex characters. The key is
+> `HKDF-SHA256(ikm = instance_secret, salt = "bsfchat/sync-token/v1",
+> info = server_name)` — a **distinct salt** from the media-ticket key, which
+> derives from the same secret. The generation of that secret moved out of
+> `MediaHandler` into `core/InstanceSecret.h`, because two subsystems generating
+> it independently on first use would race and the loser's already-issued
+> tickets would stop verifying.
 >
-> **Construction.** One AES-256 block, which is exactly "apply the PRP once":
+> **Opaque, not unforgeable — and that was the question worth asking.** The
+> finding's recommendation says "so the client can round-trip it without reading
+> it", and the reason that is enough is what `build_incremental_sync` does with
+> a position: nothing that trusts it. `SqliteStore::get_events_since` joins
+> `room_members` for the CALLER and filters addressed signalling to the caller,
+> and the loop then re-evaluates VIEW_CHANNEL per event through `room_view()`.
+> A position only says where in the stream to start scanning. A forged position
+> going backwards replays the caller's own history — which `since=s0` already
+> does, supported, on every initial sync — and one going forwards only skips the
+> caller's own events. So the property the token must have is that it REVEAL
+> nothing, not that it be impossible to construct.
 >
->   * plaintext block = 8 bytes big-endian stream position ‖ 8 bytes of
->     `HMAC-SHA256(key, user_id)`, truncated;
->   * token = `"t_"` + 32 hex characters of the ciphertext;
->   * inbound: decrypt, check the 8-byte tag against the caller, reject on
->     mismatch — which also stops a token being replayed as another user.
+> Integrity is implemented anyway, because the construction gives it for free:
+> the 8-byte tag binds the token to one account, so a token presented by another
+> account is not honoured, and a random 32-hex string clears the tag with
+> probability 2⁻⁶⁴. It is a nicety, not the load-bearing property, and the
+> header says so — the next person to change this should know which half they
+> are allowed to weaken.
 >
-> Deterministic, and that property is load-bearing: the same `(user, position)`
-> always yields the same string, so `SyncBackoff`'s `tokenAdvanced` signal keeps
-> meaning what it means today. An always-changing token would be the mirror-image
-> regression — it disables the guard against an endpoint answering 200
-> unconditionally, which is a deliberate protection with its own long comment.
+> **Determinism kept, deliberately.** The same `(user, position)` always yields
+> the same string, so `SyncBackoff`'s no-progress guard keeps meaning what it
+> means today. An always-changing token would be the mirror-image regression
+> and is pinned against by `SyncTokenStability.AnIdleReplyReturnsTheIdenticalToken`.
 >
-> **Compatibility.** Keep parsing legacy `s<N>` on the way in — clients hold
-> persisted tokens — and emit only the new form. `prev_batch` stays `s<N>` and
-> `/messages?from=` is untouched: that is a room-scoped position of an event the
-> caller can already see, not the global head, so it is not this oracle.
+> **Upgrade path.** `sync_token::parse` still accepts the legacy `s<N>` form on
+> the way in, and nothing mints it any more, so a client is migrated to the
+> opaque form after exactly one poll and no deployment does a synchronised full
+> initial sync on upgrade. `SyncToken.h` states when the branch can be deleted:
+> **one release after the release that introduces the `t_` form** — by then the
+> only holders left are clients that have not run in a whole release cycle, for
+> which one full sync is the correct outcome.
 >
-> **What actually blocks it: where the key lives.** It has to survive a restart,
-> or every client on the deployment is forced into a full initial sync on every
-> upgrade. There is no general-purpose server secret today — the only secrets in
-> `Config` are voice-specific and optional, so a mesh-only deployment has none to
-> derive from. Two options:
+> `prev_batch` and `/rooms/{id}/messages?from=` keep the numeric form and are
+> untouched, for the reason given below: that is a room-scoped position of an
+> event the caller has already been shown, not the global head.
 >
->   * a one-row `server_secrets` table, generated on first use. Correct, and it
->     needs a migration number, which is reserved for Josh to allocate;
->   * a row in the existing `server_state` table under a private `event_type`.
->     This needs no migration and is safe *today* — nothing serves `server_state`
->     generically, the write path allowlists exactly two event types
->     (`RoomHandler.cpp:1399`) and every read is by explicit type. But it puts a
->     secret in a table whose other occupants are all client-visible documents,
->     which is a trap set for whoever next writes a generic reader over it.
+> **ONE CROSS-REPO ITEM, AND IT GATES THE RELEASE.** The desktop client does not
+> merely treat the token as opaque — `LocalCache::isValidSyncToken`
+> (`client/src/store/LocalCache.cpp:64`) VALIDATES it as `s` + decimal digits,
+> capped at 24 characters, and that check guards both persisting the token
+> (`recordSync`, :370) and loading it (`open`, :143). Against a server emitting
+> `t_…` the token is therefore silently never written to the cache: a user
+> holding an old `s<N>` token keeps resuming from that same ancient position on
+> every launch, replaying an ever-widening history window, and a user with none
+> does a full initial sync every launch. Nothing errors; it just gets slower.
+> The in-session poll is unaffected, because `SyncLoop` holds the token in
+> memory and round-trips it verbatim.
 >
-> The first is right and the second is a shortcut that would be wrong within a
-> year. Not taken unilaterally: **this needs a migration number**. Roughly a
-> day's work once it has one, mostly tests.
+> The fix is to widen that validator to accept both spellings. It is
+> backward-compatible on its own, so **it must ship before or with this server
+> change** — the same protocol-first ordering rule, one repo along. Tracked
+> separately; not done here, because this branch is the server repo.
+>
+> **Tests.** `tests/test_sync_token.cpp`, 21 new cases in four groups — opacity
+> (including the banned-account reply, which is the one `next_batch` that does
+> not go through `build_incremental_sync` and so was the raw counter with
+> nothing to subtract from it), determinism, legacy compatibility, and the
+> primitive itself. Four existing tests read the integer out of `next_batch`;
+> three of them now re-open the token with the engine's key rather than being
+> weakened, and `SyncTest.StreamPositionToken` was rewritten to assert the
+> opposite of what it used to.
 
 ## 11. Media blobs are never deleted — MEDIUM
 
@@ -1213,7 +1247,7 @@ and so overstates.)
 > number exists so a later reader can judge how consequential a deletion was, so
 > it has to mean what it says.
 
-## 28. No history-visibility horizon — LOW, by design, worth a decision
+## 28. No history-visibility horizon — LOW, by design — DECIDED: accepted risk
 
 Access is evaluated **now**, over **all** history. A user newly granted VIEW_CHANNEL can
 immediately `/messages`-paginate and `/search` the channel back to its creation:
@@ -1226,38 +1260,58 @@ archive**. If the product ever wants "history from when you joined", the hook is
 per-(user, room) floor in `get_room_events_paginated` and a `stream_position >=` clause
 in `search_messages`.
 
-> ### RESOLUTION — no change. Decision left to Josh, options below.
-> Reviewed, agreed it is not a bug, and deliberately not touched. Writing the
-> options down so the decision can be made once rather than re-argued.
+> ### DECISION — ACCEPTED RISK, BY DESIGN. No change, now or planned.
+> Decided by Josh, 19 Sep 2026. Recorded on `harden/audit-final`. This closes
+> the finding; it is not deferred, and it should not be re-argued in the next
+> audit without a product reason.
 >
-> The behaviour, restated plainly: **granting someone access to a channel for
-> five minutes grants them its entire archive.** That is the Discord model and
-> most people expect it. It is also the thing that surprises somebody who adds a
-> contractor to `#eng` for one thread.
+> **The decision: leave it, and treat full history for a newly joined member as
+> intended behaviour.**
 >
-> Three positions, in increasing cost:
+> BSFChat is a self-hosted, Discord-shaped product, and this is the behaviour
+> its users expect from a Discord-shaped product: a channel you can see is a
+> channel you can scroll. Someone who joins `#general` today and finds it empty
+> above their join line has not been protected, they have been given a broken
+> chat app. The finding is right that the audit had to raise it, and right that
+> it is not a bug.
 >
-> 1. **Keep it, and say so in the UI.** Cheapest, and it is the honest version of
->    the status quo: the permission dialog for granting `VIEW_CHANNEL` says "and
->    all of this channel's history". No server change. This is the one to take if
->    nobody has asked for anything else.
+> **Why not change it quietly.** Every existing deployment already has the
+> current behaviour and every member of every channel already relies on it.
+> Flipping the default server-side would silently delete the scrollback of every
+> user in every channel on upgrade — a data-loss-shaped surprise delivered by a
+> hardening release, which is the worst way for anyone to find out.
 >
-> 2. **A per-(user, room) floor, opt-in per channel.** A `history_from` stream
->    position written when access is granted, honoured by a `stream_position >=`
->    clause in `get_room_events_paginated` and in `search_messages`. Both hooks
->    are named correctly in the finding. This is a schema change, and it has a
->    sharp edge the finding does not mention: a floor is *per user*, so it has to
->    survive a re-grant, and if it is rewritten on every grant then revoking and
->    re-granting becomes a way to *hide* history from someone rather than only to
->    show it. The floor must be a minimum over grants, never a replacement.
+> **Why not change it loudly, either — not here.** Doing this properly is a
+> per-channel setting, a UI to expose it, a decision about what existing
+> channels default to, and an answer to the re-grant problem the earlier
+> analysis found (a per-user floor must be a MINIMUM over grants, never a
+> replacement, or revoking and re-granting becomes a way to HIDE history from
+> someone). That is a product feature with a design and a migration, and it must
+> not ride in on a security pass. A hardening branch is exactly the wrong place
+> for a behaviour change that needs a product owner.
 >
-> 3. **Server-wide "history from when you joined".** Position 2 with the default
->    flipped. Do not do this without the UI from position 1, or every existing
->    member of every channel silently loses their scrollback on upgrade.
+> **The residual risk, stated plainly so nobody is surprised by it later:**
+> granting someone VIEW_CHANNEL on a channel for five minutes grants them that
+> channel's entire archive, and `/search` and `/messages` will both serve it.
+> An operator adding a contractor to `#eng` for one thread is handing over
+> everything ever said there. The honest mitigation is documentation and the
+> permission UI — the grant dialog should say "and all of this channel's
+> history" — not a server change.
 >
-> My recommendation is 1 now, and 2 only when a customer asks — it is a
-> schema change and a permanent complication of the two hottest read paths in the
-> product, in exchange for a property nobody has yet asked for.
+> **What it would take if it is ever wanted**, so the next person does not have
+> to rediscover it:
+>
+>   * a `history_from` stream position per (user, room), written when access is
+>     granted and kept as a MINIMUM over grants, never overwritten;
+>   * a `stream_position >=` clause in `get_room_events_paginated` and in
+>     `search_messages` — the two hooks the finding names, and the two hottest
+>     read paths in the product;
+>   * a per-channel opt-in setting plus the UI for it, defaulting existing
+>     channels to the current behaviour;
+>   * and a decision about what a re-join does, which is the sharp edge above.
+>
+> Estimated at a schema change plus a permanent complication of both read paths.
+> Worth doing when a customer asks for it, and not before.
 
 ## 29. Assorted values logged at `info` — LOW
 
