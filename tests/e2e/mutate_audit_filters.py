@@ -25,8 +25,13 @@ import subprocess
 import sys
 from pathlib import Path
 
-SERVER = Path("/Users/josh/dev/gamechat/server")
-BUILD = SERVER / "build-fix"
+from mutate_common import MutationGuard, build_dir, cmake_build, require_build, server_root
+
+# Resolved from this script's own location (<repo>/tests/e2e/), so a run from a
+# worktree mutates THAT worktree and not whichever checkout was hard-coded here.
+# Override with BSFCHAT_SERVER=... / --srv=... See mutate_common.
+SERVER = server_root()
+BUILD = build_dir(SERVER, "build-fix")
 
 STORE = SERVER / "src/store/SqliteStore.cpp"
 MIGRATIONS = SERVER / "src/store/Migrations.cpp"
@@ -176,8 +181,7 @@ def object_files(source: Path):
 
 
 def build():
-    r = subprocess.run(["cmake", "--build", ".", "-j8"], cwd=BUILD,
-                       capture_output=True, text=True)
+    r = cmake_build(BUILD)
     return r.returncode == 0, r.stdout + r.stderr
 
 
@@ -198,11 +202,20 @@ def apply_edits(text, edits):
 
 
 def main():
+    # Snapshots every file before it is mutated and reverts on the way out
+    # however this process ends — normally, on an exception, on Ctrl-C or a
+    # kill. recover() first repairs anything a SIGKILLed run left applied.
+    require_build(BUILD)
+    # Snapshots each file before it is mutated and reverts however this process
+    # ends — normally, on an exception, on Ctrl-C or a kill. recover() first
+    # repairs anything a SIGKILLed run left applied.
+    guard = MutationGuard(SERVER, builds=[BUILD])
+    guard.recover()
     problems = []
     caught = 0
 
     for m in MUTATIONS:
-        original = m.path.read_text()
+        original = guard.protect(m.path).decode()
         mutated, err = apply_edits(original, m.edits)
         if err:
             problems.append(f"{m.name}: {err}")
@@ -236,11 +249,13 @@ def main():
             caught += 1
             print(f"caught    {m.name}{note}")
         finally:
-            m.path.write_text(original)
-            for obj in object_files(m.path):
-                obj.unlink()
+            # Reverts the bytes, deletes the objects and stamps the source
+            # past them: a same-second restore can otherwise be judged up
+            # to date by make, leaving a stale object in the binary.
+            guard.restore(m.path)
 
     print("\nRestoring the tree and rebuilding clean...")
+    guard.restore_all()
     ok, log = build()
     if not ok:
         print("ERROR: clean rebuild FAILED after restore!\n" + log[-2000:])

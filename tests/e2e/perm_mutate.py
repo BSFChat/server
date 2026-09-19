@@ -12,15 +12,18 @@ green means the property is not actually covered.
 import hashlib
 import io
 import os
-import shutil
 import subprocess
 import sys
 
-SRV = '/Users/josh/dev/gamechat/server'
-BUILD = os.path.join(SRV, 'build-perm')
+from mutate_common import MutationGuard, build_dir, build_jobs, require_build, run_dir, server_root
+
+# Resolved from this script's own location (<repo>/tests/e2e/), so a run from a
+# worktree mutates THAT worktree and not whichever checkout was hard-coded here.
+# Override with BSFCHAT_SERVER=... / --srv=... See mutate_common.
+SRV = str(server_root())
+BUILD = str(build_dir(server_root(), 'build-perm'))
 OBJ = os.path.join(BUILD, 'tests/CMakeFiles/server_tests.dir/__/src')
 TESTBIN = os.path.join(BUILD, 'tests/server_tests')
-RUNDIR = '/private/tmp/claude-501/-Users-josh-dev-gamechat/a93cf36b-3c49-4af9-bbf5-265c130484f9/scratchpad/testrun'
 
 # (label, relpath, object relpath, find, replace, gtest filter expected to FAIL)
 MUTATIONS = [
@@ -115,23 +118,29 @@ def sha(path):
 
 
 def build():
-    r = subprocess.run(['make', '-C', BUILD, 'server_tests', '-j8'],
-                       capture_output=True, text=True)
+    r = subprocess.run(['nice', '-n', '19', 'make', '-C', BUILD, 'server_tests',
+                        '-j' + build_jobs()], capture_output=True, text=True)
     return r.returncode, r.stdout + r.stderr
 
 
 def run_tests(filt):
     r = subprocess.run([TESTBIN, '--gtest_filter=' + filt, '--gtest_brief=1'],
-                       capture_output=True, text=True, cwd=RUNDIR)
+                       capture_output=True, text=True, cwd=run_dir(SRV))
     return r.returncode, r.stdout + r.stderr
 
 
 def main():
+    require_build(BUILD)
+    # Snapshots each file before it is mutated and reverts however this process
+    # ends — normally, on an exception, on Ctrl-C or a kill. recover() first
+    # repairs anything a SIGKILLed run left applied.
+    guard = MutationGuard(SRV, builds=[BUILD])
+    guard.recover()
     results = []
     for label, rel, objrel, find, repl, filt in MUTATIONS:
         src = os.path.join(SRV, rel)
         obj = os.path.join(OBJ, objrel)
-        original = io.open(src, encoding='utf-8').read()
+        original = guard.protect(src).decode()
         before = sha(src)
 
         if find not in original:
@@ -163,12 +172,14 @@ def main():
                 results.append((label, 'NOT CAUGHT', 'tests still passed: ' + filt))
                 print('NOT CAUGHT  %s   <-- coverage gap' % label)
         finally:
-            io.open(src, 'w', encoding='utf-8').write(original)
+            # Reverts the bytes, deletes the objects and stamps the source past
+            # them: a same-second restore can otherwise be judged up to date by
+            # make, leaving a stale object in the binary.
+            guard.restore(src)
             assert sha(src) == before, 'failed to restore ' + src
-            if os.path.exists(obj):
-                os.remove(obj)
 
     # Rebuild clean at the end so the tree is left in a good state.
+    guard.restore_all()
     rc, out = build()
     print('\nfinal clean rebuild rc=%d' % rc)
 

@@ -6,10 +6,15 @@ if a named test fails when it is broken. Object files are deleted before each
 rebuild: make's timestamp granularity means a same-second edit can otherwise be
 silently skipped, which produces confidently wrong mutation results.
 """
-import os, shutil, subprocess, sys
+import os, subprocess, sys
 
-SRV = "/Users/josh/dev/gamechat/server"
-BUILD = f"{SRV}/build-media"
+from mutate_common import MutationGuard, build_dir, build_jobs, require_build, server_root
+
+# Resolved from this script's own location (<repo>/tests/e2e/), so a run from a
+# worktree mutates THAT worktree and not whichever checkout was hard-coded here.
+# Override with BSFCHAT_SERVER=... / --srv=... See mutate_common.
+SRV = str(server_root())
+BUILD = str(build_dir(server_root(), "build-media"))
 OBJDIR = f"{BUILD}/tests/CMakeFiles/server_tests.dir/__/src"
 
 MEDIA_H = f"{SRV}/src/api/MediaHandler.cpp"
@@ -154,7 +159,8 @@ MUTATIONS = [
 
 
 def build():
-    r = subprocess.run(["make", "-C", BUILD, "-j8", "server_tests"],
+    r = subprocess.run(["nice", "-n", "19", "make", "-C", BUILD,
+                        "-j" + build_jobs(), "server_tests"],
                        capture_output=True, text=True)
     return r.returncode == 0, r.stdout + r.stderr
 
@@ -170,9 +176,15 @@ def run(filt):
 
 
 def main():
+    require_build(BUILD)
+    # Snapshots each file before it is mutated and reverts however this process
+    # ends — normally, on an exception, on Ctrl-C or a kill. recover() first
+    # repairs anything a SIGKILLed run left applied.
+    guard = MutationGuard(SRV, builds=[BUILD])
+    guard.recover()
     results = []
     for name, path, find, repl, filt, expect_fail, expect_pass in MUTATIONS:
-        orig = open(path).read()
+        orig = guard.protect(path).decode()
         if find not in orig:
             results.append((name, "SETUP-ERROR", "pattern not found"))
             print(f"!! {name}: pattern not found", flush=True)
@@ -202,12 +214,13 @@ def main():
             results.append((name, status, detail))
             print(f"[{status}] {name}\n    {detail}", flush=True)
         finally:
-            open(path, "w").write(orig)
-            o = OBJ[path]
-            if os.path.exists(o):
-                os.remove(o)
+            # Reverts the bytes, deletes the objects and stamps the source past
+            # them: a same-second restore can otherwise be judged up to date by
+            # make, leaving a stale object in the binary.
+            guard.restore(path)
 
     print("\n=== revert + rebuild ===", flush=True)
+    guard.restore_all()
     ok, log = build()
     print("rebuild ok" if ok else log[-2000:], flush=True)
     failed, _ = run("*")
@@ -219,4 +232,5 @@ def main():
     return 0 if all(s == "OK" for _, s, _ in results) else 1
 
 
-sys.exit(main())
+if __name__ == "__main__":
+    sys.exit(main())

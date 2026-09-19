@@ -5,10 +5,15 @@ For each mutation: break one property in the source, rebuild, run the tests that
 are supposed to detect it, and confirm they FAIL. Then revert. A mutation that
 leaves the suite green means the corresponding test proves nothing.
 """
-import subprocess, sys, shutil, os, re
+import subprocess, sys, os, re
 
-SERVER = "/Users/josh/dev/gamechat/server"
-BUILD = f"{SERVER}/build-fix"
+from mutate_common import MutationGuard, build_dir, cmake_build, require_build, server_root
+
+# Resolved from this script's own location (<repo>/tests/e2e/), so a run from a
+# worktree mutates THAT worktree and not whichever checkout was hard-coded here.
+# Override with BSFCHAT_SERVER=... / --srv=... See mutate_common.
+SERVER = str(server_root())
+BUILD = str(build_dir(server_root(), "build-fix"))
 
 # (label, file, old, new, ctest -R regex)
 MUTATIONS = [
@@ -178,7 +183,7 @@ MUTATIONS = [
 
 
 def build():
-    r = subprocess.run(["cmake", "--build", BUILD, "-j8"], capture_output=True, text=True)
+    r = cmake_build(BUILD)
     return r.returncode == 0, r.stdout + r.stderr
 
 
@@ -191,13 +196,21 @@ SUMMARY = re.compile(r"(\d+)% tests passed, (\d+) tests failed out of (\d+)")
 
 
 def main():
+    # Snapshots each file before it is mutated and reverts however this process
+    # ends — normally, on an exception, on Ctrl-C or a kill. The old sidecar
+    # .mutbak copy could not do that: an interrupted run left both the mutation
+    # and the backup sitting in the tree. recover() repairs what a SIGKILL left.
+    require_build(BUILD)
+    # Snapshots each file before it is mutated and reverts however this process
+    # ends — normally, on an exception, on Ctrl-C or a kill. recover() first
+    # repairs anything a SIGKILLed run left applied.
+    guard = MutationGuard(SERVER, builds=[BUILD])
+    guard.recover()
     results = []
     for label, rel, old, new, regex in MUTATIONS:
         path = os.path.join(SERVER, rel)
-        backup = path + ".mutbak"
-        shutil.copy2(path, backup)
         try:
-            src = open(path).read()
+            src = guard.protect(path).decode()
             n = src.count(old)
             if n != 1:
                 results.append((label, "BAD-ANCHOR", f"anchor matched {n} times"))
@@ -212,6 +225,8 @@ def main():
             stem = os.path.basename(rel)
             subprocess.run(["find", BUILD, "-name", stem + ".o", "-delete"],
                            capture_output=True)
+            # The same hazard applies in reverse on the way out; guard.restore()
+            # purges the objects and stamps the restored source past them.
             ok, log = build()
             if not ok:
                 results.append((label, "BUILD-FAILED", log[-600:].replace("\n", " ")))
@@ -233,10 +248,10 @@ def main():
                 f"{failed}/{total} targeted tests failed (ctest rc={rc})",
             ))
         finally:
-            shutil.move(backup, path)
-            os.utime(path, None)
+            guard.restore(path)
             print(f"... done: {label}", flush=True)
 
+    guard.restore_all()
     ok, log = build()
     print("\n=== restored build:", "OK" if ok else "FAILED\n" + log)
     print("\n=== MUTATION RESULTS ===")
