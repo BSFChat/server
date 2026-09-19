@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 
@@ -66,6 +67,12 @@ constexpr const char* kRoomTypeSet = "room.type.set";
 // A per-channel allow/deny override for a role or user
 // (bsfchat.channel.permissions).
 constexpr const char* kChannelPermissionsSet = "channel.permissions.set";
+
+// A rotation of a voice channel's media key (MANAGE_CHANNELS). Recorded because
+// rotation is the server's answer to "stop this departed member decrypting", so
+// "was it ever done, and when" has to be answerable afterwards — including by an
+// operator deciding whether a database they are about to restore predates one.
+constexpr const char* kVoiceRekey = "voice.rekey";
 
 } // namespace audit_action
 
@@ -135,6 +142,12 @@ void audit_channel_override_change(SqliteStore& store, const std::string& actor,
 void audit_bot_lifecycle(SqliteStore& store, const std::string& actor,
                          const std::string& action, const std::string& bot_user_id,
                          const std::string& after_json);
+
+// Records one media-key rotation, as the generation before and after. Called
+// AFTER the generation is durably bumped, so the log can never claim a rotation
+// that did not land.
+void audit_voice_rekey(SqliteStore& store, const std::string& actor,
+                       const std::string& room_id, uint64_t before, uint64_t after);
 
 // Records a change to server-scoped state (bsfchat.server.roles /
 // bsfchat.member.roles). Called from write_server_scoped_state, which is the one

@@ -254,7 +254,22 @@ allow_peer_to_peer = true
 # #      key excludes them. Rotate with:
 # #        POST /_matrix/client/v3/rooms/{roomId}/voice/livekit_rekey
 # #      (requires MANAGE_CHANNELS). Rotation is never automatic, including on
-# #      leave, and generations reset if the server restarts.
+# #      leave — but once done it is permanent: the key generation is stored
+# #      in the database and survives restarts, upgrades and redeploys. It is
+# #      also recorded in the moderation audit log as `voice.rekey`.
+# #      A rotation also moves the channel to a new SFU room, so join tokens
+# #      handed out earlier stop being useful: they are signed tokens the
+# #      server cannot take back, and this leaves them pointing at a room
+# #      nobody is in. Each participant follows the move the next time their
+# #      client fetches a token — on reconnect, or when token_ttl below runs
+# #      out. A client already connected keeps the old room and the old key
+# #      until then, and so does anyone else holding an unexpired token, so
+# #      token_ttl is the width of that window. Lower it if you want
+# #      rotations to take hold faster; the cost is more token requests.
+# #      One caveat worth knowing before you restore a backup: restoring a
+# #      database taken before a rotation loses that rotation, and the channel
+# #      goes back to the key it had at the time of the backup. Re-rotate any
+# #      channel you rotated after the snapshot you restored.
 # #
 # # Set false to have clients connect without media encryption.
 # room_encryption = true

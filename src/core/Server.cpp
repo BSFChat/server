@@ -329,6 +329,16 @@ void Server::register_routes() {
     // Rotates a channel's media key. Requires kManageChannels — rotating
     // interrupts everyone still holding the old key. This is the only way to
     // stop a departed member decrypting; see LiveKitConfig::room_encryption.
+    // The generation it bumps is persisted (schema v19) and monotonic, so the
+    // sentence above survives a restart. It did not always: the generation was
+    // an in-memory counter, and every bounce quietly handed the old key back.
+    //
+    // The generation also names the SFU room, so a rotation moves the channel
+    // to a fresh LiveKit room and an already-issued token — a signed JWT this
+    // server cannot recall — admits only to the room everyone has left. The
+    // rotation reaches each participant when they next fetch a token
+    // (reconnect, or token_ttl); it cannot reach one already connected. See
+    // VoiceHandler::handle_livekit_rekey for that boundary spelled out.
     svr.Post(R"(/_matrix/client/v3/rooms/([^/]+)/voice/livekit_rekey)",
              [h = voice_handler_](const httplib::Request& req, httplib::Response& res) { h->handle_livekit_rekey(req, res); });
 }

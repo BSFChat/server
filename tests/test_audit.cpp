@@ -482,9 +482,10 @@ TEST(AuditMigration, FreshDatabaseGetsV13WithAnAppendOnlySchema) {
     // users.nickname, v15 server_bans, v16 the audit_log filter indexes, v17
     // events.signal_to and the call-signalling sweep, v18 the is_direct
     // backfill onto pre-existing DMs' membership state, v19 users.kind plus the
-    // bots table and access_tokens.token_kind). This test's subject remains the
-    // v13 audit_log shape below.
-    EXPECT_EQ(kTargetSchemaVersion, 19);
+    // bots table and access_tokens.token_kind, v20 the persisted LiveKit
+    // media-key generation). This test's subject remains the v13 audit_log
+    // shape below.
+    EXPECT_EQ(kTargetSchemaVersion, 20);
 
     // AUTOINCREMENT, not a bare INTEGER PRIMARY KEY. Without it SQLite reuses
     // max(rowid) + 1, which is exactly the position-reuse defect v4 fixed for
