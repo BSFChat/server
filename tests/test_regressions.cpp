@@ -29,6 +29,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 
 using namespace bsfchat;
@@ -2406,4 +2407,192 @@ TEST(AccessTokens, MissingAndInvalidTokensAreDistinguishable) {
 
     EXPECT_EQ(auth_error("").errcode, "M_MISSING_TOKEN");
     EXPECT_EQ(auth_error("Bearer something").errcode, "M_UNKNOWN_TOKEN");
+}
+
+// ── P6 / audit-data B5, B8, B15: data at rest ─────────────────────────────
+//
+// The findings behind these: the database file was created at the process
+// umask (0644 in the shipped container) and never chmod'ed by anything in the
+// server, the image or deploy/setup.sh; and SQLite was left at its default
+// `secure_delete=off` with no VACUUM anywhere, so deletes that exist
+// specifically to destroy secrets — migration v7's plaintext access-token
+// table, redaction of message bodies, the call-signalling prune that exists to
+// remove participants' IP addresses — only unlinked those bytes from the
+// b-tree and left them in the file.
+
+namespace {
+
+// A unique temp directory per test, removed on scope exit. The store is opened
+// on a real path rather than ":memory:" because both behaviours under test are
+// properties of the FILE.
+struct TempDb {
+    std::filesystem::path dir;
+    std::filesystem::path db;
+
+    TempDb() {
+        dir = std::filesystem::temp_directory_path() /
+              ("bsfchat-p6-" + std::to_string(::getpid()) + "-" +
+               std::to_string(reinterpret_cast<uintptr_t>(this)));
+        std::filesystem::create_directories(dir);
+        db = dir / "bsfchat.db";
+    }
+    ~TempDb() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+};
+
+// The whole file as bytes. This is the attacker's view — `strings bsfchat.db`
+// on a stolen volume or in a backup — not a query, which is the point: a
+// logically deleted row is invisible to SQL and perfectly visible here.
+std::string read_file_bytes(const std::filesystem::path& p) {
+    std::ifstream in(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+std::optional<std::string> read_meta(const std::filesystem::path& db, const std::string& key) {
+    sqlite3* raw = nullptr;
+    if (sqlite3_open(db.c_str(), &raw) != SQLITE_OK) return std::nullopt;
+    std::optional<std::string> out;
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(raw, "SELECT value FROM server_meta WHERE key = ?", -1, &stmt,
+                           nullptr) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            out = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        }
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_close(raw);
+    return out;
+}
+
+} // namespace
+
+TEST(DataAtRest, DatabaseFileIsNotReadableByOtherLocalUsers) {
+    TempDb t;
+    {
+        SqliteStore store(t.db.string());
+        store.initialize();
+    }
+
+    // -wal and -shm are removed by the clean close above, so only the main
+    // file is asserted on here; the open path tightens all three.
+    ASSERT_TRUE(std::filesystem::exists(t.db));
+    // Before the fix this was 0644 under the default umask: every message
+    // body, the second copy of each body in the search index, queued push
+    // payloads and the audit log, readable by any local account.
+    const auto mode = std::filesystem::status(t.db).permissions();
+    EXPECT_EQ(mode & (std::filesystem::perms::group_all | std::filesystem::perms::others_all),
+              std::filesystem::perms::none);
+}
+
+TEST(DataAtRest, DeletedContentIsOverwrittenNotJustUnlinked) {
+    TempDb t;
+    // Distinctive enough that a match cannot be anything but our own row.
+    const std::string canary = "CANARY-8f31d2a7-secure-delete-regression";
+
+    {
+        SqliteStore store(t.db.string());
+        store.initialize();
+        store.create_user("@alice:test", "hash");
+        store.create_room("!room:test", "@alice:test");
+        for (int i = 0; i < 64; ++i) {
+            json content{{"msgtype", "m.text"}, {"body", canary + "-" + std::to_string(i)}};
+            store.insert_event("$ev" + std::to_string(i), "!room:test", "@alice:test",
+                               "m.room.message", std::nullopt, content.dump(), now_ms());
+        }
+        // Deleting the room is the same class of operation as the signalling
+        // prune and the v7 token-table drop: rows go away, pages go to the
+        // freelist.
+        store.delete_room("!room:test");
+    }
+
+    const std::string bytes = read_file_bytes(t.db);
+    EXPECT_EQ(bytes.find(canary), std::string::npos)
+        << "deleted message bodies are still recoverable from the database file";
+}
+
+TEST(DataAtRest, FreshDatabaseRecordsTheVacuumMarkerWithoutVacuuming) {
+    TempDb t;
+    {
+        SqliteStore store(t.db.string());
+        store.initialize();
+    }
+    // A database this build created has never held pre-hardening deletes, so
+    // the one-time VACUUM is pointless work. It must still be marked done, or
+    // it is reconsidered on every single start.
+    EXPECT_EQ(read_meta(t.db, "maintenance.freelist_vacuumed"), std::optional<std::string>("1"));
+}
+
+TEST(DataAtRest, ExistingDatabaseIsVacuumedOnceAndOnlyOnce) {
+    TempDb t;
+
+    // Build a database, put content in it, then delete the content and clear
+    // the marker — i.e. exactly the state of a deployment upgrading to this
+    // build: a populated file with a fat freelist full of deleted secrets.
+    {
+        SqliteStore store(t.db.string());
+        store.initialize();
+        store.create_user("@alice:test", "hash");
+        store.create_room("!room:test", "@alice:test");
+        for (int i = 0; i < 400; ++i) {
+            json content{{"msgtype", "m.text"}, {"body", std::string(400, 'x')}};
+            store.insert_event("$ev" + std::to_string(i), "!room:test", "@alice:test",
+                               "m.room.message", std::nullopt, content.dump(), now_ms());
+        }
+        store.delete_room("!room:test");
+    }
+    {
+        sqlite3* raw = nullptr;
+        ASSERT_EQ(sqlite3_open(t.db.c_str(), &raw), SQLITE_OK);
+        ASSERT_EQ(sqlite3_exec(raw,
+                               "DELETE FROM server_meta WHERE key = 'maintenance.freelist_vacuumed'",
+                               nullptr, nullptr, nullptr),
+                  SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    const auto size_before = std::filesystem::file_size(t.db);
+    {
+        SqliteStore store(t.db.string());
+        store.initialize();
+    }
+    EXPECT_EQ(read_meta(t.db, "maintenance.freelist_vacuumed"), std::optional<std::string>("1"));
+    // VACUUM rewrites the file from the live pages only, so the freelist those
+    // 400 deleted rows left behind is returned to the filesystem.
+    EXPECT_LT(std::filesystem::file_size(t.db), size_before);
+
+    // And the mode survives the rewrite: VACUUM creates a new file and moves
+    // it into place, which is the obvious way to silently undo the chmod.
+    EXPECT_EQ(std::filesystem::status(t.db).permissions() &
+                  (std::filesystem::perms::group_all | std::filesystem::perms::others_all),
+              std::filesystem::perms::none);
+
+    // Second start must not VACUUM again — the marker is the whole mechanism.
+    const auto size_after_first = std::filesystem::file_size(t.db);
+    {
+        SqliteStore store(t.db.string());
+        store.initialize();
+        store.create_user("@bob:test", "hash");
+    }
+    EXPECT_GE(std::filesystem::file_size(t.db), size_after_first);
+}
+
+TEST(ConfigValidation, HonoursButWarnsAboutADeployTemplateCostOf12) {
+    // deploy/config/server.toml.template shipped `password_hash_cost = 12`
+    // (4,096 PBKDF2 iterations) and the only startup warning fired BELOW 12,
+    // so the weakest value anyone would actually deploy passed silently by
+    // exactly one step. 12 is still honoured — the login CPU bill is the
+    // operator's to spend — but it is no longer endorsed.
+    Config cfg = Config::defaults();
+    cfg.password_hash_cost = 12;
+    Config::validate(cfg);
+    EXPECT_EQ(cfg.password_hash_cost, 12);
+    EXPECT_LT(cfg.password_hash_cost, kRecommendedPasswordHashCost);
+}
+
+TEST(ConfigValidation, DefaultPasswordCostIsTheRecommendedOne) {
+    EXPECT_EQ(Config::defaults().password_hash_cost, kRecommendedPasswordHashCost);
+    EXPECT_EQ(kRecommendedPasswordHashCost, 19);
 }

@@ -692,6 +692,12 @@ public:
 
 private:
     void exec(const std::string& sql);
+    // Strips group/other access from the database file and its -wal/-shm
+    // siblings. No-op for an in-memory database; never fatal.
+    void restrict_database_file_mode();
+    // One-time VACUUM that discards free pages left behind by pre-hardening
+    // deletes. Caller must hold mutex_ and must NOT be inside a transaction.
+    void vacuum_freelist_once_locked(bool fresh_database);
     // Claims the next stream position. Caller must hold mutex_.
     int64_t claim_stream_position_locked();
     // Re-points `target_event_id` at the newest surviving (non-redacted)
@@ -720,6 +726,8 @@ private:
     bool fts5_available_locked();
 
     sqlite3* db_ = nullptr;
+    // Kept so the file mode can be re-applied after a VACUUM replaces the file.
+    std::string db_path_;
     std::mutex mutex_;
     // Monotonic; never reused even after delete_room removes the newest rows.
     // Mirrored into server_meta so it survives a restart.
