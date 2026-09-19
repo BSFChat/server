@@ -37,6 +37,27 @@ ProfileHandler::ProfileHandler(SqliteStore& store, SyncEngine& sync_engine, cons
     : store_(store), sync_engine_(sync_engine), config_(config) {}
 
 void ProfileHandler::handle_get_profile(const httplib::Request& req, httplib::Response& res) {
+
+    // AUTHENTICATION. These four GET handlers were the only read endpoints in
+    // the server that never called authenticate() — every other one does, which
+    // is what marks this as an oversight rather than a decision that profiles
+    // are public. Unauthenticated, they hand anyone who can reach the port a
+    // user-existence oracle over the whole account namespace (404 vs 200), plus
+    // the display name, avatar and per-server nickname of every account found.
+    // The rate limiter does not cover this route, so the enumeration is not even
+    // slow.
+    //
+    // The caller is `requester`; `user_id` below is the profile being READ, and
+    // conflating the two is how a cross-user write bug gets introduced later.
+    // Reading someone else's profile is legitimate — that is what the member
+    // list does — so this gates on being signed in, nothing more.
+    auto requester = authenticate(store_, req.get_header_value("Authorization"));
+    if (!requester) {
+        res.status = 401;
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(),
+                        "application/json");
+        return;
+    }
     auto match = match_route("/_matrix/client/v3/profile/{userId}", req.path);
     if (!match.matched) {
         res.status = 404;
@@ -76,6 +97,15 @@ void ProfileHandler::handle_get_profile(const httplib::Request& req, httplib::Re
 }
 
 void ProfileHandler::handle_get_displayname(const httplib::Request& req, httplib::Response& res) {
+
+    // Signed-in callers only; see handle_get_profile for why these four needed it.
+    auto requester = authenticate(store_, req.get_header_value("Authorization"));
+    if (!requester) {
+        res.status = 401;
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(),
+                        "application/json");
+        return;
+    }
     auto match = match_route("/_matrix/client/v3/profile/{userId}/displayname", req.path);
     if (!match.matched) {
         res.status = 404;
@@ -146,6 +176,15 @@ void ProfileHandler::handle_put_displayname(const httplib::Request& req, httplib
 }
 
 void ProfileHandler::handle_get_avatar_url(const httplib::Request& req, httplib::Response& res) {
+
+    // Signed-in callers only; see handle_get_profile for why these four needed it.
+    auto requester = authenticate(store_, req.get_header_value("Authorization"));
+    if (!requester) {
+        res.status = 401;
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(),
+                        "application/json");
+        return;
+    }
     auto match = match_route("/_matrix/client/v3/profile/{userId}/avatar_url", req.path);
     if (!match.matched) {
         res.status = 404;
@@ -216,6 +255,15 @@ void ProfileHandler::handle_put_avatar_url(const httplib::Request& req, httplib:
 }
 
 void ProfileHandler::handle_get_nickname(const httplib::Request& req, httplib::Response& res) {
+
+    // Signed-in callers only; see handle_get_profile for why these four needed it.
+    auto requester = authenticate(store_, req.get_header_value("Authorization"));
+    if (!requester) {
+        res.status = 401;
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(),
+                        "application/json");
+        return;
+    }
     auto match = match_route("/_matrix/client/v3/profile/{userId}/nickname", req.path);
     if (!match.matched) {
         res.status = 404;

@@ -2495,3 +2495,92 @@ TEST(ProfileShape, AnUnknownUserIsStill404RatherThanAnEmptyObject) {
     handler.handle_get_profile(req, res);
     EXPECT_EQ(res.status, 404);
 }
+
+// ---------------------------------------------------------------------------
+// These four GET handlers never called authenticate() at all. Every other read
+// endpoint in the server does, so this was an oversight, not a decision that
+// profiles are public — and unauthenticated it let anyone who could reach the
+// port walk the whole account namespace (404 vs 200) and collect display names,
+// avatars and nicknames, with no rate limiter on the route to slow it down.
+//
+// The tests below pin both halves: refused without a valid credential, and
+// STILL WORKING for a signed-in user reading somebody else's profile, which is
+// what the member list does on every channel open. A fix that only satisfied
+// the first half would be a regression wearing a security badge.
+// ---------------------------------------------------------------------------
+
+// No Authorization header at all, which make_request() cannot express.
+httplib::Request make_anonymous_request(const std::string& path) {
+    httplib::Request req;
+    req.path = path;
+    return req;
+}
+
+TEST(ProfileAuth, EveryGetterRefusesAnAnonymousCaller) {
+    Fixture f;
+    auto user = f.add_user("target");
+    ProfileHandler handler(*f.store, *f.sync, f.config);
+
+    struct Case {
+        const char* suffix;
+        void (ProfileHandler::*fn)(const httplib::Request&, httplib::Response&);
+    };
+    const Case cases[] = {
+        {"",              &ProfileHandler::handle_get_profile},
+        {"/displayname",  &ProfileHandler::handle_get_displayname},
+        {"/avatar_url",   &ProfileHandler::handle_get_avatar_url},
+        {"/nickname",     &ProfileHandler::handle_get_nickname},
+    };
+
+    for (const auto& c : cases) {
+        auto req = make_anonymous_request("/_matrix/client/v3/profile/" + user + c.suffix);
+        httplib::Response res;
+        (handler.*c.fn)(req, res);
+        EXPECT_EQ(res.status, 401) << "unauthenticated read of profile" << c.suffix
+                                   << " must be refused; body was: " << res.body;
+        EXPECT_NE(res.body.find("M_MISSING_TOKEN"), std::string::npos)
+            << "no header at all is a MISSING token, not an unknown one: " << res.body;
+    }
+}
+
+TEST(ProfileAuth, EveryGetterRefusesAnUnknownToken) {
+    Fixture f;
+    auto user = f.add_user("target");
+    ProfileHandler handler(*f.store, *f.sync, f.config);
+
+    const char* suffixes[] = {"", "/displayname", "/avatar_url", "/nickname"};
+    void (ProfileHandler::*fns[])(const httplib::Request&, httplib::Response&) = {
+        &ProfileHandler::handle_get_profile,
+        &ProfileHandler::handle_get_displayname,
+        &ProfileHandler::handle_get_avatar_url,
+        &ProfileHandler::handle_get_nickname,
+    };
+
+    for (int i = 0; i < 4; ++i) {
+        auto req = make_request("/_matrix/client/v3/profile/" + user + suffixes[i],
+                                "not-a-real-token");
+        httplib::Response res;
+        (handler.*fns[i])(req, res);
+        EXPECT_EQ(res.status, 401) << "profile" << suffixes[i] << " body: " << res.body;
+        EXPECT_NE(res.body.find("M_UNKNOWN_TOKEN"), std::string::npos)
+            << "a supplied-but-invalid token is UNKNOWN, not missing: " << res.body;
+    }
+}
+
+TEST(ProfileAuth, ASignedInUserCanStillReadSomebodyElsesProfile) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    f.store->set_display_name(bob, "Bob");
+
+    ProfileHandler handler(*f.store, *f.sync, f.config);
+    auto req = make_request("/_matrix/client/v3/profile/" + bob, "token-alice");
+    httplib::Response res;
+    handler.handle_get_profile(req, res);
+
+    ASSERT_TRUE(IsOk(res)) << "status " << res.status << " body " << res.body;
+    EXPECT_EQ(json::parse(res.body).value("displayname", ""), "Bob")
+        << "reading another user's profile is what the member list does; "
+           "gating on signed-in must not become gating on self";
+}
+
