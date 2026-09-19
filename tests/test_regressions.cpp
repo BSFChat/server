@@ -6,6 +6,8 @@
 #include "api/AuthHandler.h"
 #include "api/EventHandler.h"
 #include "api/ProfileHandler.h"
+#include "core/RateLimiter.h"
+#include "http/ClientAddress.h"
 #include "api/RoomHandler.h"
 #include "auth/AutoJoin.h"
 #include "auth/LocalAuth.h"

@@ -89,6 +89,55 @@ void write_server_roles(SqliteStore& store, const Config& config,
     get_logger()->info("Seeded default server roles");
 }
 
+// One-time upgrade step for ADD_REACTIONS (permission bit 14).
+//
+// Putting the new flag in kEveryoneDefault only covers a deployment that has
+// not been bootstrapped yet. An existing server stored @everyone's permissions
+// as a NUMBER in its server.roles event the first time it started, and nothing
+// re-seeds that: bootstrap_roles only writes defaults when roles are missing or
+// legacy-shaped. So without this, the first restart after upgrading would leave
+// every existing role short of bit 14 and NOBODY on the server able to react —
+// the exact regression the flag was placed in kEveryoneDefault to avoid.
+//
+// The rule is "whoever could react before can react now", and before this flag
+// existed reacting was gated on nothing beyond VIEW_CHANNEL, so in practice it
+// tracked SEND_MESSAGES: that is the role set this grants. A role that cannot
+// post does not gain the ability to react, because it never visibly had it in
+// any channel a moderator had actually locked down.
+//
+// Marked in `meta` and never repeated. An operator who deliberately takes
+// ADD_REACTIONS away from a role afterwards must not have it handed back on the
+// next restart — that is the difference between an upgrade step and a policy.
+void backfill_add_reactions(SqliteStore& store, const Config& config,
+                            const std::string& mirror_room) {
+    static constexpr const char* kMarker = "migration.grant_add_reactions";
+    if (store.get_meta(kMarker)) return;
+
+    auto roles = store.get_server_roles();
+    int granted = 0;
+    for (auto& r : roles) {
+        if (!permission::has(r.permissions, permission::kSendMessages)) continue;
+        if (permission::has(r.permissions, permission::kAddReactions)) continue;
+        r.permissions |= permission::kAddReactions;
+        ++granted;
+    }
+
+    if (granted > 0) {
+        ServerRolesContent c;
+        c.roles = std::move(roles);
+        nlohmann::json j;
+        to_json(j, c);
+        write_server_scoped_state(store, config, std::string(event_type::kServerRoles),
+                                  std::string(""), j.dump(), mirror_room);
+        get_logger()->info(
+            "Granted ADD_REACTIONS to {} existing role(s) that already had SEND_MESSAGES, so "
+            "the new permission changes nobody's behaviour on upgrade", granted);
+    }
+    // Marked even when nothing needed granting, so this is one lookup per
+    // restart forever after rather than a full role read.
+    store.set_meta(kMarker, "1");
+}
+
 void write_member_roles(SqliteStore& store, const Config& config,
                         const std::string& mirror_room, const std::string& user_id,
                         const std::vector<std::string>& role_ids) {
@@ -161,6 +210,8 @@ void bootstrap_roles(SqliteStore& store, SyncEngine& sync_engine, const Config& 
     }
     if (needs_seed) {
         write_server_roles(store, config, canonical);
+    } else {
+        backfill_add_reactions(store, config, canonical);
     }
 
     // 2. Ensure every user has a member.roles event. First-registered user

@@ -167,7 +167,9 @@ TEST_F(AuthHandlerTest, RegisterAllowedWhenIdentityPermitsLocalAccounts) {
     id.allow_local_accounts = true;
     config.identity = id;
 
-    auto res = do_register("newcomer", "password1");
+    // Not "password1": that is on the common-password denylist now, and these
+    // two tests are about the username path, not the password path.
+    auto res = do_register("newcomer", "correct-horse-7");
     EXPECT_EQ(res.status, 200);
     EXPECT_TRUE(store->user_exists("@newcomer:test"));
 }
@@ -184,7 +186,7 @@ TEST_F(AuthHandlerTest, RegisterRejectsColonInUsername) {
 }
 
 TEST_F(AuthHandlerTest, RegisterAcceptsValidLocalpart) {
-    auto res = do_register("new.user_1-ok", "password1");
+    auto res = do_register("new.user_1-ok", "correct-horse-7");
     EXPECT_EQ(res.status, 200);
     EXPECT_TRUE(store->user_exists("@new.user_1-ok:test"));
 
@@ -905,4 +907,300 @@ TEST(AuthLimitsConfig, BadProxyEntryStopsStartupAndBadNumbersAreClamped) {
     EXPECT_EQ(cfg.auth_limits.lockout_seconds, 1);
     EXPECT_EQ(cfg.auth_limits.register_window_seconds, 1);
     EXPECT_EQ(cfg.auth_limits.max_failures, 3);
+}
+
+// ── Password policy, device ids, and the login timing oracle ───────────────
+
+TEST(PasswordPolicy, RejectsThePasswordBeingTheUsername) {
+    EXPECT_TRUE(password_policy_error("gamertag", "gamertag").has_value());
+    // Case folding, because "GamerTag" is the same guess.
+    EXPECT_TRUE(password_policy_error("GamerTag", "gamertag").has_value());
+}
+
+TEST(PasswordPolicy, RejectsThePasswordContainingTheUsername) {
+    EXPECT_TRUE(password_policy_error("mikemikemike", "mike").has_value());
+    EXPECT_TRUE(password_policy_error("xxMIKExx99", "mike").has_value());
+}
+
+TEST(PasswordPolicy, ShortUsernamesDoNotVetoOrdinaryPasswords) {
+    // The 4-character floor is the thing keeping this proportionate: without
+    // it, user "jo" could not have a password containing "jo" anywhere, which
+    // is a large share of perfectly good passwords.
+    EXPECT_FALSE(password_policy_error("enjoythesilence", "jo").has_value());
+}
+
+TEST(PasswordPolicy, RejectsTheCommonPasswordsThatSurviveTheLengthFloor) {
+    for (const char* pw : {"password1", "12345678", "qwerty123", "iloveyou",
+                           "letmein1", "trustno1", "changeme", "P@ssw0rd"}) {
+        EXPECT_TRUE(password_policy_error(pw, "someuser").has_value())
+            << pw << " should be refused";
+    }
+}
+
+TEST(PasswordPolicy, RejectsTheServiceName) {
+    EXPECT_TRUE(password_policy_error("bsfchat2026", "someuser").has_value());
+    EXPECT_TRUE(password_policy_error("myGameChatPW", "someuser").has_value());
+}
+
+TEST(PasswordPolicy, AcceptsAnOrdinaryPassword) {
+    EXPECT_FALSE(password_policy_error("correct-horse-7", "someuser").has_value());
+    EXPECT_FALSE(password_policy_error("Tr0ubad0ur&3", "alice").has_value());
+}
+
+TEST(PasswordPolicy, StillEnforcesTheLengthFloor) {
+    EXPECT_TRUE(password_policy_error("short", "someuser").has_value());
+}
+
+TEST(DeviceId, RejectsEmptyOverlongAndControlCharacters) {
+    EXPECT_TRUE(device_id_error("").has_value());
+    EXPECT_TRUE(device_id_error(std::string(kMaxDeviceIdLength + 1, 'A')).has_value());
+    // The one that matters: a newline lets a device id forge extra lines in
+    // the server log, where it is printed next to a user id.
+    EXPECT_TRUE(device_id_error("DEV\nfake log line").has_value());
+    EXPECT_TRUE(device_id_error(std::string("DEV\0hidden", 10)).has_value());
+}
+
+TEST(DeviceId, AcceptsWhatRealClientsSend) {
+    EXPECT_FALSE(device_id_error("DEVICE_aB3xY9zQ1p").has_value());
+    EXPECT_FALSE(device_id_error(std::string(kMaxDeviceIdLength, 'A')).has_value());
+    // Not an ASCII allowlist: a client that already persisted a device id with
+    // a non-ASCII character must still be able to log in.
+    EXPECT_FALSE(device_id_error("josh’s laptop").has_value());
+}
+
+TEST(DummyPasswordHash, IsAUsableHashThatNothingVerifiesAgainst) {
+    const auto& a = dummy_password_hash(10);
+    EXPECT_TRUE(a.starts_with("$pbkdf2$"));
+    EXPECT_EQ(password_hash_cost(a).value_or(-1), 10);
+    // Whatever a caller submits, it fails — including the empty string, which
+    // is what an OIDC-backed account's stored hash looks like.
+    EXPECT_FALSE(verify_password("", a));
+    EXPECT_FALSE(verify_password("password", a));
+    // Cached, so the per-request cost is one verify and not two hashes.
+    EXPECT_EQ(&a, &dummy_password_hash(10));
+    EXPECT_NE(dummy_password_hash(11), a);
+}
+
+// ── Handler-level: enumeration timing, policy at the endpoints, refresh reuse ──
+
+namespace {
+
+// A handler with the rate limits switched off, so these tests exercise the
+// credential logic and not the limiter that already has its own tests.
+struct AuthFixture {
+    std::unique_ptr<SqliteStore> store;
+    Config config;
+    std::unique_ptr<SyncEngine> sync;
+    std::unique_ptr<AuthHandler> handler;
+
+    explicit AuthFixture(int cost = 10) {
+        store = std::make_unique<SqliteStore>(":memory:");
+        store->initialize();
+        config.server_name = "test";
+        config.password_hash_cost = cost;
+        config.auth_limits.enabled = false;
+        sync = std::make_unique<SyncEngine>(*store, config);
+        handler = std::make_unique<AuthHandler>(*store, *sync, config);
+        store->create_user("@alice:test", hash_password("correct-horse-7", cost));
+    }
+
+    httplib::Response call(void (AuthHandler::*fn)(const httplib::Request&, httplib::Response&),
+                           const nlohmann::json& body,
+                           const std::string& bearer = {}) {
+        httplib::Request req;
+        req.body = body.dump();
+        if (!bearer.empty()) req.set_header("Authorization", "Bearer " + bearer);
+        httplib::Response res;
+        (handler.get()->*fn)(req, res);
+        if (res.status == -1) res.status = 200;
+        return res;
+    }
+
+    httplib::Response login(const std::string& user, const std::string& password,
+                            bool want_refresh = false) {
+        return call(&AuthHandler::handle_login,
+                    {{"type", "m.login.password"},
+                     {"identifier", {{"type", "m.id.user"}, {"user", user}}},
+                     {"password", password},
+                     {"refresh_token", want_refresh}});
+    }
+};
+
+} // namespace
+
+TEST(AccountEnumeration, LoginCostsTheSameWhetherOrNotTheAccountExists) {
+    // Cost 15 so PBKDF2 is long enough to time without being slow to run. The
+    // defect this guards was not marginal: at the shipped cost of 19 the
+    // missing-account path returned in microseconds and the real one took
+    // roughly half a second, which is a difference anyone can read off a
+    // stopwatch, from an unauthenticated endpoint, before any rate limit has
+    // been tripped.
+    AuthFixture f(15);
+
+    const auto time_login = [&](const std::string& user) {
+        const auto start = std::chrono::steady_clock::now();
+        auto res = f.login(user, "some-wrong-password");
+        EXPECT_EQ(res.status, 403);
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    };
+
+    // Warm the cached dummy hash, so its one-time construction is not measured.
+    (void)time_login("ghost");
+
+    double existing = 0, missing = 0;
+    for (int i = 0; i < 3; ++i) {
+        existing += time_login("alice");
+        missing += time_login("ghost");
+    }
+
+    // A ratio, not an absolute bound: both runs share whatever else the
+    // machine is doing. Only the direction matters — the missing-account path
+    // must not be dramatically cheaper. Before the fix this ratio was ~0.001.
+    EXPECT_GT(missing / existing, 0.5) << "missing=" << missing << "s existing=" << existing << "s";
+}
+
+TEST(AccountEnumeration, AnOidcAccountIsNotDistinguishableByTimingEither) {
+    AuthFixture f(15);
+    // An OIDC-backed account: created with an empty hash so password login can
+    // never work for it. verify_password used to reject that in microseconds.
+    f.store->create_user("@oidc_bob:test", "");
+
+    const auto time_login = [&](const std::string& user) {
+        const auto start = std::chrono::steady_clock::now();
+        EXPECT_EQ(f.login(user, "some-wrong-password").status, 403);
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    };
+    (void)time_login("ghost");
+
+    const double oidc = time_login("oidc_bob");
+    const double real_account = time_login("alice");
+    EXPECT_GT(oidc / real_account, 0.5) << "oidc=" << oidc << "s real=" << real_account << "s";
+    // And it still cannot be signed into with a password, empty or otherwise.
+    EXPECT_EQ(f.login("oidc_bob", "").status, 403);
+}
+
+TEST(RegisterPolicy, RefusesAWeakPasswordAndCreatesNothing) {
+    AuthFixture f;
+    f.config.registration_enabled = true;
+
+    auto res = f.call(&AuthHandler::handle_register,
+                      {{"username", "newbie"}, {"password", "password1"}});
+    EXPECT_EQ(res.status, 400);
+    EXPECT_FALSE(f.store->user_exists("@newbie:test"));
+
+    res = f.call(&AuthHandler::handle_register,
+                 {{"username", "newbie"}, {"password", "newbie-newbie"}});
+    EXPECT_EQ(res.status, 400) << "a password built out of the username must be refused";
+    EXPECT_FALSE(f.store->user_exists("@newbie:test"));
+
+    res = f.call(&AuthHandler::handle_register,
+                 {{"username", "newbie"}, {"password", "correct-horse-7"}});
+    EXPECT_EQ(res.status, 200);
+    EXPECT_TRUE(f.store->user_exists("@newbie:test"));
+}
+
+TEST(RegisterPolicy, RefusesAnUnusableDeviceId) {
+    AuthFixture f;
+    f.config.registration_enabled = true;
+    auto res = f.call(&AuthHandler::handle_register,
+                      {{"username", "newbie"},
+                       {"password", "correct-horse-7"},
+                       {"device_id", std::string(300, 'A')}});
+    EXPECT_EQ(res.status, 400);
+    EXPECT_FALSE(f.store->user_exists("@newbie:test"))
+        << "a rejected device id must not leave a half-created account behind";
+}
+
+TEST(LoginPolicy, RefusesAnUnusableDeviceId) {
+    AuthFixture f;
+    auto res = f.call(&AuthHandler::handle_login,
+                      {{"type", "m.login.password"},
+                       {"identifier", {{"type", "m.id.user"}, {"user", "alice"}}},
+                       {"password", "correct-horse-7"},
+                       {"device_id", "DEV\nInjected: yes"}});
+    EXPECT_EQ(res.status, 400);
+}
+
+TEST(PasswordChangePolicy, AppliesTheSameRulesAsRegistration) {
+    AuthFixture f;
+    f.store->store_access_token("alice-token", "@alice:test", "DEV1");
+
+    const auto change = [&](const std::string& next) {
+        return f.call(&AuthHandler::handle_password_change,
+                      {{"auth", {{"type", "m.login.password"}, {"password", "correct-horse-7"}}},
+                       {"new_password", next}},
+                      "alice-token");
+    };
+
+    // Without this, the policy is two requests away from irrelevant: register
+    // with something acceptable, then change it to "password1".
+    EXPECT_EQ(change("password1").status, 400);
+    EXPECT_EQ(change("alice-alice").status, 400);
+    // A no-op change would revoke every other session and leave the credential
+    // the user is trying to replace in place.
+    EXPECT_EQ(change("correct-horse-7").status, 400);
+    EXPECT_EQ(change("a-fine-new-one-9").status, 200);
+    EXPECT_TRUE(verify_password("a-fine-new-one-9", *f.store->get_password_hash("@alice:test")));
+}
+
+TEST(RefreshReuse, RotationCarriesTheFamilyAndAReplayRevokesAllOfIt) {
+    AuthFixture f;
+
+    auto first = nlohmann::json::parse(f.login("alice", "correct-horse-7", true).body);
+    const std::string refresh_1 = first.at("refresh_token");
+
+    // Rotate twice, so the family is longer than one hop — the point of
+    // carrying family_id across a refresh rather than minting a new one.
+    auto r2 = f.call(&AuthHandler::handle_refresh, {{"refresh_token", refresh_1}});
+    ASSERT_EQ(r2.status, 200);
+    auto body_2 = nlohmann::json::parse(r2.body);
+    const std::string refresh_2 = body_2.at("refresh_token");
+
+    auto r3 = f.call(&AuthHandler::handle_refresh, {{"refresh_token", refresh_2}});
+    ASSERT_EQ(r3.status, 200);
+    auto body_3 = nlohmann::json::parse(r3.body);
+    const std::string access_3 = body_3.at("access_token");
+    EXPECT_TRUE(f.store->get_user_by_token(access_3).has_value());
+
+    // Now the theft: someone replays a refresh token from earlier in the
+    // chain. Rotation alone answers 401 and leaves the current session — which
+    // may well be the thief's — alive and self-renewing.
+    auto replay = f.call(&AuthHandler::handle_refresh, {{"refresh_token", refresh_1}});
+    EXPECT_EQ(replay.status, 401);
+
+    // The whole family is gone, including the session two rotations later.
+    EXPECT_FALSE(f.store->get_user_by_token(access_3).has_value())
+        << "a replayed refresh token must revoke every session descended from that login";
+    EXPECT_EQ(f.call(&AuthHandler::handle_refresh, {{"refresh_token", body_3.at("refresh_token")}})
+                  .status, 401);
+}
+
+TEST(RefreshReuse, OneAccountsFamilyRevocationDoesNotTouchAnother) {
+    AuthFixture f;
+    f.store->create_user("@bob:test", hash_password("correct-horse-7", 10));
+
+    auto alice = nlohmann::json::parse(f.login("alice", "correct-horse-7", true).body);
+    auto bob = nlohmann::json::parse(f.login("bob", "correct-horse-7", true).body);
+    // A second, independent login for alice: a separate family, so it must
+    // survive too. This is what the migration's "family of one" default and the
+    // empty-family guard are protecting against.
+    auto alice_2 = nlohmann::json::parse(f.login("alice", "correct-horse-7", true).body);
+
+    ASSERT_EQ(f.call(&AuthHandler::handle_refresh,
+                     {{"refresh_token", alice.at("refresh_token")}}).status, 200);
+    EXPECT_EQ(f.call(&AuthHandler::handle_refresh,
+                     {{"refresh_token", alice.at("refresh_token")}}).status, 401);
+
+    EXPECT_TRUE(f.store->get_user_by_token(bob.at("access_token")).has_value());
+    EXPECT_TRUE(f.store->get_user_by_token(alice_2.at("access_token")).has_value());
+}
+
+TEST(RefreshReuse, AnUnknownRefreshTokenRevokesNothing) {
+    AuthFixture f;
+    auto session = nlohmann::json::parse(f.login("alice", "correct-horse-7", true).body);
+
+    EXPECT_EQ(f.call(&AuthHandler::handle_refresh,
+                     {{"refresh_token", "not-a-token-anyone-issued"}}).status, 401);
+    EXPECT_EQ(f.store->revoke_family_for_replayed_refresh_token("not-a-token-anyone-issued"), 0);
+    EXPECT_TRUE(f.store->get_user_by_token(session.at("access_token")).has_value());
 }

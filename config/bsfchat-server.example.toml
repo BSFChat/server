@@ -127,6 +127,13 @@ rate_limit_enabled = true
 # The server logs a warning when it sees X-Forwarded-For arriving from a
 # private address that is not listed — that is this setting being wrong.
 #
+# It also warns at STARTUP if an entry here reaches outside loopback and the
+# private ranges. Trusting a network means believing its X-Forwarded-For, so a
+# public entry (or something as wide as "0.0.0.0/0") is not a loose limit — it
+# is an off switch: anything inside it picks its own identity once per request,
+# and the per-address limits stop applying to exactly the client that matters.
+# List only proxies you operate.
+#
 # If a trusted proxy sends no usable X-Forwarded-For, the client is unknowable
 # and the per-address limits are skipped for that request (the per-username
 # lockout and the server-wide registration ceiling still apply). Make sure the
@@ -168,6 +175,55 @@ register_window_seconds = 3600
 # 0 = no ceiling. If you expect a big launch-day rush, raise it — or better,
 # use an identity provider and turn local registration off.
 register_global_limit = 200
+
+# --- Limits on what a signed-in account may do -------------------------------
+#
+# The [auth] limits above are about getting IN: they key on the client address,
+# because those endpoints have no authenticated caller yet. These key on the
+# ACCOUNT, and cover what it does afterwards.
+#
+# Everything past authentication used to be unmetered. A looping client, or a
+# bug in a bot, could push events into a channel as fast as the socket allowed
+# and nothing on this side stopped it.
+#
+# Keyed on the account and not the connection, so opening ten connections does
+# not buy ten budgets. NOT keyed on the address: everyone behind one household
+# NAT would share a message budget, and the first misbehaving client would
+# throttle everyone else in the house.
+#
+# Over a limit the server answers 429 M_LIMIT_EXCEEDED with a Retry-After
+# header (seconds) and retry_after_ms in the body — the same shape as the
+# [auth] limits. State is in memory: a restart clears every counter.
+[limits]
+
+# Master switch for the three limits below.
+enabled = true
+
+# The window every count below is measured over.
+window_seconds = 60
+
+# Events one account may send per window (PUT /rooms/{id}/send/...), across all
+# of its sessions and all channels. Covers messages and reactions.
+#
+# Deliberately far above human use: this exists to stop a loop, not to pace a
+# conversation. 120 a minute is two a second sustained, which nobody reaches by
+# typing or by clicking reactions. Retries of a transaction the server already
+# accepted do NOT count — a client on a bad connection is doing what we asked
+# of it, and a flood is made of distinct transactions by definition.
+# Per-channel slowmode (a moderation tool) is separate and unaffected.
+# 0 = unlimited.
+send_limit = 120
+
+# Redactions per account per window. Lower, because deleting is rarer than
+# sending and a deletion loop is the more destructive of the two — still well
+# above a moderator clearing a run of messages by hand.
+redact_limit = 60
+
+# Media uploads per account per window. Lowest of the three: each one puts a
+# whole file into storage and keeps it, so the work behind it is orders of
+# magnitude larger. This bounds how MANY uploads an account can make; the size
+# of any one of them is [media] max_upload_size_mb.
+media_upload_limit = 30
 
 # Storage backend for media files
 # type = "local" stores files on disk, "s3" uses S3-compatible object storage

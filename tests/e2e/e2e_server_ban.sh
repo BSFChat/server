@@ -136,12 +136,12 @@ jfield() { python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get(sy
 
 register() {
   curl -s -o "$WORK/last-body.json" -X POST "${BASE}/register" -H 'Content-Type: application/json' \
-    -d "{\"username\":\"$1\",\"password\":\"pw-$1-12345\",\"auth\":{\"type\":\"m.login.dummy\"}}" >/dev/null
+    -d "{\"username\":\"$1\",\"password\":\"e2e-correct-horse-7\",\"auth\":{\"type\":\"m.login.dummy\"}}" >/dev/null
   jfield access_token
 }
 login() {
   curl -s -o "$WORK/last-body.json" -X POST "${BASE}/login" -H 'Content-Type: application/json' \
-    -d "{\"type\":\"m.login.password\",\"identifier\":{\"type\":\"m.id.user\",\"user\":\"$1\"},\"password\":\"pw-$1-12345\"}" >/dev/null
+    -d "{\"type\":\"m.login.password\",\"identifier\":{\"type\":\"m.id.user\",\"user\":\"$1\"},\"password\":\"e2e-correct-horse-7\"}" >/dev/null
   jfield access_token
 }
 create_room() { # create_room TOKEN NAME -> room id
@@ -200,7 +200,7 @@ check "...her sync is refused outright"        401 "$(req GET "/sync?timeout=0" 
 
 # ...and she cannot simply log back in, which is what would have made the
 # revocation theatre: she still knows her password.
-LOGIN_CAROL='{"type":"m.login.password","identifier":{"type":"m.id.user","user":"carol"},"password":"pw-carol-12345"}'
+LOGIN_CAROL='{"type":"m.login.password","identifier":{"type":"m.id.user","user":"carol"},"password":"e2e-correct-horse-7"}'
 check "a banned user cannot log in again"      403 "$(req POST "/login" "" "$LOGIN_CAROL")"
 check_body "...and is told why"                       "banned from this server"
 
@@ -218,7 +218,7 @@ INVITE_C='{"user_id":"'"$C"'"}'
 check "banned carol cannot be invited back"   403 "$(req POST "/rooms/$FRESH/invite" "$T_ALICE" "$INVITE_C")"
 check_body "...for the ban reason, not a room reason"  "banned from this server"
 
-REREG='{"username":"carol","password":"pw-carol-12345","auth":{"type":"m.login.dummy"}}'
+REREG='{"username":"carol","password":"e2e-correct-horse-7","auth":{"type":"m.login.dummy"}}'
 check "a banned identity cannot re-register"  403 "$(req POST "/register" "" "$REREG")"
 
 echo
@@ -263,7 +263,7 @@ check_body "bob's membership row really says ban"     '"membership":"ban"'
 req GET "/rooms/$SECRET/state/m.room.member/$B" "$T_ALICE" > /dev/null
 check_body "...in secret-plans as well"               '"membership":"ban"'
 
-LOGIN_BOB='{"type":"m.login.password","identifier":{"type":"m.id.user","user":"bob"},"password":"pw-bob-12345"}'
+LOGIN_BOB='{"type":"m.login.password","identifier":{"type":"m.id.user","user":"bob"},"password":"e2e-correct-horse-7"}'
 check "a state-PUT ban revoked bob's session"  401 "$(req GET "/joined_rooms" "$T_BOB")"
 check "...and he cannot log back in"           403 "$(req POST "/login" "" "$LOGIN_BOB")"
 check_body "...because he is server-banned"           "banned from this server"

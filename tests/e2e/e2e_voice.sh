@@ -128,7 +128,7 @@ print(v if isinstance(v, str) else json.dumps(v))" "$2"
 }
 
 reg() { curl -s -X POST "$V3/register" -H 'Content-Type: application/json' \
-        -d "{\"username\":\"$1\",\"password\":\"password123\"}"; }
+        -d "{\"username\":\"$1\",\"password\":\"e2e-correct-horse-7\"}"; }
 
 # The voice roster as the server reports it, flattened to a stable, comparable
 # string: "user=active/muted" per member, sorted.

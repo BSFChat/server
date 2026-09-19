@@ -684,6 +684,11 @@ TEST(ServerBanSessions, BanRevokesTheRefreshTokenToo) {
     // job. Mutation testing found exactly that: replacing the DELETE with an
     // expiry UPDATE left this test green until these two lines were swapped.
     EXPECT_FALSE(f.store->consume_refresh_token("victim-refresh").has_value());
+    // ...and it is gone, not merely spent: a ban deletes the row, so there is
+    // no consumed-token record either and nothing for reuse detection to
+    // revoke. Checked so that the family bookkeeping added in v19 cannot
+    // quietly turn a ban into "revoked on the next replay".
+    EXPECT_EQ(f.store->revoke_family_for_replayed_refresh_token("victim-refresh"), 0);
     EXPECT_FALSE(f.store->get_user_by_token("victim-access").has_value());
 }
 

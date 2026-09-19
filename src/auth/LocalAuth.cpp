@@ -24,9 +24,37 @@ Update the bsfchat-protocol dependency: before that change, access and refresh t
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
+#include <bsfchat/Constants.h>
+#include <bsfchat/Identifiers.h>
+
+// The single-SHA-256 storage of access tokens in this file is only sound
+// because the tokens are high-entropy: see hash_access_token() in the header.
+// They were not. generate_access_token() drew from an mt19937 seeded with one
+// 32-bit value, so every token the server ever issued was one of 2^32 strings
+// — about 1.3 core-hours to enumerate — and hashing them changed nothing about
+// that.
+//
+// The fix lives in the protocol library. This guard exists because the server
+// does not always build against the protocol checkout sitting next to it: with
+// no local copy present, CMake fetches protocol `main` from GitHub, so a green
+// build is not evidence of which version went in. Fail here instead of
+// shipping a server that issues guessable bearer tokens under a comment
+// promising 256 bits.
+#ifndef BSFCHAT_PROTOCOL_CSPRNG_IDENTIFIERS
+#error "This server requires a protocol library whose identifier generators use the CSPRNG. \
+Update the bsfchat-protocol dependency: before that change, access and refresh tokens had \
+32 bits of entropy regardless of their length."
+#endif
+
+#include <algorithm>
+#include <array>
+#include <cctype>
 #include <iomanip>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace bsfchat {
@@ -121,6 +149,103 @@ bool verify_password(const std::string& password, const std::string& stored_hash
     if (computed_hash.size() != expected_hash.size()) return false;
     return CRYPTO_memcmp(computed_hash.data(), expected_hash.data(),
                          computed_hash.size()) == 0;
+}
+
+const std::string& dummy_password_hash(int cost) {
+    static std::mutex cache_mutex;
+    static std::map<int, std::string> cache;
+
+    std::lock_guard lock(cache_mutex);
+    if (auto it = cache.find(cost); it != cache.end()) return it->second;
+
+    // Random, not a constant: a fixed string in the binary would let anyone
+    // with a copy of the server recognise the dummy hash. Nothing ever needs
+    // to verify against it, so it is discarded the moment it is hashed.
+    unsigned char noise[32];
+    if (RAND_bytes(noise, sizeof(noise)) != 1) {
+        throw std::runtime_error("Failed to generate dummy password material");
+    }
+    auto hashed = hash_password(
+        std::string(reinterpret_cast<const char*>(noise), sizeof(noise)), cost);
+    return cache.emplace(cost, std::move(hashed)).first->second;
+}
+
+std::optional<std::string> password_policy_error(const std::string& password,
+                                                 const std::string& localpart) {
+    if (password.size() < limits::kMinPasswordLength) {
+        return "Password must be at least " + std::to_string(limits::kMinPasswordLength) +
+               " characters";
+    }
+
+    const auto lower = [](std::string v) {
+        std::transform(v.begin(), v.end(), v.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return v;
+    };
+    const std::string pw = lower(password);
+    const std::string user = lower(localpart);
+
+    // Anything built around the username. The length floor is what keeps this
+    // proportionate: a two-letter username would otherwise veto a large share
+    // of perfectly good passwords for containing those two letters in a row.
+    if (!user.empty() && pw == user) {
+        return "Password must not be your username";
+    }
+    if (user.size() >= 4 && pw.find(user) != std::string::npos) {
+        return "Password must not contain your username";
+    }
+
+    // The head of every credential-stuffing list, filtered to entries that can
+    // actually reach this check — the 8-character minimum has already refused
+    // "123456", "qwerty" and the rest of the short classics, so listing them
+    // would be decoration. Kept deliberately short: past the first few hundred
+    // guesses the lockout and rate limits are the control that matters, and a
+    // longer list here buys less than it costs to carry.
+    static constexpr std::array<std::string_view, 40> kCommon{{
+        "password", "password1", "password123", "passw0rd", "p@ssw0rd", "password!",
+        "12345678", "123456789", "1234567890", "87654321", "11111111", "00000000",
+        "qwerty123", "qwertyui", "qwertyuiop", "1q2w3e4r", "1qaz2wsx", "zaq12wsx",
+        "asdfghjk", "asdfghjkl", "abcd1234", "1234abcd", "aaaaaaaa", "abc12345",
+        "iloveyou", "princess", "sunshine", "football", "baseball", "superman",
+        "starwars", "whatever", "computer", "trustno1", "letmein1", "welcome1",
+        "admin123", "changeme", "monkey123", "dragon123",
+    }};
+    if (std::find(kCommon.begin(), kCommon.end(), pw) != kCommon.end()) {
+        return "That password is one of the most common in use; choose another";
+    }
+
+    // The product's own name is to this server what "password" is to the
+    // world: the first thing a human reaches for and the first thing an
+    // attacker tries against THIS deployment specifically.
+    if (pw.find("bsfchat") != std::string::npos || pw.find("gamechat") != std::string::npos) {
+        return "Password must not contain the name of this service";
+    }
+
+    return std::nullopt;
+}
+
+std::optional<std::string> device_id_error(const std::string& device_id) {
+    // Empty is not an error at the call sites — they substitute a generated id
+    // — but an explicitly empty string is a client bug worth naming rather
+    // than silently treating as "not supplied".
+    if (device_id.empty()) {
+        return "device_id must not be empty";
+    }
+    if (device_id.size() > kMaxDeviceIdLength) {
+        return "device_id must be at most " + std::to_string(kMaxDeviceIdLength) +
+               " characters";
+    }
+    for (unsigned char c : device_id) {
+        // Control characters only. NOT a charset allowlist: a device id is an
+        // opaque client-chosen string, and a client that already persisted one
+        // containing, say, a non-ASCII character would be unable to log in at
+        // all if this were stricter. Newlines are the part that matters — they
+        // are what let a device id forge additional lines in the server log.
+        if (c < 0x20 || c == 0x7F) {
+            return "device_id must not contain control characters";
+        }
+    }
+    return std::nullopt;
 }
 
 std::string hash_access_token(const std::string& token) {

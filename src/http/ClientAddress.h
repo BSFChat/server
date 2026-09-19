@@ -24,6 +24,16 @@ struct IpNetwork {
     [[nodiscard]] bool contains(const std::array<uint8_t, 16>& ip) const;
 };
 
+// True when EVERY address in `net` lies inside loopback or one of the private
+// ranges — i.e. when it is a plausible entry for auth.trusted_proxies.
+//
+// Trusting a network is trusting its X-Forwarded-For, so a trusted network
+// that reaches into public address space is an off switch for every
+// per-address limit on the server: anything inside it picks its own identity
+// once per request. Containment, not overlap: "0.0.0.0/0" and "10.0.0.0/4"
+// both include private space and neither is safe to trust.
+bool is_private_or_loopback_network(const IpNetwork& net);
+
 // Works out which address a request should be attributed to for rate limiting.
 //
 // This server is documented as running behind a reverse proxy, where the

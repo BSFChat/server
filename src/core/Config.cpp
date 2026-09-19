@@ -83,6 +83,19 @@ Config Config::load(const std::string& path) {
             }
         }
 
+        // [limits] — per-account limits on writes to a room.
+        if (auto limits_tbl = tbl["limits"].as_table()) {
+            auto& sl = cfg.send_limits;
+            if (auto v = limits_tbl->get("enabled")) sl.enabled = v->value_or(sl.enabled);
+            if (auto v = limits_tbl->get("send_limit")) sl.send_limit = v->value_or(sl.send_limit);
+            if (auto v = limits_tbl->get("redact_limit"))
+                sl.redact_limit = v->value_or(sl.redact_limit);
+            if (auto v = limits_tbl->get("media_upload_limit"))
+                sl.media_upload_limit = v->value_or(sl.media_upload_limit);
+            if (auto v = limits_tbl->get("window_seconds"))
+                sl.window_seconds = v->value_or(sl.window_seconds);
+        }
+
         // [tls]
         if (auto tls = tbl["tls"].as_table()) {
             if (auto v = tls->get("enabled")) cfg.tls_enabled = v->value_or(cfg.tls_enabled);
@@ -289,6 +302,40 @@ void Config::validate(Config& cfg) {
             log->warn("auth.max_failures = {} locks an account out after fewer mistakes than "
                       "people routinely make; raising to 3.", lim.max_failures);
             lim.max_failures = 3;
+        }
+
+        // A trusted_proxies entry that covers public address space is not a
+        // limit setting, it is an off switch for every per-address limit on
+        // the server: anything inside it can pick its own X-Forwarded-For and
+        // therefore its own identity, once per request. Loud, because the
+        // symptom — limits silently never firing for the attacker who matters
+        // — looks exactly like limits working.
+        //
+        // Warned rather than refused: an operator may genuinely have a proxy
+        // on a public address, and failing startup on an upgrade over a
+        // configuration that was working would be its own outage.
+        for (const auto& entry : lim.trusted_proxies) {
+            auto net = IpNetwork::parse(entry);
+            if (!net) continue; // already thrown on above
+            if (!is_private_or_loopback_network(*net)) {
+                log->warn("auth.trusted_proxies contains '{}', which covers addresses outside "
+                          "loopback and the private ranges. Every client that can reach this "
+                          "server from inside it can choose its own X-Forwarded-For, and so its "
+                          "own rate-limit identity — the per-address limits do not apply to it "
+                          "at all. List only the proxies you operate.", entry);
+            }
+        }
+    }
+
+    {
+        auto& sl = cfg.send_limits;
+        // Same rule as the auth block: a zero COUNT means "no limit" and is
+        // honoured, a zero window would make every count meaningless.
+        if (sl.window_seconds < 1) sl.window_seconds = 1;
+        if (!sl.enabled) {
+            log->warn("limits.enabled is false — there is no server-side ceiling on how fast an "
+                      "account can post, delete or upload. A looping client or a buggy bot can "
+                      "flood a channel until someone notices.");
         }
     }
 
