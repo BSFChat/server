@@ -104,7 +104,7 @@ void Server::register_routes() {
     auto room_handler = std::make_shared<RoomHandler>(*store_, *sync_engine_, config_);
     auto event_handler =
         std::make_shared<EventHandler>(*store_, *sync_engine_, config_, push_service_.get());
-    auto sync_handler = std::make_shared<SyncHandler>(*store_, *sync_engine_);
+    auto sync_handler = std::make_shared<SyncHandler>(*store_, *sync_engine_, config_);
 
     // Auth routes
     svr.Get(std::string(api_path::kVersions),

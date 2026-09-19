@@ -27,6 +27,7 @@ add_executable(server_tests
     test_search.cpp
     test_audit.cpp
     test_permission_scope.cpp
+    test_room_visibility.cpp
     test_server_ban.cpp
     test_version.cpp
 )
@@ -59,6 +60,7 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/http/ClientAddress.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/LocalAuth.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/Permissions.cpp
+    ${CMAKE_SOURCE_DIR}/src/auth/RoomVisibility.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/PowerLevels.cpp
     ${CMAKE_SOURCE_DIR}/src/store/SqliteStore.cpp
     ${CMAKE_SOURCE_DIR}/src/store/Migrations.cpp

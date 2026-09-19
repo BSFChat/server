@@ -1,16 +1,21 @@
 #include "api/SyncHandler.h"
 #include "api/TypingHandler.h"
 #include "api/PresenceHandler.h"
+#include "auth/Permissions.h"
+#include "auth/RoomVisibility.h"
+#include "core/Config.h"
 #include "http/Middleware.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
 
 #include <algorithm>
+#include <optional>
 #include <set>
 
 #include <bsfchat/Constants.h>
 #include <bsfchat/ErrorCodes.h>
 #include <bsfchat/MatrixTypes.h>
+#include <bsfchat/Permissions.h>
 
 #include <nlohmann/json.hpp>
 
@@ -18,8 +23,8 @@ namespace bsfchat {
 
 using json = nlohmann::json;
 
-SyncHandler::SyncHandler(SqliteStore& store, SyncEngine& sync_engine)
-    : store_(store), sync_engine_(sync_engine) {}
+SyncHandler::SyncHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config)
+    : store_(store), sync_engine_(sync_engine), config_(config) {}
 
 void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& res) {
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
@@ -48,15 +53,47 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
 
     // Joined-room list is fetched once and shared by the typing and presence
     // passes below — this used to be queried twice per poll.
+    //
+    // VISIBLE joined rooms, not joined rooms. SyncEngine filters
+    // response.rooms.join by VIEW_CHANNEL, and the typing pass below then adds
+    // rooms back into that same map — so an unfiltered list here handed the
+    // caller the room id of every private channel they are denied, the moment
+    // anybody typed in one, undoing the filter the sync itself had just
+    // applied. The presence pass carries no room ids, but there is no reason to
+    // derive who the caller "shares a room with" from rooms they cannot see.
+    //
+    // One engine spans both passes and the whole list; see
+    // auth/RoomVisibility.h for why per-room construction is the expensive way
+    // to write this.
     std::vector<std::string> joined_rooms;
+    std::optional<PermissionsEngine> perms;
     if (typing_handler_ || presence_handler_) {
-        joined_rooms = store_.get_joined_rooms(*user_id);
+        perms.emplace(store_, config_);
+        joined_rooms = visible_joined_rooms(store_, *perms, *user_id);
     }
 
     // Inject typing indicators into joined rooms
     if (typing_handler_) {
         // Add typing info to rooms already in the response
         for (auto& [room_id, joined] : response.rooms.join) {
+            // Being IN rooms.join is not the same as being allowed to see what
+            // happens inside. SyncEngine exempts categories from VIEW_CHANNEL
+            // so the sidebar can still render the container node, so a room the
+            // caller is denied can legitimately be sitting in this map — and a
+            // denied category is meant to be a name-and-ordering stub, nothing
+            // more. Attaching "X is typing" to it hands the caller live
+            // activity from inside a room whose contents are the thing being
+            // withheld, which is precisely what the stub exists to prevent.
+            //
+            // kViewChannel is asked directly rather than through can_view_room,
+            // for the reason that helper's own header gives: its category
+            // exemption is a rule about LISTING a room, not about acting or
+            // observing inside one, and a typing indicator is activity inside
+            // one. Same gate and same shape as PUT /rooms/{id}/typing/{user},
+            // which refuses to let a denied user publish the indicator in the
+            // first place; this is the read half of that write.
+            if (!perms->can(*user_id, room_id, permission::kViewChannel)) continue;
+
             auto typing_users = typing_handler_->get_typing_users(room_id);
             if (!typing_users.empty()) {
                 RoomEvent typing_event;
