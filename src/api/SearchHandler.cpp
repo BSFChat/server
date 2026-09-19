@@ -194,7 +194,12 @@ void SearchHandler::handle_search(const httplib::Request& req, httplib::Response
             // some input ever does slip through, the honest response is "that
             // query was not usable", not a silent empty result set that looks
             // like "nothing matched".
-            get_logger()->warn("Search query failed for {}: {}", *user_id, e.what());
+            // log_safe on the exception text: a SQLite error can quote the
+            // offending expression back, and the offending expression is the
+            // caller's search terms. Same sweep as the auth lockout key and the
+            // rejected pusher URL — see docs/audit-requests-2026-09.md 17.
+            get_logger()->warn("Search query failed for {}: {}", log_safe(*user_id),
+                               log_safe(e.what(), 256));
             return send_error(res, 400, MatrixError::invalid_param("Search term is not usable"));
         }
         count = found.total;

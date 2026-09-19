@@ -39,6 +39,14 @@ public:
         kSend,        // PUT /rooms/{id}/send/{type}/{txn}
         kRedact,      // PUT /rooms/{id}/redact/{event}/{txn}
         kMediaUpload, // POST /_matrix/media/v3/upload
+        // PUT /profile/{me}/displayname, /avatar_url, /nickname.
+        //
+        // ONE bucket for all three on purpose. They are not three costs, they
+        // are three doors onto one: each calls broadcastMemberUpdate, which
+        // re-emits an m.room.member event in every channel the account is
+        // joined to and then wakes every parked /sync on the server. Separate
+        // buckets would just triple the ceiling on the same amplifier.
+        kProfile,
     };
 
     SendLimiter(const SendLimitsConfig& config, LimiterClock clock = limiter_steady_now_ms);
@@ -60,6 +68,7 @@ private:
     RateLimiter send_;
     RateLimiter redact_;
     RateLimiter media_upload_;
+    RateLimiter profile_;
 };
 
 } // namespace bsfchat

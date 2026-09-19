@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <chrono>
 #include <regex>
+#include <string>
+#include <vector>
 
 namespace bsfchat {
 
@@ -41,6 +43,47 @@ bool body_contains_url(const std::string& body) {
 
 bool body_mentions_everyone(const std::string& body) {
     return body.find("@everyone") != std::string::npos || body.find("@here") != std::string::npos;
+}
+
+// Every field of an m.room.message whose text a client will put in front of a
+// human, gathered once.
+//
+// EMBED_LINKS and MENTION_EVERYONE used to be tested against `body` alone, so
+// the permission was decorative: `formatted_body` is the HTML a client actually
+// renders, and
+//
+//     {"body": "see attached",
+//      "format": "org.matrix.custom.html",
+//      "formatted_body": "<a href=\"https://phish.example/login\">host login</a>"}
+//
+// has no URL in `body`, sails past the gate, and renders as a live link with a
+// preview card. `m.new_content` is the same hole one level down: an edit's
+// replacement text was never examined at all, so a permitted message could be
+// rewritten into a forbidden one afterwards.
+//
+// Collected rather than checked inline so a text field added later is caught by
+// changing one list, which is the part that kept going wrong.
+std::vector<std::string> renderable_text(const json& content) {
+    std::vector<std::string> out;
+    const auto take = [&out](const json& obj, const char* key) {
+        if (!obj.is_object()) return;
+        auto it = obj.find(key);
+        if (it == obj.end() || !it->is_string()) return;
+        auto value = it->get<std::string>();
+        if (!value.empty()) out.push_back(std::move(value));
+    };
+    take(content, "body");
+    take(content, "formatted_body");
+    if (auto it = content.find("m.new_content"); it != content.end()) {
+        take(*it, "body");
+        take(*it, "formatted_body");
+    }
+    return out;
+}
+
+bool any_text(const std::vector<std::string>& fields, bool (*pred)(const std::string&)) {
+    return std::any_of(fields.begin(), fields.end(),
+                       [pred](const std::string& f) { return pred(f); });
 }
 
 void send_error(httplib::Response& res, int status, const MatrixError& err) {
@@ -394,17 +437,21 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
 
     if (evt_type == std::string(event_type::kRoomMessage)) {
         const std::string msgtype = content.value("msgtype", "m.text");
-        const std::string body = content.value("body", "");
         const bool has_attachment = msgtype != std::string(msg_type::kText) && msgtype != std::string(msg_type::kEmote) && msgtype != std::string(msg_type::kNotice);
 
         if (has_attachment && !permission::has(user_perms, permission::kAttachFiles)) {
             return send_error(res, 403, MatrixError::forbidden("You don't have permission to attach files here"));
         }
-        if (!body.empty() && body_contains_url(body) &&
+
+        // Both content gates run over EVERY text-bearing field, not just `body`
+        // — see renderable_text() for what that list is and what walked past the
+        // old one-field check.
+        const auto text_fields = renderable_text(content);
+        if (any_text(text_fields, body_contains_url) &&
             !permission::has(user_perms, permission::kEmbedLinks)) {
             return send_error(res, 403, MatrixError::forbidden("You don't have permission to post links here"));
         }
-        if (!body.empty() && body_mentions_everyone(body) &&
+        if (any_text(text_fields, body_mentions_everyone) &&
             !permission::has(user_perms, permission::kMentionEveryone)) {
             return send_error(res, 403, MatrixError::forbidden("You don't have permission to mention everyone"));
         }
@@ -429,11 +476,35 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
                     return send_error(res, 400, MatrixError::bad_json(
                         "Edit missing target event_id"));
                 }
-                auto target = store_.get_event_by_id(target_id);
-                if (!target) {
+                // ONE answer for "there is no such message here", covering all
+                // three ways that can be true: no such event anywhere, an event
+                // that exists in another room, and an event that has been
+                // redacted. Distinguishing them made this endpoint a global
+                // event-existence oracle — `get_event_by_id` is a bare
+                // primary-key lookup with no room scoping, so a member could
+                // replay ids cached from a channel they have since been removed
+                // from and read "still exists" / "deleted" off the status code,
+                // from a DM of their own. Event ids are CSPRNG-random, so this
+                // is not blind enumeration; it is a live feed of moderation
+                // activity to someone who kept their client's cache.
+                //
+                // This is the answer handle_redact already gives (one shared 404
+                // for missing-or-elsewhere) and the one the reaction path above
+                // gives, with the same comment. The edit path was the last copy
+                // of the old shape.
+                //
+                // The redacted case is checked HERE rather than after the sender
+                // and type tests below, because reaching those means answering
+                // questions about an event, and a redacted event is one the
+                // caller must be told nothing about beyond "not found".
+                const auto not_here = [&] {
                     return send_error(res, 404, MatrixError::not_found(
                         "Target message not found"));
-                }
+                };
+
+                auto target = store_.get_event_by_id(target_id);
+                if (!target || target->room_id != room_id) return not_here();
+                if (store_.is_event_redacted(target_id)) return not_here();
 
                 // An edit aimed at a previous edit resolves to the original.
                 // Matrix says clients must always target the original, but a
@@ -441,6 +512,16 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
                 // pointer to an event nothing resolves through, making the
                 // second edit invisible. Bounded so a malformed cycle can't
                 // spin here.
+                //
+                // Every hop is confined to THIS room, and the room check above
+                // now runs before the loop rather than after it. Previously the
+                // loop followed m.relates_to pointers through the same unscoped
+                // lookup, so it walked into another room's event to find a
+                // parent and only then discovered it had left — reading across a
+                // boundary it should not have known about, and reporting the
+                // crossing when it failed. A pointer that leaves the room is
+                // treated as the end of the chain: the event we already hold is
+                // in this room and is the caller's to edit.
                 for (int hops = 0; hops < 10; ++hops) {
                     if (!target->content.data.is_object()) break;
                     auto it = target->content.data.find("m.relates_to");
@@ -449,15 +530,16 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
                     auto parent_id = it->value("event_id", "");
                     if (parent_id.empty() || parent_id == target->event_id) break;
                     auto parent = store_.get_event_by_id(parent_id);
-                    if (!parent) break;
+                    if (!parent || parent->room_id != room_id) break;
                     target = std::move(parent);
                     target_id = target->event_id;
                 }
 
-                if (target->room_id != room_id) {
-                    return send_error(res, 400, MatrixError::bad_json(
-                        "Edit target is in a different room"));
-                }
+                // Re-checked after resolution: a chain can only end on an event
+                // in this room now, but the redaction state of the ORIGINAL is a
+                // separate fact from that of the replacement we started at.
+                if (store_.is_event_redacted(target_id)) return not_here();
+
                 if (target->sender != *user_id) {
                     return send_error(res, 403, MatrixError::forbidden(
                         "You can only edit your own messages"));
@@ -466,11 +548,11 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
                     return send_error(res, 400, MatrixError::bad_json(
                         "Can only edit message events"));
                 }
-                // A deleted message must not be editable back into existence.
-                if (store_.is_event_redacted(target_id)) {
-                    return send_error(res, 404, MatrixError::not_found(
-                        "Target message has been deleted"));
-                }
+                // (The "target message has been deleted" 404 that used to sit
+                // here has moved up, above the sender and type tests. A deleted
+                // message must still not be editable back into existence; it
+                // must also not be distinguishable from one that was never
+                // there, which is why it now shares the not_here() answer.)
                 edit_target = target_id;
             }
         }
