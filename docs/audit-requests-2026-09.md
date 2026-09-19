@@ -30,14 +30,14 @@ Where I disagree with either, it is called out explicitly under
 | 2 | `GET /profile/{user}` ×4 | Entirely unauthenticated and unrate-limited: whole-user-base enumeration plus display names, avatars, nicknames | **High** | Must fix |
 | 3 | `/sync`, `/rooms/{id}/state`, `/state/{type}`, `/members` | The category exemption is an unbounded VIEW_CHANNEL bypass, flippable by MANAGE_CHANNELS | **High** | Must fix |
 | 4 | `POST /rooms/{id}/voice/livekit_rekey` | Key generation is in-memory only; a restart reverts the media key and re-admits every departed member | **High** | Must fix |
-| 5 | `PUT /rooms/{id}/send/…` (edit path) | Global event-existence oracle: 404 / 400 / 403 distinguish "no such event" from "exists elsewhere" | Medium | Should fix |
-| 6 | `POST /rooms/{id}/join` | Kick is unenforceable — the target rejoins any public-join_rule channel immediately | Medium | Should fix |
-| 7 | `PUT /profile/{me}/displayname`, `/avatar_url`, `/nickname` | Unlimited (channels × 1) event amplification per request | Medium | Should fix |
-| 8 | `PUT /rooms/{id}/send/…` | EMBED_LINKS is checked against `body` only; `formatted_body` bypasses it | Medium | Should fix |
-| 9 | `GET /_matrix/client/versions` | Unauthenticated exact version **and git revision** — tells an attacker which hosts are unpatched | Medium | Should fix |
-| 10 | `GET /voip/turnServer` | In static-credential mode, hands the shared config TURN password to every authenticated account | Medium | Should fix |
-| 11 | `PUT /rooms/{id}/state/{type}` | Unknown state event types are accepted with MANAGE_CHANNELS as the fallback gate (allow-by-default) | Low | Should fix |
-| 17 | `POST /pushers/set` | The rejected gateway URL is logged verbatim *after* the check that rejected it for containing control characters → server-log injection | Medium | Should fix |
+| 5 | `PUT /rooms/{id}/send/…` (edit path) | Global event-existence oracle: 404 / 400 / 403 distinguish "no such event" from "exists elsewhere" | Medium | **Fixed** |
+| 6 | `POST /rooms/{id}/join` | Kick is unenforceable — the target rejoins any public-join_rule channel immediately | Medium | **Open — needs a product decision** |
+| 7 | `PUT /profile/{me}/displayname`, `/avatar_url`, `/nickname` | Unlimited (channels × 1) event amplification per request | Medium | **Fixed** |
+| 8 | `PUT /rooms/{id}/send/…` | EMBED_LINKS is checked against `body` only; `formatted_body` bypasses it | Medium | **Fixed** |
+| 9 | `GET /_matrix/client/versions` | Unauthenticated exact version **and git revision** — tells an attacker which hosts are unpatched | Medium | **Fixed** |
+| 10 | `GET /voip/turnServer` | In static-credential mode, hands the shared config TURN password to every authenticated account | Medium | **Partly fixed — startup warning; the mode itself cannot be made safe** |
+| 11 | `PUT /rooms/{id}/state/{type}` | Unknown state event types are accepted with MANAGE_CHANNELS as the fallback gate (allow-by-default) | Low | **Fixed** |
+| 17 | `POST /pushers/set` | The rejected gateway URL is logged verbatim *after* the check that rejected it for containing control characters → server-log injection | Medium | **Already fixed on `main`; the sweep it asked for found a worse one — see 20** |
 | 12 | `POST /bots/{id}/token` (`feat/bots`) | No rank and no owner check — a delegated MANAGE_BOTS role extracts a permanent token for an Administrator bot | **High** (unmerged) | Must fix before merge |
 | 13 | `GET /bsfchat/bots` (`feat/bots`) | Returns every operator's bots: `owner_id`, `created_at`, `last_seen_at` | Low (unmerged) | Noted |
 | 14 | `POST /pushers/set` | `append:false` deletes another account's pusher for a known pushkey | Low | Noted |
@@ -45,9 +45,10 @@ Where I disagree with either, it is called out explicitly under
 | 16 | `PUT /rooms/{id}/state/bsfchat.channel.permissions` | No rank check — a low-ranked MANAGE_ROLES holder can lock a higher-ranked non-admin moderator out of a channel | Low | Noted |
 | 18 | `PUT /voice/state`, `/typing/{u}`, `/presence/{u}/status`, `/notify_level`, `/createRoom`, `/category` | Unguarded nlohmann type conversions → bare 500. No disclosure; robustness only | Low | Noted |
 | 19 | client `bsfchat.log` | libdatachannel's own log stream is mirrored to disk, so ICE candidate lines put the user's LAN and public IP in a plaintext file | Low | Noted |
+| 20 | `POST /_matrix/client/v3/login` | **Unauthenticated** server-log forgery: the lockout line logs the submitted login identifier verbatim | Medium | **Fixed** (found by 17's sweep) |
 
-19 findings. Four must-fix before the RC (1–4), one must-fix before `feat/bots`
-merges (12).
+20 findings. Four must-fix before the RC (1–4), one must-fix before `feat/bots`
+merges (12). Finding 20 was found by the sweep finding 17 asked for.
 
 ---
 
@@ -375,6 +376,27 @@ constrain each hop to the same room.
 `handle_redact` gets this right already (`EventHandler.cpp:513-520`: `if (!target
 || target->room_id != room_id)` → one shared 404) and is the model to copy.
 
+**Resolved** (`harden/audit-request-path`, `EventHandler.cpp`).
+
+Missing, elsewhere, and redacted now share one `404 "Target message not found"`,
+produced by a single `not_here()` closure so the three cannot drift apart again.
+The room check moved above the chain-resolution loop, and every hop is confined
+to the room: a `m.relates_to` pointer that leaves it ends the chain instead of
+being followed, so the loop no longer reads an event in a room the caller cannot
+see. The redaction test moved up with it, above the sender and type checks —
+answering "that is not a message" about a redacted event is still an answer.
+
+The in-room refusals keep their own wording on purpose. Inside a channel the
+caller can read, "you can only edit your own messages" (403) and "can only edit
+message events" (400) disclose nothing they cannot already see in the timeline,
+and collapsing them to 404 would make an ordinary client bug unexplainable. The
+line is "may this caller see this room", not "is this refusal a refusal".
+
+Four tests in `tests/test_request_hardening.cpp`. The one that bites asserts the
+**equality** of the answers for a real event elsewhere and an id that exists
+nowhere: a test that only asserted "cross-room edits are refused" passed against
+the vulnerable code, because the refusal *was* the disclosure.
+
 ---
 
 ### 6. Kick is unenforceable — the target rejoins immediately — Medium
@@ -416,6 +438,64 @@ Note this is one more argument for that document's §"Recommendation": under
 `join_rule: "invite"` for private channels, `/join` would refuse and the problem
 disappears for the channels where it matters.
 
+**Open — analysed, not fixed; it needs a product decision.** Every workable fix
+changes what a kick MEANS to an operator, and there is no version of this that is
+purely a bug fix.
+
+**What has already changed under the finding.** The finding says "`kick_intent()`
+sets `membership='leave'` and nothing else". That is still true, but the merge
+train has closed the other half of the problem: `AutoJoin::join_user_to_room` now
+returns early when *any* membership row exists, with a comment saying exactly why
+("a kick was silently undone by the next restart or deploy"). So a kick already
+survives a restart. `POST /join` is now the only way back in, which makes this a
+single-endpoint decision rather than a data-model one.
+
+**Why the finding's own two options are both wrong for this codebase.**
+
+*A cooldown* (its "minimal") is the weaker of the two and was weakened further by
+the auto-join fix: a kick is now permanent until someone acts, so putting a timer
+on `/join` converts a permanent removal into a delayed re-entry. It makes the
+moderation ladder worse, not better.
+
+*A per-user deny override* (its "correct") does fit the data model — privacy here
+IS the override set — but it is a channel ban wearing a kick's name. It writes
+permission state from a moderation endpoint, so the kicked user's id becomes
+permanent, readable channel state visible to anyone who can read the channel's
+overrides; it survives a later re-invite, so re-admitting someone silently fails
+until a second, different action is taken; and it makes kick and ban differ only
+in scope, which is precisely the middle rung the finding is trying to create.
+
+**The option the finding does not consider, and the one I would ship.** Refuse
+`/join` when the caller's current `m.room.member` state event says `leave` **and
+its sender is somebody else**. That is the definition of "was kicked", it is
+already recorded, and it needs no schema change and no migration:
+`apply_membership_moderation` emits the kick event with `sender = actor`, while
+`handle_leave` and the self-membership state write both emit with
+`sender = the user`. So a voluntary leave stays rejoinable — which matters,
+because in this model leaving a channel is how you hide one you do not care about
+— and a removal does not.
+
+**What needs deciding before it can land, and why I stopped.** The re-entry path.
+Under this rule a kicked user returns when somebody invites them, via
+`POST /rooms/{id}/invite` (MANAGE_CHANNELS), which writes `membership: invite` and
+lets the next `/join` through. The server side of that works today. The question
+is the client: a kicked user is no longer in the member list, so a moderator has
+nowhere obvious to click to reverse a kick, and they would need the raw mxid. So
+the choice is between
+
+1. ship the server rule now and accept that un-kicking is mxid-only until the
+   client grows an affordance,
+2. ship it together with a client change, or
+3. leave kick unenforceable for this RC and fold it into the `join_rule: "invite"`
+   model change that `docs/membership-vs-visibility.md` §Recommendation already
+   describes — which is where this problem actually disappears, and which that
+   document is explicit should not start in the RC.
+
+That is a product call about a moderation workflow, not a security judgement, so
+it is not mine to make quietly. Nothing in this branch touches `/join`.
+
+---
+
 ---
 
 ### 7. Profile writes are an unmetered amplifier — Medium
@@ -444,6 +524,24 @@ an identity string and an enum, so this is one enum entry and one config value.
 Something like 10/minute is far above human use. Separately, consider coalescing:
 `broadcastMemberUpdate` could debounce per user, since the member events are
 idempotent rewrites.
+
+**Resolved** (`harden/audit-request-path`).
+
+A `kProfile` bucket on `SendLimiter`, `[limits] profile_limit = 10` per minute,
+charged by all three endpoints. One bucket, not three: they are three doors onto
+one amplifier, so separate budgets would only triple the ceiling. It is charged
+against the account **being changed** rather than the caller, because the fan-out
+is over that account's channels — otherwise a MANAGE_NICKNAMES holder spends one
+budget while driving a different amplifier on every request.
+
+Charged after validation and immediately before `broadcastMemberUpdate`, so a
+malformed request that was never going to emit anything costs nothing.
+
+The debounce the finding also suggested is **not** implemented. The rate limit
+bounds the amplifier at its source; coalescing would add per-user timer state to
+a handler that currently has none, to save work that is now capped at ten
+requests a minute. Worth revisiting only if profile churn ever shows up in a
+sync-latency profile.
 
 ---
 
@@ -487,6 +585,18 @@ all of them, so a new field cannot be forgotten. The function's own comment
 already says it is deliberately permissive; the problem is not the matcher, it is
 what is fed to it.
 
+**Resolved** (`harden/audit-request-path`, `EventHandler.cpp`).
+
+`renderable_text(content)` collects every text-bearing field once — `body`,
+`formatted_body`, `m.new_content.body`, `m.new_content.formatted_body` — and both
+gates run over the collection. The finding's "better" option, because the matcher
+was never the problem: the problem was that adding a field to the wire format did
+not add it to the check.
+
+MENTION_EVERYONE is extended the same way, even though the finding rates it lower.
+It is the same line of code and the same list; leaving one of the two reading
+`body` alone would have been re-creating the defect next to its fix.
+
 ---
 
 ### 9. `/versions` publishes the exact build and git revision — Medium
@@ -514,6 +624,40 @@ where upgrades are manual and staggered, that is a meaningful force multiplier.
 `bsfchat.revision` and `bsfchat.channel` behind `authenticate()` — either onto
 `/whoami`, or return them from `/versions` only when a valid token is presented.
 An operator debugging their own server has a token; a scanner does not.
+
+**Resolved** (`harden/audit-request-path`, `AuthHandler::handle_versions`) — and
+this one is worth showing the working for, because the finding as written proposes
+the wrong half.
+
+`bsfchat.version`, `bsfchat.revision` and `bsfchat.channel` are now returned only
+to a caller presenting a valid access token. `versions` and `unstable_features`
+are unchanged and stay unauthenticated. An unauthenticated caller gets a 200 with
+those keys simply absent — never a 401, because this endpoint is how a client
+decides an address is a homeserver at all.
+
+**Why not "authenticate the revision, keep the version".** That was the option
+offered, and it does not survive contact with the threat model. The fix an
+attacker is looking for ships in a release, so `bsfchat.version` alone answers
+"has this host taken it" completely; the revision only adds precision *between*
+releases. Publishing the version while hiding the revision is the theatre
+version of this fix. It is both keys or neither.
+
+**Why neither, rather than leaving it.** The support argument is real but it is
+already satisfied twice over. `docs/release-channels.md` lists three ways to read
+the build, and two of them — the startup log line and the OCI image labels — need
+no HTTP at all and no token. An operator debugging their own server has a token
+for the third. A scanner has none of the three. So the cost of moving these keys
+is close to zero and the benefit is that fleet-wide "which hosts are unpatched"
+stops being a single unauthenticated GET.
+
+**What was checked before moving them.** The desktop client reads `/versions` in
+exactly one place, `ServerDiscovery::looksLikeHomeserver`, and asks only whether
+`versions` is an array — which is why that key could not move. Nothing in
+`client/` or `web/` reads the three vendor keys. All four registered e2e scripts
+use `/versions` purely as a liveness probe.
+
+`docs/release-channels.md` is updated to show the curl with an `Authorization`
+header and to point at the two offline routes.
 
 ---
 
@@ -547,6 +691,32 @@ when `voice.enabled` is true and `turn_secret` is empty while
 `turn_password` is set. The REST-API ephemeral mode is the only safe one for a
 multi-user server; the static branch should be treated as a single-user
 development affordance and say so.
+
+**Partly resolved** (`harden/audit-request-path`), and the honest description is
+that the handler cannot fix this.
+
+A credential shared between every account is shared however carefully it is handed
+over; there is no version of `handle_turn_server` that makes the static branch
+safe, because the secret in the config is a single value with no per-user
+component to bind to. So what landed is the recognition and the warning:
+`turn_credentials_are_shared(const VoiceConfig&)` in `core/Config.h` names the
+state — voice enabled, no `turn_secret`, a `turn_password` set — and
+`Config::validate` warns loudly on every start, naming the consequence (no expiry,
+no revocation, a banned account keeps a working relay credential, an open proxy on
+the operator's bandwidth) and the fix (coturn `use-auth-secret` plus
+`voice.turn_secret`). No secret is logged. `config/bsfchat-server.example.toml`
+now marks the static pair single-user-development-only.
+
+**Warned, not refused, deliberately.** The finding offers refusing to start.
+`deploy/config/server.toml.template` ships `turn_secret`, so a deployment in the
+static mode was hand-configured — but it is still somebody's working voice, and
+turning a security warning into a failed start on upgrade is the worse outcome for
+a self-hoster who pulls a patch release. If we would rather fail closed, it is one
+line here; it needs a deliberate decision and a release note, not a quiet flip.
+
+Four tests pin the predicate across the four mode combinations, so the condition
+the warning is built on cannot drift away from the branch
+`handle_turn_server` actually takes.
 
 ---
 
@@ -584,6 +754,33 @@ away, and because it will be copied.
 **Fix.** Mirror `send_gate_for`: a `state_gate_for(type)` table, unknown types
 refused with 403. Fold in the `bsfchat.room.type` scope change from finding 3
 while you are there.
+
+**Resolved** (`harden/audit-request-path`, `RoomHandler::handle_set_state`).
+
+`state_gate_for(type)` is a closed table mirroring `send_gate_for`; an unlisted
+type is refused with 403 and nothing is stored. Applied **before** the permission
+test, because ADMINISTRATOR short-circuits every flag inside
+`PermissionsEngine::compute` and a check ordered the other way round would leave
+the hole open for exactly the account that can do the most with it.
+
+Two absences are deliberate and commented as such. `m.room.member` never reaches
+the table — self-membership and moderation of another member both return above it
+— so listing it would be listing an unreachable case. `m.room.create` is refused:
+it names the room's creator, the server writes it once at creation, and no
+legitimate request rewrites it.
+
+`bsfchat.server.screenshare` keeps MANAGE_CHANNELS at **room** scope, which is
+what it has always had, so that this change is an allowlist and not a silent
+re-gating hidden inside one. Writing it down made something visible that is worth
+a look on its own: it is a server-wide setting (the maximum screen-share quality
+for the deployment) reachable through a per-channel permission, which is the same
+shape as the scope bug finding 3 fixed for `bsfchat.room.type`. Not changed here.
+See [21](#21-bsfchatserverscreenshare-is-server-wide-on-a-per-channel-permission--low).
+
+A regression test asserts that all thirteen types the shipped client PUTs through
+this route are still accepted, so the allowlist cannot quietly shrink the surface.
+
+---
 
 ### 17. The rejected push gateway URL is logged after the check that rejected it — Medium
 
@@ -635,6 +832,95 @@ which logs a stored pusher URL on the delivery path. Sweeping for other
 user-controlled strings that reach the logger unescaped would be worth an hour —
 `SearchHandler.cpp:197` and the `AuthHandler` lockout lines are the other
 candidates.
+
+---
+
+**Already fixed on `main`** before this branch started, by `security/push`
+(`7a0b7dc`). `PushHandler.cpp` wraps both the user id and the URL in `log_safe()`,
+and `gateway_url_allowed` bounds the URL length before anything else, so the
+"no length bound" half is closed too. `PushService.cpp`'s delivery-path log was
+fixed in the same commit. Nothing to do here.
+
+The finding's closing note — "sweeping for other user-controlled strings that
+reach the logger unescaped would be worth an hour" — was the valuable part. It
+found [20](#20-the-auth-lockout-line-is-an-unauthenticated-log-forgery--medium),
+which is worse than the finding that prompted it.
+
+---
+
+### 20. The auth lockout line is an unauthenticated log forgery — Medium
+
+**Endpoint:** `POST /_matrix/client/v3/login` (`src/api/AuthHandler.cpp`,
+`record_failure`). Found by the sweep finding 17 asked for; not in the original
+19.
+
+```cpp
+std::string user_failure_key(const std::string& user_id) {
+    return "user:" + user_id.substr(0, 255);   // as SUBMITTED
+}
+...
+get_logger()->warn("Auth lockout engaged for {}", key_a);
+```
+
+`user_failure_key` is keyed on the identifier **as submitted**, and correctly so
+— keying on an account that exists would make the lockout an existence oracle.
+The consequence is that it is arbitrary bytes from an unauthenticated request
+body, and `record_failure` logged it verbatim.
+
+**Exploitation path.** POST `/login` `max_failures` times with
+
+```json
+{"type":"m.login.password",
+ "identifier":{"type":"m.id.user",
+   "user":"victim\n[2026-09-19 03:11:00.000] [warning] Auth lockout engaged for ip:203.0.113.9"},
+ "password":"wrong"}
+```
+
+and the server log gains a fabricated lockout against somebody else's address,
+in the exact format `src/core/Logger.cpp` emits, with nothing distinguishing it
+from a real record. No account required.
+
+**Why this is worse than 17.** Finding 17 needed an account. This does not — it
+is reachable by anyone who can reach the login endpoint. And the record it forges
+is not an arbitrary line: it is *the auth lockout line itself*, which is the one
+`auth-hardening-2026-09.md` finding 19 pointed at when it decided not to mirror
+auth events into `AuditLog` ("they are all recorded in the server log already").
+That decision makes the server log the security-event record for authentication,
+and this was the unauthenticated write to it.
+
+**Resolved** (`harden/audit-request-path`). `log_safe()` on both keys in
+`record_failure`. Two more sites in the same sweep: the rejected OIDC subject in
+`handle_login` (the string that just failed validation — same shape as 17) and
+the SQLite exception text in `SearchHandler`, which can quote the caller's own
+search terms back.
+
+The test asserts the property rather than the escape: emit the forged identifier,
+capture the logger through a ringbuffer sink, and require that **every captured
+record contains exactly one newline**. Checking for a particular escape sequence
+would pass for whichever characters somebody happened to think of; counting
+records is the thing that has to be true. It fails against `main` with three
+records from one log call.
+
+---
+
+### 21. `bsfchat.server.screenshare` is server-wide on a per-channel permission — Low
+
+Noticed while writing the allowlist for finding 11, not fixed there.
+
+`bsfchat.server.screenshare` sets the maximum screen-share quality **for the
+deployment** — `ServerConnection::setMaxScreenShareQuality` writes it, nothing
+scopes it to a room — but `handle_set_state` gates it on MANAGE_CHANNELS
+evaluated at ROOM scope, so a per-channel override granting MANAGE_CHANNELS in
+one unimportant channel lets that user change a server-wide media setting.
+
+This is the same shape as finding 3's `bsfchat.room.type` scope bug and the same
+sentence `may_edit_role_definitions` already writes down: a per-channel grant must
+not be a lever on the server. The blast radius is much smaller — the worst outcome
+is everyone's screen shares capped or uncapped, which is visible and trivially
+reverted — which is why it is listed rather than folded into the finding-11 commit.
+Changing it means moving it into `is_server_scoped` (which also moves where the
+write lands) or giving it the `is_room_type_change` treatment (scope only), and
+deciding which is a deliberate call, not a drive-by.
 
 ---
 

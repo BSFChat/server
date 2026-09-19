@@ -92,6 +92,8 @@ Config Config::load(const std::string& path) {
                 sl.redact_limit = v->value_or(sl.redact_limit);
             if (auto v = limits_tbl->get("media_upload_limit"))
                 sl.media_upload_limit = v->value_or(sl.media_upload_limit);
+            if (auto v = limits_tbl->get("profile_limit"))
+                sl.profile_limit = v->value_or(sl.profile_limit);
             if (auto v = limits_tbl->get("window_seconds"))
                 sl.window_seconds = v->value_or(sl.window_seconds);
         }
@@ -201,6 +203,15 @@ Config Config::load(const std::string& path) {
     return cfg;
 }
 
+bool turn_credentials_are_shared(const VoiceConfig& voice) {
+    // The three conditions are exactly the branch VoiceHandler::handle_turn_server
+    // takes. `turn_secret` wins when set — that path mints a per-user,
+    // time-limited HMAC credential and is the safe mode — so the shared case is
+    // "voice is on, there is no secret, and there is a static password to give
+    // away".
+    return voice.enabled && voice.turn_secret.empty() && !voice.turn_password.empty();
+}
+
 void Config::validate(Config& cfg) {
     auto log = get_logger();
 
@@ -250,6 +261,33 @@ void Config::validate(Config& cfg) {
                 log->warn("voice.livekit.url uses ws:// (no TLS). Join tokens are bearer "
                           "credentials; use wss:// for anything but a loopback test.");
             }
+        }
+
+        // The static TURN credential pair is a single-user development
+        // affordance, and there is no way to make it anything else: with no
+        // `turn_secret`, GET /voip/turnServer hands `turn_username` and
+        // `turn_password` verbatim to EVERY authenticated account — including
+        // one that just self-registered, if registration is open. The
+        // credential has no expiry (the `ttl` in that response is a refresh
+        // hint and nothing enforces it) and no revocation short of editing this
+        // file and restarting coturn, so a banned account keeps a working relay
+        // credential: chat tokens are revoked by the ban, coturn's are not.
+        //
+        // Warned rather than refused. deploy/config/server.toml.template ships
+        // `turn_secret`, so a deployment in this state was hand-configured, and
+        // turning somebody's working voice into a failed start on upgrade is a
+        // worse outcome than telling them clearly on every boot. The message
+        // names the fix and the value to set, and no secret is logged.
+        if (turn_credentials_are_shared(cfg.voice)) {
+            log->warn("voice.turn_password is set with no voice.turn_secret, so "
+                      "/voip/turnServer hands the SAME long-lived TURN credential to every "
+                      "authenticated account on this server. It never expires and cannot be "
+                      "revoked without editing this config and restarting coturn, so a banned "
+                      "account keeps a working relay credential and your TURN server can be "
+                      "used as an open proxy billed to you. Switch coturn to "
+                      "`use-auth-secret` / `static-auth-secret` and set voice.turn_secret to "
+                      "the same value; the server then mints a per-user credential with a TTL. "
+                      "The static pair is a single-user development affordance only.");
         }
     }
 

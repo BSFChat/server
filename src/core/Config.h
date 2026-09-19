@@ -145,6 +145,13 @@ struct VoiceConfig {
 // registered on its pusher. A deployment that wants mobile push must run a push
 // gateway (sygnal or equivalent) holding the FCM/APNs credentials; none of those
 // credentials belong in this config, and none are read here.
+// True when /voip/turnServer is configured to hand every authenticated account
+// the SAME long-lived TURN credential: voice on, no `turn_secret` (so the
+// ephemeral REST-API branch is unreachable), and a static `turn_password` to
+// give out. See Config::validate for why that is a misconfiguration rather than
+// a mode, and VoiceHandler::handle_turn_server for the branch it selects.
+bool turn_credentials_are_shared(const VoiceConfig& voice);
+
 struct PushConfig {
     bool enabled = true;
     // How long the delivery worker sleeps when the queue is empty. It is also
@@ -234,6 +241,13 @@ struct SendLimitsConfig {
     // Lowest of the three: an upload carries a whole file into storage, so the
     // unit of work behind each one is orders of magnitude larger.
     int media_upload_limit = 30;
+    // Profile writes (displayname / avatar_url / nickname). Far the smallest
+    // number here because it is far the largest amplifier: ONE request re-emits
+    // an m.room.member event in every channel the account is joined to and wakes
+    // every parked /sync on the server, so on a 50-channel deployment the unit of
+    // work is 50 event inserts and a server-wide poll storm. Nobody renames
+    // themselves ten times a minute; anything that does is a loop.
+    int profile_limit = 10;
 
     int window_seconds = 60;
 };

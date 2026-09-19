@@ -125,18 +125,40 @@ It surfaces in three places:
 docker logs bsfchat-server | head -1
 #   BSFChat server 0.0.44 (rev 1a2b3c4, stable channel)
 
-# 2. the versions endpoint (additive; `versions` itself is unchanged)
-curl -s http://localhost:8448/_matrix/client/versions | jq
+# 2. the versions endpoint (additive; `versions` itself is unchanged).
+#    The three bsfchat.* keys need a valid access token — see below.
+curl -s -H "Authorization: Bearer $TOKEN" \
+  http://localhost:8448/_matrix/client/versions | jq
 #   { "versions": ["v1.12"],
 #     "unstable_features": { "bsfchat.server": true },
 #     "bsfchat.version": "0.0.44",
 #     "bsfchat.revision": "1a2b3c4",
 #     "bsfchat.channel": "stable" }
+#
+# Without a token the same request still returns 200 — clients probe this
+# endpoint before login to decide an address is a homeserver at all — but
+# the three bsfchat.* keys are absent:
+curl -s http://localhost:8448/_matrix/client/versions | jq
+#   { "versions": ["v1.12"],
+#     "unstable_features": { "bsfchat.server": true } }
 
 # 3. OCI labels, without starting anything
 docker inspect -f '{{index .Config.Labels "org.opencontainers.image.version"}}' \
   ghcr.io/bsfchat/server:latest
 ```
+
+### Why the endpoint needs a token and the other two do not
+
+Unauthenticated, `bsfchat.version` and `bsfchat.revision` let anyone fingerprint
+any BSFChat deployment down to the commit with one GET — which, for self-hosted
+software where upgrades are manual and staggered, is a ready-made list of which
+instances have not taken the latest security fix. See
+`docs/audit-requests-2026-09.md` finding 9.
+
+Nothing an operator does is lost: routes 1 and 3 above need no HTTP and no token
+at all, and anyone debugging their own server has a token for route 2. A scanner
+has none of the three. No client reads these keys — the desktop client's server
+discovery asks only whether `versions` is an array, and that stays public.
 
 ## What changed
 

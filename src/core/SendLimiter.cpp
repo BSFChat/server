@@ -9,7 +9,8 @@ SendLimiter::SendLimiter(const SendLimitsConfig& config, LimiterClock clock)
     , send_(config.send_limit, std::chrono::seconds(config.window_seconds), clock)
     , redact_(config.redact_limit, std::chrono::seconds(config.window_seconds), clock)
     , media_upload_(config.media_upload_limit, std::chrono::seconds(config.window_seconds),
-                    clock) {}
+                    clock)
+    , profile_(config.profile_limit, std::chrono::seconds(config.window_seconds), clock) {}
 
 int64_t SendLimiter::acquire(Bucket bucket, const std::string& identity) {
     if (!enabled_ || identity.empty()) return 0;
@@ -17,6 +18,7 @@ int64_t SendLimiter::acquire(Bucket bucket, const std::string& identity) {
         case Bucket::kSend:        return send_.acquire(identity);
         case Bucket::kRedact:      return redact_.acquire(identity);
         case Bucket::kMediaUpload: return media_upload_.acquire(identity);
+        case Bucket::kProfile:     return profile_.acquire(identity);
     }
     return 0;
 }
@@ -29,6 +31,8 @@ const char* SendLimiter::message_for(Bucket bucket) {
             return "Too many deletions in a row. Try again shortly.";
         case Bucket::kMediaUpload:
             return "Too many uploads in a row. Try again shortly.";
+        case Bucket::kProfile:
+            return "Too many profile changes in a row. Try again shortly.";
     }
     return "Too many requests. Try again later.";
 }

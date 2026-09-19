@@ -153,11 +153,31 @@ bool AuthHandler::locked_out(const std::string& key_a, const std::string& key_b,
 
 void AuthHandler::record_failure(const std::string& key_a, const std::string& key_b) {
     if (!config_.auth_limits.enabled) return;
+    // log_safe, and not merely for tidiness. One of these keys is
+    // user_failure_key(), which is "user:" + the login identifier EXACTLY AS
+    // SUBMITTED — deliberately so, since keying on an account that exists would
+    // make the lockout an existence oracle. That makes it arbitrary bytes from
+    // an unauthenticated request body, newlines included, and this line is the
+    // one an attacker wants: the log pattern is one record per line, so a
+    // submitted identifier of
+    //
+    //     victim\n[2026-09-19 03:11:00.000] [warning] Auth lockout engaged for ip:203.0.113.9
+    //
+    // failed max_failures times puts a fabricated lockout for somebody else's
+    // address in the server log, indistinguishable from a real one. That matters
+    // here specifically because auth-hardening-2026-09.md finding 19 decided not
+    // to mirror auth events into AuditLog on the grounds that the server log
+    // already records them — so this log IS the security-event record, and this
+    // was the unauthenticated write to it.
+    //
+    // Same defect as docs/audit-requests-2026-09.md finding 17 (the rejected
+    // pusher URL) and as auth finding 9 (device_id); this is the third field and
+    // the only one reachable without an account.
     if (!key_a.empty() && failures_.record_failure(key_a)) {
-        get_logger()->warn("Auth lockout engaged for {}", key_a);
+        get_logger()->warn("Auth lockout engaged for {}", log_safe(key_a));
     }
     if (!key_b.empty() && failures_.record_failure(key_b)) {
-        get_logger()->warn("Auth lockout engaged for {}", key_b);
+        get_logger()->warn("Auth lockout engaged for {}", log_safe(key_b));
     }
 }
 
@@ -165,7 +185,7 @@ int64_t AuthHandler::token_lifetime_ms() const {
     return static_cast<int64_t>(config_.access_token_lifetime_days) * 24 * 60 * 60 * 1000;
 }
 
-void AuthHandler::handle_versions(const httplib::Request&, httplib::Response& res) {
+void AuthHandler::handle_versions(const httplib::Request& req, httplib::Response& res) {
     json resp = {
         {"versions", {std::string(spec::kVersion)}},
     };
@@ -185,9 +205,40 @@ void AuthHandler::handle_versions(const httplib::Request&, httplib::Response& re
     // the version string cannot live there; we advertise the capability
     // flag there and put the string beside it.
     resp["unstable_features"] = {{"bsfchat.server", true}};
-    resp["bsfchat.version"] = build::version_string();
-    resp["bsfchat.revision"] = build::revision_string();
-    resp["bsfchat.channel"] = build::channel_of(build::kVersion);
+
+    // The BUILD IDENTITY is for whoever is running the server, so it is served
+    // only to a caller holding a valid token.
+    //
+    // Unauthenticated, these three keys let anyone fingerprint any BSFChat
+    // deployment down to the commit with one GET. For self-hosted software,
+    // where upgrades are manual and staggered, that is a list of which
+    // instances have not taken the latest security fix yet — including this
+    // RC's own, which is exactly the window in which such a list is worth the
+    // most. Nothing has to be guessed and nothing is logged as an attempt.
+    //
+    // The cost of moving them is close to zero, which is why this is worth
+    // doing rather than merely arguing about:
+    //
+    //   * no client reads them. The desktop client touches /versions in exactly
+    //     one place — ServerDiscovery::looksLikeHomeserver — and all it asks is
+    //     whether `versions` is an array. Feature negotiation is `versions` plus
+    //     `unstable_features`, both of which stay exactly as they were and stay
+    //     unauthenticated, because discovery necessarily runs before login.
+    //   * the operator keeps every use. docs/release-channels.md lists three
+    //     ways to read the build: the startup log line, this endpoint, and the
+    //     OCI image labels. Two of them need no HTTP at all, and an operator
+    //     debugging their own server has a token for the third. A scanner has
+    //     none of them.
+    //
+    // Deliberately NOT a 401 for the unauthenticated case: this endpoint is how
+    // a client decides an address is a homeserver at all, so requiring auth
+    // would break adding a server. The keys are simply absent, which is a shape
+    // the spec requires clients to tolerate.
+    if (authenticate(store_, req.get_header_value("Authorization"))) {
+        resp["bsfchat.version"] = build::version_string();
+        resp["bsfchat.revision"] = build::revision_string();
+        resp["bsfchat.channel"] = build::channel_of(build::kVersion);
+    }
 
     res.set_content(resp.dump(), "application/json");
 }
@@ -370,8 +421,12 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
         std::string localpart = "oidc_" + sanitize_localpart(claims->sub);
         std::string user_id = "@" + localpart + ":" + config_.server_name;
         if (localpart == "oidc_" || !UserId::is_valid(user_id)) {
+            // log_safe: this is the string that just FAILED validation, which is
+            // the same shape as the lockout key above and as finding 17's
+            // rejected pusher URL. The IdP signed it, but an IdP is not this
+            // server's log format.
             get_logger()->warn("Rejected identity token: subject '{}' does not map to a valid user id",
-                               claims->sub);
+                               log_safe(claims->sub));
             res.status = 403;
             res.set_content(MatrixError::forbidden("Identity token subject is not usable as a user id")
                                 .to_json().dump(), "application/json");

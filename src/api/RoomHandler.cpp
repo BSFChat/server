@@ -1438,13 +1438,76 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     const bool is_member_moderation =
         evt_type == std::string(event_type::kRoomMember) && state_key != *user_id;
 
-    // Map the state event type to the permission flag that gates it.
-    permission::Flags required = permission::kManageChannels;
-    if (is_server_scoped || evt_type == std::string(event_type::kChannelPermissions)) {
-        required = permission::kManageRoles;
-    } else if (evt_type == std::string(event_type::kServerInfo)) {
-        required = permission::kManageServer;
-    }
+    // Map the state event type to the permission flag that gates it — from a
+    // CLOSED table. An unlisted type is refused.
+    //
+    // This used to be an if/else chain over three special cases with
+    // MANAGE_CHANNELS as the fallback, so every type not named — including
+    // types nobody has defined — was accepted, stored as room state, and
+    // delivered to every member through /sync's state.events with content taken
+    // verbatim from the request body.
+    //
+    // It is the state-route twin of the hole `send_gate_for` closed on the send
+    // path, and the reasoning there applies unchanged: allowing by default is
+    // what produced the hole, and adding a settable type should be a deliberate
+    // edit to this table rather than something that happens by nobody thinking
+    // about it. The auth audit excluded state events from its table on the
+    // grounds that this route "has its own per-type authorisation" — it did, and
+    // that authorisation was the thing the same document had just argued against.
+    //
+    // Two entries are deliberately ABSENT rather than forgotten:
+    //   * m.room.create — written once, by the server, when the room is made. It
+    //     names the room's creator, and there is no legitimate request that
+    //     rewrites it.
+    //   * m.room.member — never reaches here. Self-membership and moderation of
+    //     another member both returned above, and the empty-state_key spelling
+    //     names no target. Listing it would be listing a case that cannot occur.
+    //
+    // Severity of what this closes is low on its own — it needs MANAGE_CHANNELS,
+    // and the worst outcome is attacker-shaped JSON in the state of a channel
+    // you can already administer — but it is the shape that gets copied.
+    struct StateGate {
+        bool allowed = false;
+        permission::Flags required = 0;
+    };
+    const auto state_gate_for = [](const std::string& type) -> StateGate {
+        // Channel structure and presentation. MANAGE_CHANNELS, evaluated in the
+        // room (except bsfchat.room.type, whose SCOPE is moved to the server by
+        // is_room_type_change above — the flag is the same one).
+        if (type == event_type::kRoomName || type == event_type::kRoomTopic ||
+            type == event_type::kRoomAvatar || type == event_type::kRoomJoinRules ||
+            type == event_type::kRoomCanonicalAlias ||
+            type == event_type::kRoomHistoryVisibility ||
+            type == event_type::kRoomPowerLevels || type == event_type::kRoomPinnedEvents ||
+            type == event_type::kRoomVoice || type == event_type::kRoomCategory ||
+            type == event_type::kRoomType || type == event_type::kChannelSettings) {
+            return {true, permission::kManageChannels};
+        }
+        // Who may do what. MANAGE_ROLES, and for the two server-scoped ones the
+        // scope moves too (is_server_scoped, above).
+        if (type == event_type::kChannelPermissions || type == event_type::kServerRoles ||
+            type == event_type::kMemberRoles) {
+            return {true, permission::kManageRoles};
+        }
+        // Server identity.
+        if (type == event_type::kServerInfo) {
+            return {true, permission::kManageServer};
+        }
+        // The server-wide screen-share ceiling. MANAGE_CHANNELS and room scope,
+        // which is what it has always had — deliberately unchanged here so this
+        // commit is an allowlist and not a silent re-gating. It is a server-wide
+        // setting reachable on a per-channel permission, which is worth its own
+        // look; noted in docs/audit-requests-2026-09.md rather than fixed in
+        // passing.
+        if (type == event_type::kServerScreenShare) {
+            return {true, permission::kManageChannels};
+        }
+        return {};
+    };
+
+    // Evaluated here, applied below — the two m.room.member paths return before
+    // the gate is consulted, which is why that type is not in the table.
+    const auto gate = state_gate_for(evt_type);
 
     PermissionsEngine perms(store_, config_);
     // `is_server_scoped` also decides WHERE the write lands (server_state vs room
@@ -1527,7 +1590,18 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         return;
     }
 
-    if (!perms.can(*user_id, perm_scope, required)) {
+    // The allowlist, applied before the permission test rather than after it.
+    // ADMINISTRATOR short-circuits every flag inside PermissionsEngine::compute,
+    // so an owner would still walk an unknown type straight through a check
+    // ordered the other way round.
+    if (!gate.allowed) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden(
+            "State events of type '" + evt_type + "' cannot be set on a room")
+                .to_json().dump(), "application/json");
+        return;
+    }
+    if (!perms.can(*user_id, perm_scope, gate.required)) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Insufficient permissions for this state event").to_json().dump(), "application/json");
         return;

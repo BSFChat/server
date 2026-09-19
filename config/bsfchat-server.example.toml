@@ -254,6 +254,14 @@ redact_limit = 60
 # of any one of them is [media] max_upload_size_mb.
 media_upload_limit = 30
 
+# Profile writes (displayname / avatar_url / nickname) per account per window.
+# Much the smallest number here because it is much the largest amplifier: ONE
+# request re-emits an m.room.member event in every channel the account is
+# joined to and wakes every parked /sync on the server, so on a 50-channel
+# deployment one request is 50 event inserts plus a server-wide poll storm.
+# All three endpoints share this budget, because they share the amplifier.
+profile_limit = 10
+
 # Storage backend for media files
 # type = "local" stores files on disk, "s3" uses S3-compatible object storage
 [storage]
@@ -283,7 +291,13 @@ stun_uri = "stun:stun.l.google.com:19302"
 # turn_secret = "<random-secret>"
 # turn_ttl = 3600
 #
-# Or static credentials (coturn `lt-cred-mech`):
+# Or static credentials (coturn `lt-cred-mech`). SINGLE-USER DEVELOPMENT ONLY:
+# in this mode the server hands the SAME username and password below to every
+# authenticated account that asks /voip/turnServer. It never expires and cannot
+# be revoked without editing this file and restarting coturn, so a banned
+# account keeps a working relay credential and anyone who registers can use
+# your TURN server as an open proxy on your bandwidth. The server warns about
+# this on every start. Use turn_secret above on any multi-user deployment.
 # turn_username = "bsfchat"
 # turn_password = "<random-secret>"
 

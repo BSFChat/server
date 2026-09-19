@@ -4,6 +4,7 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
+#include "http/RateLimitResponse.h"
 #include "http/Router.h"
 #include "identity/Nickname.h"
 #include "store/SqliteStore.h"
@@ -33,8 +34,17 @@ int64_t now_ms() {
 const std::string kServerScope;
 } // namespace
 
-ProfileHandler::ProfileHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config)
-    : store_(store), sync_engine_(sync_engine), config_(config) {}
+ProfileHandler::ProfileHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config,
+                               LimiterClock clock)
+    : store_(store), sync_engine_(sync_engine), config_(config)
+    , limits_(config.send_limits, std::move(clock)) {}
+
+bool ProfileHandler::profile_flood(const std::string& user_id, httplib::Response& res) {
+    const auto wait = limits_.acquire(SendLimiter::Bucket::kProfile, user_id);
+    if (!wait) return false;
+    send_rate_limited(res, wait, SendLimiter::message_for(SendLimiter::Bucket::kProfile));
+    return true;
+}
 
 void ProfileHandler::handle_get_profile(const httplib::Request& req, httplib::Response& res) {
 
@@ -182,6 +192,11 @@ void ProfileHandler::handle_put_displayname(const httplib::Request& req, httplib
         return;
     }
 
+    // Charged here, after the request has been validated and immediately before
+    // the fan-out it is protecting. Charging earlier would spend budget on
+    // malformed requests that were never going to emit anything.
+    if (profile_flood(*user_id, res)) return;
+
     store_.set_display_name(*user_id, body["displayname"].get<std::string>());
     broadcastMemberUpdate(*user_id);
 
@@ -260,6 +275,8 @@ void ProfileHandler::handle_put_avatar_url(const httplib::Request& req, httplib:
         res.set_content(MatrixError::bad_json("Missing avatar_url field").to_json().dump(), "application/json");
         return;
     }
+
+    if (profile_flood(*user_id, res)) return;
 
     store_.set_avatar_url(*user_id, body["avatar_url"].get<std::string>());
     broadcastMemberUpdate(*user_id);
@@ -402,6 +419,11 @@ void ProfileHandler::handle_put_nickname(const httplib::Request& req, httplib::R
         }
         next = check.normalised;
     }
+
+    // Against the TARGET's budget, not the caller's: the fan-out is over the
+    // renamed account's channels, so charging the caller would let one moderator
+    // spend a single budget driving a different amplifier on every request.
+    if (profile_flood(target_user_id, res)) return;
 
     store_.set_nickname(target_user_id, next);
     broadcastMemberUpdate(target_user_id);
