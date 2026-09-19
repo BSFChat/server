@@ -413,6 +413,17 @@ public:
     // deleted message must not keep a badge lit for content nobody can read).
     int count_unread(const std::string& user_id, const std::string& room_id);
 
+    // Has anybody ever sent a message in this room? Existence, not a count:
+    // the only caller asks "is this a channel with content in it", and that is
+    // answered by the first matching row.
+    //
+    // Redacted messages COUNT. A redaction tombstones the content but leaves
+    // the sender, the timestamp and the event id, and the whole point of the
+    // caller — refusing to retype a used channel as a category — is that a
+    // conversation happened here. "Every message was deleted" is not "this was
+    // never a channel".
+    bool room_has_messages(const std::string& room_id);
+
     // ── Push notifications ────────────────────────────────────────────────
     //
     // `url` is a push GATEWAY endpoint, not a provider endpoint: the server

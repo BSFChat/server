@@ -1633,6 +1633,21 @@ int SqliteStore::count_unread(const std::string& user_id, const std::string& roo
     return 0;
 }
 
+bool SqliteStore::room_has_messages(const std::string& room_id) {
+    std::lock_guard lock(mutex_);
+    // LIMIT 1 rather than COUNT(*): the caller only needs existence, and
+    // counting would walk every message in a channel that may hold years of
+    // history to answer a yes/no. idx_events_room_stream confines the scan to
+    // this room; the worst case is a room with no messages at all, whose rows
+    // are its state events and therefore few. This runs only on an
+    // administrator retyping a room, so it is not on any hot path.
+    auto stmt = prepare(db_,
+        "SELECT 1 FROM events "
+        "WHERE room_id = ? AND event_type = 'm.room.message' LIMIT 1");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    return sqlite3_step(stmt.get()) == SQLITE_ROW;
+}
+
 // Mentions
 //
 // Every write here originates from the send path, which has already established
