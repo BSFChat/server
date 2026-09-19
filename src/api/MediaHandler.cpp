@@ -1,5 +1,6 @@
 #include "api/MediaHandler.h"
 #include "api/MediaPolicy.h"
+#include "api/MediaTicket.h"
 #include "auth/Permissions.h"
 #include "core/Config.h"
 #include "core/Logger.h"
@@ -12,6 +13,7 @@
 #include <openssl/rand.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <iomanip>
 #include <sstream>
@@ -112,6 +114,43 @@ bool ranges_unsatisfiable(const httplib::Ranges& ranges, size_t content_length) 
     }
 
     return false;
+}
+
+// server_meta key holding this deployment's own signing secret.
+//
+// Not a config knob on purpose. The alternative designs were an operator-set
+// secret (one more thing to generate, distribute and forget, and one more
+// "media stopped working after the redeploy" support call) or a process-local
+// random key (every restart invalidates every outstanding ticket AND every
+// in-flight image, for nothing). This is generated once, by the server, for
+// itself, and survives a restart because it is a row.
+//
+// Deliberately generic in name: it is a SERVER instance secret, not a media
+// one. Anything else that later needs a signing key derives from it under its
+// own HKDF salt, the way media tickets do — see MediaTicket.h.
+constexpr char kInstanceSecretMetaKey[] = "server.instance_secret";
+
+int64_t now_unix_seconds() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// A media id safe to put back into a URL path.
+//
+// generate_media_id() only ever produces 32 lowercase hex characters, but this
+// is deliberately the weaker check: rows written by an older build or restored
+// from a backup are not re-typed, and refusing to mint a ticket for one would
+// be a new way to make old attachments unfetchable. What it does rule out is a
+// separator — '/', '?', '#', '%' or a control character in the id would let a
+// ticket request smuggle a second path segment or a query into the URL the
+// client then builds.
+bool is_url_safe_media_id(const std::string& s) {
+    if (s.empty() || s.size() > 255) return false;
+    return std::all_of(s.begin(), s.end(), [](unsigned char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            || c == '.' || c == '-' || c == '_';
+    });
 }
 
 } // namespace
@@ -261,19 +300,169 @@ void MediaHandler::handle_upload(const httplib::Request& req, httplib::Response&
     }
 }
 
-std::optional<std::string> MediaHandler::authenticate_media(const httplib::Request& req) {
-    // Header first — that's what every other endpoint uses.
+const std::vector<unsigned char>& MediaHandler::ticket_key() {
+    std::call_once(ticket_key_once_, [this] {
+        auto secret = store_.get_meta(kInstanceSecretMetaKey);
+
+        // Generated on first use rather than in a migration: a migration that
+        // writes a secret puts it in every operator's backup of the schema
+        // step, and this needs no schema change at all (server_meta has existed
+        // since v1). One process, one database — the SQLite store is not shared
+        // between servers — so there is no writer to race with here.
+        if (!secret || secret->size() < 32) {
+            unsigned char buf[32];
+            if (RAND_bytes(buf, sizeof(buf)) != 1) {
+                throw std::runtime_error("media tickets: RAND_bytes failed generating the "
+                                         "server instance secret");
+            }
+            std::ostringstream oss;
+            for (unsigned char b : buf) {
+                oss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(b);
+            }
+            secret = oss.str();
+            store_.set_meta(kInstanceSecretMetaKey, *secret);
+            get_logger()->info("Generated this server's instance secret (media tickets are "
+                               "signed with a key derived from it)");
+        }
+        ticket_key_ = media_ticket::derive_key(*secret, config_.server_name);
+    });
+    return ticket_key_;
+}
+
+int64_t MediaHandler::ticket_ttl_seconds() const {
+    return std::clamp<int64_t>(config_.media_ticket_ttl_seconds,
+                               media_ticket::kMinTtlSeconds,
+                               media_ticket::kMaxTtlSeconds);
+}
+
+std::optional<std::string> MediaHandler::authenticate_media(const httplib::Request& req,
+                                                            const std::string& media_id) {
+    // 1. Authorization header — what every other endpoint uses, and the only
+    //    thing POST /ticket itself accepts.
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (user_id) return user_id;
 
-    // Fall back to ?access_token=, the legacy Matrix media auth mechanism.
-    // Media URLs are handed straight to image/video widgets, which cannot
-    // attach an Authorization header, so this is the only way an authenticated
-    // download can work from a plain <img>-style consumer.
+    // 2. A signed ticket: ?mt=<b64url(user)>.<b64url(mac)>&exp=<unix seconds>.
+    //
+    //    This is what replaces the session token in the URL. The ticket names
+    //    ONE media id and ONE user and is signed over both plus its own expiry,
+    //    so it cannot be moved to another object, re-pointed at another user, or
+    //    extended by editing the query string.
+    //
+    //    It resolves the caller and nothing more. handle_download re-runs
+    //    may_download() on the id returned here, at fetch time — the ticket is a
+    //    pointer to an authorization, never a replacement for one, so a channel
+    //    locked down between minting and fetching takes effect immediately.
+    if (req.has_param("mt") && req.has_param("exp")) {
+        const auto exp = media_ticket::parse_exp(req.get_param_value("exp"));
+        if (exp) {
+            auto ticketed = media_ticket::verify(ticket_key(), config_.server_name, media_id,
+                                                 req.get_param_value("mt"), *exp,
+                                                 now_unix_seconds());
+            if (ticketed) {
+                // The signature says a user id; it does not say the account is
+                // still one this server serves. A ticket outlives the session
+                // that minted it, so a deleted or server-banned account holding
+                // one must not keep fetching with it.
+                if (store_.user_exists(*ticketed) && !store_.is_server_banned(*ticketed)) {
+                    return ticketed;
+                }
+            }
+        }
+        // A present-but-bad ticket falls through rather than short-circuiting to
+        // 401, so a client that sends both a stale ticket and a legacy token
+        // still works during the transition. It gets no further than the
+        // access_token branch below, which is going away.
+    }
+
+    // 3. LEGACY — ?access_token=, the Matrix media auth mechanism, and the
+    //    credential-in-a-URL this whole change exists to remove.
+    //
+    //    REMOVE THIS BRANCH IN THE RELEASE AFTER THE ONE THAT SHIPS TICKETS.
+    //    It cannot go now: an older client has no ticket cache and would show
+    //    an empty box for every image on the server the moment this is dropped,
+    //    so a client release carrying the ticket path has to be out in the field
+    //    first. When it is, delete this branch, its test, and the note in the
+    //    client's MediaUrl.h. Nothing else depends on it — the desktop client on
+    //    this branch does not send it at all.
     if (req.has_param("access_token")) {
         return store_.get_user_by_token(req.get_param_value("access_token"));
     }
     return std::nullopt;
+}
+
+void MediaHandler::handle_ticket(const httplib::Request& req, httplib::Response& res) {
+    auto log = get_logger();
+
+    // Header only. A ticket must never be able to mint another ticket — that
+    // would turn a five-minute capability for one object into a renewable one
+    // for everything, which is the property the TTL exists to deny. So this
+    // does NOT call authenticate_media().
+    auto user_id = authenticate(store_, req.get_header_value("Authorization"));
+    if (!user_id) {
+        res.status = 401;
+        res.set_content(R"({"errcode":"M_UNKNOWN_TOKEN","error":"Invalid or missing access token"})",
+                        "application/json");
+        return;
+    }
+
+    std::string mxc_uri;
+    try {
+        auto body = nlohmann::json::parse(req.body);
+        if (!body.is_object() || !body.contains("mxc_uri") || !body["mxc_uri"].is_string()) {
+            throw std::runtime_error("mxc_uri must be a string");
+        }
+        mxc_uri = body["mxc_uri"].get<std::string>();
+    } catch (const std::exception&) {
+        res.status = 400;
+        res.set_content(R"({"errcode":"M_BAD_JSON","error":"Expected {\"mxc_uri\": \"mxc://…\"}"})",
+                        "application/json");
+        return;
+    }
+
+    // mxc://<server>/<id>, ours only. Parsed here rather than trusted, because
+    // the id goes back out in a URL and into a signature.
+    const std::string prefix = "mxc://" + config_.server_name + "/";
+    if (mxc_uri.rfind(prefix, 0) != 0) {
+        res.status = 404;
+        res.set_content(R"({"errcode":"M_NOT_FOUND","error":"Media not found"})",
+                        "application/json");
+        return;
+    }
+    const std::string media_id = mxc_uri.substr(prefix.size());
+    if (!is_url_safe_media_id(media_id)) {
+        res.status = 404;
+        res.set_content(R"({"errcode":"M_NOT_FOUND","error":"Media not found"})",
+                        "application/json");
+        return;
+    }
+
+    auto meta = store_.get_media(media_id);
+
+    // The SAME authorization the download path runs, and the same answer shape:
+    // 404 whether the object does not exist or is not this caller's to have, so
+    // minting is not an oracle for which media ids are real. Nothing here is
+    // cheaper for a permitted id than a refused one — both are one metadata read
+    // plus, at most, the permission walk.
+    if (!meta || !may_download(*user_id, media_id, *meta)) {
+        log->info("Media ticket refused to {} for {}", *user_id, media_id);
+        res.status = 404;
+        res.set_content(R"({"errcode":"M_NOT_FOUND","error":"Media not found"})",
+                        "application/json");
+        return;
+    }
+
+    const int64_t ttl = ticket_ttl_seconds();
+    const int64_t exp = now_unix_seconds() + ttl;
+
+    nlohmann::json out;
+    out["mt"] = media_ticket::mint(ticket_key(), config_.server_name, media_id, *user_id, exp);
+    out["exp"] = exp;
+    // The client refreshes on a relative deadline so it does not have to trust
+    // its own clock to agree with ours; see MediaTicketCache on the client.
+    out["ttl_ms"] = ttl * 1000;
+    res.set_content(out.dump(), "application/json");
+    res.status = 200;
 }
 
 bool MediaHandler::may_download(const std::string& user_id,
@@ -340,13 +529,12 @@ void MediaHandler::handle_download(const httplib::Request& req, httplib::Respons
     // require_media_auth defaults ON. With it OFF there is no caller to check,
     // so the per-room ACL cannot apply either — turning it off does not merely
     // drop the token requirement, it drops the channel ACL with it.
-    auto caller = authenticate_media(req);
-    if (config_.require_media_auth && !caller) {
-        res.status = 401;
-        res.set_content(R"({"errcode":"M_UNKNOWN_TOKEN","error":"Invalid or missing access token"})",
-                        "application/json");
-        return;
-    }
+    //
+    // The path is parsed BEFORE authentication now, because a signed ticket is
+    // scoped to one media id and verifying it needs to know which. Nothing is
+    // read from the database to do it, and a 400 for a path that does not match
+    // the route's own regex discloses nothing an unauthenticated caller could
+    // not get from the route table.
 
     // Extract serverName and mediaId from path
     // Pattern: /_matrix/media/v3/download/{serverName}/{mediaId}
@@ -364,6 +552,14 @@ void MediaHandler::handle_download(const httplib::Request& req, httplib::Respons
     std::string requested_filename;
     if (match_count >= 4) {
         requested_filename = req.matches[3];
+    }
+
+    auto caller = authenticate_media(req, media_id);
+    if (config_.require_media_auth && !caller) {
+        res.status = 401;
+        res.set_content(R"({"errcode":"M_UNKNOWN_TOKEN","error":"Invalid or missing access token"})",
+                        "application/json");
+        return;
     }
 
     // Only serve media from our server

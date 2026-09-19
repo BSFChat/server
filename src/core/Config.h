@@ -352,6 +352,19 @@ struct Config {
     // readable by anyone who learns its id.
     bool require_media_auth = true;
 
+    // Lifetime of a signed media ticket, in seconds. See api/MediaTicket.h.
+    //
+    // A ticket is what the client puts in a media URL instead of the session
+    // token, so this is how long a URL recovered from an access log, a browser
+    // history entry or a clipboard is worth anything — and it is worth one
+    // object, to the one already-authorized user it names, even then. Clamped
+    // to [30, 3600] at use: the ceiling is the point, an operator must not be
+    // able to turn a capability URL back into a long-lived bearer token.
+    //
+    // 300 is sized so a channel's images resolve on one mint each and a video
+    // plays through without the client re-minting mid-stream.
+    int media_ticket_ttl_seconds = 300;
+
     // Storage
     StorageConfig storage;
 

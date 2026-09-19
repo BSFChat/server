@@ -47,6 +47,9 @@ Config Config::load(const std::string& path) {
                     v->value_or(static_cast<int64_t>(cfg.max_upload_size_mb)));
             if (auto v = media->get("require_auth"))
                 cfg.require_media_auth = v->value_or(cfg.require_media_auth);
+            if (auto v = media->get("ticket_ttl_seconds"))
+                cfg.media_ticket_ttl_seconds = static_cast<int>(
+                    v->value_or(static_cast<int64_t>(cfg.media_ticket_ttl_seconds)));
         }
 
         // [auth]
