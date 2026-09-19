@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <cstddef>
-#include <initializer_list>
 
 namespace bsfchat::media_policy {
 
@@ -116,7 +114,7 @@ struct Entry {
 // two answers cannot drift apart. PDF is storable but NOT inline: a browser's
 // built-in PDF viewer is a scripting host, and no client feature depends on
 // previewing a PDF in place.
-constexpr std::array<Entry, 15> kAllowlist{{
+constexpr std::array<Entry, 16> kAllowlist{{
     {"image/png",       is_png,     true},
     {"image/jpeg",      is_jpeg,    true},
     {"image/gif",       is_gif,     true},
@@ -132,6 +130,7 @@ constexpr std::array<Entry, 15> kAllowlist{{
     {"audio/aac",       is_aac,     true},
     {"audio/ogg",       is_ogg,     true},
     {"audio/wav",       is_wav,     true},
+    {"audio/flac",      is_flac,    true},
 }};
 
 // Two spellings the wild uses for types already on the list. Mapped rather than
