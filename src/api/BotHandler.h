@@ -1,10 +1,14 @@
 #pragma once
 
+#include "store/SqliteStore.h"
+
 #include <httplib.h>
+
+#include <optional>
+#include <string>
 
 namespace bsfchat {
 
-class SqliteStore;
 class SyncEngine;
 struct Config;
 
@@ -49,6 +53,53 @@ public:
     void handle_deactivate_bot(const httplib::Request& req, httplib::Response& res);
 
 private:
+    // Everything an authorized operation on an existing bot needs.
+    struct BotAdminContext {
+        std::string actor;
+        SqliteStore::BotRecord bot;
+    };
+
+    // THE gate for any operation on an EXISTING bot. Authentication, MANAGE_BOTS
+    // at server scope, the bot lookup, and the hierarchy check — in that order,
+    // in one call. On refusal it writes the response and returns nullopt.
+    //
+    // It returns the BotRecord because that is what makes it hard to misuse: a
+    // handler cannot act on a bot without having come through here, so a future
+    // endpoint cannot acquire a bot and forget half the gate. The original hole
+    // was exactly that shape — two handlers each doing their own permission
+    // check, both doing only the easy half.
+    //
+    // THE HIERARCHY CHECK, AND WHY IT IS NOT OPTIONAL. A bot token is a bearer
+    // credential for an account that holds roles. Handing one to a human is
+    // therefore equivalent to granting that human the bot's roles, and it is
+    // worse than a role grant in two ways: it leaves no bsfchat.member.roles
+    // event naming the new principal, and the credential never expires. Without
+    // a rank check, a delegated MANAGE_BOTS holder at position 10 could rotate
+    // the token of a bot holding Administrator and walk away with permanent
+    // ownership of the server.
+    //
+    // This is the same hole, in the same codebase, that may_assign_roles was
+    // written for — see the long comment in auth/Permissions.h about MANAGE_ROLES
+    // not being "a one-request path to owning the server". MANAGE_BOTS has
+    // exactly that property, so it gets exactly that treatment, reusing
+    // outranks() rather than inventing a parallel notion of rank.
+    //
+    // Exemptions match may_assign_roles: the synthetic @server actor and holders
+    // of ADMINISTRATOR pass. The ADMINISTRATOR exemption is load-bearing rather
+    // than a convenience — an admin bot sits at the admin role's position, so a
+    // strict outranks() would leave a bot that no human could ever rotate.
+    //
+    // Deliberately NOT applied to creation or listing. A newly created bot holds
+    // no roles, so it sits at position 0 and everyone outranks it; the escalation
+    // "create a bot, then grant it Administrator" is already refused by
+    // may_assign_roles, which will not assign a role at or above the actor's own
+    // position. A rank check on creation would be noise that implied a
+    // protection living somewhere else. Listing discloses no credential.
+    std::optional<BotAdminContext> authorize_bot_admin(const httplib::Request& req,
+                                                       httplib::Response& res,
+                                                       const std::string& bot_user_id,
+                                                       const char* action);
+
     SqliteStore& store_;
     SyncEngine& sync_engine_;
     const Config& config_;

@@ -237,6 +237,10 @@ struct Fixture {
         content.roles.push_back(role("everything_else", 20,
                                      permission::kAllFlags & ~permission::kManageBots &
                                          ~permission::kAdministrator));
+        // A role ABOVE the delegated MANAGE_BOTS holder at position 10, for the
+        // privilege-escalation tests: a bot wearing this outranks "botmod".
+        content.roles.push_back(role("senior", 50,
+                                     permission::kEveryoneDefault | permission::kBanMembers));
         content.roles.push_back(role(permission::role_id::kAdmin, 100, permission::kAllFlags));
         json j;
         to_json(j, content);
@@ -1712,4 +1716,234 @@ TEST(BotMemberEvent, TheStoreRefusesABotOutsideTheNamespace) {
     EXPECT_TRUE(fx.store->create_bot(good));
     EXPECT_TRUE(fx.store->is_bot("@bot_fine:test"));
     EXPECT_TRUE(bot::is_bot_user_id("@bot_fine:test"));
+}
+
+// ── 15. Privilege escalation via bot credentials ────────────────────────────
+//
+// A bot token is a bearer credential for an account that holds roles, so handing
+// one to a human is equivalent to granting that human the bot's roles — and it
+// is worse than a role grant, because it leaves no bsfchat.member.roles event
+// naming the new principal and the credential never expires.
+//
+// MANAGE_BOTS alone must therefore NOT be enough to act on a bot that outranks
+// you. This is the same hole may_assign_roles was written for; see the
+// MANAGE_ROLES comment in auth/Permissions.h.
+
+namespace {
+
+// A bot wearing `role_id`, so it outranks a plain MANAGE_BOTS holder.
+std::string make_ranked_bot(Fixture& fx, const std::string& admin_token,
+                            const std::string& localpart, const std::string& role_id) {
+    auto res = call(*fx.bots, &BotHandler::handle_create_bot, kBotsPath, admin_token,
+                    create_body(localpart));
+    EXPECT_TRUE(HasStatus(res, 201));
+    const std::string bot_id = json::parse(res.body).value("user_id", "");
+    fx.assign_roles(bot_id, {role_id});
+    return bot_id;
+}
+
+} // namespace
+
+TEST(BotEscalation, ALowRankedHolderCannotRotateABotThatOutranksThem) {
+    Fixture fx("esc-rotate");
+    fx.seed_roles();
+    // Position 100. Creates the bot and gives it a role nobody below can touch.
+    fx.add_user("root", {std::string(permission::role_id::kAdmin)});
+    // Position 10, holds MANAGE_BOTS and nothing else of interest.
+    auto botmod = fx.add_user("botmod_user", {"botmod"});
+
+    auto bot_id = make_ranked_bot(fx, "token-root", "bot_privileged",
+                                  std::string(permission::role_id::kAdmin));
+
+    // Precondition: the delegated holder really does hold MANAGE_BOTS, and
+    // really is outranked. Without this the test could pass for the wrong reason.
+    {
+        PermissionsEngine perms(*fx.store, fx.config);
+        ASSERT_TRUE(perms.can(botmod, "", permission::kManageBots));
+        ASSERT_FALSE(perms.outranks(botmod, bot_id));
+        ASSERT_FALSE(perms.can(botmod, "", permission::kAdministrator));
+    }
+
+    auto res = call(*fx.bots, &BotHandler::handle_rotate_token, bot_token_path(bot_id),
+                    "token-botmod_user");
+    EXPECT_TRUE(RefusedBecause(res, 403, "ranks at or above you"));
+    // No credential was handed out. Checked as a JSON FIELD rather than by
+    // grepping the body for "token": the refusal message legitimately contains
+    // that word, and a substring assertion here would fail for the wrong reason
+    // (it did, first time round) while telling you nothing about whether a
+    // credential leaked.
+    {
+        auto body = json::parse(res.body, nullptr, false);
+        ASSERT_FALSE(body.is_discarded());
+        EXPECT_FALSE(body.contains("token"));
+        EXPECT_FALSE(body.contains("access_token"));
+    }
+
+    // And nothing was revoked either: a refused rotation must not be a way to
+    // knock a higher-ranked bot offline.
+    EXPECT_EQ(raw_int(fx.db_path,
+                      "SELECT COUNT(*) FROM access_tokens WHERE user_id = '" + bot_id + "'"),
+              1);
+}
+
+TEST(BotEscalation, ALowRankedHolderCannotDeactivateABotThatOutranksThem) {
+    Fixture fx("esc-deactivate");
+    fx.seed_roles();
+    fx.add_user("root", {std::string(permission::role_id::kAdmin)});
+    fx.add_user("botmod_user", {"botmod"});
+    auto bot_id = make_ranked_bot(fx, "token-root", "bot_moderator", "senior");
+
+    EXPECT_TRUE(RefusedBecause(call(*fx.bots, &BotHandler::handle_deactivate_bot,
+                                    bot_path(bot_id), "token-botmod_user"),
+                               403, "ranks at or above you"));
+
+    // Still live: not deactivated, token intact, still able to authenticate.
+    auto bot = fx.store->get_bot(bot_id);
+    ASSERT_TRUE(bot.has_value());
+    EXPECT_FALSE(bot->deactivated_at.has_value());
+    EXPECT_EQ(raw_int(fx.db_path,
+                      "SELECT COUNT(*) FROM access_tokens WHERE user_id = '" + bot_id + "'"),
+              1);
+}
+
+// Equal rank is refused too. outranks() is strictly greater, matching the rule
+// may_assign_roles applies to a human target ("at or above you"): standing level
+// with the bot does not make its roles already yours.
+TEST(BotEscalation, EqualRankIsRefused) {
+    Fixture fx("esc-equal");
+    fx.seed_roles();
+    fx.add_user("root", {std::string(permission::role_id::kAdmin)});
+    auto botmod = fx.add_user("botmod_user", {"botmod"});
+    // The bot wears the SAME role as the actor: both at position 10.
+    auto bot_id = make_ranked_bot(fx, "token-root", "bot_peer", "botmod");
+
+    {
+        PermissionsEngine perms(*fx.store, fx.config);
+        ASSERT_EQ(perms.highest_role_position(botmod),
+                  perms.highest_role_position(bot_id));
+    }
+
+    EXPECT_TRUE(RefusedBecause(call(*fx.bots, &BotHandler::handle_rotate_token,
+                                    bot_token_path(bot_id), "token-botmod_user"),
+                               403, "ranks at or above you"));
+}
+
+// An Administrator can still do everything. The exemption is load-bearing, not a
+// convenience: an admin bot sits at the admin role's own position, so a strict
+// outranks() with no exemption would leave a bot no human could ever rotate.
+TEST(BotEscalation, AnAdministratorCanRotateAndDeactivateAnythingIncludingAnAdminBot) {
+    Fixture fx("esc-admin");
+    fx.seed_roles();
+    fx.add_user("root", {std::string(permission::role_id::kAdmin)});
+    auto bot_id = make_ranked_bot(fx, "token-root", "bot_adminbot",
+                                  std::string(permission::role_id::kAdmin));
+
+    // Equal position — this only works because of the ADMINISTRATOR exemption.
+    {
+        PermissionsEngine perms(*fx.store, fx.config);
+        ASSERT_FALSE(perms.outranks("@root:test", bot_id));
+        ASSERT_TRUE(perms.can("@root:test", "", permission::kAdministrator));
+    }
+
+    auto rot = call(*fx.bots, &BotHandler::handle_rotate_token, bot_token_path(bot_id),
+                    "token-root");
+    ASSERT_TRUE(IsOk(rot));
+    const std::string token = json::parse(rot.body).value("token", "");
+    EXPECT_FALSE(token.empty());
+    EXPECT_EQ(authenticate(*fx.store, "Bearer " + token).value_or(""), bot_id);
+
+    EXPECT_TRUE(IsOk(call(*fx.bots, &BotHandler::handle_deactivate_bot, bot_path(bot_id),
+                          "token-root")));
+    EXPECT_TRUE(fx.store->get_bot(bot_id)->deactivated_at.has_value());
+}
+
+// The synthetic @server actor passes, the same way it short-circuits every other
+// check. Asserted at the PermissionsEngine level rather than over HTTP because
+// @server holds no access token and cannot make a request — which is itself part
+// of why the exemption is safe.
+TEST(BotEscalation, TheServerActorOutranksEveryBot) {
+    Fixture fx("esc-server");
+    fx.seed_roles();
+    fx.add_user("root", {std::string(permission::role_id::kAdmin)});
+    auto bot_id = make_ranked_bot(fx, "token-root", "bot_topranked",
+                                  std::string(permission::role_id::kAdmin));
+
+    PermissionsEngine perms(*fx.store, fx.config);
+    const std::string server_actor = "@server:" + fx.config.server_name;
+    EXPECT_TRUE(perms.outranks(server_actor, bot_id));
+    EXPECT_TRUE(perms.can(server_actor, "", permission::kAdministrator));
+    EXPECT_FALSE(fx.store->user_exists(server_actor))
+        << "@server holds no account and so cannot present a token";
+}
+
+// The normal case must still work: an ordinary MANAGE_BOTS holder administers an
+// ordinary bot. A rank check that refused everything would also pass the tests
+// above, so this is what stops the fix being a lockout.
+TEST(BotEscalation, AnOrdinaryHolderCanStillAdministerAnOrdinaryBot) {
+    Fixture fx("esc-normal");
+    fx.seed_roles();
+    auto botmod = fx.add_user("botmod_user", {"botmod"});
+
+    // Created by the delegated holder, with no roles beyond @everyone.
+    auto [bot_id, first] = fx.make_bot("token-botmod_user", "bot_ordinary");
+    {
+        PermissionsEngine perms(*fx.store, fx.config);
+        ASSERT_TRUE(perms.outranks(botmod, bot_id));
+    }
+
+    auto rot = call(*fx.bots, &BotHandler::handle_rotate_token, bot_token_path(bot_id),
+                    "token-botmod_user");
+    ASSERT_TRUE(IsOk(rot));
+    const std::string second = json::parse(rot.body).value("token", "");
+    EXPECT_FALSE(second.empty());
+    EXPECT_NE(second, first);
+    EXPECT_EQ(authenticate(*fx.store, "Bearer " + second).value_or(""), bot_id);
+
+    EXPECT_TRUE(IsOk(call(*fx.bots, &BotHandler::handle_deactivate_bot, bot_path(bot_id),
+                          "token-botmod_user")));
+    EXPECT_TRUE(fx.store->get_bot(bot_id)->deactivated_at.has_value());
+}
+
+// Listing stays on MANAGE_BOTS alone and is NOT rank-filtered: it returns no
+// credential, and hiding higher-ranked bots from a delegated admin would make
+// the list lie about which localparts are taken.
+TEST(BotEscalation, ListingIsNotRankFilteredAndStillLeaksNoCredential) {
+    Fixture fx("esc-list");
+    fx.seed_roles();
+    fx.add_user("root", {std::string(permission::role_id::kAdmin)});
+    fx.add_user("botmod_user", {"botmod"});
+    auto high = make_ranked_bot(fx, "token-root", "bot_high",
+                                std::string(permission::role_id::kAdmin));
+
+    auto res = call(*fx.bots, &BotHandler::handle_list_bots, kBotsPath, "token-botmod_user");
+    ASSERT_TRUE(IsOk(res));
+    EXPECT_NE(res.body.find(high), std::string::npos);
+    EXPECT_EQ(res.body.find("token"), std::string::npos);
+}
+
+// The escalation the rank check does NOT need to cover, pinned so it stays that
+// way: creating a bot and then granting it a role above your own. That is
+// refused by may_assign_roles, which is why no rank check was added to creation.
+// If this ever starts passing, creation needs one after all.
+TEST(BotEscalation, ALowRankedHolderCannotGrantTheirNewBotAHigherRole) {
+    Fixture fx("esc-create-grant");
+    fx.seed_roles();
+    auto botmod = fx.add_user("botmod_user", {"botmod"});
+
+    // Creating is allowed — the new bot holds nothing, so there is no escalation.
+    auto [bot_id, token] = fx.make_bot("token-botmod_user", "bot_trojan");
+
+    PermissionsEngine perms(*fx.store, fx.config);
+    // ...but arming it is not, at any level above the creator's own position 10.
+    for (const auto& role_id : {std::string(permission::role_id::kAdmin),
+                                std::string("senior")}) {
+        auto verdict = perms.may_assign_roles(botmod, bot_id, {role_id});
+        EXPECT_FALSE(verdict.allowed) << "granting " << role_id << " should be refused";
+        EXPECT_NE(verdict.reason.find("at or above"), std::string::npos) << verdict.reason;
+    }
+
+    // And the bot is still harmless: position 0, no elevated flags.
+    EXPECT_EQ(perms.highest_role_position(bot_id), 0);
+    EXPECT_FALSE(perms.can(bot_id, "", permission::kAdministrator));
+    EXPECT_FALSE(perms.can(bot_id, "", permission::kManageBots));
 }

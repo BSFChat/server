@@ -86,6 +86,56 @@ json bot_to_json(const SqliteStore::BotRecord& bot) {
 BotHandler::BotHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config)
     : store_(store), sync_engine_(sync_engine), config_(config) {}
 
+std::optional<BotHandler::BotAdminContext> BotHandler::authorize_bot_admin(
+    const httplib::Request& req, httplib::Response& res, const std::string& bot_user_id,
+    const char* action) {
+    auto actor = authenticate(store_, req.get_header_value("Authorization"));
+    if (!actor) {
+        send_error(res, 401, auth_error(req.get_header_value("Authorization")));
+        return std::nullopt;
+    }
+
+    PermissionsEngine perms(store_, config_);
+    if (!perms.can(*actor, kServerScope, permission::kManageBots)) {
+        send_error(res, 403, MatrixError::forbidden(
+            std::string("Insufficient permissions to ") + action));
+        return std::nullopt;
+    }
+
+    auto bot = store_.get_bot(bot_user_id);
+    if (!bot) {
+        send_error(res, 404, MatrixError::not_found("No such bot"));
+        return std::nullopt;
+    }
+
+    // The hierarchy check. See BotHandler.h for why handing out a bot credential
+    // is a role grant and therefore needs the same rank rule role grants get.
+    //
+    // AFTER the lookup, so a bot that does not exist is a 404 rather than a 403
+    // that leaks whether the id is taken. That ordering costs nothing here:
+    // everyone who reaches this line already holds MANAGE_BOTS and can list every
+    // bot on the server, so there is no existence oracle to protect.
+    //
+    // outranks() is strict, and strictness is the point: an actor at the SAME
+    // position as the bot is refused, because equal rank means the bot's roles
+    // are not already theirs to hold. That is the same rule may_assign_roles
+    // applies to a human target ("at or above you").
+    const bool exempt = perms.can(*actor, kServerScope, permission::kAdministrator);
+    if (!exempt && !perms.outranks(*actor, bot_user_id)) {
+        get_logger()->warn(
+            "Refused attempt by {} to {} for bot {}, which ranks at or above them "
+            "(bot credentials confer the bot's roles)",
+            *actor, action, bot_user_id);
+        send_error(res, 403, MatrixError::forbidden(
+            std::string("You cannot ") + action +
+            " for a bot that ranks at or above you: its token would grant you the "
+            "bot's roles"));
+        return std::nullopt;
+    }
+
+    return BotAdminContext{.actor = *actor, .bot = std::move(*bot)};
+}
+
 void BotHandler::handle_create_bot(const httplib::Request& req, httplib::Response& res) {
     auto actor = authenticate(store_, req.get_header_value("Authorization"));
     if (!actor) {
@@ -150,7 +200,11 @@ void BotHandler::handle_create_bot(const httplib::Request& req, httplib::Respons
     // Owner and creator are the same person today, and are separate columns
     // because they stop being the same person the moment ownership is
     // transferable or the creating admin leaves. `created_by` is history and must
-    // never change; `owner_id` is a current fact about who is responsible for it.
+    // never change; `owner_id` is who to go and ask about this bot.
+    //
+    // Both are ADVISORY: neither gates anything, here or anywhere else. What
+    // gates rotation and deactivation is rank — see authorize_bot_admin. The
+    // reasoning is on SqliteStore::BotRecord::owner_id.
     record.owner_id = *actor;
     record.created_by = *actor;
     record.created_at = now_ms();
@@ -227,23 +281,17 @@ void BotHandler::handle_list_bots(const httplib::Request& req, httplib::Response
 }
 
 void BotHandler::handle_rotate_token(const httplib::Request& req, httplib::Response& res) {
-    auto actor = authenticate(store_, req.get_header_value("Authorization"));
-    if (!actor) {
-        return send_error(res, 401, auth_error(req.get_header_value("Authorization")));
-    }
-
-    PermissionsEngine perms(store_, config_);
-    if (!perms.can(*actor, kServerScope, permission::kManageBots)) {
-        return send_error(res, 403, MatrixError::forbidden(
-            "Insufficient permissions to rotate a bot token"));
-    }
-
     auto match = match_route(std::string(api_path::kBots) + "/{userId}/token", req.path);
     if (!match.matched) return send_error(res, 404, MatrixError::not_found());
     const auto& user_id = match.params.at("userId");
 
-    auto bot = store_.get_bot(user_id);
-    if (!bot) return send_error(res, 404, MatrixError::not_found("No such bot"));
+    // Authentication, MANAGE_BOTS, the lookup and the rank check, in one call.
+    // Rotation is the endpoint the hierarchy check exists for: it hands the
+    // caller a live, non-expiring credential for the bot.
+    auto ctx = authorize_bot_admin(req, res, user_id, "rotate a bot token");
+    if (!ctx) return;
+    const auto& actor = ctx->actor;
+    const auto* bot = &ctx->bot;
 
     // A deactivated bot does not get a new credential. Deactivation is how a bot
     // is turned off, and if rotating could revive one then "deactivated" would
@@ -263,33 +311,28 @@ void BotHandler::handle_rotate_token(const httplib::Request& req, httplib::Respo
         return send_error(res, 500, MatrixError::unknown("Failed to rotate the bot token"));
     }
 
-    audit_bot_lifecycle(store_, *actor, audit_action::kBotTokenRotate, user_id,
+    audit_bot_lifecycle(store_, actor, audit_action::kBotTokenRotate, user_id,
                         json{{"rotated", true}}.dump());
 
     get_logger()->info("Bot token rotated for {} (by {}); all prior tokens revoked",
-                       user_id, *actor);
+                       user_id, actor);
 
     res.set_content(json{{"token", token}}.dump(), "application/json");
 }
 
 void BotHandler::handle_deactivate_bot(const httplib::Request& req, httplib::Response& res) {
-    auto actor = authenticate(store_, req.get_header_value("Authorization"));
-    if (!actor) {
-        return send_error(res, 401, auth_error(req.get_header_value("Authorization")));
-    }
-
-    PermissionsEngine perms(store_, config_);
-    if (!perms.can(*actor, kServerScope, permission::kManageBots)) {
-        return send_error(res, 403, MatrixError::forbidden(
-            "Insufficient permissions to deactivate a bot account"));
-    }
-
     auto match = match_route(std::string(api_path::kBots) + "/{userId}", req.path);
     if (!match.matched) return send_error(res, 404, MatrixError::not_found());
     const auto& user_id = match.params.at("userId");
 
-    auto bot = store_.get_bot(user_id);
-    if (!bot) return send_error(res, 404, MatrixError::not_found("No such bot"));
+    // Same gate as rotation, and it belongs here for a second reason: deactivating
+    // a bot that outranks you is destroying a higher-ranked principal. That is the
+    // shape outranks() already refuses for kicking or banning a person above you,
+    // and a moderation bot is exactly the thing a badly-behaved moderator would
+    // most like to switch off.
+    auto ctx = authorize_bot_admin(req, res, user_id, "deactivate a bot account");
+    if (!ctx) return;
+    const auto& actor = ctx->actor;
 
     // Rooms are left BEFORE the store call, because leaving is the part that has
     // to be visible to everyone else and the part that can be interrupted.
@@ -320,10 +363,10 @@ void BotHandler::handle_deactivate_bot(const httplib::Request& req, httplib::Res
     const bool newly_deactivated = store_.deactivate_bot(user_id, now_ms());
 
     if (newly_deactivated) {
-        audit_bot_lifecycle(store_, *actor, audit_action::kBotDeactivate, user_id,
+        audit_bot_lifecycle(store_, actor, audit_action::kBotDeactivate, user_id,
                             json{{"rooms_left", left}}.dump());
         get_logger()->info("Bot deactivated: {} (by {}); tokens revoked, left {} room(s)",
-                           user_id, *actor, left);
+                           user_id, actor, left);
     }
 
     res.set_content("{}", "application/json");

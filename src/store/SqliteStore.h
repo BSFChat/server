@@ -153,6 +153,23 @@ public:
         std::string user_id;
         std::string display_name;
         std::string description;
+        // ADVISORY. Who to go and ask about this bot — nothing more.
+        //
+        // It participates in NO authorization decision, deliberately, and this
+        // comment exists so nobody has to read BotHandler to find that out. A
+        // field that looks like access control but is not is worse than no field,
+        // because a reviewer sees "owner" in a listing and assumes something is
+        // enforcing it.
+        //
+        // Why rank and not ownership is the control: the danger in handing out a
+        // bot's credential is acquiring the bot's ROLES, which is a question
+        // about the actor's rank relative to the bot, not about who filled in a
+        // form. Owner-as-a-bypass would reintroduce the escalation outright — a
+        // low-ranked owner could rotate a bot that was later granted
+        // Administrator. Owner-as-an-extra-restriction would add no security the
+        // rank check does not already provide, and would strand every bot whose
+        // owner has left the company, unless admins bypassed it, at which point
+        // it would be decorative anyway.
         std::string owner_id;
         int64_t created_at = 0;
         std::string created_by;
