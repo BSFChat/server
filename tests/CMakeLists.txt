@@ -15,6 +15,7 @@ add_executable(server_tests
     test_rooms.cpp
     test_sync.cpp
     test_sync_latency.cpp
+    test_sync_invites.cpp
     test_call_privacy.cpp
     test_permissions.cpp
     test_media.cpp
@@ -147,6 +148,17 @@ set_tests_properties(e2e_profile_shape PROPERTIES
     # and a client parses it off the wire.
     TIMEOUT 300
     # Registers two users (bcrypt) and starts a server process.
+    RUN_SERIAL TRUE)
+
+add_test(NAME e2e_invites
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/e2e/e2e_invites.sh)
+set_tests_properties(e2e_invites PROPERTIES
+    LABELS e2e
+    ENVIRONMENT "BSFCHAT_SERVER_BIN=$<TARGET_FILE:bsfchat-server>"
+    # It registers three accounts (bcrypt), restarts the server so role
+    # bootstrap runs, and parks two long polls it has to let expire.
+    TIMEOUT 300
+    # Fixed port, plus two timing assertions on how long a poll blocks.
     RUN_SERIAL TRUE)
 
 # --- release-channel script --------------------------------------------------

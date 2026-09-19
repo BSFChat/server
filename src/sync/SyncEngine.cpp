@@ -102,6 +102,60 @@ void attach_direct_rooms(SqliteStore& store, const std::string& user_id,
     for (auto& [room_id, peer] : direct) out[peer].push_back(std::move(room_id));
 }
 
+// Categories bypass VIEW_CHANNEL so the sidebar can still show the container
+// node even when individual child channels are hidden.
+bool can_view_room(SqliteStore& store, PermissionsEngine& perms, const std::string& user_id,
+                   const std::string& room_id) {
+    return is_category_room(store, room_id) ||
+           perms.can(user_id, room_id, permission::kViewChannel);
+}
+
+// One room's invite section: the stripped state and nothing else. Already
+// stated wins, so a delta that found the invite is never overwritten by the
+// restatement below.
+void attach_invite(SqliteStore& store, const std::string& user_id, const std::string& room_id,
+                   SyncResponse& response) {
+    if (response.rooms.invite.count(room_id)) return;
+    InvitedRoom invited;
+    invited.invite_state.events = store.get_invite_state(room_id, user_id);
+    response.rooms.invite[room_id] = std::move(invited);
+}
+
+// Every invite this user currently has pending, whether or not it arrived in
+// this delta — the same restatement m.direct gets, for the same reason.
+//
+// The delta path alone is enough for an invite sent from now on and nothing at
+// all for one that is already pending: a client resumes from a persisted sync
+// token, so it never asks for an initial sync again, and the member event
+// announcing an older invite sits below that token forever. Upgrading the
+// server would therefore have fixed nothing for the invites an owner actually
+// has outstanding. Restating them fixes that within one poll.
+//
+// Safe for the long poll, and structurally so: this runs from deliver(), on
+// the response AFTER the decision to keep waiting has been taken on it. A
+// pending invite can therefore never make an empty response look non-empty —
+// which would return instantly, poll again with an advanced token, find the
+// same invite still pending, and spin.
+//
+// It is also what makes a delivered response's invite set authoritative: it is
+// read from current membership, so an invite accepted or declined elsewhere is
+// simply absent next poll and the client drops it. That is the whole of
+// rooms.leave's job here, without the section.
+void attach_pending_invites(SqliteStore& store, const Config& config,
+                            const std::string& user_id, SyncResponse& response) {
+    auto invited = store.get_invited_rooms(user_id);
+    if (invited.empty()) return;  // the common case: one indexed lookup, no rows
+    PermissionsEngine perms(store, config);
+    for (const auto& room_id : invited) {
+        // The same gate every other room in the response passes. An invite into
+        // a channel this user's roles cannot view would be an invitation to
+        // accept and still see nothing, and it would surface a channel the
+        // server has decided they cannot see.
+        if (!can_view_room(store, perms, user_id, room_id)) continue;
+        attach_invite(store, user_id, room_id, response);
+    }
+}
+
 } // namespace
 
 SyncEngine::SyncEngine(SqliteStore& store, const Config& config)
@@ -188,9 +242,26 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
     // merge is idempotent and reports only what changed, and next_batch is
     // untouched — so a restatement on an idle timeout cannot be mistaken for
     // progress, and cannot churn the sidebar.
+    //
+    // Pending invites ride along for the same reasons, argued in full at
+    // attach_pending_invites: they are read from current membership, so the
+    // set on a delivered response is the complete one, and an invite that was
+    // already outstanding when the client's token was minted is learned within
+    // one poll instead of never.
     auto deliver = [this, &user_id](SyncResponse&& r) {
         if (!r.direct_rooms) attach_direct_rooms(store_, user_id, r);
+        attach_pending_invites(store_, config_, user_id, r);
         return std::move(r);
+    };
+
+    // What counts as "something for this user", i.e. worth returning now
+    // rather than parking on. An invite is content: the whole complaint is
+    // that an invitee learned nothing until they were told out of band.
+    //
+    // This deliberately reads the response BUILT BY build_incremental_sync,
+    // never one that deliver() has touched — see attach_pending_invites.
+    auto has_payload = [](const SyncResponse& r) {
+        return !r.rooms.join.empty() || !r.rooms.invite.empty();
     };
 
     int64_t since_pos = 0;
@@ -215,7 +286,7 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
     // wait below still treats it as unseen and wakes on it at once.
     int64_t covered_pos = since_pos;
     auto response = build_incremental_sync(user_id, since_pos, &covered_pos);
-    if (!response.rooms.join.empty()) {
+    if (has_payload(response)) {
         return deliver(std::move(response));
     }
 
@@ -264,7 +335,7 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
             response = build_incremental_sync(user_id, since_pos, &covered_pos);
             // Real events, or an ephemeral change the caller injects typing and
             // presence from — either is worth returning immediately.
-            if (!response.rooms.join.empty() ||
+            if (has_payload(response) ||
                 ephemeral_seq_.load() != edu_at_entry) {
                 return deliver(std::move(response));
             }
@@ -364,6 +435,9 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
     }
 
     attach_direct_rooms(store_, user_id, response);
+    // A fresh client learns its pending invites here; an established one is
+    // told again on every delivered incremental response (see deliver()).
+    attach_pending_invites(store_, config_, user_id, response);
 
     response.next_batch = "s" + std::to_string(head_before_scan);
     return response;
@@ -409,6 +483,7 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
     }
 
     std::set<std::string> newly_joined_rooms;
+    std::set<std::string> invited_rooms;
     // Cache visibility decisions so we don't recompute for every event in
     // the same room (hot path during bursts).
     std::unordered_map<std::string, RoomView> view_cache;
@@ -419,8 +494,47 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
         view_cache.emplace(room_id, view);
         return view;
     };
+    // "May this user be told the room exists" — the LISTING rule, used by the
+    // invite trigger below. Equal to the free can_view_room() above
+    // (is_category_room || VIEW_CHANNEL) and therefore to `!= kNone`; if you
+    // ever change one, change both, or invites and the sidebar will disagree
+    // about which rooms are namable.
+    auto can_view = [&](const std::string& room_id) {
+        return view_of(room_id) != RoomView::kNone;
+    };
+    // Same caching, for the same reason: the scan can return many rows per
+    // room and this is one query each.
+    std::unordered_map<std::string, std::string> membership_cache;
+    auto membership_of = [&](const std::string& room_id) -> const std::string& {
+        auto it = membership_cache.find(room_id);
+        if (it == membership_cache.end()) {
+            it = membership_cache.emplace(room_id, store_.get_membership(room_id, user_id))
+                     .first;
+        }
+        return it->second;
+    };
 
     for (auto& event : events) {
+        // feat/sync-invites' invite trigger, kept AHEAD of the view switch: a
+        // room this user has only been invited to contributes no timeline and
+        // no state, so it must not fall through to the join-section handling
+        // below.
+        //
+        // can_view() is `view_of() != kNone`, deliberately not `== kFull`. The
+        // old predicate this replaced was `VIEW_CHANNEL || is_category`, and
+        // `!= kNone` is exactly that set — so invite delivery is unchanged by
+        // the category work. Requiring kFull would silently drop an invite into
+        // a category the invitee cannot view yet, which is precisely the case
+        // an invite exists to resolve.
+        const bool own_member_event =
+            event.type == std::string(event_type::kRoomMember) &&
+            event.state_key.has_value() && *event.state_key == user_id;
+        if (own_member_event &&
+            membership_of(event.room_id) == std::string(membership::kInvite)) {
+            if (can_view(event.room_id)) invited_rooms.insert(event.room_id);
+            continue;
+        }
+
         const RoomView view = view_of(event.room_id);
         if (view == RoomView::kNone) continue;
 
@@ -451,6 +565,10 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
             joined.state.events.push_back(event);
         }
         joined.timeline.events.push_back(std::move(event));
+    }
+
+    for (const auto& room_id : invited_rooms) {
+        attach_invite(store_, user_id, room_id, response);
     }
 
     bool joined_direct_room = false;
