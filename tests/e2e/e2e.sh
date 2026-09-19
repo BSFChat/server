@@ -246,7 +246,20 @@ fi
 echo
 echo "== schema =="
 SV=$(sqlite3 "$RUN/data/bsfchat.db" "PRAGMA user_version" 2>/dev/null || echo "?")
-# Pinned on purpose, so bumping the schema is a conscious edit rather than
+# Derived from the build's own source of truth, not restated here.
+#
+# Two branches fixed this independently — one with a `>= 16` floor, this one
+# by reading the header. The derived form wins because a floor still drifts
+# away from what it is checking; this cannot. This used to
+# be a literal pinned "so bumping the schema is a conscious edit", but in
+# practice the pin just went stale on every migration (it sat at 12 while the
+# schema was 15, then at 16 while it was 18) and a permanently-red check teaches
+# people to ignore the whole suite. The conscious-edit tripwire still exists
+# where it costs nothing to keep current: EXPECT_EQ(kTargetSchemaVersion, N) in
+# tests/test_audit.cpp. What this check is really for is that the server
+# actually ran its migrations up to the version this checkout expects.
+EXPECT_SV=$(sed -n \
+  's/^inline constexpr int kTargetSchemaVersion = \([0-9][0-9]*\);.*/# Pinned on purpose, so bumping the schema is a conscious edit rather than
 # something that slides past review — the same convention the C++ migration tests
 # use (kTargetSchemaVersion in server/src/store/Migrations.h).
 #
@@ -260,6 +273,14 @@ SV=$(sqlite3 "$RUN/data/bsfchat.db" "PRAGMA user_version" 2>/dev/null || echo "?
 [ "$SV" -ge 16 ] 2>/dev/null \
     && pass "database is at schema v$SV (>= 16)" \
     || fail "database is at schema v$SV, expected 16 or newer"
+/p' \
+  "$SRV/src/store/Migrations.h" 2>/dev/null)
+if [ -n "$EXPECT_SV" ]; then
+  check "database is at schema v$EXPECT_SV (kTargetSchemaVersion)" "^$EXPECT_SV\$" "$SV"
+else
+  echo "  FAIL  could not read kTargetSchemaVersion from $SRV/src/store/Migrations.h"
+  FAIL=$((FAIL+1))
+fi
 TB=$(sqlite3 "$RUN/data/bsfchat.db" ".tables" 2>/dev/null | tr -s ' \n' ' ')
 check "event_mentions exists" "event_mentions" "$TB"
 check "pushers exists" "pushers" "$TB"
