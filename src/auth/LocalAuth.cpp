@@ -1,5 +1,25 @@
 #include "auth/LocalAuth.h"
 
+#include <bsfchat/Identifiers.h>
+
+// The single-SHA-256 storage of access tokens in this file is only sound because
+// the tokens are high-entropy: see hash_access_token() in the header. They were
+// not. generate_access_token() drew from an mt19937 seeded with one 32-bit
+// value, so every token this server ever issued was one of 2^32 strings — about
+// 1.3 core-hours to enumerate — and hashing them changed nothing about that.
+//
+// The fix lives in the protocol library (protocol 671e803). This guard exists
+// because the server does not always build against the protocol checkout
+// sitting next to it: with no local copy present, cmake/Dependencies.cmake
+// fetches protocol `main` from GitHub, so a green build is not by itself
+// evidence of which version went in. Fail loudly here rather than ship a server
+// that issues guessable bearer tokens under a comment promising 256 bits.
+#ifndef BSFCHAT_PROTOCOL_CSPRNG_IDENTIFIERS
+#error "This server requires a protocol library whose identifier generators use the CSPRNG. \
+Update the bsfchat-protocol dependency: before that change, access and refresh tokens had \
+32 bits of entropy regardless of their length."
+#endif
+
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
