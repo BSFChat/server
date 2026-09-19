@@ -45,6 +45,7 @@ add_executable(bsfchat-server
     src/api/TypingHandler.cpp
     src/api/PresenceHandler.cpp
     src/api/MediaHandler.cpp
+    src/api/MediaPolicy.cpp
     src/api/ProfileHandler.cpp
     src/api/VoiceHandler.cpp
     src/api/PushHandler.cpp

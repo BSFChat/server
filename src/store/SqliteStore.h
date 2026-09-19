@@ -899,6 +899,25 @@ public:
     std::optional<MediaMeta> get_media(const std::string& media_id);
     bool delete_media(const std::string& media_id);
 
+    // --- media access control -------------------------------------------
+    //
+    // Media has no room column of its own and never can: POST /upload carries
+    // no room. The binding is recorded when the object is first *named* by an
+    // event, by insert_event(), and these are the two reads the download path
+    // uses to decide whether a caller may have the bytes.
+
+    /// Every room in which a surviving, unredacted event names this exact
+    /// `mxc://host/id`. Empty means the object is not attached to anything —
+    /// which the caller must treat as "nobody but the uploader", NOT as
+    /// "public". Whole URIs, not bare ids: see media_uris_in_content().
+    std::vector<std::string> get_media_rooms(const std::string& mxc_uri);
+
+    /// True when this URI is some account's current profile avatar. Avatars
+    /// are the one legitimately room-less media class — they are shown next to
+    /// a name in every channel and in profile cards — so they are readable by
+    /// any authenticated caller, matching what /profile already discloses.
+    bool is_avatar_media(const std::string& mxc_uri);
+
 private:
     void exec(const std::string& sql);
     // Claims the next stream position. Caller must hold mutex_.

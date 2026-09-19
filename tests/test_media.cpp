@@ -686,7 +686,10 @@ TEST(MediaRangeHandler, ZeroLengthObjectDoesNotInstallAContentProvider) {
 
     EXPECT_EQ(res.content_provider_, nullptr);
     EXPECT_EQ(res.content_length_, 0u);
-    EXPECT_EQ(res.get_header_value("Content-Type"), "text/plain");
+    // Not "text/plain": text/* is not on the media allowlist, so the download
+    // path re-types it. This test is about the zero-length provider, not the
+    // content type — see test_media_security.cpp for the type policy itself.
+    EXPECT_EQ(res.get_header_value("Content-Type"), "application/octet-stream");
     EXPECT_EQ(storage->range_reads, 0u);
 }
 

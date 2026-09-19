@@ -1,4 +1,6 @@
 #include "api/MediaHandler.h"
+#include "api/MediaPolicy.h"
+#include "auth/Permissions.h"
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
@@ -181,11 +183,19 @@ void MediaHandler::handle_upload(const httplib::Request& req, httplib::Response&
         return;
     }
 
-    // Get content type and filename
-    auto content_type = req.get_header_value("Content-Type");
-    if (content_type.empty()) {
-        content_type = "application/octet-stream";
-    }
+    // NEVER store the uploader's Content-Type verbatim.
+    //
+    // This header used to go straight into the media row and straight back out
+    // on download, which meant an uploader chose the type their bytes would be
+    // served as. `Content-Type: text/html` on a file named `Q3-budget.pdf`, and
+    // the victim's browser executed the attacker's page on the chat origin with
+    // the victim's access token in location.search. See MediaPolicy.h.
+    //
+    // normalise_content_type() answers with an allowlisted type whose magic
+    // bytes agree with it, or application/octet-stream. The header is now a
+    // hint, not a decision.
+    auto content_type = media_policy::normalise_content_type(
+        req.get_header_value("Content-Type"), body);
 
     std::string filename;
     if (req.has_param("filename")) {
@@ -198,9 +208,25 @@ void MediaHandler::handle_upload(const httplib::Request& req, httplib::Response&
     try {
         auto file_path = storage_->upload(media_id, body, content_type, filename);
 
-        // Store metadata in database
-        store_.insert_media(media_id, *user_id, content_type, filename,
-                           static_cast<int64_t>(body.size()), file_path);
+        // Store metadata in database.
+        //
+        // If this throws, the blob is already written and nothing will ever
+        // reference it: there is no orphan reaper (audit B11), so it would sit
+        // in data/media/ for the life of the deployment. Undo the upload rather
+        // than leak it. Best-effort — a failed remove is worth a log line and
+        // nothing more, since the caller is about to get a 500 either way.
+        try {
+            store_.insert_media(media_id, *user_id, content_type, filename,
+                               static_cast<int64_t>(body.size()), file_path);
+        } catch (...) {
+            try {
+                storage_->remove(media_id);
+            } catch (const std::exception& e) {
+                log->error("Orphaned media blob {}: metadata insert failed and the "
+                           "blob could not be removed: {}", media_id, e.what());
+            }
+            throw;
+        }
 
         // Build content URI
         std::string content_uri = "mxc://" + config_.server_name + "/" + media_id;
@@ -235,19 +261,72 @@ std::optional<std::string> MediaHandler::authenticate_media(const httplib::Reque
     return std::nullopt;
 }
 
+bool MediaHandler::may_download(const std::string& user_id,
+                                const std::string& media_id,
+                                const SqliteStore::MediaMeta& meta) {
+    // 1. The uploader. They supplied the bytes, and this is also what keeps a
+    //    freshly uploaded object fetchable in the window between POST /upload
+    //    and the PUT /send that attaches it to a room.
+    if (meta.uploader == user_id) return true;
+
+    // The whole URI, not the bare id — see SqliteStore::get_media_rooms().
+    const std::string mxc_uri = "mxc://" + config_.server_name + "/" + media_id;
+
+    // 2. VIEW_CHANNEL in any room where a surviving event names this object.
+    //    One object can legitimately be in several rooms (a forward, a repost),
+    //    and access to any one of those rooms is access to the bytes, because
+    //    that room's timeline already shows them.
+    auto rooms = store_.get_media_rooms(mxc_uri);
+    if (!rooms.empty()) {
+        PermissionsEngine perms(store_, config_);
+        for (const auto& room_id : rooms) {
+            // Membership AND VIEW_CHANNEL, the same pair can_read_room() uses.
+            //
+            // Neither half is redundant. Everyone is force-joined into every
+            // public channel, so membership alone is not authorization — that
+            // is the bug can_read_room's own comment describes. And VIEW_CHANNEL
+            // alone is not either: a DM has no channel overrides, so @everyone's
+            // default VIEW_CHANNEL evaluates true for a user who has never been
+            // near it, which would have made every DM attachment on the server
+            // world-readable.
+            //
+            // Deliberately NOT mirroring can_read_room's is_category_room()
+            // short-circuit: that exemption is an unbounded VIEW_CHANNEL bypass
+            // (audit A3/B2, work package P2) and reproducing it here would carry
+            // it into the media path too.
+            if (store_.is_room_member(room_id, user_id) &&
+                perms.can(user_id, room_id, permission::kViewChannel)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 3. Room-less media. This is the case the fix turns on: "no room recorded"
+    //    must mean "nobody", not "everybody", or the backfill gap and every
+    //    future ingestion path become the bypass.
+    //
+    //    The one legitimate room-less class is a profile avatar, which is shown
+    //    next to its owner's name everywhere and is already disclosed by
+    //    /profile, so any authenticated caller may have it.
+    return store_.is_avatar_media(mxc_uri);
+}
+
 void MediaHandler::handle_download(const httplib::Request& req, httplib::Response& res) {
     auto log = get_logger();
 
-    // Media ids are 128-bit random, so an unauthenticated download is
-    // capability-URL security: no revocation, no per-room ACL, and the URL
-    // leaks through any surface that records it. When require_media_auth is
-    // on, a valid access token is required.
+    // Media ids are 128-bit random, but that was the ONLY thing protecting an
+    // object: the previous implementation checked "is this a live token for
+    // some user" and threw the user id away, so a valid token was a server-wide
+    // media capability and locking a channel down did nothing for what was
+    // already posted in it (audit B3). The caller is now carried through to
+    // may_download() below and checked against VIEW_CHANNEL.
     //
-    // Defaults ON. The desktop client appends ?access_token= to every media
-    // URL it builds (client/src/util/MediaUrl.h) because QML Image.source
-    // cannot attach an Authorization header. A deployment fronting clients
-    // older than that has to set [media] require_auth = false.
-    if (config_.require_media_auth && !authenticate_media(req)) {
+    // require_media_auth defaults ON. With it OFF there is no caller to check,
+    // so the per-room ACL cannot apply either — turning it off does not merely
+    // drop the token requirement, it drops the channel ACL with it.
+    auto caller = authenticate_media(req);
+    if (config_.require_media_auth && !caller) {
         res.status = 401;
         res.set_content(R"({"errcode":"M_UNKNOWN_TOKEN","error":"Invalid or missing access token"})",
                         "application/json");
@@ -289,6 +368,20 @@ void MediaHandler::handle_download(const httplib::Request& req, httplib::Respons
         return;
     }
 
+    // Per-room ACL. 404, not 403, and byte-identical to the "no such id" answer
+    // above: "this id exists but is not yours" is itself worth knowing, and the
+    // existing 404/404 symmetry is what makes a media id un-probeable. Nothing
+    // is read from storage before this point, so a refused caller cannot even
+    // time the difference against a stat().
+    if (caller && !may_download(*caller, media_id, *meta)) {
+        log->info("Media {} refused to {}: no VIEW_CHANNEL in any room referencing it",
+                  media_id, *caller);
+        res.status = 404;
+        res.set_content(R"({"errcode":"M_NOT_FOUND","error":"Media not found"})",
+                        "application/json");
+        return;
+    }
+
     // Size and content type only — NOT the bytes. The previous implementation
     // called storage_->download(), which materialises the entire object as a
     // std::string, and then let httplib slice a range out of it: a 1-byte
@@ -311,11 +404,67 @@ void MediaHandler::handle_download(const httplib::Request& req, httplib::Respons
         content_type = "application/octet-stream";
     }
 
-    // Determine filename for Content-Disposition
-    std::string filename = requested_filename.empty() ? meta->filename : requested_filename;
-    if (!filename.empty()) {
-        res.set_header("Content-Disposition", "inline; filename=\"" + filename + "\"");
+    // Whatever the storage backend or an older build recorded, the type served
+    // is re-checked against the allowlist here. The upload-side normalisation
+    // is the primary gate; this is the one that also covers rows written before
+    // it existed, a restored backup, or a hand-edited database.
+    if (!media_policy::is_inline_safe(content_type) && content_type != "application/pdf") {
+        content_type = "application/octet-stream";
     }
+
+    // Response hardening. Every one of these was absent, which is what turned
+    // an attacker-chosen Content-Type into script execution on the chat origin.
+    //
+    //   nosniff          — without it a browser content-sniffs an
+    //                      octet-stream body back up to text/html, which would
+    //                      undo the normalisation above on its own.
+    //   CSP              — defence in depth for the inline-allowlisted types
+    //                      and for any future format that turns out to be
+    //                      scriptable. `sandbox` with no tokens denies scripts,
+    //                      plugins, forms and same-origin, so even a document
+    //                      that does render has no origin to steal from.
+    //   frame-ancestors  — media must not be framed by a page that then reads
+    //   + X-Frame-Options  it; the legacy header is for anything that predates CSP.
+    //   Referrer-Policy  — media URLs carry ?access_token= today (see the
+    //                      MediaUrl note in the report); no-referrer stops it
+    //                      being handed to whatever the media links out to.
+    //   CORP             — with Access-Control-Allow-Origin removed below, this
+    //                      is what stops another origin embedding the bytes.
+    res.set_header("X-Content-Type-Options", "nosniff");
+    res.set_header("Content-Security-Policy",
+                   "default-src 'none'; sandbox; frame-ancestors 'none'; "
+                   "base-uri 'none'; form-action 'none'");
+    res.set_header("X-Frame-Options", "DENY");
+    res.set_header("Referrer-Policy", "no-referrer");
+    res.set_header("Cross-Origin-Resource-Policy", "same-origin");
+
+    // Server::register_routes() sets `Access-Control-Allow-Origin: *` on every
+    // response from a pre-routing handler. On media that is an invitation for
+    // any page on the internet to read a logged-in user's attachments with
+    // their cookies — erase it here rather than weakening it globally, which is
+    // a change other packages own. Erased, not re-set: httplib's headers are a
+    // multimap and set_header() appends, so setting it again would emit two.
+    //
+    // No effect on the desktop client: Qt's network stack does not enforce CORS.
+    res.headers.erase("Access-Control-Allow-Origin");
+
+    // Content-Disposition is now ALWAYS present. It used to be emitted only
+    // when a filename was known, and always as `inline` — so an upload with no
+    // filename got no disposition at all and every browser rendered it in
+    // place. `inline` is now reserved for the narrow set of types the client
+    // has to render (bitmap images, video, audio); everything else, including
+    // every type that normalised to octet-stream, downloads.
+    //
+    // The filename is attacker-controlled — `requested_filename` is the last
+    // path segment of the URL, percent-decoded by httplib before routing — so
+    // media_policy::content_disposition() sanitises it. A CR or LF in there
+    // would make httplib 0.47 silently DROP the whole header (it validates
+    // field values), which is precisely the "no disposition, therefore inline"
+    // state an attacker wants back.
+    std::string filename = requested_filename.empty() ? meta->filename : requested_filename;
+    res.set_header("Content-Disposition",
+                   media_policy::content_disposition(
+                       media_policy::is_inline_safe(content_type), filename));
 
     res.set_header("Accept-Ranges", "bytes");
 

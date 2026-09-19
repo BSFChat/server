@@ -1,5 +1,7 @@
 #pragma once
 
+#include "store/SqliteStore.h"
+
 #include <httplib.h>
 #include <memory>
 #include <optional>
@@ -7,7 +9,6 @@
 
 namespace bsfchat {
 
-class SqliteStore;
 class MediaStorage;
 struct Config;
 
@@ -24,6 +25,16 @@ private:
     // Resolves the caller from either the Authorization header or an
     // ?access_token= query param (image/video widgets can't set headers).
     std::optional<std::string> authenticate_media(const httplib::Request& req);
+
+    // May `user_id` have the bytes of `media_id`?
+    //
+    // Media carries no room of its own — POST /upload has no room in it — so
+    // the answer comes from the events that NAME the object: VIEW_CHANNEL in
+    // any room where one survives. Uploader and profile-avatar are the two
+    // explicit exceptions; everything else with no room recorded is refused,
+    // because "unattached" must never be read as "public".
+    bool may_download(const std::string& user_id, const std::string& media_id,
+                      const SqliteStore::MediaMeta& meta);
 
     SqliteStore& store_;
     const Config& config_;

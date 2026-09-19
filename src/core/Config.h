@@ -299,10 +299,21 @@ struct Config {
     std::string media_path = "./data/media/";
     size_t max_upload_size_mb = 50;
     // Require an access token (header or ?access_token=) on media downloads.
-    // On by default. Without it a media id is a bare capability URL: no
-    // revocation, no per-room ACL. The desktop client appends ?access_token=
-    // (see util/MediaUrl.h) because QML Image.source cannot set headers.
-    // Set to false only for a deployment still running pre-token clients.
+    // On by default. The desktop client appends ?access_token= (see
+    // util/MediaUrl.h) because QML Image.source cannot set headers.
+    //
+    // TURNING THIS OFF ALSO TURNS OFF THE PER-ROOM ACL. Media downloads are
+    // gated on VIEW_CHANNEL in a room that names the object
+    // (MediaHandler::may_download), and that check needs a caller to evaluate;
+    // with no token there is nobody to check, so every object on the server
+    // becomes a bare capability URL again. The previous wording here said the
+    // switch existed because a media id "is a bare capability URL: no
+    // revocation, no per-room ACL" — implying the switch mitigated those. It
+    // never did, and now it is the thing that disables the ACL.
+    //
+    // Set to false only for a deployment still running pre-token clients, and
+    // understand that doing so makes every attachment in every private channel
+    // readable by anyone who learns its id.
     bool require_media_auth = true;
 
     // Storage

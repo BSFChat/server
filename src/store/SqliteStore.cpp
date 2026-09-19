@@ -104,6 +104,66 @@ std::optional<std::string> replacement_target(const std::string& content_json) {
     return target;
 }
 
+// Every media id this event's content names, so the event row and the media
+// ACL can never disagree about what the event grants access to.
+//
+// A full recursive walk for any string beginning with `mxc://`, rather than a
+// list of known keys (`$.url`, `$.info.thumbnail_url`, `$.m.new_content.url`,
+// …). That is not laziness — it is the exact invariant we want to index:
+//
+//   a reader of this event can learn every mxc id printed anywhere in it,
+//   so a reader of this event may fetch every one of them.
+//
+// Keyed extraction would under-collect the moment a new message shape puts a
+// URI somewhere unanticipated, and an under-collected id is a working image
+// that suddenly 404s for everyone but its uploader. Over-collecting is
+// impossible by construction: a string that is not in the content cannot be
+// collected, and a string that IS in the content is already visible to anyone
+// who can read the event.
+// Whole `mxc://host/id` URIs are indexed, never the bare id. The host is
+// load-bearing: with only the id in the table, posting
+// `mxc://anything/<id-from-a-private-channel>` into a channel you control
+// would bind that id to your channel and hand you the object. The download
+// path looks up the URI it builds from its own configured server name, so a
+// foreign host simply never matches.
+std::vector<std::string> media_uris_in_content(const std::string& content_json) {
+    std::vector<std::string> uris;
+    auto j = nlohmann::json::parse(content_json, nullptr, false);
+    if (j.is_discarded()) return uris;
+
+    // Iterative rather than recursive: content is attacker-supplied, and
+    // nlohmann will happily parse a few thousand levels of nesting, which a
+    // recursive walker would turn into a stack overflow — a remote crash from
+    // one PUT /send. A worklist has no such ceiling.
+    std::vector<const nlohmann::json*> todo{&j};
+    while (!todo.empty()) {
+        const nlohmann::json* node = todo.back();
+        todo.pop_back();
+        if (node->is_string()) {
+            const auto& s = node->get_ref<const std::string&>();
+            if (s.rfind("mxc://", 0) != 0 || s.size() > 512) continue;
+            auto slash = s.find('/', 6);
+            if (slash == std::string::npos || slash == 6) continue; // no host
+            auto id = s.substr(slash + 1);
+            // A media id is lowercase hex (MediaHandler::generate_media_id).
+            // Refusing anything else keeps a crafted `mxc://host/../..` out of
+            // the table entirely rather than relying on downstream checks.
+            if (id.empty() || id.size() > 128 ||
+                id.find_first_not_of("0123456789abcdef") != std::string::npos) {
+                continue;
+            }
+            uris.push_back(s);
+        } else if (node->is_object() || node->is_array()) {
+            for (const auto& child : *node) todo.push_back(&child);
+        }
+    }
+
+    std::sort(uris.begin(), uris.end());
+    uris.erase(std::unique(uris.begin(), uris.end()), uris.end());
+    return uris;
+}
+
+
 // Stamps `bsfchat.bot` onto an m.room.member event's content, DERIVED from the
 // member's user id rather than read back from what was stored.
 //
@@ -693,6 +753,10 @@ void SqliteStore::delete_room(const std::string& room_id) {
                 reindex_search_locked(id, room_id, "", 0, std::nullopt);
             }
         }
+        // Media grants die with the room. Not doing this would leave every
+        // attachment ever posted in a deleted channel fetchable by whoever was
+        // in it, keyed off a room whose permissions can no longer be evaluated.
+        run("DELETE FROM media_refs WHERE room_id = ?");
         run("DELETE FROM events WHERE room_id = ?");
         run("DELETE FROM room_members WHERE room_id = ?");
         run("DELETE FROM rooms WHERE room_id = ?");
@@ -1395,6 +1459,30 @@ int64_t SqliteStore::insert_event(const std::string& event_id, const std::string
             }
         }
 
+        // Media ACL index, on the door for the same reason `signal_to` is.
+        //
+        // Upload is not room-scoped — POST /upload has no room in it — so this
+        // is the only moment at which the server learns which channel a media
+        // object belongs to. Recorded inside the same transaction as the event
+        // so a reader can never see an event whose attachment the ACL would
+        // then refuse, nor the reverse.
+        //
+        // State events go in too, not just messages: a channel icon set by
+        // PUT /state is read through the same VIEW_CHANNEL gate as the rest of
+        // that room's state, so binding it to the room is exactly right.
+        for (const auto& uri : media_uris_in_content(content_json)) {
+            auto ref = prepare(db_,
+                "INSERT OR IGNORE INTO media_refs (mxc_uri, room_id, event_id) "
+                "VALUES (?, ?, ?)");
+            sqlite3_bind_text(ref.get(), 1, uri.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ref.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ref.get(), 3, event_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(ref.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("Failed to index media reference: ") +
+                                         sqlite3_errmsg(db_));
+            }
+        }
+
         exec("COMMIT");
         return stream_pos;
     } catch (...) {
@@ -1687,6 +1775,22 @@ bool SqliteStore::redact_event(const std::string& event_id, const std::string& r
     // already held here.
     if (newly_redacted) {
         auto del = prepare(db_, "DELETE FROM event_mentions WHERE event_id = ?");
+        sqlite3_bind_text(del.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(del.get());
+    }
+
+    // ...and stop granting media access through it. The UPDATE above stripped
+    // the mxc URI out of the content, so the event no longer tells anyone what
+    // the id is; leaving the ACL row behind would keep the object fetchable for
+    // everyone who had already seen it, through an event that no longer exists
+    // as far as every read path is concerned.
+    //
+    // The blob itself still survives — nothing in the codebase deletes media
+    // (audit B11), so someone who noted the id before the redaction keeps their
+    // copy. Narrowing the grant is what this row can do; erasure is a separate
+    // piece of work that this index is the prerequisite for.
+    if (newly_redacted) {
+        auto del = prepare(db_, "DELETE FROM media_refs WHERE event_id = ?");
         sqlite3_bind_text(del.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_step(del.get());
     }
@@ -3180,6 +3284,24 @@ std::optional<SqliteStore::MediaMeta> SqliteStore::get_media(const std::string& 
         return meta;
     }
     return std::nullopt;
+}
+
+std::vector<std::string> SqliteStore::get_media_rooms(const std::string& mxc_uri) {
+    std::lock_guard lock(mutex_);
+    std::vector<std::string> rooms;
+    auto stmt = prepare(db_, "SELECT DISTINCT room_id FROM media_refs WHERE mxc_uri = ?");
+    sqlite3_bind_text(stmt.get(), 1, mxc_uri.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        rooms.emplace_back(column_text_or_empty(stmt.get(), 0));
+    }
+    return rooms;
+}
+
+bool SqliteStore::is_avatar_media(const std::string& mxc_uri) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT 1 FROM users WHERE avatar_url = ? LIMIT 1");
+    sqlite3_bind_text(stmt.get(), 1, mxc_uri.c_str(), -1, SQLITE_TRANSIENT);
+    return sqlite3_step(stmt.get()) == SQLITE_ROW;
 }
 
 bool SqliteStore::delete_media(const std::string& media_id) {
