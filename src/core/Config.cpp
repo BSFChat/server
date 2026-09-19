@@ -253,11 +253,44 @@ void Config::validate(Config& cfg) {
         }
     }
 
+    // The cost is an EXPONENT: iterations = 2^cost. 12 is 4,096 PBKDF2-HMAC-SHA256
+    // iterations, which a single GPU works through at hundreds of millions of
+    // guesses a second — a stolen database is then a wordlist exercise, not a
+    // wall. The recommended value is 19 (524,288), in line with OWASP, and it is
+    // what Config.h defaults to and what config/bsfchat-server.example.toml and
+    // deploy/config/server.toml.template both ship.
+    //
+    // Two thresholds on purpose:
+    //
+    //   * below 12 is clamped, because those values are indistinguishable from
+    //     a typo and provide no meaningful resistance at all;
+    //   * 12..18 is warned about but honoured, because the login cost is the
+    //     operator's to spend. Silently multiplying their per-login CPU by up
+    //     to 128x on an upgrade is not a decision to make on their behalf on a
+    //     box that may be sized for exactly the load it has.
+    //
+    // Older deploy templates shipped 12, so this warning is the upgrade path for
+    // every deployment created from one: it fires on every start, names the fix,
+    // and the fix is genuinely one line because stored hashes record their own
+    // cost and are re-derived at the owner's next login
+    // (AuthHandler.cpp, "Transparently upgrade a hash").
     if (cfg.password_hash_cost < 12) {
         log->warn("auth.password_hash_cost = {} is dangerously low ({} PBKDF2 iterations). "
                   "Raising to 12; 19 or higher is recommended.",
                   cfg.password_hash_cost, 1u << cfg.password_hash_cost);
         cfg.password_hash_cost = 12;
+    }
+    if (cfg.password_hash_cost < kRecommendedPasswordHashCost) {
+        log->warn("auth.password_hash_cost = {} is only {} PBKDF2 iterations — {}x weaker than "
+                  "the recommended {} ({}). If this database is ever stolen, local-account "
+                  "passwords fall to offline cracking. Set auth.password_hash_cost = {} in your "
+                  "server.toml and restart: existing password hashes record the cost they were "
+                  "created with, keep verifying, and are re-hashed at each owner's next "
+                  "successful login, so nobody is locked out.",
+                  cfg.password_hash_cost, 1u << cfg.password_hash_cost,
+                  1u << (kRecommendedPasswordHashCost - cfg.password_hash_cost),
+                  kRecommendedPasswordHashCost, 1u << kRecommendedPasswordHashCost,
+                  kRecommendedPasswordHashCost);
     }
     if (cfg.password_hash_cost > 24) {
         // 2^24 iterations would take seconds per login.

@@ -14,6 +14,12 @@
 #include <stdexcept>
 #include <unordered_set>
 
+// For tightening the mode on the database file. POSIX-only, which matches the
+// only platforms the server is deployed on; the Windows build of the server is
+// not a supported target.
+#include <sys/stat.h>
+#include <sys/types.h>
+
 namespace bsfchat {
 
 namespace {
@@ -278,13 +284,42 @@ RoomEvent read_event_row(sqlite3_stmt* stmt) {
 
 } // namespace
 
-SqliteStore::SqliteStore(const std::string& db_path) {
+SqliteStore::SqliteStore(const std::string& db_path) : db_path_(db_path) {
     if (sqlite3_open(db_path.c_str(), &db_) != SQLITE_OK) {
         throw std::runtime_error(std::string("Failed to open database: ") + sqlite3_errmsg(db_));
     }
     exec("PRAGMA journal_mode=WAL");
     exec("PRAGMA foreign_keys=ON");
     exec("PRAGMA busy_timeout=5000");
+
+    // Overwrite deleted content instead of just returning its pages to the
+    // freelist. Without this, "deleted" is a bookkeeping change only: the bytes
+    // stay in the file until some later insert happens to reuse that page, and
+    // `strings bsfchat.db` recovers them in the meantime. Three of our deletes
+    // are deletes of secrets and exist precisely so the data stops existing:
+    //
+    //   * migration v7 dropped the pre-hash `access_tokens` table, which held
+    //     bearer tokens in plaintext;
+    //   * redaction rewrites `content` to '{}', which frees the old body;
+    //   * the recurring call-signalling prune (and migration v17's one-time
+    //     purge) deletes rows *because* they carry participants' LAN and public
+    //     IP addresses.
+    //
+    // A logical delete finishes none of those jobs. This pragma is per
+    // connection rather than a property of the file, so it has to be set on
+    // every open — do not move it into a migration.
+    //
+    // Cost: SQLite zeroes the freed region on the page before writing it back,
+    // so deletes do more work and dirty more pages. For this workload — where
+    // deletes are rare and small next to the message insert path — that is not
+    // measurable, and it is the correct trade for the three cases above.
+    //
+    // This only governs deletes from here on. Pages already on the freelist
+    // still hold their old contents; `vacuum_freelist_once_locked()` below
+    // deals with those, once.
+    exec("PRAGMA secure_delete=ON");
+
+    restrict_database_file_mode();
 }
 
 SqliteStore::~SqliteStore() {
@@ -298,6 +333,155 @@ void SqliteStore::exec(const std::string& sql) {
         sqlite3_free(err);
         throw std::runtime_error("SQL exec error: " + msg);
     }
+}
+
+namespace {
+
+// True for the forms sqlite3_open() treats as "no file on disk", where there is
+// nothing to chmod and stat() would fail for an uninteresting reason.
+bool is_in_memory_path(const std::string& path) {
+    return path.empty() || path == ":memory:" || path.rfind("file::memory:", 0) == 0 ||
+           path.find("mode=memory") != std::string::npos;
+}
+
+} // namespace
+
+// The database is the most sensitive file this process owns: every message
+// body, a second full copy of each body in the search index, queued push
+// payloads and the audit log, all in plaintext. Nothing in the server, the
+// image or deploy/setup.sh ever set a mode on it, so it was created at the
+// process umask — 0644 in the shipped container — and readable by every local
+// user. On the current production host the parent directory happens to be under
+// /root, and that accident is the only thing that was protecting it.
+//
+// So take the mode away here rather than relying on the deployment to do it:
+// the server is the one component that is present in every install, however the
+// operator laid the host out.
+//
+// The group and other bits are stripped rather than the mode being set to a
+// fixed 0600, because the owner bits are not ours to decide and stripping can
+// only ever remove access. It does mean a deliberately group-readable database
+// (say, for a backup user) is narrowed on the next start — that is intended;
+// run backups as the owning user, or as root, and see deploy/backup.sh.
+//
+// -wal and -shm get the same treatment. SQLite copies the main file's mode onto
+// them when it creates them, but they can predate this code, and an operator's
+// own chmod of the database usually misses them.
+void SqliteStore::restrict_database_file_mode() {
+    if (is_in_memory_path(db_path_)) return;
+
+    for (const char* suffix : {"", "-wal", "-shm"}) {
+        const std::string path = db_path_ + suffix;
+        struct stat st {};
+        if (::stat(path.c_str(), &st) != 0) continue; // not created yet, or not ours to see
+        const mode_t current = st.st_mode & 07777;
+        const mode_t wanted = current & ~static_cast<mode_t>(S_IRWXG | S_IRWXO);
+        if (current == wanted) continue;
+        if (::chmod(path.c_str(), wanted) == 0) {
+            get_logger()->info("Tightened mode on {} from {:04o} to {:04o} (owner only)", path,
+                               current, wanted);
+        } else {
+            // Not fatal: a read-only bind mount or a file owned by another uid
+            // is a deployment choice, not a reason to refuse to start. But say
+            // so, because the operator is now relying on the directory.
+            get_logger()->warn(
+                "Could not restrict {} to owner-only access (mode is {:04o}). Every local user "
+                "on this host can read every message, the search index and the audit log. Fix "
+                "the ownership of the data directory, or chmod it yourself.",
+                path, current);
+        }
+    }
+}
+
+// PRAGMA secure_delete stops NEW deletes from leaving their bytes behind. It
+// does nothing about what is already on the freelist, and on any database that
+// predates this change that freelist is the interesting part: dropped plaintext
+// access tokens (migration v7), pre-redaction message bodies, and the ICE
+// candidates that migration v17 deleted specifically because they carry
+// participants' IP addresses. VACUUM rewrites the file from the live pages
+// only, so the freelist — and everything in it — is gone afterwards.
+//
+// Once, not on every start: VACUUM rewrites the entire database and needs room
+// for a second copy of it while it runs, which is not something to do at every
+// restart for no gain. The marker lives in server_meta rather than being tied to
+// a schema version because it is a property of the FILE, not of the schema, and
+// because an operator who needs to skip it (a database too large for the disk
+// headroom, say) can set the marker by hand:
+//
+//   INSERT OR REPLACE INTO server_meta (key, value)
+//     VALUES ('maintenance.freelist_vacuumed', '1');
+//
+// Caller must hold mutex_, and must not be inside a transaction: SQLite refuses
+// to VACUUM within one. That is why this runs after run_migrations() returns
+// rather than as a migration step.
+void SqliteStore::vacuum_freelist_once_locked(bool fresh_database) {
+    bool already_done = false;
+    {
+        auto stmt = prepare(
+            db_, "SELECT value FROM server_meta WHERE key = 'maintenance.freelist_vacuumed'");
+        already_done = sqlite3_step(stmt.get()) == SQLITE_ROW;
+    }
+    if (already_done) return;
+
+    const auto mark_done = [&] {
+        exec("INSERT OR REPLACE INTO server_meta (key, value) "
+             "VALUES ('maintenance.freelist_vacuumed', '1')");
+    };
+
+    // A database this server created has never held any of the above, so there
+    // is nothing to shred. Record it as done so the check is a single indexed
+    // lookup on every subsequent start.
+    if (fresh_database) {
+        mark_done();
+        return;
+    }
+
+    int64_t free_pages = 0;
+    int64_t page_size = 0;
+    {
+        auto stmt = prepare(db_, "PRAGMA freelist_count");
+        if (sqlite3_step(stmt.get()) == SQLITE_ROW) free_pages = sqlite3_column_int64(stmt.get(), 0);
+    }
+    {
+        auto stmt = prepare(db_, "PRAGMA page_size");
+        if (sqlite3_step(stmt.get()) == SQLITE_ROW) page_size = sqlite3_column_int64(stmt.get(), 0);
+    }
+
+    get_logger()->info(
+        "One-time VACUUM: rewriting the database to discard {} free pages ({} KiB) that may still "
+        "contain deleted tokens, redacted message text and purged call-signalling IP addresses. "
+        "This runs once. Startup will pause until it finishes; do not interrupt it.",
+        free_pages, (free_pages * page_size) / 1024);
+
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        exec("VACUUM");
+    } catch (const std::exception& e) {
+        // Almost always "database or disk is full" — VACUUM needs headroom for a
+        // second copy. Leaving the marker unset means the next start retries,
+        // which is what an operator who frees up disk would expect.
+        get_logger()->error(
+            "One-time VACUUM failed: {}. Deleted secrets remain recoverable from free pages in "
+            "this database file. VACUUM needs free disk space roughly equal to the database "
+            "size; free some and restart, or run `sqlite3 <db> VACUUM` yourself. Starting anyway.",
+            e.what());
+        return;
+    }
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
+                                                              started);
+
+    mark_done();
+    get_logger()->info("One-time VACUUM finished in {} ms.", elapsed.count());
+
+    // VACUUM writes a brand new file and moves it into place, so whatever mode
+    // we set at open is not necessarily the mode of the file that is there now.
+    restrict_database_file_mode();
+
+    get_logger()->warn(
+        "VACUUM has cleaned this database, but any EXISTING BACKUP still contains the deleted "
+        "plaintext access tokens, pre-redaction message bodies and purged IP addresses. Rotate "
+        "old backups out; see 'Backup and restore' in deploy/README.md.");
 }
 
 void SqliteStore::initialize() {
@@ -400,6 +584,9 @@ void SqliteStore::initialize() {
     // EXISTS` silently does nothing on an existing deployment, so a column
     // added to a block above would never appear there.
     run_migrations(db_, fresh_database);
+
+    // After the migrations and outside any transaction — see the function.
+    vacuum_freelist_once_locked(fresh_database);
 
     // Load the monotonic stream counter, never letting it go backwards past
     // what the events table already contains (covers a database last written

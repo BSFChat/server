@@ -7,6 +7,14 @@
 
 namespace bsfchat {
 
+// PBKDF2 work factor we consider adequate, as a power of two: 2^19 = 524,288
+// iterations. It is both the built-in default below and the threshold
+// Config::validate() warns under, so a deployment that carries an older,
+// weaker value from a previous deploy template says so on every start instead
+// of looking fine. Raising it is always safe — see the comment on
+// password_hash_cost.
+inline constexpr int kRecommendedPasswordHashCost = 19;
+
 struct IdentityConfig {
     std::string provider_url;
     bool required = false;
@@ -354,7 +362,7 @@ struct Config {
     // The old default of 12 gave 4,096. Each stored hash records the cost it
     // was created with, so existing hashes still verify; AuthHandler
     // transparently re-hashes on the next successful login.
-    int password_hash_cost = 19;
+    int password_hash_cost = kRecommendedPasswordHashCost;
     // Access-token validity, in days. Long on purpose: the desktop client
     // stores one access token and has no background refresh, so a short
     // lifetime would log people out mid-session. Every authenticated request

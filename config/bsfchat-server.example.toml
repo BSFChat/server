@@ -35,6 +35,35 @@ workers = 64
 max_workers = 512
 
 [database]
+# This file is NOT encrypted. It holds every message body in plaintext, a
+# second full copy of each body in the search index, queued push payloads and
+# the audit log. There is no passphrase setting and no SQLCipher build: the
+# controls are file permissions and who can read the host, so put it somewhere
+# only the server's own user can reach, and encrypt the disk underneath it if
+# the host is not yours alone.
+#
+# Three things the server does on its own, with no setting to turn them on:
+#
+#   * On every start it strips group and other access from this file and its
+#     -wal/-shm siblings. Nothing used to set a mode at all, so the database
+#     was created at the process umask (0644) and readable by every local
+#     user. The server logs a warning if it cannot chmod it — that warning
+#     means something else owns the file and the directory is the only thing
+#     protecting it.
+#   * PRAGMA secure_delete is on, so a delete overwrites the row rather than
+#     just returning its pages to the freelist. This matters because the
+#     deletes that matter here are deletes of secrets: redaction blanking a
+#     message body, and the call-signalling prune, which exists specifically to
+#     remove participants' LAN and public IP addresses.
+#   * The first start against a database created before that pragma existed
+#     runs a one-time VACUUM to discard free pages that still hold the old
+#     contents, then records that it has done so in server_meta. It logs
+#     before and after; on a large database it will pause startup.
+#
+# Backups need care of their own: WAL mode means a copy of this file alone is
+# missing whatever is still in the -wal, and a copy of all three is three
+# different instants of a live database. Use SQLite's online backup API
+# (sqlite3 .backup, or VACUUM INTO) — deploy/backup.sh does.
 path = "./data/bsfchat.db"
 
 [media]
