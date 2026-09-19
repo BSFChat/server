@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Mutation-test the F1/F2 work: break each fix, confirm a test fails, revert."""
-import subprocess, sys, shutil, os, pathlib
+import subprocess, sys
 
-SRV = pathlib.Path("/Users/josh/dev/gamechat/server")
-BUILD = SRV / "build-fix"
+from mutate_common import MutationGuard, build_dir, cmake_build, require_build, server_root
+
+# The checkout this harness mutates is the one it LIVES in, never a hard-coded
+# path: these scripts sit at <repo>/tests/e2e/, and several worktrees of this
+# repo are open at once. See mutate_common for the overrides.
+SRV = server_root()
+BUILD = build_dir(SRV, "build-fix")
 TESTBIN = BUILD / "tests" / "server_tests"
 
 # (label, file, old, new, gtest_filter, timeout_s)
@@ -179,43 +184,51 @@ def run(cmd, timeout=None):
 
 def main():
     results = []
-    backups = {}
-    files = {m[1] for m in MUTATIONS}
-    for f in files:
-        backups[f] = (SRV / f).read_text()
+    # Every mutation below is applied in place. The guard snapshots each file
+    # before it is touched and reverts on the way out however this process ends
+    # — normally, on an exception, on Ctrl-C or a kill — and leaves a journal
+    # behind, so even a SIGKILL is repaired by the next run rather than by
+    # someone eventually noticing a mutant in `git diff`.
+    require_build(BUILD)
+    with MutationGuard(SRV, builds=[BUILD]) as guard:
+        backups = {f: guard.protect(SRV / f).decode() for f in {m[1] for m in MUTATIONS}}
 
-    for label, relpath, old, new, filt, tmo in MUTATIONS:
-        path = SRV / relpath
-        src = backups[relpath]
-        if old not in src:
-            results.append((label, "SKIP", "mutation anchor not found"))
-            continue
-        assert src.count(old) == 1, f"{label}: anchor not unique ({src.count(old)})"
-        path.write_text(src.replace(old, new, 1))
+        for label, relpath, old, new, filt, tmo in MUTATIONS:
+            path = SRV / relpath
+            src = backups[relpath]
+            if old not in src:
+                results.append((label, "SKIP", "mutation anchor not found"))
+                continue
+            assert src.count(old) == 1, f"{label}: anchor not unique ({src.count(old)})"
+            path.write_text(src.replace(old, new, 1))
 
-        build = run("cmake --build build-fix -j8", timeout=900)
-        if build.returncode != 0:
-            results.append((label, "BUILD-FAIL",
-                            "mutation did not compile (still counts as detected)"))
-            path.write_text(src)
-            continue
+            try:
+                build = cmake_build(BUILD, cwd=SRV, timeout=900)
+                if build.returncode != 0:
+                    results.append((label, "BUILD-FAIL",
+                                    "mutation did not compile (still counts as detected)"))
+                    continue
 
-        try:
-            t = run(f"./build-fix/tests/server_tests --gtest_filter='{filt}'", timeout=tmo)
-            if t.returncode != 0:
-                names = [l.strip() for l in t.stdout.splitlines() if l.strip().startswith("[  FAILED  ]")]
-                results.append((label, "DETECTED", "; ".join(names[:3]) or "test failed"))
-            else:
-                results.append((label, "*** SURVIVED ***", "tests still passed!"))
-        except subprocess.TimeoutExpired:
-            results.append((label, "DETECTED", f"test hung (>{tmo}s) — blocked, which is the failure"))
+                try:
+                    t = run(f"'{TESTBIN}' --gtest_filter='{filt}'", timeout=tmo)
+                    if t.returncode != 0:
+                        names = [l.strip() for l in t.stdout.splitlines()
+                                 if l.strip().startswith("[  FAILED  ]")]
+                        results.append((label, "DETECTED", "; ".join(names[:3]) or "test failed"))
+                    else:
+                        results.append((label, "*** SURVIVED ***", "tests still passed!"))
+                except subprocess.TimeoutExpired:
+                    results.append((label, "DETECTED",
+                                    f"test hung (>{tmo}s) — blocked, which is the failure"))
+            finally:
+                # Purges the objects and stamps the source past them: a restore
+                # that only rewrites the bytes can be skipped by make, leaving
+                # the mutant's behaviour in a binary built from a clean tree.
+                guard.restore(path)
 
-        path.write_text(src)
-
-    # restore + rebuild clean
-    for f, src in backups.items():
-        (SRV / f).write_text(src)
-    run("cmake --build build-fix -j8", timeout=900)
+        # restore + rebuild clean
+        guard.restore_all()
+        cmake_build(BUILD, cwd=SRV, timeout=900)
 
     print("\n" + "=" * 100)
     print("MUTATION TEST RESULTS")
@@ -232,4 +245,5 @@ def main():
     return 1 if survived else 0
 
 
-sys.exit(main())
+if __name__ == "__main__":
+    sys.exit(main())

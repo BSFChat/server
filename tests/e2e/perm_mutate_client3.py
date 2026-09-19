@@ -11,16 +11,28 @@ import os
 import subprocess
 import sys
 
-CLIENT = '/Users/josh/dev/gamechat/client'
-BUILD = os.path.join(CLIENT, 'build')
-TESTBIN = os.path.join(BUILD, 'tests/test_models')
-RUNDIR = '/private/tmp/claude-501/-Users-josh-dev-gamechat/a93cf36b-3c49-4af9-bbf5-265c130484f9/scratchpad/testrun'
+from mutate_common import MutationGuard, build_dir, build_jobs, client_root, require_build, run_dir
 
-# The object for MemberListModel.cpp as compiled INTO the test target.
-OBJ_CANDIDATES = [
-    os.path.join(BUILD, 'tests/CMakeFiles/test_models.dir/__/src/model/MemberListModel.cpp.o'),
-    os.path.join(BUILD, 'tests/CMakeFiles/test_models.dir/__/src/util/PermissionMath.cpp.o'),
-]
+# This script lives in the server repo but patches the CLIENT one, so there is
+# no location to derive that from with certainty — see mutate_common.client_root
+# for the search order and the BSFCHAT_CLIENT override. Resolved lazily so that
+# importing this module to read MUTATIONS stays free of side effects.
+CLIENT = None
+BUILD = None
+TESTBIN = None
+OBJ_CANDIDATES = []
+
+
+def resolve():
+    global CLIENT, BUILD, TESTBIN, OBJ_CANDIDATES
+    CLIENT = client_root()
+    BUILD = build_dir(CLIENT, 'build')
+    TESTBIN = os.path.join(BUILD, 'tests/test_models')
+    # The object for MemberListModel.cpp as compiled INTO the test target.
+    OBJ_CANDIDATES = [
+        os.path.join(BUILD, 'tests/CMakeFiles/test_models.dir/__/src/model/MemberListModel.cpp.o'),
+        os.path.join(BUILD, 'tests/CMakeFiles/test_models.dir/__/src/util/PermissionMath.cpp.o'),
+    ]
 
 MUTATIONS = [
     ("client treats nickname flags as channel-scoped",
@@ -36,21 +48,29 @@ def sha(p):
 
 
 def build():
-    r = subprocess.run(['cmake', '--build', BUILD, '--target', 'test_models', '-j8'],
+    r = subprocess.run(['nice', '-n', '19', 'cmake', '--build', BUILD,
+                        '--target', 'test_models', '-j', build_jobs()],
                        capture_output=True, text=True)
     return r.returncode, r.stdout + r.stderr
 
 
 def run(funcs):
-    r = subprocess.run([TESTBIN] + funcs, capture_output=True, text=True, cwd=RUNDIR)
+    r = subprocess.run([TESTBIN] + funcs, capture_output=True, text=True, cwd=run_dir(CLIENT))
     return r.returncode, r.stdout + r.stderr
 
 
 def main():
+    resolve()
+    require_build(BUILD)
+    # Snapshots each file before it is mutated and reverts however this process
+    # ends — normally, on an exception, on Ctrl-C or a kill. recover() first
+    # repairs anything a SIGKILLed run left applied.
+    guard = MutationGuard(CLIENT, builds=[BUILD])
+    guard.recover()
     results = []
     for label, rel, find, repl, funcs in MUTATIONS:
         src = os.path.join(CLIENT, rel)
-        original = io.open(src, encoding='utf-8').read()
+        original = guard.protect(src).decode()
         before = sha(src)
         if find not in original:
             results.append((label, 'SKIP', 'anchor not found'))
@@ -77,12 +97,16 @@ def main():
                 results.append((label, 'NOT CAUGHT', 'still passed: ' + funcs))
                 print('NOT CAUGHT  %s   <-- coverage gap' % label)
         finally:
-            io.open(src, 'w', encoding='utf-8').write(original)
-            assert sha(src) == before, 'failed to restore ' + src
+            # Reverts the bytes, deletes the objects and stamps the source past
+            # them: a same-second restore can otherwise be judged up to date by
+            # make, leaving a stale object in the binary.
+            guard.restore(src)
             for o in OBJ_CANDIDATES:
                 if os.path.exists(o):
                     os.remove(o)
+            assert sha(src) == before, 'failed to restore ' + src
 
+    guard.restore_all()
     rc, _ = build()
     print('\nfinal clean rebuild rc=%d' % rc)
     print('\n===== CLIENT MUTATION RESULTS =====')
