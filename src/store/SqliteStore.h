@@ -414,6 +414,35 @@ public:
     // own sync had surfaced, which is why unsynced channels kept the user.
     std::vector<std::pair<std::string, std::string>> get_user_memberships(const std::string& user_id);
 
+    // One phantom membership: a room_members row whose user_id names no account.
+    struct OrphanMembership {
+        std::string room_id;
+        std::string user_id;
+        std::string membership;
+        int64_t updated_at = 0;
+    };
+    // Every row in room_members for an account that does not exist.
+    //
+    // These are not supposed to be possible. They became possible because
+    // room_members.user_id has no REFERENCES users(user_id) — unlike
+    // access_tokens, bots and linked_identities, which all constrain theirs —
+    // and three request paths wrote the column from a caller-supplied id
+    // without checking it (see kNoSuchAccount in RoomHandler.cpp). The paths
+    // are closed; a database that was running before they were closed can still
+    // hold the rows, and nothing on the read side would ever mention them: they
+    // are reported in the roster, counted in joined-member counts, and walked by
+    // every projection over room_members, as if they were people.
+    //
+    // A REPORT, deliberately, and there is no matching delete. Removing one
+    // correctly is not a DELETE: other members' clients have already rendered
+    // the arrival and cached the roster, so the row has to go out as a
+    // membership event as well, and deciding that on an operator's behalf is
+    // exactly the kind of hand-written repair AdminCli.h exists to stop. The
+    // first thing an operator needs is to know whether they have any.
+    //
+    // Ordered by room then user so a repeated run is diffable.
+    std::vector<OrphanMembership> list_orphan_memberships();
+
     // ── Server-wide bans (schema v15) ─────────────────────────────────────
     //
     // The single authoritative record of "this identity is banned from this

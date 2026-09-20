@@ -339,3 +339,84 @@ TEST(AdminCli, ListUsersShowsIdsDisplayNamesAndWhoHoldsAdmin) {
     EXPECT_NE(r.output.find("josh"), std::string::npos);
     EXPECT_NE(r.output.find("[admin]"), std::string::npos);
 }
+
+// ── list-orphan-members ───────────────────────────────────────────────────
+//
+// The report an existing deployment needs. POST /rooms/{id}/invite used to
+// write a membership row for an id that named no account, so a server that has
+// been running since before that was fixed can be holding rows nothing on the
+// read side would ever tell anyone about. Closing the write path does not clean
+// up after it.
+
+TEST(AdminCli, ListOrphanMembersSaysSoWhenThereAreNone) {
+    Fixture f("orphans-clean");
+    const auto bob = f.add_user("bob", {std::string(permission::role_id::kEveryone)});
+    f.store->set_membership(f.mirror_room, bob, std::string(membership::kJoin));
+
+    auto r = run({"list-orphan-members", "--config", f.config_path}, server_stopped());
+    EXPECT_EQ(r.code, 0);
+    EXPECT_NE(r.output.find("no phantom memberships"), std::string::npos) << r.output;
+}
+
+TEST(AdminCli, ListOrphanMembersFindsARowLeftByTheOldInvitePath) {
+    Fixture f("orphans-found");
+    const auto bob = f.add_user("bob", {std::string(permission::role_id::kEveryone)});
+    f.store->set_membership(f.mirror_room, bob, std::string(membership::kJoin));
+    // Exactly what the unguarded handler wrote: a membership row, straight in,
+    // for an id with no users row behind it.
+    f.store->set_membership(f.mirror_room, "@tpyo:test", std::string(membership::kInvite));
+
+    auto r = run({"list-orphan-members", "--config", f.config_path}, server_stopped());
+    EXPECT_EQ(r.code, 0);
+    EXPECT_NE(r.output.find("@tpyo:test"), std::string::npos) << r.output;
+    EXPECT_NE(r.output.find(f.mirror_room), std::string::npos) << r.output;
+    // The real member is not swept up in it.
+    EXPECT_EQ(r.output.find(bob), std::string::npos) << r.output;
+}
+
+TEST(AdminCli, ListOrphanMembersDeletesNothing) {
+    // The whole reason it is a report. Removing the row correctly means sending
+    // a membership event too — every client that saw the arrival has the ghost
+    // in its cached roster — and that decision is not this command's to make.
+    Fixture f("orphans-readonly");
+    f.store->set_membership(f.mirror_room, "@tpyo:test", std::string(membership::kInvite));
+
+    run({"list-orphan-members", "--config", f.config_path}, server_stopped());
+
+    EXPECT_EQ(f.store->get_membership(f.mirror_room, "@tpyo:test"),
+              std::string(membership::kInvite));
+    EXPECT_EQ(f.store->list_orphan_memberships().size(), 1u);
+}
+
+TEST(AdminCli, ListOrphanMembersDoesNotCountABotAsAPhantom) {
+    // A bot IS an account — bot creation writes a users row with kind='bot' —
+    // so its membership is ordinary. Worth pinning because the invite path
+    // treats bots specially and a report that cried wolf about every bot on the
+    // server would be ignored, which is the failure mode that matters for a
+    // diagnostic.
+    //
+    // create_bot(), not create_user(): the account has to carry kind='bot',
+    // which is the column the report's subquery would have to get wrong. A
+    // fixture that wrote an ordinary users row with a bot-shaped id would leave
+    // this test passing against a report that flags every bot on the server —
+    // it did, and the mutation harness (M8) is what said so.
+    Fixture f("orphans-bot");
+    SqliteStore::BotRecord bot;
+    bot.user_id = "@bot_deploy:test";
+    bot.display_name = "Deploy";
+    ASSERT_TRUE(f.store->create_bot(bot));
+    f.store->set_membership(f.mirror_room, bot.user_id, std::string(membership::kJoin));
+
+    auto r = run({"list-orphan-members", "--config", f.config_path}, server_stopped());
+    EXPECT_EQ(r.code, 0);
+    EXPECT_NE(r.output.find("no phantom memberships"), std::string::npos) << r.output;
+}
+
+TEST(AdminCli, ListOrphanMembersRefusesBehindARunningServer) {
+    // Read-only, but opening the database is not: initialize() runs the
+    // migration pass, which makes this a second writer.
+    Fixture f("orphans-running");
+    auto r = run({"list-orphan-members", "--config", f.config_path}, server_running());
+    EXPECT_EQ(r.code, 1);
+    EXPECT_NE(r.output.find("still running"), std::string::npos) << r.output;
+}

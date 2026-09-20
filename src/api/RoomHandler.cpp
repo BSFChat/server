@@ -143,6 +143,61 @@ bool was_removed_by_moderator(SqliteStore& store, const std::string& room_id,
     return ev->content.data.contains(std::string(kRemovedByKey));
 }
 
+// ONE wording for every way an invited id can fail to name an account: a
+// mistyped localpart, an id on somebody else's homeserver, a string that is not
+// an mxid at all. Shared by POST /rooms/{id}/invite and the generic state route
+// so the two cannot drift into two sentences for one fact.
+//
+// ── Why the server says this at all ──────────────────────────────────────
+//
+// It did not, and that was the bug: handle_invite never called user_exists()
+// and room_members has no foreign key to `users`, so inviting @tpyo:chat.
+// bsfchat.com answered 200 and wrote a membership row for nobody. The invitee
+// never appeared, the inviter had no way to find out, and the row stayed —
+// in the roster, in joined-member counts, in the presence sweep, and in every
+// later projection that walks room_members.
+//
+// ── Why it is not an account-existence oracle ────────────────────────────
+//
+// "Does this account exist" is the question a directory attack asks, so this
+// refusal has to justify answering it. Three reasons it is safe here, and the
+// first is the one that matters:
+//
+//   * It discloses nothing a caller cannot already get more cheaply. GET
+//     /profile/{userId} answers 404 for an unknown account and 200 for a known
+//     one, to ANY authenticated caller, and says so in as many words
+//     (ProfileHandler.cpp). This refusal needs MANAGE_CHANNELS in a room the
+//     caller is already in, and costs a write-path request per guess. It is a
+//     strictly smaller oracle than the one already on the server — which is
+//     also the standing condition on this decision: if /profile is ever closed,
+//     this must be closed with it, or it becomes the new way to walk the
+//     namespace.
+//
+//   * The endpoint already discloses more than this about a named target, on
+//     purpose. It distinguishes "banned from this room" from "banned from this
+//     server" from "deactivated bot", because a moderator who cannot tell why
+//     an invite failed cannot fix it. Existence is the least sensitive fact in
+//     that set.
+//
+//   * It is ordered AFTER the MANAGE_CHANNELS check (and, on the state route,
+//     after the rank check), so an ordinary member gets byte-identical answers
+//     for a real id and a fictional one. That ordering is the actual boundary
+//     and it is pinned by a test.
+//
+// This deliberately DIFFERS from PermissionsHandler's kRefusal, which answers
+// "stranger", "invisible member" and "no such account" identically. That is a
+// read endpoint: its refusal is its only output, and no caller has a use for
+// the distinction. This is a write endpoint whose failure mode was a silent
+// success — the refusal IS the feature, and a moderator who typed a letter
+// wrong has to be told that is what happened.
+//
+// FEDERATION. There is none today, so "not a local account" and "does not
+// exist" are the same statement and user_exists() answers both. When a remote
+// user can be invited, this check becomes a resolution step rather than a local
+// lookup, and the wording below stops being true for a remote id — revisit it
+// then rather than designing for it now.
+const char* const kNoSuchAccount = "There is no account on this server with that id";
+
 // Derived from the (before, after) pair and the ban list — NOT from which URL the
 // request arrived at. That is the whole point: POST /rooms/{id}/ban and
 // PUT /rooms/{id}/state/m.room.member/{user} describe the same act, so they must
@@ -157,6 +212,14 @@ struct MembershipIntent {
     bool lifts_server_ban = false;
     bool require_target_in_room = false;
     bool require_target_banned = false;
+    // The target must name a real account before a membership row is written
+    // for it. Set on the INVITE intent only: a kick already requires the target
+    // to be in the room and an unban already requires it to be banned, so
+    // neither can reach a write for an id with no account — and a BAN must
+    // stay possible on one, because handle_register consults the ban list
+    // before it creates anything, which makes a ban on an unregistered id a
+    // reservation rather than a mistake. See kNoSuchAccount.
+    bool require_target_exists = false;
     // Stamps kRemovedByKey onto the member event this writes, so /join can tell
     // "a moderator removed you" from every other way a row reads `leave`.
     // See kRemovedByKey for why the sender is not enough on its own.
@@ -212,6 +275,11 @@ MembershipIntent invite_intent() {
     MembershipIntent i;
     i.recognised = true;
     i.required = permission::kManageChannels;
+    // The state route reaches this for membership "join" as well as "invite",
+    // and that branch FORCE-JOINS — it was the worse half of the phantom-row
+    // bug, because an invite row at least stays out of the joined-member counts
+    // and the presence sweep while a join does not.
+    i.require_target_exists = true;
     i.verb = "invite";
     return i;
 }
@@ -291,7 +359,18 @@ std::string RoomHandler::project_membership_everywhere(const std::string& actor,
     // audit record names this room. An unban is filtered (only_when = "ban") and
     // gets no such override on purpose: forcing "leave" into the origin room would
     // eject a user from a channel they were still joined to.
-    if (only_when.empty() && !origin_room.empty() &&
+    //
+    // user_exists() gates the OVERRIDE and nothing else, which is the whole of
+    // the distinction. Banning an id that has not been registered is a
+    // legitimate reservation — handle_register consults the ban list before it
+    // creates anything — so the `server_bans` row is written either way and
+    // that table deliberately has no foreign key to `users`. But this override
+    // is the one place a ban INVENTS a membership row rather than rewriting
+    // one, and inventing it for an account that does not exist is how a ban
+    // produced a phantom member. With no account there is also nothing to
+    // rewrite: the loop above found no rows, so this returns having written
+    // nothing, and the audit record still names the room. See kNoSuchAccount.
+    if (only_when.empty() && !origin_room.empty() && store_.user_exists(target_user) &&
         store_.get_membership(origin_room, target_user) != membership_value) {
         if (std::find(rooms.begin(), rooms.end(), origin_room) == rooms.end()) {
             rooms.push_back(origin_room);
@@ -353,6 +432,13 @@ RoomHandler::ModerationResult RoomHandler::apply_membership_moderation(
     }
     if (intent.require_target_banned && before != membership::kBan && !target_banned) {
         refusal.message = "User is not banned";
+        return refusal;
+    }
+    // Ordered here for the same reason as the two above, and it is load-bearing
+    // for this one in particular: below the permission and rank checks, an
+    // ordinary member's refusal is identical whether or not the id exists.
+    if (intent.require_target_exists && !store_.user_exists(target_user)) {
+        refusal.message = kNoSuchAccount;
         return refusal;
     }
     // An invite is not a way around a ban. This is one of the entry points a
@@ -1393,6 +1479,27 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
     if (store_.is_server_banned(target_user)) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("User is banned from this server").to_json().dump(),
+                        "application/json");
+        return;
+    }
+
+    // The target has to be somebody. Without this the endpoint answered 200 for
+    // an id nobody holds and left a membership row behind for it — see
+    // kNoSuchAccount for what the row does and for why this refusal is allowed
+    // to be specific about the reason.
+    //
+    // Above the bot branch, so one check covers both: is_bot() reads users.kind
+    // and so implies existence for a real bot, while a FICTIONAL @bot_* id
+    // fails it and falls through to the human path. That is the only reason the
+    // reported bug wrote an invite row rather than a join — and nothing should
+    // be one edit away from emitting a join event whose sender does not exist.
+    //
+    // Below the two ban checks, so a pre-ban on an unregistered id keeps
+    // answering "banned from this server", which is both true and the more
+    // actionable of the two.
+    if (!store_.user_exists(target_user)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden(kNoSuchAccount).to_json().dump(),
                         "application/json");
         return;
     }
