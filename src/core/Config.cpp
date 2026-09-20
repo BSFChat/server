@@ -10,7 +10,10 @@
 #include <bsfchat/Constants.h>
 
 #include <toml++/toml.hpp>
+
+#include <algorithm>
 #include <stdexcept>
+#include <vector>
 
 namespace bsfchat {
 
@@ -83,16 +86,29 @@ Config Config::load(const std::string& path) {
             // Single string or array, same as voice.turn_uri. Present-but-empty
             // is meaningful ("trust nothing, not even loopback"), so the
             // default is replaced rather than appended to.
-            if (auto v = auth->get("trusted_proxies")) {
-                lim.trusted_proxies.clear();
-                if (auto arr = v->as_array()) {
+            const auto read_proxy_list = [](const toml::node& v, std::vector<std::string>& out) {
+                out.clear();
+                if (auto arr = v.as_array()) {
                     for (const auto& el : *arr) {
-                        if (auto s = el.value<std::string>()) lim.trusted_proxies.push_back(*s);
+                        if (auto s = el.value<std::string>()) out.push_back(*s);
                     }
-                } else if (auto s = v->value<std::string>()) {
-                    lim.trusted_proxies.push_back(*s);
+                } else if (auto s = v.value<std::string>()) {
+                    out.push_back(*s);
                 }
+            };
+            if (auto v = auth->get("trusted_proxies")) {
+                read_proxy_list(*v, lim.trusted_proxies);
             }
+            // Public ranges the operator has deliberately trusted — a CDN in
+            // front of the origin. validate() merges these into
+            // trusted_proxies; kept separate here so it can tell an
+            // acknowledged range from one that just turned up.
+            if (auto v = auth->get("trusted_public_proxies")) {
+                read_proxy_list(*v, lim.trusted_public_proxies);
+            }
+            if (auto v = auth->get("trusted_public_proxies_reason"))
+                lim.trusted_public_proxies_reason =
+                    v->value_or(lim.trusted_public_proxies_reason);
         }
 
         // [limits] — per-account limits on writes to a room.
@@ -365,10 +381,38 @@ void Config::validate(Config& cfg) {
         // Fail startup on a bad entry instead of dropping it. The entry that
         // failed to parse is the one that was meant to stop every client
         // sharing the proxy's rate-limit bucket.
-        for (const auto& entry : lim.trusted_proxies) {
-            if (!IpNetwork::parse(entry)) {
-                throw std::runtime_error("auth.trusted_proxies: '" + entry +
-                                         "' is not an IP address or CIDR network");
+        //
+        // Parsed once, here, and carried to the checks below: they used to
+        // re-parse the same strings.
+        struct Entry {
+            std::string text; // by value: the merge below reallocates the list
+            IpNetwork net;
+            bool acknowledged;
+        };
+        std::vector<Entry> entries;
+        const auto parse_all = [&](const std::vector<std::string>& list, const char* key,
+                                   bool acknowledged) {
+            for (const auto& text : list) {
+                auto net = IpNetwork::parse(text);
+                if (!net) {
+                    throw std::runtime_error(std::string("auth.") + key + ": '" + text +
+                                             "' is not an IP address or CIDR network");
+                }
+                entries.push_back({text, *net, acknowledged});
+            }
+        };
+        parse_all(lim.trusted_proxies, "trusted_proxies", false);
+        parse_all(lim.trusted_public_proxies, "trusted_public_proxies", true);
+
+        // The acknowledged ranges are trusted exactly like the others — the
+        // second key exists to record intent, not to create a second trust
+        // tier. Merged rather than kept apart so ClientAddressResolver and
+        // every other reader still see one list, and appended only when
+        // absent so a second validate() over the same Config is a no-op.
+        for (const auto& text : lim.trusted_public_proxies) {
+            if (std::find(lim.trusted_proxies.begin(), lim.trusted_proxies.end(), text) ==
+                lim.trusted_proxies.end()) {
+                lim.trusted_proxies.push_back(text);
             }
         }
         if (!lim.enabled) {
@@ -387,9 +431,9 @@ void Config::validate(Config& cfg) {
             lim.max_failures = 3;
         }
 
-        // A trusted_proxies entry that covers public address space is not a
-        // limit setting, it is an off switch for every per-address limit on
-        // the server: anything inside it can pick its own X-Forwarded-For and
+        // A trusted range that covers public address space is not a limit
+        // setting, it is an off switch for every per-address limit on the
+        // server: anything inside it can pick its own X-Forwarded-For and
         // therefore its own identity, once per request. Loud, because the
         // symptom — limits silently never firing for the attacker who matters
         // — looks exactly like limits working.
@@ -397,16 +441,102 @@ void Config::validate(Config& cfg) {
         // Warned rather than refused: an operator may genuinely have a proxy
         // on a public address, and failing startup on an upgrade over a
         // configuration that was working would be its own outage.
-        for (const auto& entry : lim.trusted_proxies) {
-            auto net = IpNetwork::parse(entry);
-            if (!net) continue; // already thrown on above
-            if (!is_private_or_loopback_network(*net)) {
-                log->warn("auth.trusted_proxies contains '{}', which covers addresses outside "
-                          "loopback and the private ranges. Every client that can reach this "
-                          "server from inside it can choose its own X-Forwarded-For, and so its "
-                          "own rate-limit identity — the per-address limits do not apply to it "
-                          "at all. List only the proxies you operate.", entry);
+        //
+        // ── Why this is not one warning per entry ─────────────────────────
+        // It was, and the first CDN-fronted deployment it met produced eleven
+        // consecutive warnings on a correct configuration, because production
+        // is behind Cloudflare and Cloudflare publishes fifteen IPv4 ranges
+        // and seven IPv6 ones. Every line was true and every line was
+        // deliberate. A wall of true warnings on a correct server is worse
+        // than no warning: it is how an operator learns to skim the log, and
+        // this is the log the auth lockout records land in.
+        //
+        // So the check asks a sharper question than "is this public". Public
+        // and deliberate — written under auth.trusted_public_proxies with a
+        // stated reason — is reported once, at info, as a record of what is
+        // trusted and why. Public and unexplained is one warning naming the
+        // count, the widest range and the way to acknowledge it. And a range
+        // too wide to be any proxy fleet gets its own line whichever key it
+        // was written under, because that is the entry the check exists for
+        // and it is not something a reason can talk away.
+        std::vector<const Entry*> unexplained; // public, under trusted_proxies
+        std::vector<const Entry*> unreasoned;  // public, acknowledged, but no reason given
+        std::vector<const Entry*> explained;   // public, acknowledged, reason given
+        const bool have_reason =
+            lim.trusted_public_proxies_reason.find_first_not_of(" \t\r\n") != std::string::npos;
+
+        for (const auto& e : entries) {
+            // Private first. The private ranges are themselves wide — 10/8 is
+            // a /8 and fc00::/7 is a /7 — and none of that matters, because
+            // nothing outside this network can present an address in them.
+            // Width is only alarming once the range is publicly routable.
+            if (is_private_or_loopback_network(e.net)) continue;
+            if (is_too_wide_to_be_a_proxy_fleet(e.net)) {
+                log->warn(
+                    "auth.{} contains '{}'. That is not a proxy fleet, it is every address "
+                    "this server can be reached from: anything that reaches it picks its own "
+                    "X-Forwarded-For, and so its own rate-limit identity, once per request — "
+                    "the per-address limits on /login, /register, /refresh and "
+                    "/account/password stop applying to exactly the client they exist for. "
+                    "No auth.trusted_public_proxies_reason acknowledges a range this wide. "
+                    "Replace it with the addresses your proxy actually speaks from.",
+                    e.acknowledged ? "trusted_public_proxies" : "trusted_proxies", e.text);
+                continue;
             }
+            if (!e.acknowledged) unexplained.push_back(&e);
+            else if (have_reason) explained.push_back(&e);
+            else unreasoned.push_back(&e);
+        }
+
+        // Widest by the prefix length as written. Comparing an IPv4 /15 with
+        // an IPv6 /29 is not meaningful arithmetic, but the shortest prefix is
+        // what an operator scanning the list would point at, and the number is
+        // there to be recognised, not summed.
+        const auto widest = [](const std::vector<const Entry*>& v) {
+            return (*std::min_element(v.begin(), v.end(), [](const Entry* a, const Entry* b) {
+                return a->net.cidr_prefix() < b->net.cidr_prefix();
+            }))->text;
+        };
+        const auto join = [](const std::vector<const Entry*>& v) {
+            std::string out;
+            for (const auto* e : v) {
+                if (!out.empty()) out += ", ";
+                out += e->text;
+            }
+            return out;
+        };
+
+        if (!unexplained.empty()) {
+            log->warn("auth.trusted_proxies trusts {} range(s) reaching outside loopback and "
+                      "the private ranges (widest: {}) — {}. Trusting a network means believing "
+                      "its X-Forwarded-For, so every client that can reach this server from "
+                      "inside one of them chooses its own rate-limit identity and the "
+                      "per-address limits do not apply to it. If these are a CDN in front of "
+                      "the origin and you meant them, move them to "
+                      "auth.trusted_public_proxies and set auth.trusted_public_proxies_reason "
+                      "to whose they are and when you last refreshed them — they stay trusted "
+                      "and this stops. Otherwise remove them.",
+                      unexplained.size(), widest(unexplained), join(unexplained));
+        }
+        if (!unreasoned.empty()) {
+            log->warn("auth.trusted_public_proxies lists {} public range(s) (widest: {}) but "
+                      "auth.trusted_public_proxies_reason is empty, so they are being trusted "
+                      "with no record of why. Set the reason to whose ranges these are and when "
+                      "you last refreshed them from the source that publishes them; it is what "
+                      "tells the next person whether the list is still current.",
+                      unreasoned.size(), widest(unreasoned));
+        }
+        if (!explained.empty()) {
+            // Not silent. The decision is deliberate, so it is stated rather
+            // than warned about — but it is stated in full, every boot, so
+            // that diffing this line across restarts shows the list changing.
+            log->info("auth: trusting {} public proxy range(s) as deliberate — {}. Their "
+                      "X-Forwarded-For is believed, so this list has to stay in step with what "
+                      "the provider publishes: a range they add and you have not listed puts "
+                      "every client behind it in one rate-limit bucket, and a range they give "
+                      "up stays trusted here after somebody else is issued it. Ranges: {}.",
+                      explained.size(), log_safe(lim.trusted_public_proxies_reason, 200),
+                      join(explained));
         }
     }
 
@@ -491,6 +621,12 @@ void Config::validate(Config& cfg) {
                   "Internal-address gateways: {}.",
                   list, cfg.push.default_payload,
                   cfg.push.allow_internal_gateway ? "permitted" : "refused");
+        // Same shape as the trusted_proxies check above, and for the same
+        // reason: one line per offending entry turns a list into a wall. The
+        // list is short in practice, but a cleartext gateway is a deliberate,
+        // documented deployment shape (sygnal in the same compose file), so it
+        // is exactly the case that would repeat on a correct configuration.
+        std::string cleartext;
         for (const auto& prefix : cfg.push.allowed_gateway_prefixes) {
             // An entry with no scheme can never match anything, and the only
             // symptom would be every pusher registration failing with "not an
@@ -504,12 +640,16 @@ void Config::validate(Config& cfg) {
                 continue;
             }
             if (prefix.rfind("http://", 0) == 0) {
-                log->warn("push.allowed_gateway_prefixes contains a cleartext entry ({}). "
-                          "Notification payloads and pushkeys will cross the network "
-                          "unencrypted, and an on-path attacker can forge the gateway's "
-                          "response. Use https:// unless the gateway is on this host.",
-                          prefix);
+                if (!cleartext.empty()) cleartext += ", ";
+                cleartext += prefix;
             }
+        }
+        if (!cleartext.empty()) {
+            log->warn("push.allowed_gateway_prefixes contains cleartext entries ({}). "
+                      "Notification payloads and pushkeys will cross the network "
+                      "unencrypted, and an on-path attacker can forge the gateway's "
+                      "response. Use https:// unless the gateway is on this host.",
+                      cleartext);
         }
         if (cfg.push.default_payload == "full") {
             log->warn("push.default_payload = \"full\": a pusher that does not ask for "

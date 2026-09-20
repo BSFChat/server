@@ -22,6 +22,16 @@ struct IpNetwork {
     static std::optional<IpNetwork> parse(const std::string& cidr);
 
     [[nodiscard]] bool contains(const std::array<uint8_t, 16>& ip) const;
+
+    // True when this network was written in IPv4 form (and so is held as an
+    // IPv4-mapped /96+n).
+    [[nodiscard]] bool is_v4() const;
+
+    // The prefix length as the operator wrote it: 15 for "162.158.0.0/15",
+    // 29 for "2a06:98c0::/29". `prefix_bits` is the internal, always-IPv6
+    // form and is 96 larger for IPv4, which makes it useless for anything an
+    // operator reads.
+    [[nodiscard]] int cidr_prefix() const;
 };
 
 // True when EVERY address in `net` lies inside loopback or one of the private
@@ -33,6 +43,25 @@ struct IpNetwork {
 // once per request. Containment, not overlap: "0.0.0.0/0" and "10.0.0.0/4"
 // both include private space and neither is safe to trust.
 bool is_private_or_loopback_network(const IpNetwork& net);
+
+// True when `net` is too wide for any proxy fleet to occupy — a default route,
+// or a slice of the internet so large that "these are my edge nodes" cannot be
+// a true statement about it.
+//
+// This is the floor under the acknowledgement in auth.trusted_public_proxies.
+// An operator fronting the origin with a CDN has a real reason to trust public
+// address space and should be able to say so once and have the server believe
+// them; what they must NOT be able to do is say it about "0.0.0.0/0" and have
+// the per-address limits quietly stop existing. So a network this wide keeps
+// warning no matter which key it was written under.
+//
+// The thresholds are set from what real edge fleets actually publish, with
+// room to spare: Cloudflare's widest block is a /13 (IPv4) and a /29 (IPv6),
+// AWS CloudFront's is a /14, and the CGNAT range an overlay network like
+// Tailscale sits in is 100.64.0.0/10. Everything at or below those passes;
+// "0.0.0.0/0", "::/0", a public /8 and "2000::/3" (the whole global unicast
+// space) do not.
+bool is_too_wide_to_be_a_proxy_fleet(const IpNetwork& net);
 
 // An address in a form that is safe to put in a log line.
 //

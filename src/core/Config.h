@@ -273,7 +273,44 @@ struct AuthLimitsConfig {
     // and the worst it can do by forging the header is dodge a rate limit. A
     // proxy anywhere else — including the Docker bridge gateway, which is what
     // a containerised server sees when nginx runs on the host — must be listed.
+    //
+    // Config::validate() merges trusted_public_proxies (below) into this, so
+    // by the time anything reads it this is the whole effective trust set and
+    // ClientAddressResolver still takes one list.
     std::vector<std::string> trusted_proxies = {"127.0.0.0/8", "::1"};
+
+    // The same thing, for ranges that reach into PUBLIC address space, which
+    // an operator may have a real reason to trust: a CDN in front of the
+    // origin appends its edge address to X-Forwarded-For, so the edge fleet
+    // has to be trusted or every client behind it shares one rate-limit
+    // bucket.
+    //
+    // Why a second key rather than a flag, or a CDN list built into the
+    // server:
+    //
+    //   * Startup warns about every public range that is NOT written here, so
+    //     a range added to `trusted_proxies` next month is still called out —
+    //     which a one-time "I know what I'm doing" boolean would swallow.
+    //   * It is the list, not a duplicate of it, so there is nothing to keep
+    //     in step. The CDN's ranges are written exactly once.
+    //   * No published CDN range list ships in the binary. Those lists change
+    //     between our releases, so a built-in copy would be wrong in both
+    //     directions — blessing a range the CDN has given up, and warning
+    //     about one it has just added. The operator's own copy is the only one
+    //     that can be current, and the server's job is to make them state it,
+    //     not to guess it.
+    //
+    // Entries here are parsed and rejected exactly like the ones above, and a
+    // range too wide to be a proxy fleet still warns (see
+    // is_too_wide_to_be_a_proxy_fleet) — this key narrows the check, it does
+    // not switch it off.
+    std::vector<std::string> trusted_public_proxies;
+
+    // Whose ranges those are and when they were last refreshed. Required for
+    // the acknowledgement to count: an empty reason leaves the ranges trusted
+    // but still warned about, because a list nobody has explained is
+    // indistinguishable from one somebody pasted in.
+    std::string trusted_public_proxies_reason;
 
     // Attempts per client address per window, counted separately for each of
     // /login, /register, /refresh and /account/password. Successful attempts
