@@ -56,6 +56,11 @@ json direct_marked(json content, bool is_direct) {
 // the structural half — nothing can make a DM reachable or listable in the
 // first place.
 //
+// MEMBERSHIP IS THE OTHER HALF AND IT IS NOT DONE HERE. "Who is in it" is
+// decided by MembershipIntent::direct_room_refusal, one field on the intent
+// every membership write is classified into, because there are two doors to
+// that write and only one of them called this helper — see that field.
+//
 // Returns true (and answers the request) when the room is direct.
 // `reason` is the refusal::k* code to put in `bsfchat.errcode`, and is empty
 // for the three call sites that have no client keying on them yet. Empty means
@@ -243,8 +248,38 @@ struct MembershipIntent {
     // "a moderator removed you" from every other way a row reads `leave`.
     // See kRemovedByKey for why the sender is not enough on its own.
     bool records_removal = false;
+    // THE DM RULE, carried by the intent rather than by the endpoint. nullptr
+    // means "this act is legitimate in a direct room"; any other value is the
+    // sentence to refuse with.
+    //
+    // WHY IT LIVES HERE. refuse_on_direct_room already guarded POST
+    // /rooms/{id}/invite, and the generic state route had no equivalent: its
+    // deny-list of state types named bsfchat.room.category, .type,
+    // m.room.join_rules and bsfchat.channel.permissions but NOT m.room.member,
+    // so a member write for somebody else fell straight through to
+    // apply_membership_moderation. `{"membership":"invite"}` and
+    // `{"membership":"join"}` both classify to invite_intent(), which asks for
+    // room-scoped MANAGE_CHANNELS and nothing else — so a participant in a DM
+    // who held that flag could add a third account to it, and the join spelling
+    // force-joined them outright with the whole backlog. Exactly the drift this
+    // struct exists to stop, in the one rule that had not been moved onto it
+    // yet.
+    //
+    // DEFAULTS TO REFUSING, and that is the point rather than an accident.
+    // A rule spelled out per-intent is a rule a fifth intent can be added
+    // without, which is how this gap opened in the first place; defaulting the
+    // other way means the next membership act somebody invents is refused on a
+    // DM until a person has thought about it and written down why it should
+    // not be. Same argument as state_gate_for's closed table below.
+    const char* direct_room_refusal = "That cannot be done in a direct message";
     const char* verb = "";           // "ban"/"unban"/"kick"/"invite", for messages
 };
+
+// The sentence POST /rooms/{id}/invite has always refused with, and now also
+// the one the state route refuses the same act with. UNCHANGED text: the
+// client's add-member dialog matches on it (ChannelInviteModel::explainFailure)
+// alongside the errcode, so it is a contract, not a message.
+const char* const kInviteIntoDirectRoom = "Cannot invite someone into a direct message";
 
 MembershipIntent ban_intent() {
     // BAN_MEMBERS, not KICK_MEMBERS. The generic state route used to gate every
@@ -256,6 +291,20 @@ MembershipIntent ban_intent() {
     i.server_scope = true;
     i.needs_rank = true;
     i.places_server_ban = true;
+    // ALLOWED IN A DIRECT MESSAGE, and it has to be. A ban is not an act on
+    // this room — it is an act on the ACCOUNT, and the membership rows it
+    // rewrites (project_membership_everywhere, every room the target has a row
+    // in) are a projection of that one decision. Refusing it on a direct room
+    // would leave a banned account still joined to every DM it was in, holding
+    // the backlog and able to go on reading it: the same blind spot the
+    // server-wide ban list was added to close, reopened one room type at a
+    // time.
+    //
+    // It also has to work FROM a direct room, which is where the gesture
+    // actually happens: `room_id` here is only the room the request arrived
+    // through, and the person you need to ban is usually the person in the DM
+    // window you are looking at.
+    i.direct_room_refusal = nullptr;
     i.verb = "ban";
     return i;
 }
@@ -270,6 +319,11 @@ MembershipIntent unban_intent() {
     i.needs_rank = true;
     i.lifts_server_ban = true;
     i.require_target_banned = true;
+    // Allowed on a direct room for the same reason a ban is, and it is the
+    // mirror of it: a rule that let the ban reach a DM but not the unban would
+    // make a ban permanent there, which is the shape handle_unban exists to
+    // stop ("a trail that reads as if nobody is ever forgiven").
+    i.direct_room_refusal = nullptr;
     i.verb = "unban";
     return i;
 }
@@ -282,6 +336,22 @@ MembershipIntent kick_intent() {
     i.needs_rank = true;
     i.require_target_in_room = true;
     i.records_removal = true;
+    // REFUSED on a direct room, unlike ban and unban, and the difference is
+    // scope rather than severity. A kick touches exactly one room, so in a DM
+    // it means "eject the other participant from our two-person conversation"
+    // — which leaves a one-member direct room they cannot come back to, since
+    // invites into a DM are refused and handle_join refuses a non-member of a
+    // direct room. It is also gated on KICK_MEMBERS at SERVER scope, so it is
+    // a server moderation power, and refuse_on_direct_room already says what
+    // that must not buy: "a role that lets someone run the SERVER must not let
+    // them run somebody's private conversation."
+    //
+    // Nothing legitimate is lost. Wanting out of a DM is LEAVING it, which is
+    // self-membership and never reaches this function at all — handle_leave,
+    // and the state route's own `state_key == *user_id` branch, which returns
+    // long before the moderation delegation. Wanting the other person gone
+    // from the server is a ban, which is allowed above.
+    i.direct_room_refusal = "Cannot remove someone from a direct message";
     i.verb = "kick";
     return i;
 }
@@ -302,6 +372,10 @@ MembershipIntent invite_intent() {
     // See the field: this is the only intent that can be asked for a state the
     // target is already in, and the only one whose write would WEAKEN it.
     i.no_op_on_existing_join = true;
+    // The rule POST /rooms/{id}/invite has always enforced and this route did
+    // not. Same sentence at both doors, from one constant, so a reword cannot
+    // reach one client path and miss the other.
+    i.direct_room_refusal = kInviteIntoDirectRoom;
     i.verb = "invite";
     return i;
 }
@@ -426,6 +500,22 @@ RoomHandler::ModerationResult RoomHandler::apply_membership_moderation(
     const auto intent = classify_transition(declared, target_membership, before, target_banned);
     if (!intent.recognised) {
         refusal.message = "Unsupported membership: " + target_membership;
+        return refusal;
+    }
+
+    // The DM rule, applied once for every door into this function — see
+    // MembershipIntent::direct_room_refusal for which acts it covers and why
+    // ban and unban are not among them.
+    //
+    // ORDERED ABOVE THE PERMISSION CHECK, like the guard on the dedicated
+    // invite endpoint, because it is structural: no permission makes it false.
+    // That ordering discloses nothing, which is the usual objection to putting
+    // anything above a permission test here — every caller that reaches this
+    // function has already passed an is_room_member check at the endpoint it
+    // came through, so it is a participant in the DM and already knows the room
+    // is one.
+    if (intent.direct_room_refusal && store_.is_direct_room(room_id)) {
+        refusal.message = intent.direct_room_refusal;
         return refusal;
     }
 
@@ -1500,9 +1590,17 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
     }
     // Even a participant cannot widen a DM: "only the two of us" is the whole
     // guarantee, and a third member would also be handed the entire backlog.
-    if (refuse_on_direct_room(store_, res, room_id,
-                              "Cannot invite someone into a direct message",
-                              refusal::kInviteDirectRoom)) {
+    //
+    // ASKED OF THE INTENT rather than decided here, because this endpoint is
+    // the one door into a membership write that does NOT route through
+    // apply_membership_moderation — it carries seven refusals the client tells
+    // apart, and the bot branch below, so it keeps its own body. What it must
+    // not keep is its own copy of the RULE: that is how the generic state route
+    // ended up enforcing a different one (see direct_room_refusal). One field
+    // decides for both doors, and flipping it flips both.
+    if (const auto* dm_refusal = invite_intent().direct_room_refusal;
+        dm_refusal && refuse_on_direct_room(store_, res, room_id, dm_refusal,
+                                            refusal::kInviteDirectRoom)) {
         return;
     }
 
@@ -1798,6 +1896,14 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     // refusing everything unnamed on a DM would break server administration
     // from a DM window. What is wrong here is specifically per-CHANNEL
     // configuration on a room that is not a channel.
+    // m.room.member is NOT in this list, deliberately, and its absence used to
+    // be the bug rather than a decision. A DM refuses membership writes too,
+    // but which ones depends on what the write MEANS — a ban has to reach a DM
+    // and an invite must not — and that is a question only classify_transition
+    // can answer. Adding m.room.member here would refuse all four; leaving it
+    // out silently allowed all four. It is gated on the intent instead, in
+    // apply_membership_moderation, which is also where the dedicated endpoints
+    // get the same rule.
     if ((evt_type == std::string(event_type::kRoomCategory) ||
          evt_type == std::string(event_type::kRoomType) ||
          evt_type == std::string(event_type::kRoomJoinRules) ||
