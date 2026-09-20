@@ -13,6 +13,7 @@
 #include <bsfchat/Constants.h>
 #include <bsfchat/ErrorCodes.h>
 #include <bsfchat/Identifiers.h>
+#include <bsfchat/MatrixTypes.h>
 #include <bsfchat/Permissions.h>
 
 #include <nlohmann/json.hpp>
@@ -227,17 +228,40 @@ void BotHandler::handle_create_bot(const httplib::Request& req, httplib::Respons
         return send_error(res, 500, MatrixError::unknown("Failed to issue the bot token"));
     }
 
-    // Give the new account its role assignment now rather than at the next
-    // restart, for the same reason handle_register does: without it the bot holds
-    // no bsfchat.member.roles row and falls through to @everyone until somebody
-    // reboots the server. A bot is supposed to go through the ordinary roles
-    // machinery, and that starts by actually being in it.
+    // Give the new account its role assignment now: an EMPTY one.
     //
-    // Note what this does NOT do: auto-join. bootstrap_roles assigns roles, and
-    // auto_join_public_rooms — which handle_register calls right before it — is
-    // deliberately absent here. AutoJoin refuses bots at its own funnel too, so
-    // this is belt and braces rather than the only guard.
-    bootstrap_roles(store_, sync_engine_, config_);
+    // A bot starts with no permissions anywhere. It does not inherit @everyone
+    // (permission::inherits_everyone_role), so this empty document is the whole
+    // of what it may do until an operator grants something — which is the point
+    // of the feature: a credential that can be minted and then scoped, rather
+    // than one that arrives holding VIEW_CHANNEL and SEND_MESSAGES on every
+    // channel the server has and has to be cut back afterwards.
+    //
+    // WRITTEN, not left absent, and through write_server_scoped_state like every
+    // other assignment. Three things follow from that and none of them would
+    // from a missing row: the grant is audited from the first moment ("this bot
+    // was created with nothing" is a record an owner can read), it is mirrored
+    // to clients so the Bots tab has a document to edit rather than an absence
+    // to interpret, and it is indistinguishable in shape from a human's, so
+    // every existing reader of bsfchat.member.roles keeps working.
+    //
+    // bootstrap_roles is deliberately NOT called here any more. It assigns
+    // @everyone to any account without an assignment and runs at every boot; it
+    // now skips bots for exactly that reason, so calling it would be a no-op
+    // that reads as though it did the work this block does.
+    //
+    // Note what this does NOT do, as before: auto-join. AutoJoin refuses bots at
+    // its own funnel, and a bot with no VIEW_CHANNEL would have nothing to read
+    // in those channels anyway.
+    {
+        MemberRolesContent assignment;  // no roles
+        json j;
+        to_json(j, assignment);
+        write_server_scoped_state(store_, config_, std::string(event_type::kMemberRoles),
+                                  user_id, j.dump(), pick_server_state_mirror_room(store_),
+                                  *actor);
+        sync_engine_.notify_new_event();
+    }
 
     audit_bot_lifecycle(store_, *actor, audit_action::kBotCreate, user_id,
                         json{{"display_name", record.display_name},
