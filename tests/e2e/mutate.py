@@ -223,6 +223,12 @@ MUTATIONS = [
   "            // MUTATED",
   "PushRoleMentions.AHolderWithoutViewChannelIsNeverPushed", 120),
 
+ ("F5 mentionable dropped back out of same_role()",
+  "src/auth/Permissions.cpp",
+  "        && a.self_assignable == b.self_assignable\n        && a.mentionable == b.mentionable;",
+  "        && a.self_assignable == b.self_assignable;",
+  "RoleEscalation.CannotFlipMentionableOnARoleRankedAboveYou", 120),
+
  ("F5 role mention silenced by 'mentions only'",
   "src/push/PushService.cpp",
   "            return is_mentioned_here;",

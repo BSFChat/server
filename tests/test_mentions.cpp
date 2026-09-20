@@ -97,7 +97,7 @@ struct MentionFixture {
 
     // Appends a role to whatever set_roles() last wrote. For the cases that
     // need a role the well-known ids cannot express.
-    void define_role(const std::string& id, bool mentionable) {
+    void define_role(const std::string& id, bool mentionable, bool self_assignable = false) {
         auto existing = store->get_server_roles();
         ServerRolesContent roles;
         roles.roles = std::move(existing);
@@ -107,6 +107,7 @@ struct MentionFixture {
         r.position = 5;
         r.permissions = permission::kEveryoneDefault;
         r.mentionable = mentionable;
+        r.self_assignable = self_assignable;
         roles.roles.push_back(r);
         json j;
         to_json(j, roles);
@@ -942,4 +943,32 @@ TEST(RoleMentions, ReadingTheBadgeDoesNotMatchTheEveryoneSentinel) {
     EXPECT_NE(std::find(keys.begin(), keys.end(), "@room"), keys.end());
     EXPECT_NE(std::find(keys.begin(), keys.end(), "@role/mod"), keys.end());
     EXPECT_EQ(std::find(keys.begin(), keys.end(), "@role/everyone"), keys.end());
+}
+
+// The notification-role picker, end to end on the mention side. A role that is
+// self-assignable AND mentionable is what "@Raiders" is on Discord, and it is
+// the combination this work exists to make possible.
+//
+// The property worth pinning is that mentions do not consult RANK. A
+// self-assignable role deliberately confers none (it is excluded from
+// highest_role_position, so a picker role cannot make its holder un-kickable),
+// and a mention path that had grown a rank check somewhere would quietly
+// exclude exactly these roles — the ones that matter most here.
+TEST(RoleMentions, ASelfAssignablePickerRoleNotifiesItsHolders) {
+    MentionFixture f;
+    f.set_roles(permission::kEveryoneDefault);
+    f.define_role("raiders", /*mentionable=*/true, /*self_assignable=*/true);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+    // Bob opted in; Carol did not.
+    f.grant_exact(bob, {std::string(permission::role_id::kEveryone), "raiders"});
+
+    ASSERT_TRUE(IsOk(f.send("alice",
+                            MentionFixture::role_mention("@raiders forming up", {"raiders"}),
+                            "t1")));
+
+    EXPECT_EQ(f.highlight_from_sync(bob), 1);
+    EXPECT_EQ(f.highlight_from_sync(carol), 0)
+        << "a member who never opted in was notified";
 }
