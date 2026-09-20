@@ -67,6 +67,10 @@ Content-Type: application/json
      "token": "syt_...long-random-string..."}
 ```
 
+The new bot holds **no permissions anywhere** until somebody grants it some —
+see §8. That is not a Matrix behaviour and it is the thing most likely to
+surprise you on first run.
+
 **The token is shown once** — it appears in this response and nowhere else,
 ever. Only its hash is stored, so it cannot be recovered from the database or
 the audit log. If you lose it, rotate.
@@ -136,7 +140,7 @@ This is a **deactivation, not a hard delete**, and the distinction matters:
   there is a creation record for it.
 - Calling it twice is idempotent and returns `200`.
 
-All four management endpoints evaluate `MANAGE_BOTS` at **server scope**, so a
+All five management endpoints evaluate `MANAGE_BOTS` at **server scope**, so a
 per-channel permission override cannot unlock them.
 
 ### Telling a bot from a human
@@ -328,6 +332,15 @@ POST /_matrix/client/v3/rooms/{roomId}/invite
 invitation to accept and nothing for the bot to do: the server writes a real
 `m.room.member` join event, and your bot simply observes itself joined on its
 next `/sync`, in the ordinary timeline, like any other membership change.
+
+**An invite is not a grant.** Membership and access are separate on this server
+(`docs/membership-vs-visibility.md`), and a bot holds no permissions it was not
+given (§8), so being invited into a channel does not by itself let a bot read or
+post there — and, because `/sync` is filtered by `VIEW_CHANNEL`, a bot with no
+permission in that channel will not even see the join event that added it. For
+the operator, that makes the order matter: **write the channel grant first, then
+invite.** For the bot author, it means "I was invited but I receive nothing" is
+a permissions answer, not a bug — ask your operator for the grant in §8.
 
 From the bot author's side that means: **you write no invite-handling code at
 all.** If your bot needs to react to being added to a channel — post a greeting,
@@ -856,10 +869,45 @@ because it can still react. Deny both if that is what you mean.
 role that already had `SEND_MESSAGES`, so nothing changed on upgrade. But a bot
 given a deliberately narrow allow-mask needs the bit set explicitly.
 
+### A bot starts with nothing
+
+**A newly created bot holds no permissions anywhere.** It does not inherit the
+`@everyone` role the way a person does, so until somebody grants it something it
+can authenticate, call `/whoami`, read its own permissions — and nothing else.
+`/sync` is empty, the channel directory is empty, every read and every send is a
+`403`.
+
+This is deliberate and it is the difference between a bot and a human account.
+`@everyone` is the default role for people who *join* a server; a bot was
+manufactured by an administrator for one job, and it is already excluded from
+the other two things joining confers (it cannot log in with a password, and it
+is excluded from channel auto-join). A role can only ever ADD permissions, so if
+a bot inherited `@everyone` there would be no way to take those permissions back
+— which is why the grant is withheld rather than granted-then-trimmed.
+
+Note what does **not** change: `POST /rooms/{roomId}/join` still succeeds on a
+public channel, because membership is not a permission on this server. It gains
+the bot nothing. Do not read a successful join as access.
+
+If you are the operator and you want the old behaviour for a particular bot,
+that is one grant and it is worth saying explicitly:
+
+```http
+PUT /_matrix/client/v3/rooms/{roomId}/state/bsfchat.member.roles/@bot_weather:chat.example.com
+{"role_ids": ["everyone"]}
+```
+
+**Existing bots are unaffected.** Every bot created before this change already
+holds `["everyone"]` in its assignment, so nothing it could do yesterday stopped
+working. Scope it down from the Bots tab when you are ready.
+
 ### Granting permission to a bot
 
 Grant a bot the minimum, per channel, with a **user-specific channel override**.
-This is a state event, so it needs `MANAGE_ROLES`:
+This is a state event, so it needs `MANAGE_ROLES` **in that channel** — note
+that `MANAGE_BOTS`, which is what lets somebody create the bot in the first
+place, does not confer this. Minting a credential and handing it channel access
+are separate authorities:
 
 ```http
 PUT /_matrix/client/v3/rooms/{roomId}/state/bsfchat.channel.permissions/user:@bot_weather:chat.example.com
@@ -879,6 +927,38 @@ PUT /_matrix/client/v3/rooms/{roomId}/state/bsfchat.member.roles/@bot_weather:ch
 ```
 
 A bot that only reads and replies in one channel does **not** need a role.
+
+### Seeing where a bot may go
+
+For an operator tool rather than for the bot itself. One call answers, for every
+channel the *caller* may be told about, what the *bot* may do there:
+
+```http
+GET /_matrix/client/v3/bsfchat/bots/@bot_weather:chat.example.com/access
+```
+```json
+200 {"user_id": "@bot_weather:chat.example.com",
+     "deactivated": false,
+     "role_ids": [],
+     "server_permissions": "0x0",
+     "channels": [
+       {"room_id": "!rel:chat.example.com", "name": "releases", "type": "text",
+        "joined": true, "permissions": "0x4003",
+        "override": {"allow": "0x4003", "deny": "0x0"}},
+       {"room_id": "!gen:chat.example.com", "name": "general", "type": "text",
+        "joined": false, "permissions": "0x0"}
+     ]}
+```
+
+`MANAGE_BOTS` at server scope, plus the same rank rule rotation gets. `override`
+appears only where one exists — an absent key means nothing is written for this
+bot in that channel, which is a different state from `allow: 0, deny: 0`.
+`joined` is the **bot's** membership, not yours. The channel list is filtered by
+your own `VIEW_CHANNEL`, so it is not a complete list of the server's channels
+and must not be presented as one.
+
+There is no write counterpart. Grants are the two `PUT`s above; see
+`docs/bot-scoping.md` for why that is the design rather than an omission.
 
 ### Asking whether somebody may administer *your* bot
 
@@ -1159,6 +1239,16 @@ Honest list, as of this writing:
   if you think you need the ids, you are probably asking the wrong question.
 - **No push notification when somebody's permissions change** (§8). Ask at the
   moment you authorize an action; there is nothing to subscribe to.
+- **Channel scoping does not restrict which ACCOUNTS a bot can see.** Every
+  channel on this server is created public and every human is force-joined into
+  it, so `GET /rooms/{id}/members` on any channel a bot may view returns
+  essentially the whole server — and `/profile/{userId}` needs only a token. A
+  bot narrowed to one channel is narrowed in what it may read and where it may
+  act, not in who it knows about. `docs/bot-scoping.md` §8.1 explains why a
+  member allowlist was not added rather than added badly.
+- **A category's overrides do not reach its channels.** Permissions are
+  evaluated per room with no parent lookup, so "deny this bot the whole Team
+  category" has to be written on each channel in it.
 
 Closed since earlier drafts of this guide, noted because you may have read
 around them: there is now a **channel directory** (§3.0), so a bot no longer has
@@ -1197,6 +1287,7 @@ POST   /_matrix/client/v3/bsfchat/bots                       create a bot (admin
 GET    /_matrix/client/v3/bsfchat/bots                       list bots (admin)
 POST   /_matrix/client/v3/bsfchat/bots/{user}/token          rotate (admin)
 DELETE /_matrix/client/v3/bsfchat/bots/{user}                deactivate (admin)
+GET    /_matrix/client/v3/bsfchat/bots/{user}/access         where may it go (admin)
 ```
 
 Now go read [`examples/python-bot/`](../examples/python-bot/).

@@ -47,6 +47,7 @@ add_executable(server_tests
     test_effective_permissions.cpp
     test_mirror_room.cpp
     test_phantom_membership.cpp
+    test_bot_scoping.cpp
     test_invite_idempotency.cpp
     test_invite_refusal_codes.cpp
 )

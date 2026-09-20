@@ -23,18 +23,32 @@ bool is_server_actor(const std::string& user_id, const Config& config) {
 // Sort roles the user has, by position ascending (low → high). The effective
 // permissions are then computed by OR'ing left-to-right (order doesn't matter
 // for the base OR, but overrides are applied in this order).
+//
+// `implicit_everyone` is permission::inherits_everyone_role() for the account
+// being evaluated — false for a bot, which does not get the server's default
+// role handed to it. See that predicate for the whole argument. Here it changes
+// exactly one thing: whether @everyone is added whatever the assignment says, or
+// only when the assignment NAMES it. A bot given @everyone explicitly resolves
+// it through the ordinary loop below and comes out identical to a member, which
+// is what makes the upgrade invisible — every bot on a running server already
+// holds it, written by bootstrap_roles at creation.
 std::vector<ServerRole> resolve_user_roles(
     const std::vector<ServerRole>& all_roles,
-    const std::vector<std::string>& user_role_ids) {
+    const std::vector<std::string>& user_role_ids,
+    bool implicit_everyone) {
     std::vector<ServerRole> out;
     out.reserve(user_role_ids.size() + 1);
     // @everyone is implicit — always applied first, regardless of membership.
-    auto everyone = std::find_if(all_roles.begin(), all_roles.end(),
-        [](const ServerRole& r) { return r.id == permission::role_id::kEveryone; });
-    if (everyone != all_roles.end()) out.push_back(*everyone);
+    if (implicit_everyone) {
+        auto everyone = std::find_if(all_roles.begin(), all_roles.end(),
+            [](const ServerRole& r) { return r.id == permission::role_id::kEveryone; });
+        if (everyone != all_roles.end()) out.push_back(*everyone);
+    }
 
     for (const auto& id : user_role_ids) {
-        if (id == permission::role_id::kEveryone) continue;
+        // Skipped only because it is already there. When it is not implicit,
+        // an assignment naming @everyone resolves it like any other role.
+        if (implicit_everyone && id == permission::role_id::kEveryone) continue;
         auto it = std::find_if(all_roles.begin(), all_roles.end(),
             [&](const ServerRole& r) { return r.id == id; });
         if (it != all_roles.end()) out.push_back(*it);
@@ -76,14 +90,22 @@ permission::Flags PermissionsEngine::compute(const std::string& user_id, const s
     const auto& all_roles = server_roles();
     const auto& user_role_ids = member_role_ids(user_id);
 
+    // Does the server's default role apply to this account at all? False for a
+    // bot — see permission::inherits_everyone_role() for why, and note that it
+    // is asked ONCE and used in both branches below. The fallback is not an
+    // exception to the rule: it is the rule's most dangerous corner, because it
+    // hands out kEveryoneDefault with no document to read it out of, which is
+    // exactly the grant a scoped bot was not given.
+    const bool implicit_everyone = permission::inherits_everyone_role(user_id);
+
     // Fallback: if the server hasn't been bootstrapped yet (no roles at all
     // and no member.roles events), grant the default @everyone permissions
     // so a fresh deployment still lets users see and send messages.
     if (all_roles.empty() && user_role_ids.empty()) {
-        return permission::kEveryoneDefault;
+        return implicit_everyone ? permission::kEveryoneDefault : 0;
     }
 
-    auto user_roles = resolve_user_roles(all_roles, user_role_ids);
+    auto user_roles = resolve_user_roles(all_roles, user_role_ids, implicit_everyone);
 
     // Base = OR of all role permission bitfields.
     permission::Flags base = 0;
@@ -313,6 +335,32 @@ PermissionsEngine::RoleChangeVerdict PermissionsEngine::validate_role_document(
 
 PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_self_assign_role(
     const std::string& actor_id, const std::string& role_id, bool adding) {
+    // A BOT MAY NOT HAND ITSELF A ROLE, in either direction.
+    //
+    // This is the one path on the server that grants a role with no rank check
+    // and no MANAGE_ROLES — deliberately, because an ordinary member sits at
+    // position 0 and could otherwise never be given anything. It pays for that
+    // bypass with the containment rule: a self-assignable role's permissions
+    // are a subset of @everyone's. For a person that is exactly the right
+    // trade. For a bot it is the whole of its scoping, because @everyone's
+    // permissions are precisely the set a scoped bot was NOT given — so one
+    // request against an opt-in role would take a bot from "may see three
+    // channels" back to "may see and post in every channel on the server",
+    // using nothing but the token it already holds.
+    //
+    // Refused by account kind rather than by making opt-in roles bot-proof,
+    // because the roles are not the problem: a server is entitled to offer
+    // "@announcements" to its members. What has no meaning is a bot opting in.
+    // There is no human behind the token to click it, so every such request is
+    // either a misconfigured integration or an attempt to grow.
+    //
+    // Removal is refused too, for the reason the header already gives about
+    // removal generally: a role can carry channel DENY overrides, so "muted" is
+    // a role, and a bot that could shed roles could unmute itself.
+    if (bot::is_bot_user_id(actor_id)) {
+        return {false, "A bot account cannot assign roles to itself; ask an administrator"};
+    }
+
     const auto& all = server_roles();
     const ServerRole* role = find_role(all, role_id);
     if (!role) return {false, "Unknown role: " + role_id};

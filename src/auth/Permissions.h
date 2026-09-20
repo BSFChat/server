@@ -163,6 +163,12 @@ public:
     // Everything else still binds both directions, which is the point of the
     // paragraph above: self_assignable itself is re-checked on removal so a
     // mute role cannot be shed.
+    //
+    // A BOT MAY NOT USE THIS PATH AT ALL, in either direction. The containment
+    // rule that pays for the rank bypass caps an opt-in role at @everyone's
+    // permissions — and @everyone's permissions are exactly what a scoped bot
+    // was not given, so for a bot this would be a one-request way out of its
+    // scoping with no privilege required. The refusal is first in the function.
     RoleChangeVerdict may_self_assign_role(const std::string& actor_id,
                                            const std::string& role_id,
                                            bool adding);

@@ -334,6 +334,8 @@ void Server::register_routes() {
              [h = bot_handler](const httplib::Request& req, httplib::Response& res) { h->handle_rotate_token(req, res); });
     svr.Delete(R"(/_matrix/client/v3/bsfchat/bots/([^/]+)$)",
                [h = bot_handler](const httplib::Request& req, httplib::Response& res) { h->handle_deactivate_bot(req, res); });
+    svr.Get(R"(/_matrix/client/v3/bsfchat/bots/([^/]+)/access$)",
+            [h = bot_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_bot_access(req, res); });
 
     // Server roles. bsfchat.* namespaced for the same reason the bot routes
     // above are: Matrix models permissions with m.room.power_levels, which this

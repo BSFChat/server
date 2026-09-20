@@ -429,8 +429,16 @@ TEST(BotCreate, ProducesAUserAccountWithATokenShownOnce) {
     EXPECT_FALSE(bot->deactivated_at.has_value());
 
     // ...and a role assignment, so it goes through PermissionsEngine like anyone
-    // else rather than falling through to the un-bootstrapped default.
-    EXPECT_FALSE(fx.store->get_member_role_ids("@bot_deploy:test").empty());
+    // else rather than falling through to the un-bootstrapped default. The
+    // document exists and is EMPTY: a bot starts with no permissions anywhere
+    // and is scoped upward from there (tests/test_bot_scoping.cpp). Asserted on
+    // the stored document rather than on get_member_role_ids(), which cannot
+    // tell "no assignment" from "an empty one" and so cannot see the difference
+    // this line is about.
+    EXPECT_TRUE(fx.store->get_server_state(std::string(event_type::kMemberRoles),
+                                           "@bot_deploy:test")
+                    .has_value());
+    EXPECT_TRUE(fx.store->get_member_role_ids("@bot_deploy:test").empty());
 
     // The PLAINTEXT is not in the database anywhere. Only its hash is, exactly
     // like an access token post-v7.
@@ -1175,6 +1183,21 @@ TEST(BotPermissions, ABotGoesThroughRolesLikeAnyoneElse) {
     auto [bot_id, token] = fx.make_bot("token-admin", "bot_roled");
     auto room = fx.add_public_channel(admin, "general");
 
+    {
+        PermissionsEngine perms(*fx.store, fx.config);
+        // Nothing, until it is given something: a bot does not inherit the
+        // implicit @everyone role (permission::inherits_everyone_role, and
+        // tests/test_bot_scoping.cpp for the whole of it). This used to assert
+        // SEND_MESSAGES here, which was the old default and the reason a bot
+        // minted for one channel could post in every channel on the server.
+        EXPECT_FALSE(perms.can(bot_id, room, permission::kSendMessages));
+        EXPECT_FALSE(perms.can(bot_id, room, permission::kManageChannels));
+    }
+
+    // Given @everyone by name, it is an ordinary member again — which is the
+    // claim this test is actually about: nothing in the evaluation is
+    // bot-flavoured, the default role simply is not handed over unasked.
+    fx.assign_roles(bot_id, {});
     {
         PermissionsEngine perms(*fx.store, fx.config);
         EXPECT_TRUE(perms.can(bot_id, room, permission::kSendMessages));

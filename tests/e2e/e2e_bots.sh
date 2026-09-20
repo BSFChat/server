@@ -321,6 +321,30 @@ fi
 check "bot cannot send before joining"          403 "$(req PUT "/rooms/${ROOM}/send/m.room.message/pre1" "$BOT_TOKEN" \
   '{"msgtype":"m.text","body":"should not appear"}')"
 
+# A bot starts with NO permissions anywhere — it does not inherit @everyone
+# (docs/bot-scoping.md). So it is scoped into this one channel the way an
+# operator would: a user-specific channel override, written by the admin, which
+# is the gesture the Bots tab performs. Everything after this point exercises a
+# bot that was let in deliberately rather than one that arrived holding the
+# server's defaults.
+#
+# 0x4403 = VIEW_CHANNEL | SEND_MESSAGES | ATTACH_FILES | EMBED_LINKS |
+# ADD_REACTIONS — the set this script goes on to use. Written as a literal so a
+# change to kEveryoneDefault cannot silently widen what is under test.
+check "admin scopes the bot into the channel"   200 "$(req PUT \
+  "/rooms/${ROOM}/state/bsfchat.channel.permissions/user:${BOT_ID}" "$T_ADMIN" \
+  '{"allow":"0x440f","deny":"0x0"}')"
+
+# ...and the grant is per-channel, not server-wide: the bot still cannot see
+# anything it was not given. Asserted against the directory, which filters by
+# the caller's own VIEW_CHANNEL.
+check "the grant did not widen anywhere else"   200 "$(req GET "/bsfchat/channels" "$BOT_TOKEN")"
+if [[ $(grep -o '"room_id"' "$WORK/last-body.json" | wc -l) -eq 1 ]]; then
+  note "  bot sees exactly the one channel" "$(cat "$WORK/last-body.json")"
+else
+  fail "  bot sees exactly the one channel" "body=$(cat "$WORK/last-body.json")"
+fi
+
 check "bot joins explicitly"                    200 "$(req POST "/rooms/${ROOM}/join" "$BOT_TOKEN")"
 check "  join returns the room id"              "$ROOM" "$(jfield room_id)"
 # The other spelling of the same thing, and joining twice must be harmless.
@@ -461,6 +485,13 @@ check "  returns the original redaction id"     "$REDACTION_EVENT" "$(jfield eve
 # ── phase 5: invite auto-joins a bot ─────────────────────────────────────
 echo
 echo "── T5: inviting a bot joins it outright ─────────────────────────────"
+#
+# JOINS IT — and joins it only. Membership is not access on this server
+# (docs/membership-vs-visibility.md), and a bot holds no permissions it was not
+# given (docs/bot-scoping.md), so the grant below is a SEPARATE act from the
+# invite and this phase asserts both halves in order: invited and visibly
+# joined, still unable to read or post, then granted and able to.
+#
 
 # A SECOND channel, which the bot is not in — bots are excluded from auto-join,
 # so a channel created now leaves the bot outside it.
@@ -476,6 +507,21 @@ if grep -q "$ROOM2" "$WORK/last-body.json"; then
 else
   note "bot is outside the new channel"
 fi
+
+# Scope it into the new channel BEFORE inviting it, which is the order an
+# operator works in and the order the Bots tab should: decide what the bot may
+# do there, then add it. Inviting first is not wrong, it is just invisible — a
+# bot with no VIEW_CHANNEL cannot see the channel in /sync, so it would not
+# observe its own join until the grant landed.
+check "admin scopes the bot into room2"         200 "$(req PUT \
+  "/rooms/${ROOM2}/state/bsfchat.channel.permissions/user:${BOT_ID}" "$T_ADMIN" \
+  '{"allow":"0x440f","deny":"0x0"}')"
+
+# The grant alone is not membership: it still cannot post, because it is not in
+# the channel. Access and membership are separate on this server and this is the
+# half that is easy to forget in the other direction.
+check "granted but not joined, cannot post"     403 "$(req PUT "/rooms/${ROOM2}/send/m.room.message/pre2" "$BOT_TOKEN" \
+  '{"msgtype":"m.text","body":"not in here yet"}')"
 
 # Park the bot's poll FIRST. The whole point of the design is that the bot does
 # nothing: no invite to accept, no join call. It must simply observe itself

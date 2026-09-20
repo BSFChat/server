@@ -134,6 +134,58 @@ void write_member_roles(SqliteStore& store, const Config& config,
                               user_id, j.dump(), mirror_room);
 }
 
+// One-time upgrade step for bot scoping.
+//
+// A bot no longer inherits @everyone (permission::inherits_everyone_role), so
+// the base permissions of every bot on this server are now whatever its
+// assignment says and nothing else. That is invisible for the bots this server
+// actually has — step 2 below wrote ["everyone"] into each of them when they
+// were created, and an assignment that NAMES @everyone still resolves it — but
+// it is not invisible for a bot that somehow carries no assignment at all. That
+// bot would come back from this restart holding nothing, which for an
+// integration means a working deployment that stops working with a 403 and no
+// explanation.
+//
+// So: whatever a bot could do before the upgrade, it can do after it. The
+// backfill states the grant those bots were relying on implicitly, exactly once.
+//
+// ONCE, and the marker is why. An operator who then scopes a bot down must not
+// have @everyone handed back at the next boot — that is the difference between
+// an upgrade step and a policy, and it is the same reason
+// backfill_add_reactions carries one. Ordered before the assignment loop, which
+// skips bots, so the two cannot fight over the same account.
+void backfill_bot_everyone(SqliteStore& store, const Config& config,
+                           const std::string& mirror_room) {
+    static constexpr const char* kMarker = "migration.bot_explicit_everyone";
+    if (store.get_meta(kMarker)) return;
+
+    int granted = 0;
+    for (const auto& [user_id, _created] : store.list_users_with_created_at()) {
+        if (!bot::is_bot_user_id(user_id)) continue;
+        // "HAS NO ASSIGNMENT DOCUMENT", not "has no roles". The two are
+        // different accounts and get_member_role_ids() cannot tell them apart:
+        // it answers with an empty vector both for a bot that predates scoping
+        // and for one created since, whose assignment is deliberately empty.
+        // Sweeping on the roles would therefore un-scope every new bot the next
+        // time this ran, which is the bug this whole function exists to prevent,
+        // performed by the thing preventing it.
+        if (store.get_server_state(std::string(event_type::kMemberRoles), user_id)) continue;
+        write_member_roles(store, config, mirror_room, user_id,
+                           {std::string(permission::role_id::kEveryone)});
+        ++granted;
+    }
+
+    if (granted > 0) {
+        get_logger()->info(
+            "Bot scoping: wrote an explicit @everyone assignment for {} existing bot(s), so the "
+            "upgrade changes nothing about what they may do. Scope them from the Bots tab",
+            granted);
+    }
+    // Marked even when nothing needed writing, so this is one lookup per
+    // restart forever after rather than a sweep of every account.
+    store.set_meta(kMarker, "1");
+}
+
 } // namespace
 
 // Room to MIRROR server-wide state into so clients pick it up on sync.
@@ -244,6 +296,10 @@ void bootstrap_roles(SqliteStore& store, SyncEngine& sync_engine, const Config& 
         backfill_add_reactions(store, config, canonical);
     }
 
+    // 1b. Bots that predate scoping keep what they had. Before step 2, which
+    // no longer writes assignments for bots at all.
+    backfill_bot_everyone(store, config, canonical);
+
     // 2. Ensure every user has a member.roles event. First-registered user
     // (oldest created_at) gets Admin; everyone else gets @everyone only.
     auto users = store.list_users_with_created_at();
@@ -255,6 +311,16 @@ void bootstrap_roles(SqliteStore& store, SyncEngine& sync_engine, const Config& 
     const std::string& owner_id = users.front().first;
     int wrote = 0;
     for (const auto& [user_id, _ts] : users) {
+        // A BOT IS NOT GIVEN @everyone HERE, and this is the line that makes
+        // bot scoping survive a restart. This sweep runs at every boot and
+        // grants the default role to any account with no assignment, so without
+        // the exclusion an operator's careful scoping would be quietly undone
+        // overnight by the server itself — the same shape as
+        // backfill_auto_join re-joining bots to every channel, closed the same
+        // way. A bot's assignment is written once, at creation, and after that
+        // it is the operator's document and nothing else writes it.
+        if (bot::is_bot_user_id(user_id)) continue;
+
         auto current = store.get_member_role_ids(user_id);
         if (!current.empty()) continue; // already assigned, leave alone
 

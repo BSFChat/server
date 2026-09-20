@@ -12,9 +12,9 @@ namespace bsfchat {
 class SyncEngine;
 struct Config;
 
-// Bot account administration: create, list, rotate, deactivate.
+// Bot account administration: create, list, rotate, deactivate, and read scope.
 //
-// These four endpoints are the ENTIRE bot-specific request surface. There is no
+// These five endpoints are the ENTIRE bot-specific request surface. There is no
 // bot-flavoured /sync, no bot variant of /rooms/{id}/send, no parallel
 // authentication path — because a bot is a user account, so everything else it
 // does goes through the routes that already exist and the bearer-token
@@ -51,6 +51,52 @@ public:
     // Revokes every token, leaves every room, marks the bot deactivated.
     // Idempotent: a second call is a 200 that changes nothing.
     void handle_deactivate_bot(const httplib::Request& req, httplib::Response& res);
+
+    // GET /_matrix/client/v3/bsfchat/bots/{userId}/access
+    //   -> 200 {user_id, deactivated, role_ids, server_permissions,
+    //           channels: [{room_id, name, type, category_id?, joined,
+    //                       permissions, override?: {allow, deny}}]}
+    //
+    // WHERE CAN THIS BOT GO — the read side of bot scoping, and READ ONLY.
+    //
+    // THE FIFTH ENDPOINT, against the rule three paragraphs up. It earns its
+    // place because it duplicates no authority: everything in the answer is
+    // something the caller could already obtain, and the endpoint is purely the
+    // aggregation. A caller holding MANAGE_BOTS can already list bots; a caller
+    // who can view a channel can already read its overrides out of /state and
+    // its own effective permissions out of GET /bsfchat/permissions/{userId}.
+    // What does not exist is a way to ask that question about ANOTHER account
+    // across every channel at once, and without it a bots tab would have to
+    // issue one /state request per channel and then compute the answer itself —
+    // which is a second implementation of the permission algorithm, in a client,
+    // for a security decision. That has already drifted once here
+    // (client/src/util/PermissionMath.cpp). PermissionsEngine answers instead.
+    //
+    // THERE IS NO WRITE SIBLING, deliberately. Granting a bot a channel is
+    // writing `bsfchat.channel.permissions` with state_key `user:<bot id>`, and
+    // granting it a server-wide permission is writing `bsfchat.member.roles` —
+    // both of which already exist, are already audited, and already carry the
+    // rank and containment rules. A bot-flavoured write route would be a second
+    // way to author the same state, and the second way is the one that ends up
+    // missing a rule. A consequence worth stating plainly: MANAGE_BOTS alone
+    // cannot grant a bot access to anything. Letting a bot into a channel needs
+    // MANAGE_ROLES in that channel, which is the same authority it takes to let
+    // a person in, and that is the intended answer rather than a gap.
+    //
+    // GATED BY authorize_bot_admin, so it carries the rank rule too. Reading
+    // where a credential may go is reconnaissance for rotating it, and rotation
+    // is already refused for a bot that outranks the caller.
+    //
+    // FILTERED BY WHAT THE CALLER MAY BE TOLD ABOUT. The channel list is the
+    // caller's own visible_channel_directory(), not the server's room list.
+    // MANAGE_BOTS is a licence to manufacture accounts, not to enumerate the
+    // server: without this, a delegated bot administrator who cannot see
+    // #leadership would learn that it exists, what it is called and how its
+    // overrides are shaped, by asking about an unrelated bot. The BOT's
+    // permissions inside those channels are then computed for the bot, which is
+    // the whole point — the caller's visibility decides which channels are
+    // listed, and the bot's decides what each entry says.
+    void handle_get_bot_access(const httplib::Request& req, httplib::Response& res);
 
 private:
     // Everything an authorized operation on an existing bot needs.
