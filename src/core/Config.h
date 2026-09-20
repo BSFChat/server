@@ -1,5 +1,8 @@
 #pragma once
 
+#include <bsfchat/Constants.h>
+
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -250,6 +253,33 @@ struct SendLimitsConfig {
     int profile_limit = 10;
 
     int window_seconds = 60;
+
+    // ── How big one write may be, as opposed to how many ──────────────────
+    //
+    // Everything above is a RATE: how often an account may do a thing. These
+    // two are a SIZE: how big one of those things may be. They live in the
+    // same block because they defend the same resource from the same caller,
+    // and because an operator reading "[limits]" is looking for both — but
+    // note they are deliberately NOT under `enabled`. Turning the rate limiter
+    // off is a defensible choice when something upstream is pacing requests;
+    // there is no upstream that can decide a message body is too big for this
+    // server's database, so the size ceilings always apply.
+    //
+    // Both are bytes. See limits::kMaxMessageBodyBytes in the protocol headers
+    // for why bytes and not characters, and why the default is where it is.
+
+    // Ceiling on `body` (and `m.new_content.body`) of an m.room.message.
+    // `formatted_body` is allowed limits::kFormattedBodyMultiplier times this,
+    // derived rather than configured, because it is the same message with
+    // markup and an operator setting the two independently would only ever set
+    // them inconsistently.
+    size_t max_message_bytes = limits::kMaxMessageBodyBytes;
+
+    // Ceiling on the whole request body of a PUT .../send/{type}/{txn},
+    // whatever the type, checked before the JSON is parsed. Covers the event
+    // types that are not messages — m.reaction and the call signalling — and
+    // any field on a message that nothing reads.
+    size_t max_event_bytes = limits::kMaxEventContentBytes;
 };
 
 // Rate limiting and lockout for /login, /register, /refresh and

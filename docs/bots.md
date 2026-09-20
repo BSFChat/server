@@ -558,6 +558,34 @@ clients render it dimmer. It is otherwise identical to `m.text`.
 {"msgtype": "m.notice", "body": "Deploy finished."}
 ```
 
+### How big a message may be
+
+| What | Default | Config key |
+| --- | --- | --- |
+| `body` (and `m.new_content.body` on an edit) | 16 KiB | `[limits] max_message_bytes` |
+| `formatted_body` (and the edit's) | 4x that — 64 KiB | derived, not configurable |
+| The whole request body, any event type | 128 KiB | `[limits] max_event_bytes` |
+
+**Bytes, not characters.** A four-byte emoji costs four. Non-Latin text gets
+fewer characters for the same budget, which is why the number is high rather
+than set at some tidy character count: even worst-case four-byte text gets
+~4,000 characters.
+
+Over any of them is `413 M_TOO_LARGE`, naming the field and both numbers. It is
+a `4xx`: do not retry it, split the message. An oversize **edit** is refused
+whole — the message already in the timeline is left exactly as it was, so there
+is no half-applied state to reconcile.
+
+An operator may lower `max_message_bytes`, so do not hard-code 16384. If you
+post long output, either check `len(body.encode("utf-8"))` against a
+conservative figure of your own and chunk above it, or upload it as a file
+(§7) — which is the better answer for anything log-shaped anyway.
+
+Generous by design: a formatted roster of fifty names with matrix.to links
+comes to roughly 1 KB of `body` and 6 KB of `formatted_body`, about a
+sixteenth of each ceiling. If a legitimate bot message is anywhere near these
+numbers, it is a file, not a message.
+
 **Emote** (`/me`): `{"msgtype": "m.emote", "body": "shrugs"}`.
 
 **Reply.** Purely a content convention — the server does not validate the target
@@ -829,6 +857,7 @@ meet: `M_FORBIDDEN`, `M_UNKNOWN_TOKEN`, `M_MISSING_TOKEN`, `M_NOT_FOUND`,
 | Read timeout on `/sync` | **Not an error.** Your client's socket timeout must exceed `timeout` + margin (e.g. `timeout=300000` → socket timeout 330 s). Reconnect immediately with the *same* `since`. |
 | `401 M_UNKNOWN_TOKEN` | **Stop.** Do not retry, do not back off. The token was rotated or the bot deleted. Exit non-zero and let your supervisor restart you with fresh credentials. |
 | `403` on a send | A permission problem or a content gate (§8). Log it and drop the message; retrying will fail identically. |
+| `413 M_TOO_LARGE` on a send | The message is over a size ceiling (§6). Split it or upload it as a file; retrying will fail identically. |
 | `400 M_BAD_JSON` | Your bug. Log the payload. |
 
 Never retry a `4xx` other than `429`. Nothing about the request will have changed.

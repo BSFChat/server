@@ -17,6 +17,24 @@
 
 namespace bsfchat {
 
+namespace {
+
+// Floor under limits::max_message_bytes. A ceiling below this is a typo or a
+// misunderstanding of the unit (someone who meant kilobytes), and honouring it
+// literally would make the server refuse ordinary sentences — a failure mode
+// far more disruptive than the one the ceiling prevents, and one that presents
+// as "chat is broken" rather than as a config error.
+constexpr size_t kMinConfigurableMessageBytes = 512;
+
+// Everything in a maximal m.room.message that is neither `body` nor
+// `formatted_body`: msgtype, format, fifty mention ids, an m.relates_to block,
+// an m.new_content wrapper and JSON punctuation. Generous, because the cost of
+// overshooting is a slightly larger request ceiling and the cost of
+// undershooting is a legitimate message refused with a misleading error.
+constexpr size_t kEventEnvelopeSlack = 8 * 1024;
+
+} // namespace
+
 Config Config::load(const std::string& path) {
     Config cfg;
 
@@ -124,6 +142,21 @@ Config Config::load(const std::string& path) {
                 sl.profile_limit = v->value_or(sl.profile_limit);
             if (auto v = limits_tbl->get("window_seconds"))
                 sl.window_seconds = v->value_or(sl.window_seconds);
+            // Sizes, not rates. Read as int64 and clamped in validate(): toml++
+            // will happily hand back a negative, and a negative folded into a
+            // size_t is the largest ceiling there is — which would silently
+            // turn a typo into "no limit at all", the state this whole block
+            // exists to leave.
+            if (auto v = limits_tbl->get("max_message_bytes")) {
+                if (auto n = v->value<int64_t>(); n && *n > 0) {
+                    sl.max_message_bytes = static_cast<size_t>(*n);
+                }
+            }
+            if (auto v = limits_tbl->get("max_event_bytes")) {
+                if (auto n = v->value<int64_t>(); n && *n > 0) {
+                    sl.max_event_bytes = static_cast<size_t>(*n);
+                }
+            }
         }
 
         // [tls]
@@ -549,6 +582,36 @@ void Config::validate(Config& cfg) {
             log->warn("limits.enabled is false — there is no server-side ceiling on how fast an "
                       "account can post, delete or upload. A looping client or a buggy bot can "
                       "flood a channel until someone notices.");
+        }
+
+        // Size ceilings. Unlike the counts above, zero is NOT "no limit" — it
+        // is a value that would refuse every message — so both are floored at
+        // something usable rather than honoured literally.
+        if (sl.max_message_bytes < kMinConfigurableMessageBytes) {
+            log->warn("limits.max_message_bytes = {} is below the {}-byte floor and would refuse "
+                      "ordinary messages; using the floor. Set it to a real ceiling or leave it "
+                      "unset to get the {}-byte default.",
+                      sl.max_message_bytes, kMinConfigurableMessageBytes,
+                      limits::kMaxMessageBodyBytes);
+            sl.max_message_bytes = kMinConfigurableMessageBytes;
+        }
+
+        // The request ceiling has to admit a message that passes both field
+        // ceilings, or the field ceilings are unreachable and their error
+        // messages lie: the caller is told "body may be N bytes" by a server
+        // that refused the request before it looked at `body`. Same relation
+        // the static_assert in Constants.h pins for the defaults; enforced here
+        // for the operator-set pair, which can be edited one at a time.
+        const size_t required_event_bytes =
+            sl.max_message_bytes * (1 + limits::kFormattedBodyMultiplier) + kEventEnvelopeSlack;
+        if (sl.max_event_bytes < required_event_bytes) {
+            log->warn("limits.max_event_bytes = {} cannot hold a message of "
+                      "limits.max_message_bytes = {} plus its formatted_body ({}x) and envelope; "
+                      "raising it to {}. Lower max_message_bytes instead if a smaller ceiling is "
+                      "what you meant.",
+                      sl.max_event_bytes, sl.max_message_bytes, limits::kFormattedBodyMultiplier,
+                      required_event_bytes);
+            sl.max_event_bytes = required_event_bytes;
         }
     }
 

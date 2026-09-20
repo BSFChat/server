@@ -19,6 +19,10 @@
 //       shared long-lived credential goes to every authenticated account.
 //  11.  PUT /state/{type} accepted UNKNOWN types on MANAGE_CHANNELS — the same
 //       allow-by-default shape the send path already closed with an allowlist.
+//  12.  Nothing anywhere bounded the SIZE of a message. Any member could post a
+//       multi-megabyte body, which is then stored, FTS-indexed, delivered to
+//       every member through /sync and paginated forever: one request from one
+//       account, paid for by everybody else.
 
 #include <gtest/gtest.h>
 
@@ -42,6 +46,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -783,4 +789,360 @@ TEST(LogForgery, ALoginIdentifierCannotWriteExtraLogRecords) {
             << "a single log call emitted more than one record: " << line;
     }
     EXPECT_TRUE(saw_lockout) << "the lockout never engaged, so the forging path was not reached";
+}
+
+// ══ 12. A message body has a size ═════════════════════════════════════════
+//
+// There was no bound on the text of an m.room.message anywhere — not in the
+// client composer, not in Constants.h, not in handle_send_event.
+// kMaxMessagesLimit = 1000 is a PAGE SIZE and was repeatedly read as though it
+// were a size limit.
+//
+// The asymmetry is the whole finding: one authenticated member spends one
+// request, and every other member of the room pays for the result on every
+// sync, every backfill and forever in storage, with the FTS index roughly
+// doubling the on-disk cost. Cheaper to send than to receive is the definition
+// of an amplifier.
+//
+// What the tests below pin, in order: the boundary is inclusive and one byte
+// past it is refused; formatted_body gets its own larger ceiling because it is
+// the same message with markup; an edit cannot smuggle a large body in through
+// m.new_content; the request as a whole is bounded whatever the event type, so
+// the hole cannot reopen under a key nobody parses; and the two shapes that
+// MUST keep working — a fifty-name formatted roster, and non-Latin text, which
+// a byte limit taxes hardest.
+
+namespace {
+
+std::string repeat(char c, size_t n) { return std::string(n, c); }
+
+// Body of exactly `bytes` bytes, carrying no URL and no @everyone so neither
+// content gate can be what refuses it.
+std::string body_of(size_t bytes) { return repeat('a', bytes); }
+
+std::string message_body(const std::string& body) {
+    return json{{"msgtype", "m.text"}, {"body", body}}.dump();
+}
+
+std::string errcode_of(const httplib::Response& res) {
+    try {
+        return json::parse(res.body).value("errcode", "");
+    } catch (...) {
+        return "<unparseable: " + res.body + ">";
+    }
+}
+
+} // namespace
+
+TEST(MessageSize, ABodyExactlyAtTheLimitIsAccepted) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = f.add_room(alice);
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request(send_path(room, "t1"), "token-alice",
+                            message_body(body_of(limits::kMaxMessageBodyBytes)));
+    handler.handle_send_event(req, res);
+
+    EXPECT_TRUE(IsOk(res)) << "the boundary is inclusive: " << res.body;
+}
+
+TEST(MessageSize, ABodyOneByteOverTheLimitIsRefused) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = f.add_room(alice);
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request(send_path(room, "t1"), "token-alice",
+                            message_body(body_of(limits::kMaxMessageBodyBytes + 1)));
+    handler.handle_send_event(req, res);
+
+    EXPECT_TRUE(HasStatus(res, 413)) << res.body;
+    EXPECT_EQ(errcode_of(res), "M_TOO_LARGE");
+    // Nothing may be stored. A refusal that still writes the event would leave
+    // the amplifier in place and only change what the sender is told.
+    EXPECT_TRUE(f.store->get_room_events(room, 100).empty())
+        << "an oversize message was stored despite the refusal";
+}
+
+// The composer can count what the user typed, so the plain-text ceiling is the
+// one it can warn about in advance. A megabyte is the shape the finding was
+// actually about.
+TEST(MessageSize, AMultiMegabyteBodyIsRefused) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = f.add_room(alice);
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request(send_path(room, "t1"), "token-alice",
+                            message_body(body_of(4 * 1024 * 1024)));
+    handler.handle_send_event(req, res);
+
+    EXPECT_TRUE(HasStatus(res, 413)) << res.body;
+    EXPECT_EQ(errcode_of(res), "M_TOO_LARGE");
+}
+
+// formatted_body is the same message after markup and is legitimately larger,
+// so it has its own ceiling — and that ceiling is real, not absent.
+TEST(MessageSize, FormattedBodyGetsALargerCeilingOfItsOwn) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = f.add_room(alice);
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+
+    {
+        httplib::Response res;
+        auto req = make_request(
+            send_path(room, "at-limit"), "token-alice",
+            json{{"msgtype", "m.text"},
+                 {"body", "short"},
+                 {"format", "org.matrix.custom.html"},
+                 {"formatted_body", body_of(limits::kMaxFormattedBodyBytes)}}
+                .dump());
+        handler.handle_send_event(req, res);
+        EXPECT_TRUE(IsOk(res)) << "formatted_body at its own boundary: " << res.body;
+    }
+    {
+        httplib::Response res;
+        auto req = make_request(
+            send_path(room, "over"), "token-alice",
+            json{{"msgtype", "m.text"},
+                 {"body", "short"},
+                 {"format", "org.matrix.custom.html"},
+                 {"formatted_body", body_of(limits::kMaxFormattedBodyBytes + 1)}}
+                .dump());
+        handler.handle_send_event(req, res);
+        EXPECT_TRUE(HasStatus(res, 413)) << res.body;
+        EXPECT_EQ(errcode_of(res), "M_TOO_LARGE");
+    }
+}
+
+// An edit replaces the message everyone already has, so an unbounded
+// m.new_content is the same amplifier reached one level down — and it was the
+// exact level the EMBED_LINKS gate had already been caught missing.
+TEST(MessageSize, AnOversizeEditIsRefusedAndLeavesTheOriginal) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = f.add_room(alice);
+    auto target = f.post_message(room, alice, "hello");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request(
+        send_path(room, "t1"), "token-alice",
+        json{{"msgtype", "m.text"},
+             {"body", "* edited"},
+             {"m.relates_to", {{"rel_type", "m.replace"}, {"event_id", target}}},
+             {"m.new_content",
+              {{"msgtype", "m.text"}, {"body", body_of(limits::kMaxMessageBodyBytes + 1)}}}}
+            .dump());
+    handler.handle_send_event(req, res);
+
+    EXPECT_TRUE(HasStatus(res, 413)) << res.body;
+    EXPECT_EQ(errcode_of(res), "M_TOO_LARGE");
+
+    auto original = f.store->get_event_by_id(target);
+    ASSERT_TRUE(original.has_value());
+    EXPECT_EQ(original->content.data.value("body", ""), "hello")
+        << "the refused edit was applied anyway";
+}
+
+// The send allowlist admits m.reaction and the call-signalling types, and
+// `content` on any of them is stored and delivered exactly like a message.
+// Bounding only the fields we read would leave the hole open under a key
+// nobody parses.
+TEST(MessageSize, AReactionCarryingABulkFieldIsRefused) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = f.add_room(alice);
+    auto target = f.post_message(room, alice, "hello");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request(
+        "/_matrix/client/v3/rooms/" + room + "/send/m.reaction/t1", "token-alice",
+        json{{"m.relates_to",
+              {{"rel_type", "m.annotation"}, {"event_id", target}, {"key", "\xF0\x9F\x91\x8D"}}},
+             // A perfectly valid reaction with 4 MB bolted onto a key the
+             // server never looks at.
+             {"com.evil.payload", body_of(4 * 1024 * 1024)}}
+            .dump());
+    handler.handle_send_event(req, res);
+
+    EXPECT_TRUE(HasStatus(res, 413)) << res.body;
+    EXPECT_EQ(errcode_of(res), "M_TOO_LARGE");
+}
+
+TEST(MessageSize, AnOrdinaryReactionStillWorks) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = f.add_room(alice);
+    auto target = f.post_message(room, alice, "hello");
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request(
+        "/_matrix/client/v3/rooms/" + room + "/send/m.reaction/t1", "token-alice",
+        json{{"m.relates_to",
+              {{"rel_type", "m.annotation"}, {"event_id", target}, {"key", "\xF0\x9F\x91\x8D"}}}}
+            .dump());
+    handler.handle_send_event(req, res);
+
+    EXPECT_TRUE(IsOk(res)) << res.body;
+}
+
+// The use case that must not break. A bot posting a formatted roster of fifty
+// names is a real thing this deployment does (TibiaGuru), and it is the worst
+// realistic body/formatted_body ratio there is: every name is a plain word in
+// `body` and a full matrix.to anchor in the HTML.
+TEST(MessageSize, AFiftyNameFormattedRosterFitsComfortably) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = f.add_room(alice);
+
+    std::string body;
+    std::string html = "<p><b>Raid roster</b></p><ul>";
+    for (int i = 0; i < 50; ++i) {
+        const std::string name = "Knight Of The Long Name " + std::to_string(i);
+        const std::string uid = "@knight_of_the_long_name_" + std::to_string(i) + ":test";
+        body += name + " — level 3" + std::to_string(i) + " Elite Knight\n";
+        html += "<li><a href=\"https://matrix.to/#/" + uid + "\">" + name +
+                "</a> — level 3" + std::to_string(i) + " Elite Knight</li>";
+    }
+    html += "</ul>";
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request(send_path(room, "t1"), "token-alice",
+                            json{{"msgtype", "m.text"},
+                                 {"body", body},
+                                 {"format", "org.matrix.custom.html"},
+                                 {"formatted_body", html}}
+                                .dump());
+    handler.handle_send_event(req, res);
+
+    ASSERT_TRUE(IsOk(res)) << res.body;
+    // Not just "it fits" — it fits with room to spare, so the limit is not one
+    // longer name away from breaking the bot.
+    EXPECT_LT(body.size() * 4, limits::kMaxMessageBodyBytes)
+        << "a roster body is within a quarter of the plain-text ceiling";
+    EXPECT_LT(html.size() * 4, limits::kMaxFormattedBodyBytes)
+        << "a roster's HTML is within a quarter of the formatted ceiling";
+}
+
+// A byte limit taxes non-Latin text hardest, which is why the number is set
+// where it is rather than at Discord's 2,000 characters. Four-byte characters
+// are the worst case and still get thousands of them.
+TEST(MessageSize, NonLatinTextGetsTheWholeByteBudget) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = f.add_room(alice);
+
+    // U+1F600, four bytes each. Fill the budget exactly.
+    const std::string emoji = "\xF0\x9F\x98\x80";
+    const size_t count = limits::kMaxMessageBodyBytes / emoji.size();
+    std::string body;
+    body.reserve(count * emoji.size());
+    for (size_t i = 0; i < count; ++i) body += emoji;
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request(send_path(room, "t1"), "token-alice", message_body(body));
+    handler.handle_send_event(req, res);
+
+    EXPECT_TRUE(IsOk(res)) << res.body;
+    EXPECT_GT(count, 2000u)
+        << "worst-case four-byte text must still get more characters than Discord allows";
+}
+
+// The number is an operator's to set — a deployment of five friends and one of
+// five thousand strangers do not want the same ceiling — so the default must
+// not be baked into the handler.
+TEST(MessageSize, TheCeilingIsConfigurable) {
+    Fixture f;
+    f.config.send_limits.max_message_bytes = 2000; // Discord's, roughly
+    auto alice = f.add_user("alice");
+    auto room = f.add_room(alice);
+
+    EventHandler handler(*f.store, *f.sync, f.config);
+    {
+        httplib::Response res;
+        auto req = make_request(send_path(room, "under"), "token-alice",
+                                message_body(body_of(2000)));
+        handler.handle_send_event(req, res);
+        EXPECT_TRUE(IsOk(res)) << res.body;
+    }
+    {
+        // Comfortably inside the DEFAULT, and refused anyway: the handler is
+        // reading config and not the constant.
+        httplib::Response res;
+        auto req = make_request(send_path(room, "over"), "token-alice",
+                                message_body(body_of(2001)));
+        handler.handle_send_event(req, res);
+        EXPECT_TRUE(HasStatus(res, 413)) << res.body;
+        EXPECT_LT(2001u, limits::kMaxMessageBodyBytes)
+            << "this case only proves anything while it is under the default";
+    }
+}
+
+// Zero is "no limit" for every COUNT in [limits] and would be "refuse
+// everything" for a size, which is the one reading an operator cannot have
+// meant. Same for a value small enough to be a unit mix-up.
+TEST(MessageSize, AnUnusableCeilingIsFlooredRatherThanHonoured) {
+    Config cfg = Config::defaults();
+    cfg.send_limits.max_message_bytes = 0;
+    Config::validate(cfg);
+    EXPECT_GE(cfg.send_limits.max_message_bytes, 512u)
+        << "a zero ceiling would refuse every message ever sent";
+}
+
+// The request ceiling has to admit a message that passes the field ceilings,
+// or the field ceiling is unreachable and its error message is a lie.
+TEST(MessageSize, TheRequestCeilingIsRaisedToFitTheFieldCeilings) {
+    Config cfg = Config::defaults();
+    cfg.send_limits.max_message_bytes = 64 * 1024; // operator raised one…
+    cfg.send_limits.max_event_bytes = 70 * 1024;   // …and not the other
+    Config::validate(cfg);
+    EXPECT_GT(cfg.send_limits.max_event_bytes,
+              cfg.send_limits.max_message_bytes * (1 + limits::kFormattedBodyMultiplier))
+        << "a maximal body plus its formatted_body must fit inside the request ceiling";
+}
+
+// Defaults must not trip their own validation — if they did, every server
+// would log a warning on every boot and operators would learn to ignore it.
+TEST(MessageSize, TheDefaultsAreSelfConsistent) {
+    Config cfg = Config::defaults();
+    const auto before = cfg.send_limits;
+    Config::validate(cfg);
+    EXPECT_EQ(cfg.send_limits.max_message_bytes, before.max_message_bytes);
+    EXPECT_EQ(cfg.send_limits.max_event_bytes, before.max_event_bytes);
+}
+
+// The keys have to actually be read out of [limits]. An option documented in
+// the example config and silently ignored by the parser is worse than no
+// option: the operator believes they have set a ceiling.
+TEST(MessageSize, TheKeysLoadFromTheLimitsTable) {
+    auto path = std::filesystem::temp_directory_path() / "bsfchat_test_msg_size.toml";
+    std::ofstream(path) << "[limits]\n"
+                           "max_message_bytes = 4096\n"
+                           "max_event_bytes = 262144\n";
+    auto cfg = Config::load(path.string());
+    std::filesystem::remove(path);
+    EXPECT_EQ(cfg.send_limits.max_message_bytes, 4096u);
+    EXPECT_EQ(cfg.send_limits.max_event_bytes, 262144u);
+}
+
+// toml++ hands back whatever is in the file, and a negative folded into a
+// size_t is the largest ceiling there is — a typo that reads as "no limit".
+TEST(MessageSize, ANegativeCeilingDoesNotWrapIntoNoLimit) {
+    auto path = std::filesystem::temp_directory_path() / "bsfchat_test_msg_size_neg.toml";
+    std::ofstream(path) << "[limits]\nmax_message_bytes = -1\n";
+    auto cfg = Config::load(path.string());
+    std::filesystem::remove(path);
+    EXPECT_EQ(cfg.send_limits.max_message_bytes, limits::kMaxMessageBodyBytes)
+        << "a nonsense value must fall back to the default, not to SIZE_MAX";
 }
