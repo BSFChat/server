@@ -89,7 +89,37 @@ the real binary, passes unchanged.
 - **`POST /rooms/{id}/leave`** — membership is the correct and only gate;
   leaving is an act on your own membership row.
 - **`list_public_rooms()`** — used only by auto-join. It is not reachable from
-  any HTTP route; there is no public-rooms directory endpoint.
+  any HTTP route, and the channel directory below deliberately does not use it:
+  its "public" is the room's `visibility`, which is `public` on every channel on
+  this server including the private ones, so it is precisely the wrong predicate
+  for a listing.
+
+- **`GET /bsfchat/channels`** (`feat/channel-directory`) — the channel
+  directory, and the first endpoint here that enumerates rooms the caller is
+  **not** a member of. It sweeps every non-direct room and filters each through
+  `can_view_room()`; membership is never consulted, and appears in the response
+  only as the caller's own `joined` flag, computed after the filter. Three
+  things about it are worth keeping in mind before the next listing endpoint is
+  written:
+
+  * **DMs are excluded in SQL**, in `list_room_directory_rows()`, before any
+    permission is evaluated. This is not tidiness. `compute()` clears channel
+    overrides on a direct room (finding 6 above), so a DM that reached a
+    VIEW_CHANNEL filter would **pass** it for every account on the server, and
+    the directory would publish every private conversation on the instance. The
+    invariant "a DM's privacy is its membership" has no expression in a
+    server-wide room list, so a DM must never enter one.
+  * **`category_id` is checked against the response**, not echoed from state.
+    `handle_create_room` validates only that `parent_id` names an existing room
+    — only `handle_move_channel` checks that it is a category — so a channel can
+    genuinely carry a private channel as its parent, and echoing that id back
+    would leak the room the filter had just removed.
+  * **The sort order is not on the wire.** It is assigned per category with
+    gaps, so publishing it would let a caller read the gaps and count what was
+    filtered out of their own response. Position is carried by the array's own
+    order, which is dense by construction. The general form of that rule — *a
+    field derived from the unfiltered set is a disclosure even when every id in
+    the response is permitted* — is the one most likely to be missed next time.
 
 ### Findings 4–6 — closed in `harden/ip-and-membership`, 20 Sep 2026
 

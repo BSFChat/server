@@ -322,6 +322,42 @@ public:
     // rooms the one-time legacy-publicize migration is allowed to touch.
     std::vector<std::string> list_legacy_untyped_rooms();
 
+    // One room as the channel directory needs it: the sidebar fields, resolved
+    // from state in the same query that finds the room.
+    //
+    // `type` is bsfchat.room.type, empty on a legacy room that predates it.
+    // `parent_id` and `sort_order` come from bsfchat.room.category; parent_id
+    // is empty for an uncategorized channel. NO topic, NO member count, NO
+    // creator: this row is built to be rendered in a picker, and every field
+    // that is not needed to render one is a field a directory call would
+    // otherwise hand to anybody who asks.
+    struct RoomDirectoryRow {
+        std::string room_id;
+        std::string name;
+        std::string type;
+        std::string parent_id;
+        int sort_order = 0;
+    };
+
+    // Every non-direct room on the server, CATEGORIES INCLUDED, with the fields
+    // above. UNFILTERED — this is the candidate set, not an answer. The caller
+    // must run every row past auth/RoomVisibility before showing it to anyone;
+    // see list_public_rooms' own history for what happens when a store-level
+    // room list is mistaken for an access decision.
+    //
+    // Direct rooms are excluded IN SQL rather than by the caller, and that is
+    // load-bearing rather than tidy: PermissionsEngine::compute() deliberately
+    // clears channel overrides on a DM, so a DM that reached a VIEW_CHANNEL
+    // filter would PASS it for every user on the server (@everyone carries
+    // VIEW_CHANNEL by default) and the directory would publish every private
+    // conversation on the instance. Membership is the privacy boundary for a
+    // DM and this list cannot express that, so a DM must never enter it.
+    //
+    // One statement, not one per room: the correlated subqueries ride
+    // idx_events_room_type_state exactly as a per-room get_state_event would,
+    // but the whole sweep takes the store mutex once instead of 3N times.
+    std::vector<RoomDirectoryRow> list_room_directory_rows();
+
     // Room membership
     void set_membership(const std::string& room_id, const std::string& user_id, const std::string& membership);
     // Note: returns "leave" when there is NO row, so it cannot tell "never a

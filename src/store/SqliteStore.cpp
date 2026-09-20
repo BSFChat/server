@@ -1440,6 +1440,72 @@ std::vector<std::string> SqliteStore::list_legacy_untyped_rooms() {
     return rooms;
 }
 
+std::vector<SqliteStore::RoomDirectoryRow> SqliteStore::list_room_directory_rows() {
+    std::lock_guard lock(mutex_);
+
+    // Categories are IN this result, unlike every other list_* above — the
+    // directory has to name the containers so a channel's parent resolves to
+    // something the caller was also shown. Filtering them out here and adding
+    // them back in the caller would be a second definition of "is a category".
+    //
+    // `ORDER BY stream_position DESC LIMIT 1` per subquery is how the rest of
+    // this file resolves "the latest state event of this type", and it is what
+    // makes each subquery an index seek on idx_events_room_type_state rather
+    // than a scan: room_id is the leading column, so a grouped
+    // `WHERE event_type = 'm.room.name'` across all rooms would miss the index
+    // and walk the whole events table — on a server whose events table is
+    // overwhelmingly message history.
+    //
+    // Built from the event_type constants rather than spelled inline: these
+    // three are the entire wire contract of the directory, and a typo in a
+    // string literal inside SQL fails silently as "no such state event", i.e.
+    // as an unnamed channel rather than as an error.
+    const std::string sql =
+        "SELECT r.room_id,"
+        " COALESCE((SELECT json_extract(content, '$.name') FROM events"
+        "           WHERE room_id = r.room_id AND event_type = '" +
+        std::string(event_type::kRoomName) +
+        "' AND state_key = ''"
+        "           ORDER BY stream_position DESC LIMIT 1), ''),"
+        " COALESCE((SELECT json_extract(content, '$.type') FROM events"
+        "           WHERE room_id = r.room_id AND event_type = '" +
+        std::string(event_type::kRoomType) +
+        "' AND state_key = ''"
+        "           ORDER BY stream_position DESC LIMIT 1), ''),"
+        " COALESCE((SELECT json_extract(content, '$.parent_id') FROM events"
+        "           WHERE room_id = r.room_id AND event_type = '" +
+        std::string(event_type::kRoomCategory) +
+        "' AND state_key = ''"
+        "           ORDER BY stream_position DESC LIMIT 1), ''),"
+        " COALESCE((SELECT json_extract(content, '$.order') FROM events"
+        "           WHERE room_id = r.room_id AND event_type = '" +
+        std::string(event_type::kRoomCategory) +
+        "' AND state_key = ''"
+        "           ORDER BY stream_position DESC LIMIT 1), 0)"
+        " FROM rooms r WHERE r.is_direct = 0";
+
+    auto stmt = prepare(db_, sql.c_str());
+    std::vector<RoomDirectoryRow> rows;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        // COALESCE guarantees a non-NULL column, but json_extract on a
+        // malformed or differently-typed content yields whatever it yields —
+        // so every text read goes through a null-tolerant helper rather than
+        // straight into std::string, which is UB on a null pointer.
+        auto text = [&](int col) -> std::string {
+            const auto* p = sqlite3_column_text(stmt.get(), col);
+            return p ? reinterpret_cast<const char*>(p) : std::string();
+        };
+        RoomDirectoryRow row;
+        row.room_id = text(0);
+        row.name = text(1);
+        row.type = text(2);
+        row.parent_id = text(3);
+        row.sort_order = sqlite3_column_int(stmt.get(), 4);
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+
 std::vector<std::string> SqliteStore::list_public_rooms() {
     std::lock_guard lock(mutex_);
     // Return rooms where the latest m.room.join_rules state event has join_rule == "public"

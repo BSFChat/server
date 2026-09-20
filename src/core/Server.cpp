@@ -143,6 +143,10 @@ void Server::register_routes() {
              [h = room_handler](const httplib::Request& req, httplib::Response& res) { h->handle_create_room(req, res); });
     svr.Get(std::string(api_path::kJoinedRooms),
             [h = room_handler](const httplib::Request& req, httplib::Response& res) { h->handle_joined_rooms(req, res); });
+    // The channel directory: what the caller MAY see, member or not. Filtered
+    // per room by VIEW_CHANNEL inside the handler — see RoomHandler.h.
+    svr.Get(std::string(api_path::kChannelDirectory),
+            [h = room_handler](const httplib::Request& req, httplib::Response& res) { h->handle_channel_directory(req, res); });
 
     // Parameterized room routes — use regex patterns
     svr.Post(R"(/_matrix/client/v3/join/(.+))",

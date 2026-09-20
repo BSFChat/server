@@ -41,6 +41,7 @@ add_executable(server_tests
     test_request_hardening.cpp
     test_kick_enforcement.cpp
     test_role_management.cpp
+    test_channel_directory.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -173,6 +174,21 @@ set_tests_properties(e2e_profile_shape PROPERTIES
     # and a client parses it off the wire.
     TIMEOUT 300
     # Registers two users (bcrypt) and starts a server process.
+    RUN_SERIAL TRUE)
+
+add_test(NAME e2e_channel_directory
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/e2e/e2e_channel_directory.sh)
+set_tests_properties(e2e_channel_directory PROPERTIES
+    LABELS e2e
+    ENVIRONMENT "BSFCHAT_SERVER_BIN=$<TARGET_FILE:bsfchat-server>"
+    # The unit tests call RoomHandler directly, so the one thing they cannot
+    # cover is whether anything ROUTES to it — and the disclosure assertion here
+    # is a substring scan over the bytes curl received, which is the only form
+    # of "the room id is nowhere in the response" that a C++ struct cannot
+    # quietly satisfy.
+    TIMEOUT 300
+    # Registers two accounts (bcrypt), restarts the server so role bootstrap
+    # runs, and binds a fixed port (8907) that a second copy cannot share.
     RUN_SERIAL TRUE)
 
 add_test(NAME e2e_invites
