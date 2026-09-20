@@ -146,9 +146,39 @@ void write_member_roles(SqliteStore& store, const Config& config,
 // (SqliteStore::set_server_state); this mirror is presentation only, and it
 // being absent or deleted costs nothing.
 std::string pick_server_state_mirror_room(SqliteStore& store) {
+    // Pinned once and reused — see the header for the migration bug this closes.
+    //
+    // Deliberately NOT a deterministic re-pick (sorting the list, taking the
+    // oldest room, anything of that kind): every such rule chooses a DIFFERENT
+    // room from the one an existing deployment is already mirroring into, so
+    // upgrading would perform exactly the silent migration this is here to
+    // prevent. Pinning what the old expression returns preserves the current
+    // choice on every server that already has one, and only newly-created
+    // servers get to pick at all.
+    static constexpr const char* kMirrorRoomKey = "server_state.mirror_room";
+
+    if (auto pinned = store.get_meta(kMirrorRoomKey);
+        pinned && !pinned->empty() && store.room_exists(*pinned)) {
+        return *pinned;
+    }
+
     auto non_cat = store.list_all_non_category_rooms();
-    if (!non_cat.empty()) return non_cat.front();
-    return {};
+    if (non_cat.empty()) return {};
+
+    // Re-pinning is a real move — the events already mirrored into the old room
+    // stay there and clients that only see that room keep a stale copy. It
+    // happens when the pinned channel is deleted, which is rare and operator-
+    // driven, so it is logged at warn rather than being silent the way the
+    // old recompute-every-time behaviour was.
+    const std::string chosen = non_cat.front();
+    if (auto previous = store.get_meta(kMirrorRoomKey); previous && !previous->empty()) {
+        get_logger()->warn(
+            "server-state mirror room {} no longer exists; moving the mirror to {}. Clients that "
+            "only see the old room will keep a stale role document until they see the new one",
+            *previous, chosen);
+    }
+    store.set_meta(kMirrorRoomKey, chosen);
+    return chosen;
 }
 
 void write_server_scoped_state(SqliteStore& store, const Config& config,

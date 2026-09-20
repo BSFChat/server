@@ -5,6 +5,7 @@
 #include "api/AuditHandler.h"
 #include "api/AuthHandler.h"
 #include "api/BotHandler.h"
+#include "api/PermissionsHandler.h"
 #include "api/RoleHandler.h"
 #include "api/RoomHandler.h"
 #include "api/EventHandler.h"
@@ -368,6 +369,27 @@ void Server::register_routes() {
             [h = role_handler](const httplib::Request& req, httplib::Response& res) { h->handle_add_self_role(req, res); });
     svr.Delete(R"(/_matrix/client/v3/bsfchat/self_roles/([^/]+)$)",
                [h = role_handler](const httplib::Request& req, httplib::Response& res) { h->handle_remove_self_role(req, res); });
+
+    // One member's effective SERVER-SCOPE permission mask. Read-only; there is
+    // no write verb here and there must never be one — a permission is changed
+    // by editing a role or an assignment, through the routes above, where the
+    // hierarchy rules live.
+    //
+    // Its own handler rather than a fifth verb on RoleHandler, for the reason
+    // /self_roles is its own path: the authority is different in kind. The role
+    // routes are MANAGE_ROLES plus rank; this is "you already share a channel
+    // with this person", which is a visibility rule, not a privilege. Sharing a
+    // handler is how the visibility rule eventually gets skipped on one branch.
+    //
+    // Registered with the {userId} pattern only. There is deliberately no
+    // collection route: GET /bsfchat/permissions with no target would be a
+    // whole-server dump of who holds power, which is the enumeration oracle this
+    // endpoint's authorization rule exists to prevent. httplib has no route
+    // here, so it 404s.
+    auto permissions_handler = std::make_shared<PermissionsHandler>(*store_, config_);
+
+    svr.Get(R"(/_matrix/client/v3/bsfchat/permissions/([^/]+)$)",
+            [h = permissions_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_permissions(req, res); });
 
     // Voice routes — handler is kept as a member so start()/stop() can
     // manage the ghost-participant reaper thread.

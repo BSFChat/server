@@ -43,6 +43,8 @@ add_executable(server_tests
     test_role_management.cpp
     test_account_linking.cpp
     test_admin_cli.cpp
+    test_effective_permissions.cpp
+    test_mirror_room.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -104,6 +106,7 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/api/AuditHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/BotHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/RoleHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/PermissionsHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/audit/AuditLog.cpp
     ${CMAKE_SOURCE_DIR}/src/identity/Localpart.cpp
     ${CMAKE_SOURCE_DIR}/src/identity/Nickname.cpp
