@@ -1,3 +1,4 @@
+#include "cli/AdminCli.h"
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "core/Server.h"
@@ -6,6 +7,8 @@
 #include <csignal>
 #include <iostream>
 #include <memory>
+#include <string>
+#include <vector>
 
 static std::unique_ptr<bsfchat::Server> g_server;
 __attribute__((used)) static const char g_build_tag[] = "Bullshit Free Chat";
@@ -39,6 +42,7 @@ int main(int argc, char* argv[]) {
     // the one outcome an operator never wants from a typo.
     const auto usage = [&log](int code) {
         log->info("usage: bsfchat-server [--config <path>]");
+        log->info("       bsfchat-server <admin-subcommand> --config <path> [...]");
         log->info("  --config <path>   TOML configuration file");
         log->info("  --help, -h        this message");
         log->info("");
@@ -46,8 +50,34 @@ int main(int argc, char* argv[]) {
         log->info("database path is RELATIVE to the working directory. That is");
         log->info("convenient for a throwaway instance and dangerous anywhere");
         log->info("else, so prefer an explicit --config.");
+        log->info("");
+        bsfchat::print_admin_usage(std::cout);
         return code;
     };
+
+    // OFFLINE ADMIN SUBCOMMANDS, AND WHY THEY LIVE IN THIS BINARY.
+    //
+    // `bsfchat-server grant-admin --config ... --user @me:example.org` is the
+    // supported way to hand out the first (or a replacement) admin role when
+    // nobody who holds MANAGE_ROLES can reach the client — the lockout that
+    // put hand-written SQL into a production database. See src/cli/AdminCli.h
+    // for the full incident, the stopped-server requirement, and the argument
+    // that this is not a privilege-escalation path.
+    //
+    // A separate binary would have been the tidier shape and was rejected: it
+    // would have to be built, shipped, and put on the host alongside the
+    // server, and the one moment an operator needs it is the moment they are
+    // least inclined to go fetch a second tool. The server binary is already
+    // there, already the right version for the database next to it.
+    //
+    // Dispatched BEFORE the flag loop below, so the subcommand owns its own
+    // argument grammar and an unrecognised flag is refused by the command that
+    // was actually asked for.
+    if (argc > 1 && bsfchat::is_admin_subcommand(argv[1])) {
+        std::vector<std::string> args;
+        for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
+        return bsfchat::run_admin_cli(args, std::cout);
+    }
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];

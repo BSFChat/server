@@ -244,6 +244,25 @@ TEST_F(AuthHandlerTest, RegisterReservesTheServerNameUnderItsSkeletonToo) {
     }
 }
 
+TEST_F(AuthHandlerTest, RegisterReservesTheConsoleActorUnderItsSkeletonToo) {
+    // @console:<server_name> is the actor the offline admin CLI records its
+    // writes under (src/cli/AdminCli.cpp). It confers no permissions, so this
+    // is not about privilege — it is about the audit log staying unambiguous.
+    // "@console granted admin" has to mean "somebody with shell access on the
+    // host", never "a user who registered a clever name", because that record
+    // is the only answer to how an account became an administrator.
+    for (const char* attempt : {"console", "c0nsole", "con.sole", "c-o-n-s-o-l-e"}) {
+        auto res = do_register(attempt, "tr0mbone-seven");
+        EXPECT_EQ(res.status, 400) << attempt;
+        EXPECT_EQ(nlohmann::json::parse(res.body)["error"], "That username is reserved")
+            << attempt;
+    }
+
+    // And the reservation is the skeleton of that one word, not a substring of
+    // it: names that merely contain it stay available.
+    EXPECT_EQ(do_register("consolidate", "tr0mbone-seven").status, 200);
+}
+
 TEST_F(AuthHandlerTest, RegisterDoesNotReserveNamesThatMerelyStartLikeAPrefix) {
     // Why the `oidc_` reservation stays a LITERAL prefix match. Under the
     // skeleton the prefix folds to `oldc` (separators go), and comparing
