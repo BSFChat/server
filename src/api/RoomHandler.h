@@ -96,8 +96,15 @@ private:
     };
 
     // THE single implementation of "a moderator changes somebody else's
-    // membership". POST /rooms/{id}/kick, /ban, /unban, /invite and
+    // membership". POST /rooms/{id}/kick, /ban, /unban and
     // PUT /rooms/{id}/state/m.room.member/{user} all route through here.
+    //
+    // POST /rooms/{id}/invite does NOT, and the list above used to say it did.
+    // That endpoint answers seven situations the client tells apart by errcode
+    // and joins a bot outright rather than inviting it, none of which this
+    // function models, so it keeps its own body — which is exactly why the ONE
+    // rule it shares with this path, the direct-room rule below, is read off
+    // the intent instead of written out at both ends.
     //
     // They used to be five separate implementations of the same decision, and
     // they drifted exactly as far apart as you would expect: the state-PUT route
@@ -107,10 +114,16 @@ private:
     // to four copies would have produced a fifth divergence, so the copies are
     // gone instead.
     //
-    // Performs, in order: transition validation, permission evaluation at the
-    // correct scope, the rank check where one applies, the server ban-list write,
-    // the membership projection across every room, the member event(s), and the
-    // audit record. `reason` may be empty.
+    // Performs, in order: transition validation, the direct-room rule, permission
+    // evaluation at the correct scope, the rank check where one applies, the
+    // server ban-list write, the membership projection across every room, the
+    // member event(s), and the audit record. `reason` may be empty.
+    //
+    // The direct-room rule is carried by the intent
+    // (MembershipIntent::direct_room_refusal), so an invite or a kick is refused
+    // in a DM while a ban and an unban — which are acts on the account, not on
+    // the room — still reach it. POST /rooms/{id}/invite does not route through
+    // here, and asks that same field rather than deciding for itself.
     ModerationResult apply_membership_moderation(const std::string& actor,
                                                  const std::string& room_id,
                                                  const std::string& target_user,
