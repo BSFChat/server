@@ -22,6 +22,15 @@ void bootstrap_roles(SqliteStore& store, SyncEngine& sync_engine, const Config& 
 // receives a normal state event so clients keep learning about the change
 // through /sync — that mirror is delivery only and is never read back.
 // `sender` defaults to the synthetic @server:<name> actor when empty.
+// The room server-scoped state is MIRRORED into, so clients keep learning about
+// role changes through /sync. Presentation only: authority lives in the
+// server_state table, and this returning empty (a server with no channels yet)
+// costs nothing but a client refresh. Exposed because every writer of
+// server-scoped state needs the same answer, and two callers picking different
+// mirror rooms would leave clients reading whichever stale copy their sync
+// happened to carry.
+std::string pick_server_state_mirror_room(SqliteStore& store);
+
 void write_server_scoped_state(SqliteStore& store, const Config& config,
                                 const std::string& evt_type, const std::string& state_key,
                                 const std::string& content_json,

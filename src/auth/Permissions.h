@@ -33,6 +33,16 @@ public:
 
     // Returns the highest role position the user holds. Used for hierarchy
     // checks like "mods can't modify admins." @everyone is position 0.
+    //
+    // SELF-ASSIGNABLE ROLES DO NOT COUNT. A role anyone may take cannot also
+    // confer rank, or rank stops meaning anything: a "Boss pings" role sitting
+    // at position 50 so it hoists above the moderators would, the moment
+    // someone clicked it in the picker, make them un-kickable and un-bannable
+    // by every moderator on the server — outranks() is the whole of that gate.
+    // Excluding them here is what lets `position` stay a free display choice on
+    // a role that is, by construction, not a privilege. No existing role is
+    // affected: the flag defaults to false and nothing on an upgraded server
+    // has it set.
     int highest_role_position(const std::string& user_id);
 
     // Returns true if `actor` outranks `target` — i.e. actor's highest role
@@ -68,8 +78,56 @@ public:
                                        const std::vector<std::string>& new_role_ids);
 
     // May `actor` replace the server's role definitions with `proposed`?
+    //
+    // THE ONE AUTHORITY for a role-document change. The wholesale
+    // `bsfchat.server.roles` PUT calls it, and so does every endpoint in
+    // api/RoleHandler.cpp — those endpoints build the proposed document
+    // server-side from a delta and hand it to this function rather than
+    // carrying their own opinion about who may do what. A create/edit/delete
+    // route with its own check is how one of the rules below eventually gets
+    // dropped on one path.
     RoleChangeVerdict may_edit_role_definitions(const std::string& actor_id,
                                                 const std::vector<ServerRole>& proposed);
+
+    // Invariants a role document must satisfy WHOEVER is writing it —
+    // administrators and the synthetic @server actor included. Called first
+    // from may_edit_role_definitions, before any exemption.
+    //
+    // These are not privilege rules, they are coherence rules about what a role
+    // list is allowed to say, and the important one is about `self_assignable`.
+    // A self-assignable role may carry no permission bit @everyone does not
+    // already carry, so taking it or dropping it cannot change the holder's
+    // server-wide capabilities at all. That is the answer to the obvious attack
+    // on the feature — "mark a role MANAGE_ROLES and self-assignable, then
+    // every member is a role admin" — and it has to bind an administrator too,
+    // because "I am allowed to do anything" is not a reason to be allowed to
+    // publish a document whose meaning is "everyone may promote themselves".
+    // An opt-in role that should unlock a CHANNEL still can: that is a
+    // per-channel override keyed on the role id, which is a deliberate act by
+    // someone holding MANAGE_ROLES in that channel, not a server-wide grant
+    // handed out by a checkbox.
+    static RoleChangeVerdict validate_role_document(const std::vector<ServerRole>& proposed);
+
+    // May `actor` add this role to themselves, or take it back off, with no
+    // MANAGE_ROLES and no rank?
+    //
+    // Deliberately NOT a relaxation of may_assign_roles — a separate question
+    // with a separate answer. may_assign_roles asks "does the actor outrank
+    // this?", and for an ordinary member the answer is permanently no: they sit
+    // at position 0, every role sits at position >= 0, and the rule is "nothing
+    // at or above your own rank". There is no position an opt-in role could be
+    // given that would make that check pass, so a self-service picker is
+    // impossible until the rank check is bypassed. This bypasses it, and pays
+    // for the bypass with validate_role_document's containment rule, re-checked
+    // here against the CURRENT document rather than trusted from write time.
+    //
+    // The same verdict governs REMOVAL, which is not a weaker act than
+    // addition: a role can carry channel DENY overrides, so "muted" is a role,
+    // and letting a member shed any role they happen to hold would be letting
+    // them unmute themselves. You may drop exactly what you were allowed to
+    // take.
+    RoleChangeVerdict may_self_assign_role(const std::string& actor_id,
+                                           const std::string& role_id);
 
 private:
     // Role data is identical for every room in a single request, but compute()
