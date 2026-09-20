@@ -30,6 +30,22 @@ public:
     // Destructive — removes the room and every event in it.
     void handle_delete_room(const httplib::Request& req, httplib::Response& res);
     void handle_joined_rooms(const httplib::Request& req, httplib::Response& res);
+
+    // GET /_matrix/client/v3/bsfchat/channels — the channel directory.
+    //
+    // The complement of handle_joined_rooms, and the reason it had to exist:
+    // /joined_rooms answers only "where am I", so nothing on this server could
+    // answer "where COULD I be". An integration bot could not offer an operator
+    // a list of channels to send alerts to until somebody had already put it in
+    // the channel, and the documented way to do that — invite the bot — has no
+    // UI in the desktop client, so the documented path could not be walked.
+    //
+    // Authentication is the whole of the authorization: any account may ask,
+    // and what it gets back is filtered per room by its own VIEW_CHANNEL. There
+    // is no directory permission to hold, because a directory permission would
+    // be a second answer to "may this account know this channel exists" sitting
+    // beside the real one.
+    void handle_channel_directory(const httplib::Request& req, httplib::Response& res);
     void handle_room_state(const httplib::Request& req, httplib::Response& res);
     void handle_room_state_event(const httplib::Request& req, httplib::Response& res);
     void handle_room_members(const httplib::Request& req, httplib::Response& res);

@@ -31,7 +31,7 @@ differently. Specifically, none of the following exist:
 | Account data (`/user/{id}/account_data/{type}`) | **No route.** `m.direct` appears in `/sync` (synthesised by the server from room flags), but you cannot read or write account data. |
 | E2EE, device keys, `/keys/*`, cross-signing | **Not implemented.** No route, no device list, no to-device messaging. |
 | Application Service API (`/_matrix/app/*`) | **Not implemented.** There are no appservices, no namespaces, no transaction pushes. |
-| Room versions, federation, `/directory`, spaces | **Not implemented.** |
+| Room versions, federation, `/directory`, `/publicRooms`, spaces | **Not implemented.** Channel discovery exists, but as a BSFChat endpoint with different semantics — `/bsfchat/channels` (§3.0) answers "what may *this caller* see", not "what has the server published". Do not substitute a spec room-directory call for it. |
 | `/relations` endpoints | **No route.** Relations are plain content fields; you aggregate them yourself. |
 | Presence `/presence/{id}/status` GET | **PUT only.** Presence is read out of `/sync`. |
 
@@ -234,9 +234,88 @@ to every new public channel as it is created. **Bots are excluded from this.**
 That is deliberate: a server with forty channels should not have every bot
 sitting in all forty, holding membership rows and receiving every message.
 
-There are two ways in, and the first is the one to reach for.
+There are two ways in, and the first is the one to reach for. Before either,
+there is the question of **where** — see §3.0.
 
-### Being invited (the normal gesture)
+### 3.0 Finding out what channels exist
+
+```http
+GET /_matrix/client/v3/bsfchat/channels
+Authorization: Bearer <your bot token>
+```
+```json
+200 {"channels": [
+      {"room_id": "!cat:chat.example.com", "name": "Team",   "type": "category", "joined": false},
+      {"room_id": "!gen:chat.example.com", "name": "general", "type": "text",
+       "category_id": "!cat:chat.example.com", "joined": true},
+      {"room_id": "!lng:chat.example.com", "name": "Lounge",  "type": "voice",
+       "category_id": "!cat:chat.example.com", "joined": false},
+      {"room_id": "!ann:chat.example.com", "name": "announcements", "type": "text",
+       "joined": false}
+    ]}
+```
+
+This is the endpoint to build a channel picker on. `GET /joined_rooms` (§3.3)
+answers *where am I*, which on a fresh install is **nowhere** — a bot is excluded
+from auto-join, so until somebody has already put it in a channel it has no
+membership anywhere and nothing to list. This answers the other question: which
+channels exist on this server that **you** are allowed to see, member or not.
+
+**Auth.** A bearer token, and nothing else. There is no directory permission to
+hold. Every entry is filtered individually by your own `VIEW_CHANNEL` in that
+channel, so two accounts asking at the same moment legitimately get different
+lists. A bot and a human holding the same roles get **identical** answers; there
+is no bot-flavoured variant of this endpoint and no bot-flavoured filter.
+
+**The fields, and only these fields:**
+
+| Field | Notes |
+| --- | --- |
+| `room_id` | The id to pass to `/join`, `/send`, `/messages` — anything. |
+| `name` | `m.room.name`. Empty string on a channel that has never been named. |
+| `type` | `"text"`, `"voice"`, or `"category"`. Empty string on a legacy channel that predates the field. **Do not offer a `voice` channel as a destination for text messages, and never send to a `category`** — it is a sidebar container and holds no messages. |
+| `category_id` | Present **only** when this channel is filed under a category that is **also in this response**. Absent means top-level. It is never an id you were not otherwise shown. |
+| `joined` | **Always present.** Your own membership, nothing about anyone else's. |
+
+Anything you might expect and do not see is absent on purpose: no topic, no
+member count, no last-activity timestamp, no creator, no numeric sort order. A
+directory that any account can call about channels it is not in should tell you
+where you may post, not describe places you cannot enter. If you need a
+channel's topic or roster, join it and read `/state` and `/members`.
+
+**Ordering.** The array is in render order: top-level entries first by the
+operator's arrangement, and each category immediately followed by its own
+channels. Ties break on `room_id`, so the order is total and stable — polling
+twice gives the same list in the same order. **Render the array as it arrives;
+do not sort it yourself, and do not read anything into the positions.** The list
+is dense by construction: channels you may not see are removed outright, leaving
+no gap, no placeholder and no count of what was omitted.
+
+**What to do about a channel with `joined: false`.** Offer it. It is a channel
+you are permitted to see, and the fact that nobody has added you to it yet is
+not an error:
+
+- **The good path** — an operator invites you (§3.1), which on this server joins
+  a bot outright.
+- **Doing it yourself** — `POST /rooms/{roomId}/join` (§3.2). Every channel here
+  carries `join_rule: "public"`, including the private ones, so this usually
+  succeeds. Do it lazily, when you are about to post, not for every channel in
+  the directory at startup: joining forty channels means receiving every message
+  in forty channels on every `/sync`.
+- If you were **kicked** from it, `/join` refuses (§3.2) and nothing you send
+  will fix that. Ask the operator.
+
+Treat a `403` or a `404` from a later call on a directory `room_id` as ordinary,
+not as a bug: permissions can change between the directory call and the send.
+
+**What the directory is not.** Appearing here is not access. A category you
+cannot `VIEW_CHANNEL` is still listed by name, because a client has to draw the
+container its visible channels sit in — but `/state`, `/members`, `/messages`
+and `/typing` on it will all refuse you. Being told a room exists and being
+allowed into it are separate questions, and this endpoint only answers the
+first.
+
+### 3.1 Being invited (the normal gesture)
 
 An operator invites the bot the same way they would invite anyone:
 
@@ -270,7 +349,7 @@ This is bot-specific behaviour. **Inviting a human still creates an ordinary
 pending invite** that the person accepts in their client; nothing about human
 invite semantics changed.
 
-### Joining by room id (public channels)
+### 3.2 Joining by room id (public channels)
 
 A bot can also let itself into any public channel using its own token, which is
 useful when the bot is configured with a list of channels rather than being
@@ -293,11 +372,18 @@ by request.
 Joining a room the bot is already in is harmless, so a bot can simply attempt
 its configured rooms at every startup.
 
-### Knowing where you are
+### 3.3 Knowing where you are
 
 `GET /_matrix/client/v3/joined_rooms` returns `{"joined_rooms": [...]}`, which is
 how a bot rediscovers itself across restarts — including channels it was invited
 into while it was down.
+
+It answers only "where am I", and it is **filtered by `VIEW_CHANNEL`**, not by
+membership: a room you hold a membership row for but may not see is not in it.
+For "where *could* I be", use the directory in §3.0. The two are different
+questions and neither substitutes for the other — a channel can be in the
+directory and not in `/joined_rooms` (you have not been added), and you should
+never infer from a room's absence here that it does not exist.
 
 ---
 
@@ -1075,7 +1161,10 @@ Honest list, as of this writing:
   moment you authorize an action; there is nothing to subscribe to.
 
 Closed since earlier drafts of this guide, noted because you may have read
-around them: `/sync` now has a real `rooms.invite` section (irrelevant to bots —
+around them: there is now a **channel directory** (§3.0), so a bot no longer has
+to be put in a channel before it can offer one — the old advice, "hardcode the
+room ids your operator gives you", is obsolete; `/sync` now has a real
+`rooms.invite` section (irrelevant to bots —
 inviting a bot still joins it outright, so you still write no invite-handling
 code, see §3); reactions are validated and permissioned (§6, §8); `/redact` is
 idempotent (§6); profile reads return an object and require auth (§1); a bot can
@@ -1090,6 +1179,7 @@ allowlist (§8).
 GET    /_matrix/client/versions                              server version, no auth
 GET    /_matrix/client/v3/account/whoami                     who am I
 GET    /_matrix/client/v3/joined_rooms                       where am I
+GET    /_matrix/client/v3/bsfchat/channels                   where could I be
 POST   /_matrix/client/v3/rooms/{room}/join                  get in
 POST   /_matrix/client/v3/rooms/{room}/leave                 get out
 GET    /_matrix/client/v3/sync?since=&timeout=               receive (long poll)
