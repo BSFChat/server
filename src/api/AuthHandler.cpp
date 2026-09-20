@@ -76,6 +76,38 @@ std::string user_failure_key(const std::string& user_id) {
     return "user:" + user_id.substr(0, 255);
 }
 
+// The address inside an "ip:<address>" failure-tracker key, redacted to its
+// network. See redact_ip_for_log() in http/ClientAddress.h for what that means
+// and why the log gets a network rather than a host.
+//
+// THIS IS APPLIED TO THE ADDRESS KEY AND TO NOTHING ELSE, which is the whole
+// difficulty of finding 16. record_failure() prints two keys and only one of
+// them is an address: the other is user_failure_key(), "user:" + the login
+// identifier exactly as submitted, deliberately keyed on what was typed rather
+// than on an account that exists so a lockout is not an existence oracle. It is
+// not an address, and redact_ip_for_log — which by design never echoes input it
+// could not parse — would flatten it to the constant "unparseable", deleting the
+// only half of the lockout line an operator can act on.
+std::string redact_ip_key(const std::string& key) {
+    constexpr std::string_view kPrefix = "ip:";
+    const bool prefixed = key.compare(0, kPrefix.size(), kPrefix) == 0;
+    std::string address = prefixed ? key.substr(kPrefix.size()) : key;
+
+    // The address half can ALREADY be a network: ClientAddressResolver::resolve
+    // collapses every IPv6 client to a /64 before the key is built, for the same
+    // subscriber-granularity reason the redactor uses. redact_ip_for_log parses
+    // bare addresses only, so handing it "2001:db8::/64" verbatim would come
+    // back "unparseable" and drop a line that was already correct. Give it the
+    // base address; it re-derives the identical prefix.
+    if (const auto slash = address.find('/'); slash != std::string::npos) {
+        address.resize(slash);
+    }
+
+    // Fail closed if the "ip:" prefix is ever missing: this must not become a
+    // pass-through for an address in a shape it did not expect.
+    return (prefixed ? std::string(kPrefix) : std::string{}) + redact_ip_for_log(address);
+}
+
 // Rejects a client-supplied device_id, answering 400 if it is unusable.
 // Returns true when the response has been sent and the caller must stop.
 //
@@ -116,12 +148,22 @@ std::string AuthHandler::client_key(const httplib::Request& req) {
         auto last = last_proxy_warning_ms_.load();
         if ((last == 0 || now - last > 60'000) &&
             last_proxy_warning_ms_.compare_exchange_strong(last, now)) {
+            //
+            // The NETWORK, not the peer. looks_like_untrusted_proxy only fires
+            // for a peer inside private or loopback space, so what would be
+            // printed here is infrastructure topology rather than a subscriber
+            // — but this line and the lockout line below are the only two
+            // places any address reaches the log at all (audit-data finding
+            // 16), and leaving one of them exact makes the pair depend on that
+            // private-range gate never widening. The operator set their own
+            // reverse proxy up and knows its address; the network is what the
+            // message needs to identify which one it means.
             get_logger()->warn(
-                "Request from {} carries X-Forwarded-For, but that address is not in "
+                "Requests from {} carry X-Forwarded-For, but that network is not in "
                 "auth.trusted_proxies, so the header is ignored and every client behind it is "
                 "rate-limited as ONE address — one abusive client can lock all of them out of "
-                "/login. If {} is your reverse proxy, add it to auth.trusted_proxies.",
-                req.remote_addr, req.remote_addr);
+                "/login. If that is your reverse proxy, add its address to auth.trusted_proxies.",
+                redact_ip_for_log(req.remote_addr));
         }
     }
 
@@ -151,7 +193,7 @@ bool AuthHandler::locked_out(const std::string& key_a, const std::string& key_b,
     return true;
 }
 
-void AuthHandler::record_failure(const std::string& key_a, const std::string& key_b) {
+void AuthHandler::record_failure(const std::string& ip_key, const std::string& id_key) {
     if (!config_.auth_limits.enabled) return;
     // log_safe, and not merely for tidiness. One of these keys is
     // user_failure_key(), which is "user:" + the login identifier EXACTLY AS
@@ -173,11 +215,19 @@ void AuthHandler::record_failure(const std::string& key_a, const std::string& ke
     // Same defect as docs/audit-requests-2026-09.md finding 17 (the rejected
     // pusher URL) and as auth finding 9 (device_id); this is the third field and
     // the only one reachable without an account.
-    if (!key_a.empty() && failures_.record_failure(key_a)) {
-        get_logger()->warn("Auth lockout engaged for {}", log_safe(key_a));
+    //
+    // redact_ip_key on the FIRST key only, and log_safe still on both. The two
+    // guards answer different problems and neither replaces the other: log_safe
+    // stops the identifier forging log records, redact_ip_key stops the address
+    // naming a subscriber. Applying the address redactor to `id_key` as well —
+    // the obvious two-line version of this change — would print
+    // "user:unparseable" for every lockout and destroy the half of the line that
+    // says who was being attacked. See redact_ip_key above.
+    if (!ip_key.empty() && failures_.record_failure(ip_key)) {
+        get_logger()->warn("Auth lockout engaged for {}", log_safe(redact_ip_key(ip_key)));
     }
-    if (!key_b.empty() && failures_.record_failure(key_b)) {
-        get_logger()->warn("Auth lockout engaged for {}", log_safe(key_b));
+    if (!id_key.empty() && failures_.record_failure(id_key)) {
+        get_logger()->warn("Auth lockout engaged for {}", log_safe(id_key));
     }
 }
 

@@ -778,3 +778,294 @@ TEST(RoomVisibility, PresenceStillReportsALiveJoinedPeer) {
     presence.touch(bob);
     EXPECT_TRUE(contains(sync_presence_users(sync_handler, "token-alice"), bob));
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Findings 4, 5 and 6 of docs/membership-vs-visibility.md.
+//
+// Three endpoints that were still treating "is a member" as an access check,
+// deprioritised at the time because none of them discloses channel content.
+// They are closed here now that the surrounding work has landed.
+//
+// All three are ACTING paths, so they ask kViewChannel directly rather than
+// going through can_view_room(): that helper exempts categories, which is a
+// rule about listing a room in a sidebar. See the comment above can_read_room
+// in RoomHandler.cpp.
+// ════════════════════════════════════════════════════════════════════════════
+
+#include "api/EventHandler.h"
+#include "api/PushHandler.h"
+#include "push/PushService.h"
+
+namespace {
+
+// A DM as the create-room path makes one: is_direct, two members, no overrides,
+// and no bsfchat.room.type.
+std::string add_dm(Fixture& f, const std::string& a, const std::string& b) {
+    auto room_id = generate_room_id("test");
+    f.store->create_room(room_id, a, /*is_direct=*/true);
+    f.store->set_membership(room_id, a, std::string(membership::kJoin));
+    f.store->set_membership(room_id, b, std::string(membership::kJoin));
+    return room_id;
+}
+
+struct StatusAndBody {
+    int status = 0;
+    std::string body;
+    bool operator==(const StatusAndBody& o) const { return status == o.status && body == o.body; }
+};
+
+StatusAndBody post_read_marker(EventHandler& handler, const std::string& room_id,
+                               const std::string& token) {
+    auto req = make_request("/_matrix/client/v3/rooms/" + room_id + "/read_marker", token,
+                            json{{"m.fully_read", "$whatever"}}.dump());
+    httplib::Response res;
+    handler.handle_read_marker(req, res);
+    return {res.status == -1 ? 200 : res.status, res.body};
+}
+
+StatusAndBody get_notify_level(PushHandler& handler, const std::string& room_id,
+                               const std::string& token) {
+    auto req = make_request(
+        "/_matrix/client/v3/bsfchat/rooms/" + room_id + "/notify_level", token);
+    httplib::Response res;
+    handler.handle_get_notify_level(req, res);
+    return {res.status == -1 ? 200 : res.status, res.body};
+}
+
+StatusAndBody put_notify_level(PushHandler& handler, const std::string& room_id,
+                               const std::string& token, const std::string& level) {
+    auto req = make_request("/_matrix/client/v3/bsfchat/rooms/" + room_id + "/notify_level",
+                            token, json{{"level", level}}.dump());
+    httplib::Response res;
+    handler.handle_put_notify_level(req, res);
+    return {res.status == -1 ? 200 : res.status, res.body};
+}
+
+StatusAndBody put_state(RoomHandler& handler, const std::string& room_id,
+                        const std::string& type, const std::string& state_key,
+                        const std::string& token, const json& body) {
+    auto req = make_request(
+        "/_matrix/client/v3/rooms/" + room_id + "/state/" + type + "/" + state_key,
+        token, body.dump());
+    httplib::Response res;
+    handler.handle_set_state(req, res);
+    return {res.status == -1 ? 200 : res.status, res.body};
+}
+
+} // namespace
+
+// ── 4. POST /rooms/{id}/read_marker ─────────────────────────────────────────
+
+TEST(RoomVisibility, ReadMarkerRefusesADeniedMember) {
+    Fixture f("rmdeny");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+
+    auto room = f.add_channel(alice, "secret");
+    f.join(room, bob);
+    f.make_private(room);
+
+    EventHandler events(*f.store, *f.sync, f.config);
+    EXPECT_EQ(post_read_marker(events, room, "token-bob").status, 403);
+    // Not merely refused — nothing was written. A read position in a channel
+    // the writer cannot read is a row that should not exist.
+    EXPECT_EQ(f.store->get_read_marker(bob, room), 0);
+}
+
+// The control, and it is the half that would hurt: an ORDINARY member holding
+// only kEveryoneDefault must still be able to mark a channel read. Asserting
+// this with the admin proves nothing, because ADMINISTRATOR short-circuits
+// every flag.
+TEST(RoomVisibility, ReadMarkerStillWorksForAPermittedMember) {
+    Fixture f("rmallow");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+
+    auto room = f.add_channel(alice, "general");
+    f.join(room, bob);
+
+    EventHandler events(*f.store, *f.sync, f.config);
+    EXPECT_EQ(post_read_marker(events, room, "token-bob").status, 200);
+}
+
+// The precedence chain, same as /joined_rooms: a user-specific ALLOW must
+// reinstate the endpoint for that one user, or the check is a blanket hide
+// rather than a permission evaluation.
+TEST(RoomVisibility, ReadMarkerHonoursAUserSpecificAllowOverride) {
+    Fixture f("rmallowov");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+
+    auto room = f.add_channel(alice, "secret");
+    f.join(room, bob);
+    f.make_private(room);
+    f.set_override(room, "user:" + bob, permission::kViewChannel);
+
+    EventHandler events(*f.store, *f.sync, f.config);
+    EXPECT_EQ(post_read_marker(events, room, "token-bob").status, 200);
+}
+
+// ── 5. GET/PUT /bsfchat/rooms/{id}/notify_level ─────────────────────────────
+//
+// This one is an existence oracle rather than a disclosure, so the property to
+// assert is not "it refuses" but "its refusal is INDISTINGUISHABLE from the
+// refusal for a room that does not exist". A denied room and an invented room
+// id must produce the same status and the same body, byte for byte — otherwise
+// the fix has only moved the oracle.
+TEST(RoomVisibility, NotifyLevelGetAnswersADeniedRoomExactlyLikeAnUnknownOne) {
+    Fixture f("nldeny");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+
+    auto room = f.add_channel(alice, "secret");
+    f.join(room, bob);
+    f.make_private(room);
+
+    PushService push(*f.store, f.config);
+    PushHandler handler(*f.store, push, f.config);
+
+    const auto denied = get_notify_level(handler, room, "token-bob");
+    const auto unknown = get_notify_level(handler, generate_room_id("test"), "token-bob");
+    EXPECT_EQ(denied.status, 403);
+    EXPECT_EQ(denied, unknown)
+        << "denied: " << denied.status << " " << denied.body
+        << "\nunknown: " << unknown.status << " " << unknown.body;
+}
+
+TEST(RoomVisibility, NotifyLevelPutAnswersADeniedRoomExactlyLikeAnUnknownOne) {
+    Fixture f("nlput");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+
+    auto room = f.add_channel(alice, "secret");
+    f.join(room, bob);
+    f.make_private(room);
+
+    PushService push(*f.store, f.config);
+    PushHandler handler(*f.store, push, f.config);
+
+    const auto denied = put_notify_level(handler, room, "token-bob", "all");
+    const auto unknown = put_notify_level(handler, generate_room_id("test"), "token-bob", "all");
+    EXPECT_EQ(denied.status, 403);
+    EXPECT_EQ(denied, unknown);
+    EXPECT_FALSE(f.store->get_room_notify_level(bob, room).has_value())
+        << "a preference was recorded for a channel the user cannot read";
+}
+
+TEST(RoomVisibility, NotifyLevelStillWorksForAPermittedMember) {
+    Fixture f("nlallow");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+
+    auto room = f.add_channel(alice, "general");
+    f.join(room, bob);
+
+    PushService push(*f.store, f.config);
+    PushHandler handler(*f.store, push, f.config);
+
+    EXPECT_EQ(put_notify_level(handler, room, "token-bob", "all").status, 200);
+    EXPECT_EQ(get_notify_level(handler, room, "token-bob").status, 200);
+    ASSERT_TRUE(f.store->get_room_notify_level(bob, room).has_value());
+    EXPECT_EQ(*f.store->get_room_notify_level(bob, room), "all");
+}
+
+// A DM has no channel overrides and every participant can read it, so the new
+// check must not touch it. This is the room kind the notify_level default is
+// actually different for (kLevelAll rather than kLevelMentions), so breaking it
+// would be visible.
+TEST(RoomVisibility, NotifyLevelStillWorksInADirectMessage) {
+    Fixture f("nldm");
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto dm = add_dm(f, alice, bob);
+
+    PushService push(*f.store, f.config);
+    PushHandler handler(*f.store, push, f.config);
+    EXPECT_EQ(get_notify_level(handler, dm, "token-bob").status, 200);
+}
+
+// ── 6. bsfchat.channel.permissions on a DM ──────────────────────────────────
+
+TEST(RoomVisibility, ADirectMessageRefusesAChannelPermissionOverride) {
+    Fixture f("dmov");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto dm = add_dm(f, alice, bob);
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    json deny_view;
+    {
+        ChannelPermissionOverride ov;
+        ov.allow = 0;
+        ov.deny = permission::kViewChannel;
+        to_json(deny_view, ov);
+    }
+    const auto res = put_state(handler, dm, std::string(event_type::kChannelPermissions),
+                               std::string("role:") + permission::role_id::kEveryone,
+                               "token-alice", deny_view);
+    EXPECT_EQ(res.status, 403) << res.body;
+    EXPECT_FALSE(f.store
+                     ->get_state_event(dm, std::string(event_type::kChannelPermissions),
+                                       std::string("role:") + permission::role_id::kEveryone)
+                     .has_value());
+}
+
+// The control: the same write on a real channel is exactly how a channel is
+// made private, and must keep working.
+TEST(RoomVisibility, AChannelStillAcceptsAPermissionOverride) {
+    Fixture f("chov");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto room = f.add_channel(alice, "general");
+
+    RoomHandler handler(*f.store, *f.sync, f.config);
+    json deny_view;
+    {
+        ChannelPermissionOverride ov;
+        ov.allow = 0;
+        ov.deny = permission::kViewChannel;
+        to_json(deny_view, ov);
+    }
+    EXPECT_EQ(put_state(handler, room, std::string(event_type::kChannelPermissions),
+                        std::string("role:") + permission::role_id::kEveryone,
+                        "token-alice", deny_view).status,
+              200);
+}
+
+// Refusing the write stops new ones. It does NOT repair a DM that already
+// carries an override — and after the refusal there is no request that can,
+// because removing one means writing an empty override through the same route.
+// So the invariant the rest of the codebase already assumes ("DMs carry no
+// overrides", docs/membership-vs-visibility.md) is enforced where it is read
+// rather than only where it is written.
+TEST(RoomVisibility, ADirectMessageIgnoresAnOverrideWrittenBeforeTheRefusal) {
+    Fixture f("dmlegacy");
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto dm = add_dm(f, alice, bob);
+
+    // Straight into the store, as a build without the refusal would have.
+    f.make_private(dm);
+
+    PermissionsEngine perms(*f.store, f.config);
+    EXPECT_TRUE(perms.can(bob, dm, permission::kViewChannel))
+        << "a channel override took away a DM participant's access to their own DM";
+
+    // And the visible symptom the finding named: the DM disappearing from
+    // /joined_rooms and /sync while m.direct still lists it.
+    RoomHandler rooms(*f.store, *f.sync, f.config);
+    EXPECT_TRUE(contains(joined_rooms(rooms, "token-bob"), dm));
+}
+
+// The override mechanism itself is untouched for real channels — the DM rule
+// must not become "overrides do nothing".
+TEST(RoomVisibility, AChannelOverrideStillAppliesAfterTheDmRule) {
+    Fixture f("dmnotchan");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto room = f.add_channel(alice, "secret");
+    f.join(room, bob);
+    f.make_private(room);
+
+    PermissionsEngine perms(*f.store, f.config);
+    EXPECT_FALSE(perms.can(bob, room, permission::kViewChannel));
+}

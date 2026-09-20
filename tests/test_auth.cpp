@@ -1322,11 +1322,10 @@ TEST(RefreshReuse, AnUnknownRefreshTokenRevokesNothing) {
 // exposure surface, and two lines in AuthHandler put a full address into it at
 // `warn`, on a server whose log level is hardcoded to `info`.
 //
-// redact_ip_for_log() is the fix for those lines. It is landed and tested here
-// on its own because the two call sites are in AuthHandler.cpp, which the
-// request-path hardening branch owns — see docs/audit-data-2026-09.md under
-// finding 16 for the hand-off. Everything about whether the redaction is
-// CORRECT is testable without them, and is tested here.
+// redact_ip_for_log() is the fix for those lines. These four tests cover the
+// helper in isolation — whether the redaction is CORRECT — and the three under
+// "Finding 16, the call sites" below cover the thing that was missing for a
+// release after the helper landed: anything calling it.
 TEST(ClientAddress, RedactedIpv4KeepsTheNetworkAndDropsTheHost) {
     EXPECT_EQ(redact_ip_for_log("203.0.113.42"), "203.0.113.0/24");
     EXPECT_EQ(redact_ip_for_log("10.1.2.3"), "10.1.2.0/24");
@@ -1363,4 +1362,147 @@ TEST(ClientAddress, RedactionNeverEchoesSomethingItDidNotUnderstand) {
                              "1.2.3.4 5.6.7.8"}) {
         EXPECT_EQ(redact_ip_for_log(junk), "unparseable") << junk;
     }
+}
+
+// ── Finding 16, the call sites ──────────────────────────────────────────────
+//
+// The helper above was landed on its own and had ZERO callers, so nothing about
+// the log stream changed. These two tests are the ones that fail if it goes back
+// to having none: they drive the real handler and read the real sink, rather
+// than asserting anything about the helper.
+
+#include "core/Logger.h"
+
+#include <spdlog/sinks/ringbuffer_sink.h>
+
+namespace {
+
+// Captures every record the shared logger emits for the lifetime of the object.
+// Pops its sink in the destructor so a failing EXPECT cannot leave the sink
+// attached and leak records into the next test in this binary.
+class LogCapture {
+public:
+    LogCapture() : logger_(get_logger()), ring_(std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(64)) {
+        previous_level_ = logger_->level();
+        logger_->sinks().push_back(ring_);
+        logger_->set_level(spdlog::level::trace);
+    }
+    ~LogCapture() {
+        logger_->sinks().pop_back();
+        logger_->set_level(previous_level_);
+    }
+
+    std::vector<std::string> lines() const { return ring_->last_formatted(64); }
+
+    // Every captured record containing `needle`, joined — the thing an operator
+    // would actually see.
+    std::string matching(const std::string& needle) const {
+        std::string out;
+        for (const auto& line : lines()) {
+            if (line.find(needle) != std::string::npos) out += line;
+        }
+        return out;
+    }
+
+private:
+    std::shared_ptr<spdlog::logger> logger_;
+    std::shared_ptr<spdlog::sinks::ringbuffer_sink_mt> ring_;
+    spdlog::level::level_enum previous_level_ = spdlog::level::info;
+};
+
+// A login attempt that will fail, from a chosen address, with a chosen
+// identifier. Built by hand rather than through AuthFixture::call because
+// remote_addr is the whole point.
+void failed_login_from(AuthHandler& handler, const std::string& remote_addr,
+                       const std::string& identifier,
+                       const std::vector<std::pair<std::string, std::string>>& headers = {}) {
+    httplib::Request req;
+    req.path = "/_matrix/client/v3/login";
+    req.remote_addr = remote_addr;
+    for (const auto& [k, v] : headers) req.set_header(k, v);
+    req.body = nlohmann::json{{"type", "m.login.password"},
+                              {"identifier", {{"type", "m.id.user"}, {"user", identifier}}},
+                              {"password", "definitely-wrong"}}
+                   .dump();
+    httplib::Response res;
+    handler.handle_login(req, res);
+}
+
+// A fixture whose lockout trips after two failures.
+struct LockoutFixture : AuthFixture {
+    LockoutFixture() : AuthFixture(10) {
+        config.auth_limits.enabled = true;
+        config.auth_limits.rate_limit = 1000;
+        config.auth_limits.max_failures = 2;
+        config.auth_limits.lockout_seconds = 300;
+        // The handler captured the config by reference, but the limiters read
+        // their bounds in the constructor, so it has to be rebuilt.
+        handler = std::make_unique<AuthHandler>(*store, *sync, config);
+    }
+};
+
+} // namespace
+
+// The lockout line prints TWO keys and they are not the same kind of thing.
+// Redacting both is the obvious wrong fix: key_b is "user:" + the identifier
+// exactly as submitted, deliberately not an address, and redact_ip_for_log
+// flattens anything it cannot parse to the constant "unparseable" — which would
+// silently delete the only half of the line an operator can act on.
+TEST(IpInLogs, LockoutLineRedactsTheAddressKeyAndKeepsTheIdentifierKey) {
+    LockoutFixture f;
+    LogCapture log;
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        failed_login_from(*f.handler, "203.0.113.42", "ghost-account");
+    }
+
+    const auto lockouts = log.matching("Auth lockout engaged");
+    ASSERT_FALSE(lockouts.empty()) << "the lockout never engaged, so nothing was proved";
+
+    // The address half: network kept, host dropped.
+    EXPECT_NE(lockouts.find("ip:203.0.113.0/24"), std::string::npos) << lockouts;
+    EXPECT_EQ(lockouts.find("203.0.113.42"), std::string::npos)
+        << "the full client address is still in the log: " << lockouts;
+
+    // The identifier half: untouched. This is the assertion that fails on a
+    // blind two-line substitution.
+    EXPECT_NE(lockouts.find("ghost-account"), std::string::npos)
+        << "the submitted identifier was destroyed: " << lockouts;
+    EXPECT_EQ(lockouts.find("unparseable"), std::string::npos)
+        << "a non-address key went through the address redactor: " << lockouts;
+}
+
+// IPv6 goes to /64 rather than /24 — the same unit resolve() already collapses
+// to for rate limiting, because a subscriber routinely holds a whole /64.
+TEST(IpInLogs, LockoutLineRedactsIpv6ToTheSubscriberPrefix) {
+    LockoutFixture f;
+    LogCapture log;
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        failed_login_from(*f.handler, "2001:db8:0:1::99", "ghost-account");
+    }
+
+    const auto lockouts = log.matching("Auth lockout engaged");
+    ASSERT_FALSE(lockouts.empty()) << "the lockout never engaged, so nothing was proved";
+    EXPECT_NE(lockouts.find("ip:2001:db8:0:1::/64"), std::string::npos) << lockouts;
+    EXPECT_EQ(lockouts.find("::99"), std::string::npos)
+        << "the full client address is still in the log: " << lockouts;
+}
+
+// The other call site: the once-a-minute warning about an X-Forwarded-For from
+// a peer that is not in auth.trusted_proxies.
+TEST(IpInLogs, UntrustedProxyWarningNamesTheNetworkNotTheHost) {
+    LockoutFixture f; // trusted_proxies is empty, so no peer is trusted
+    LogCapture log;
+
+    failed_login_from(*f.handler, "10.9.8.7", "ghost-account",
+                      {{"X-Forwarded-For", "203.0.113.5"}});
+
+    const auto warning = log.matching("X-Forwarded-For");
+    ASSERT_FALSE(warning.empty()) << "the proxy warning did not fire, so nothing was proved";
+    EXPECT_NE(warning.find("10.9.8.0/24"), std::string::npos) << warning;
+    EXPECT_EQ(warning.find("10.9.8.7"), std::string::npos)
+        << "the peer address is still in the log: " << warning;
+    // And it must not have leaked the address the header claimed, either.
+    EXPECT_EQ(warning.find("203.0.113.5"), std::string::npos) << warning;
 }
