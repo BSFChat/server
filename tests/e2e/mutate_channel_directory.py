@@ -43,16 +43,28 @@ STORE = SERVER / "src/store/SqliteStore.cpp"
 HANDLER = SERVER / "src/api/RoomHandler.cpp"
 
 # The security half of tests/test_channel_directory.cpp: every test whose
-# subject is "a caller must not learn about a room it may not see".
+# subject is "a caller must not learn about a room it may not see" — plus the
+# one whose subject is the converse, that being IN a room is not a licence to be
+# told about it. That last one is the sharpest detector of M1 there is: under a
+# membership filter its two assertions swap places, so it cannot pass by
+# accident, and it belongs with the security half because it is the same
+# sentence read the other way round.
 DISCLOSURE = ("ChannelDirectory.DeniedUserLearnsNothingAboutAPrivateChannel"
               ":ChannelDirectory.UserSpecificAllowOverrideReinstatesTheChannel"
               ":ChannelDirectory.RoleAllowOverrideReinstatesTheChannel"
               ":ChannelDirectory.DirectMessagesAreNeverListed"
               ":ChannelDirectory.CategoryIdNeverNamesARoomTheCallerCannotSee"
-              ":ChannelDirectory.OrderingDoesNotDiscloseWhatWasFiltered")
+              ":ChannelDirectory.OrderingDoesNotDiscloseWhatWasFiltered"
+              ":ChannelDirectory.AChannelTheCallerJoinedWithoutAGrantIsNotListed")
 
 # The other half — the controls. If these are the ones a mutation breaks, the
 # endpoint has been made useless rather than unsafe, which is its own bug.
+#
+# The first of them is asserted with a BOT, and since bot scoping that is no
+# longer a bot holding the server's defaults: it holds one explicit per-channel
+# grant and no membership anywhere. That is what makes it a control worth having
+# — a mutation that tightens the gate stops honouring the grant, and one that
+# loosens it stops needing it.
 CAPABILITY = ("ChannelDirectory.ACallerThatIsAMemberOfNothingStillSeesTheChannels"
               ":ChannelDirectory.AnOrdinaryMemberSeesThePublicChannels"
               ":ChannelDirectory.ADeniedCategoryIsStillNamedAsAContainer")

@@ -265,11 +265,25 @@ from auto-join, so until somebody has already put it in a channel it has no
 membership anywhere and nothing to list. This answers the other question: which
 channels exist on this server that **you** are allowed to see, member or not.
 
+**Expect it to be empty at first, and say so in your UI.** A bot holds no
+permissions it was not given (§8, `docs/bot-scoping.md`), and this endpoint
+reports that scope rather than widening it — so a bot nobody has granted a
+channel to gets back its server's **categories** and not one channel, because a
+category is a sidebar container and is exempt from `VIEW_CHANNEL`. That is not
+an error and it is not a fresh-install quirk that resolves itself: it stays
+empty until an operator writes the grant. A picker built on this should render
+the empty case as "this bot has not been given access to any channel yet",
+pointing at whoever administers the server, rather than as a loading state or a
+failure. The order is grant, then pick.
+
 **Auth.** A bearer token, and nothing else. There is no directory permission to
 hold. Every entry is filtered individually by your own `VIEW_CHANNEL` in that
 channel, so two accounts asking at the same moment legitimately get different
 lists. A bot and a human holding the same roles get **identical** answers; there
-is no bot-flavoured variant of this endpoint and no bot-flavoured filter.
+is no bot-flavoured variant of this endpoint and no bot-flavoured filter — but
+note that "the same roles" is something a bot has to be **given**: it does not
+inherit `@everyone`, so an unscoped bot and an ordinary member do not hold the
+same roles and correctly do not get the same answer.
 
 **The fields, and only these fields:**
 

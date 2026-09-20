@@ -43,15 +43,23 @@
 //      filtered out of their own response.
 //   6. Bots and humans get the same answer. A special case in a security filter
 //      is a second filter that only one class of caller ever exercises.
+//      "The same" now has to be arranged rather than assumed: a bot does not
+//      inherit the implicit @everyone role (docs/bot-scoping.md), so the test
+//      assigns it explicitly and compares two callers of the same scope.
 //
 // Then the half that would hurt more if it broke — the controls. Every one of
-// them is asserted with an ORDINARY MEMBER holding only kEveryoneDefault, never
-// with an admin, because ADMINISTRATOR short-circuits every flag and proves
-// nothing about the gate:
+// them is asserted with an ORDINARY MEMBER holding only kEveryoneDefault, or
+// with a bot holding one explicit per-channel grant, and never with an admin,
+// because ADMINISTRATOR short-circuits every flag and proves nothing about the
+// gate:
 //
-//   7. A caller that is a member of NOTHING still gets the public channels, with
-//      joined = false. This is the whole feature: without it a bot still cannot
-//      discover anywhere to post.
+//   7. A caller that is a member of NOTHING still gets the channels it has been
+//      GRANTED, with joined = false — and, in the same breath, is not given a
+//      channel it has JOINED but holds no grant on. That pair is the whole
+//      feature and the whole of "membership is not visibility": one is the
+//      false negative the endpoint exists to fix, the other is the false
+//      positive /joined_rooms shipped. Only a bot can state both at once,
+//      because auto-join makes grants and memberships coincide for a human.
 //   8. A category the caller cannot VIEW_CHANNEL is still listed, as a named
 //      container — the same exemption /sync applies, so the directory and the
 //      sidebar agree about what containers exist.
@@ -180,6 +188,14 @@ struct Fixture {
     // A real bot account: kind = 'bot' in `users` plus its `bots` row. Created
     // through the store's own constructor rather than faked with a bot_-prefixed
     // human, so §6 is comparing what the server actually treats as a bot.
+    //
+    // And scoped the way handle_create_bot scopes one: an EXPLICIT EMPTY role
+    // assignment. A bot does not inherit the implicit @everyone role
+    // (docs/bot-scoping.md §3), so it arrives holding nothing anywhere and is
+    // granted upward per channel. Writing `{"role_ids": []}` rather than no
+    // document at all is deliberate and is what creation does — the two are
+    // different states, and the migration that tells them apart is keyed on the
+    // document's existence.
     std::string add_bot(const std::string& localpart, const std::string& owner) {
         std::string uid = "@" + localpart + ":test";
         SqliteStore::BotRecord bot;
@@ -190,7 +206,11 @@ struct Fixture {
         bot.created_by = owner;
         EXPECT_TRUE(store->create_bot(bot));
         store->store_access_token("token-" + localpart, uid, "dev");
-        assign_roles(uid, {});
+        MemberRolesContent empty;
+        json j;
+        to_json(j, empty);
+        store->set_server_state(std::string(event_type::kMemberRoles), uid, "@server:test",
+                                j.dump());
         return uid;
     }
 
@@ -242,6 +262,14 @@ struct Fixture {
         to_json(j, ov);
         store->insert_event(generate_event_id("test"), room_id, "@server:test",
                             std::string(event_type::kChannelPermissions), target, j.dump(), 1004);
+    }
+
+    // "Let this account into this one channel", as an operator does it and as
+    // the Bots tab will: a user-specific ALLOW of VIEW_CHANNEL and nothing
+    // else. The minimum this endpoint filters on, so a gate tightened to any
+    // other flag stops honouring it.
+    void grant_view(const std::string& room_id, const std::string& user_id) {
+        set_override(room_id, "user:" + user_id, permission::kViewChannel);
     }
 
     // "Make this channel private", as ChannelSettings.qml defines it: deny
@@ -495,6 +523,13 @@ TEST(ChannelDirectory, ABotAndAHumanWithTheSameRolesGetIdenticalAnswers) {
     auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
     auto human = f.add_user("human");
     auto bot = f.add_bot("bot_alerts", alice);
+    // THE SAME ROLES, which for a bot has to be said out loud: a bot does not
+    // inherit the implicit @everyone role, so an unscoped one would differ from
+    // the human by its scope rather than by its kind and would prove nothing
+    // about whether a bot-flavoured branch exists in the filter. @everyone
+    // remains an ordinary, assignable role for a bot; this is that assignment,
+    // and it is the shape every bot created before scoping already has.
+    f.assign_roles(bot, {});
 
     auto cat = f.add_channel(alice, "Team", room_type::kCategory);
     auto open_room = f.add_channel(alice, "general");
@@ -515,10 +550,10 @@ TEST(ChannelDirectory, ABotAndAHumanWithTheSameRolesGetIdenticalAnswers) {
 
 // ── 7. the feature: a caller that is a member of nothing ─────────────────────
 //
-// The control that matters most. A bot is excluded from auto-join, so on a fresh
-// install it holds no membership row anywhere — and if the directory answered
-// from membership it would answer "nothing", which is the bug this endpoint
-// exists to fix. `joined` reports the truth without gating on it.
+// The control that matters most. A bot is excluded from auto-join, so it holds
+// no membership row anywhere — and if the directory answered from membership it
+// would answer "nothing" to the one caller the endpoint was built for, which is
+// the bug it exists to fix. `joined` reports the truth without gating on it.
 TEST(ChannelDirectory, ACallerThatIsAMemberOfNothingStillSeesTheChannels) {
     Fixture f("nonmember");
     auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
@@ -526,6 +561,14 @@ TEST(ChannelDirectory, ACallerThatIsAMemberOfNothingStillSeesTheChannels) {
 
     auto open_room = f.add_channel(alice, "general");
     ASSERT_FALSE(f.store->is_room_member(open_room, bot));
+
+    // Nothing granted yet, so there is nothing to discover: the directory
+    // reports a scope, it does not widen one.
+    EXPECT_EQ(directory(*f.rooms, "token-bot_alerts").body.at("channels").size(), 0u);
+
+    // One grant, on a channel it is still not in. That is the whole entry
+    // condition — no membership is written here and none is needed.
+    f.grant_view(open_room, bot);
 
     auto d = directory(*f.rooms, "token-bot_alerts");
     ASSERT_EQ(d.body.at("channels").size(), 1u);
@@ -537,6 +580,32 @@ TEST(ChannelDirectory, ACallerThatIsAMemberOfNothingStillSeesTheChannels) {
     f.join(open_room, bot);
     auto after = directory(*f.rooms, "token-bot_alerts");
     EXPECT_TRUE(after.body.at("channels")[0].at("joined").get<bool>());
+}
+
+// The other half of the same sentence, and the half that is easy to leave
+// unwritten. §7 proves a channel appears without membership; this proves
+// membership does not make one appear. Together they are "membership is not
+// visibility" stated in both directions by one caller at one moment — which
+// only a bot can do, because auto-join puts every human in every channel and
+// so makes the two sets coincide for everybody else.
+//
+// A directory filtered on is_room_member returns exactly the opposite pair, so
+// this is the test that has to go red under that mutation.
+TEST(ChannelDirectory, AChannelTheCallerJoinedWithoutAGrantIsNotListed) {
+    Fixture f("joined-no-grant");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bot = f.add_bot("bot_alerts", alice);
+
+    auto granted = f.add_channel(alice, "releases");
+    auto joined_only = f.add_channel(alice, "general");
+
+    f.grant_view(granted, bot);
+    f.join(joined_only, bot);   // a membership row, and nothing else
+
+    auto ids = room_ids(directory(*f.rooms, "token-bot_alerts"));
+    EXPECT_TRUE(contains(ids, granted)) << "a grant without a join must still list";
+    EXPECT_FALSE(contains(ids, joined_only)) << "a join without a grant must not";
+    EXPECT_EQ(ids.size(), 1u);
 }
 
 // An ORDINARY member holding only kEveryoneDefault sees the public channels.
