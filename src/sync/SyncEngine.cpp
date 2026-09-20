@@ -19,7 +19,7 @@ namespace {
 bool is_category_room(SqliteStore& store, const std::string& room_id) {
     auto ev = store.get_state_event(room_id, std::string(event_type::kRoomType), "");
     if (!ev) return false;
-    return ev->content.data.value("type", "") == "category";
+    return ev->content.data.value("type", "") == room_type::kCategory;
 }
 
 // How much of a room a user may be shown. Three answers, not two, because a
