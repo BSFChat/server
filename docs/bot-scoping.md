@@ -461,7 +461,25 @@ not a server one, and it is why the access report carries `category_id`.
 The same fan-out under the old default would have failed **open**, which is why
 this ordering matters.
 
-### 8.3 Cleanup on deactivation
+### 8.3 Making an invite grant access
+
+`docs/bots.md` calls inviting a bot "the normal gesture", and inviting one joins
+it outright. Under default-deny that gesture no longer produces a working bot on
+its own: membership is not access here, so the invite has to be accompanied by a
+channel grant, and the grant should come **first** — a bot with no `VIEW_CHANNEL`
+cannot see the channel in `/sync` and so does not even observe its own join.
+
+Making `/invite` write the `user:<bot>` override was considered and rejected.
+Writing an override is `MANAGE_ROLES` in that channel; inviting is not. Folding
+the grant into the invite would be a second path that authors channel
+permissions without the authority channel permissions require, which is the
+exact shape of the escalations this codebase has already shipped twice. The Bots
+tab can perform both in one click — that is a UI affordance, not a server rule.
+
+`tests/e2e/e2e_bots.sh` asserts both halves in order, against the real binary:
+granted-but-not-joined cannot post, and invited-after-granting can.
+
+### 8.4 Cleanup on deactivation
 
 Deactivation revokes every token and makes the bot leave its rooms. It does not
 strip the bot's role assignment or its channel overrides, and should not: the

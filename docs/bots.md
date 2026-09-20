@@ -333,6 +333,15 @@ invitation to accept and nothing for the bot to do: the server writes a real
 `m.room.member` join event, and your bot simply observes itself joined on its
 next `/sync`, in the ordinary timeline, like any other membership change.
 
+**An invite is not a grant.** Membership and access are separate on this server
+(`docs/membership-vs-visibility.md`), and a bot holds no permissions it was not
+given (§8), so being invited into a channel does not by itself let a bot read or
+post there — and, because `/sync` is filtered by `VIEW_CHANNEL`, a bot with no
+permission in that channel will not even see the join event that added it. For
+the operator, that makes the order matter: **write the channel grant first, then
+invite.** For the bot author, it means "I was invited but I receive nothing" is
+a permissions answer, not a bug — ask your operator for the grant in §8.
+
 From the bot author's side that means: **you write no invite-handling code at
 all.** If your bot needs to react to being added to a channel — post a greeting,
 register the room in its own state — watch for an `m.room.member` event whose
