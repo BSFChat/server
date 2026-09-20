@@ -1364,3 +1364,239 @@ TEST(ClientAddress, RedactionNeverEchoesSomethingItDidNotUnderstand) {
         EXPECT_EQ(redact_ip_for_log(junk), "unparseable") << junk;
     }
 }
+
+// ── auth.trusted_proxies: the startup warning, and the CDN case ───────────
+//
+// The warning that fires when a trusted range reaches into public address
+// space is a real check — trusting a network is trusting its X-Forwarded-For,
+// so a careless entry turns every per-address limit off. But it was written
+// and shipped without ever being pointed at a CDN-fronted deployment, which is
+// the one configuration where a pile of public ranges is *correct*: production
+// sits behind Cloudflare, whose published edge list is fifteen v4 ranges and
+// seven v6 ones, and every single one of them drew its own warning on every
+// boot. Eleven consecutive warnings on a correct server is how an operator
+// learns to skim the log — the same log that carries the auth lockout records.
+//
+// So the check has to keep two properties at once: silent on a deployment that
+// has deliberately and explicitly trusted a CDN, still loud on the careless
+// entry, and still loud on a range added after the acknowledgement was written.
+
+#include "core/Logger.h"
+#include <spdlog/sinks/ringbuffer_sink.h>
+
+namespace {
+
+// Cloudflare's published IPv4 edge ranges (cloudflare.com/ips-v4) as of the
+// deploy that prompted this. Verbatim on purpose: the point of the test is
+// that a REAL CDN list, at its real width, comes out clean.
+const std::vector<std::string> kCloudflareV4 = {
+    "173.245.48.0/20",  "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18",  "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15",  "104.16.0.0/13",
+    "104.24.0.0/14",    "172.64.0.0/13",   "131.0.72.0/22",
+};
+const std::vector<std::string> kCloudflareV6 = {
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
+    "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+};
+
+std::string toml_array(const std::vector<std::string>& items) {
+    std::string out = "[";
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (i) out += ", ";
+        out += "\"" + items[i] + "\"";
+    }
+    return out + "]";
+}
+
+// Runs Config::validate over `cfg` and returns the records it logged.
+struct Captured {
+    std::vector<std::string> all;
+
+    [[nodiscard]] std::vector<std::string> matching(const char* level,
+                                                    const char* needle) const {
+        std::vector<std::string> hits;
+        for (const auto& line : all) {
+            if (line.find(std::string("[") + level + "]") != std::string::npos &&
+                line.find(needle) != std::string::npos) {
+                hits.push_back(line);
+            }
+        }
+        return hits;
+    }
+};
+
+Captured validate_capturing_log(Config& cfg) {
+    auto ring = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(256);
+    auto logger = get_logger();
+    const auto prior = logger->level();
+    logger->sinks().push_back(ring);
+    logger->set_level(spdlog::level::trace);
+    Config::validate(cfg);
+    logger->sinks().pop_back();
+    logger->set_level(prior);
+    return Captured{ring->last_formatted(256)};
+}
+
+// A config with nothing else in it that warns, so a test counting warnings is
+// counting only the ones it is about.
+Config quiet_config() {
+    auto cfg = Config::defaults();
+    cfg.password_hash_cost = 19;
+    cfg.voice.enabled = false;
+    cfg.push.enabled = false;
+    return cfg;
+}
+
+} // namespace
+
+TEST(TrustedProxyWarning, ACdnRangeSetAcknowledgedUnderItsOwnKeyDoesNotWarnAtAll) {
+    auto cfg = quiet_config();
+    cfg.auth_limits.trusted_proxies = {"127.0.0.0/8", "::1", "172.16.0.0/12"};
+    cfg.auth_limits.trusted_public_proxies = kCloudflareV4;
+    cfg.auth_limits.trusted_public_proxies.insert(
+        cfg.auth_limits.trusted_public_proxies.end(), kCloudflareV6.begin(), kCloudflareV6.end());
+    cfg.auth_limits.trusted_public_proxies_reason =
+        "Cloudflare edge, refreshed 2026-09-20 from cloudflare.com/ips-v4 and ips-v6";
+
+    auto log = validate_capturing_log(cfg);
+    EXPECT_TRUE(log.matching("warning", "trusted_prox").empty())
+        << "a correctly-configured CDN-fronted server warned "
+        << log.matching("warning", "trusted_prox").size() << " time(s) at boot";
+
+    // Not silent, though: one line says what is being trusted and why, so the
+    // decision is still visible to whoever reads the boot log.
+    auto notices = log.matching("info", "public proxy range");
+    ASSERT_EQ(notices.size(), 1u);
+    EXPECT_NE(notices[0].find("22"), std::string::npos) << notices[0]; // the count
+    EXPECT_NE(notices[0].find("Cloudflare edge"), std::string::npos) << notices[0];
+}
+
+TEST(TrustedProxyWarning, AcknowledgedRangesAreActuallyTrusted) {
+    // The acknowledgement key is the list, not a duplicate of it: an operator
+    // must not have to write the CDN ranges twice and keep two copies in step.
+    auto cfg = quiet_config();
+    cfg.auth_limits.trusted_proxies = {"127.0.0.0/8"};
+    cfg.auth_limits.trusted_public_proxies = {"104.16.0.0/13"};
+    cfg.auth_limits.trusted_public_proxies_reason = "Cloudflare edge";
+    Config::validate(cfg);
+
+    ClientAddressResolver r(cfg.auth_limits.trusted_proxies);
+    httplib::Request req;
+    req.remote_addr = "104.16.0.5";
+    req.set_header("X-Forwarded-For", "203.0.113.9");
+    EXPECT_EQ(r.resolve(req), std::optional<std::string>("203.0.113.9"));
+}
+
+TEST(TrustedProxyWarning, ValidateIsIdempotentOverTheMergedList) {
+    // validate() runs once from load(), but main and the tests can call it
+    // again; merging must not grow the list each time.
+    auto cfg = quiet_config();
+    cfg.auth_limits.trusted_proxies = {"127.0.0.0/8"};
+    cfg.auth_limits.trusted_public_proxies = {"104.16.0.0/13"};
+    cfg.auth_limits.trusted_public_proxies_reason = "Cloudflare edge";
+    Config::validate(cfg);
+    const auto once = cfg.auth_limits.trusted_proxies;
+    Config::validate(cfg);
+    EXPECT_EQ(cfg.auth_limits.trusted_proxies, once);
+}
+
+TEST(TrustedProxyWarning, ARangeTooWideToBeAProxyFleetWarnsEvenWhenAcknowledged) {
+    // The acknowledgement says "these are my CDN's edge nodes". It is not a
+    // blanket "stop checking": a default route, or a whole public /8, is not a
+    // proxy fleet under anybody's definition, and must stay loud no matter
+    // which key it was written under.
+    for (const char* careless : {"0.0.0.0/0", "::/0", "104.0.0.0/8", "2000::/3"}) {
+        auto cfg = quiet_config();
+        cfg.auth_limits.trusted_proxies = {"127.0.0.0/8"};
+        cfg.auth_limits.trusted_public_proxies = {careless};
+        cfg.auth_limits.trusted_public_proxies_reason = "honestly I do know what I am doing";
+
+        auto log = validate_capturing_log(cfg);
+        auto warnings = log.matching("warning", careless);
+        EXPECT_EQ(warnings.size(), 1u) << careless << " drew " << warnings.size() << " warning(s)";
+    }
+}
+
+TEST(TrustedProxyWarning, PublicRangesInTheOrdinaryKeyWarnOnceNotOncePerEntry) {
+    // The pre-upgrade shape: the CDN ranges are sitting in plain
+    // trusted_proxies. That is still worth saying — the operator has not told
+    // the server they meant it — but it is worth saying ONCE, naming the
+    // count and the widest entry, with the remedy.
+    auto cfg = quiet_config();
+    cfg.auth_limits.trusted_proxies = {"127.0.0.0/8", "::1", "172.16.0.0/12"};
+    cfg.auth_limits.trusted_proxies.insert(cfg.auth_limits.trusted_proxies.end(),
+                                           kCloudflareV4.begin(), kCloudflareV4.end());
+
+    auto log = validate_capturing_log(cfg);
+    auto warnings = log.matching("warning", "trusted_proxies");
+    ASSERT_EQ(warnings.size(), 1u) << "got " << warnings.size() << " warnings, wanted one summary";
+    EXPECT_NE(warnings[0].find("15"), std::string::npos) << warnings[0];          // the count
+    EXPECT_NE(warnings[0].find("162.158.0.0/15"), std::string::npos) << warnings[0]; // the widest
+    EXPECT_NE(warnings[0].find("trusted_public_proxies"), std::string::npos)
+        << "the warning must name the way out: " << warnings[0];
+}
+
+TEST(TrustedProxyWarning, AnAcknowledgementWithNoStatedReasonIsNotAnAcknowledgement) {
+    // An empty reason degrades to the old behaviour rather than silencing the
+    // check: the reason is the part a human reads in six months, and a list
+    // with no reason is indistinguishable from a list someone pasted in.
+    auto cfg = quiet_config();
+    cfg.auth_limits.trusted_proxies = {"127.0.0.0/8"};
+    cfg.auth_limits.trusted_public_proxies = {"104.16.0.0/13", "172.64.0.0/13"};
+    cfg.auth_limits.trusted_public_proxies_reason = "   ";
+
+    auto log = validate_capturing_log(cfg);
+    auto warnings = log.matching("warning", "trusted_public_proxies");
+    ASSERT_EQ(warnings.size(), 1u);
+    EXPECT_NE(warnings[0].find("reason"), std::string::npos) << warnings[0];
+}
+
+TEST(TrustedProxyWarning, ARangeAddedAfterTheCdnWasAcknowledgedIsStillCalledOut) {
+    // The upgrade-then-drift case. Cloudflare is acknowledged and quiet; a
+    // month later somebody adds a public range to the ordinary key. That must
+    // not ride in on the CDN's acknowledgement.
+    auto cfg = quiet_config();
+    cfg.auth_limits.trusted_proxies = {"127.0.0.0/8", "::1", "198.51.100.0/24"};
+    cfg.auth_limits.trusted_public_proxies = kCloudflareV4;
+    cfg.auth_limits.trusted_public_proxies_reason = "Cloudflare edge";
+
+    auto log = validate_capturing_log(cfg);
+    auto warnings = log.matching("warning", "198.51.100.0/24");
+    ASSERT_EQ(warnings.size(), 1u) << "the newly added range was not called out";
+}
+
+TEST(TrustedProxyWarning, PrivateEntriesUnderEitherKeyStayQuiet) {
+    auto cfg = quiet_config();
+    cfg.auth_limits.trusted_proxies = {"127.0.0.0/8", "::1", "172.16.0.0/12", "10.0.0.0/8"};
+    auto log = validate_capturing_log(cfg);
+    EXPECT_TRUE(log.matching("warning", "trusted_prox").empty());
+    EXPECT_TRUE(log.matching("info", "public proxy range").empty());
+}
+
+TEST(TrustedProxyWarning, BothKeysLoadFromTheAuthTableAndMerge) {
+    auto path = write_toml("bsfchat_test_auth_cdn_proxies.toml",
+        "[auth]\n"
+        "trusted_proxies = [\"127.0.0.0/8\", \"172.16.0.0/12\"]\n"
+        "trusted_public_proxies = " + toml_array(kCloudflareV4) + "\n"
+        "trusted_public_proxies_reason = \"Cloudflare edge, refreshed 2026-09-20\"\n");
+    auto cfg = Config::load(path.string());
+    std::filesystem::remove(path);
+
+    const auto& l = cfg.auth_limits;
+    EXPECT_EQ(l.trusted_public_proxies, kCloudflareV4);
+    EXPECT_EQ(l.trusted_public_proxies_reason, "Cloudflare edge, refreshed 2026-09-20");
+    // Merged, in order, with no duplicates and the ordinary entries first.
+    ASSERT_EQ(l.trusted_proxies.size(), 2u + kCloudflareV4.size());
+    EXPECT_EQ(l.trusted_proxies[0], "127.0.0.0/8");
+    EXPECT_EQ(l.trusted_proxies[2], kCloudflareV4[0]);
+}
+
+TEST(TrustedProxyWarning, AnUnparseableAcknowledgedEntryStopsStartupLikeAnyOther) {
+    auto bad = write_toml("bsfchat_test_auth_cdn_bad.toml",
+                          "[auth]\n"
+                          "trusted_public_proxies = [\"104.16.0.0/13\", \"cloudflare\"]\n"
+                          "trusted_public_proxies_reason = \"Cloudflare edge\"\n");
+    EXPECT_THROW(Config::load(bad.string()), std::runtime_error);
+    std::filesystem::remove(bad);
+}

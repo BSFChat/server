@@ -127,6 +127,27 @@ std::string redact_ip_for_log(const std::string& address) {
     return std::string(buf) + "/64";
 }
 
+bool IpNetwork::is_v4() const {
+    // A network narrower than the IPv4-mapped prefix itself cannot be IPv4,
+    // and checking the bytes alone would call "::/0" an IPv4 network.
+    return prefix_bits >= kV4Offset && is_v4_mapped(addr);
+}
+
+int IpNetwork::cidr_prefix() const {
+    return is_v4() ? prefix_bits - kV4Offset : prefix_bits;
+}
+
+bool is_too_wide_to_be_a_proxy_fleet(const IpNetwork& net) {
+    // See the header for where these two numbers come from. They are floors,
+    // not recommendations: a /10 of public IPv4 is still an enormous thing to
+    // trust, and it gets there only by being written under the acknowledging
+    // key with a stated reason.
+    constexpr int kMinAcknowledgeablePrefixV4 = 10;
+    constexpr int kMinAcknowledgeablePrefixV6 = 20;
+    const int floor = net.is_v4() ? kMinAcknowledgeablePrefixV4 : kMinAcknowledgeablePrefixV6;
+    return net.cidr_prefix() < floor;
+}
+
 bool is_private_or_loopback_network(const IpNetwork& net) {
     // A shorter prefix means a WIDER network, so a candidate is only fully
     // contained when the private range's prefix is no longer than its own and

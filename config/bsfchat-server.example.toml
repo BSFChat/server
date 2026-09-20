@@ -197,7 +197,7 @@ rate_limit_enabled = true
 # public entry (or something as wide as "0.0.0.0/0") is not a loose limit — it
 # is an off switch: anything inside it picks its own identity once per request,
 # and the per-address limits stop applying to exactly the client that matters.
-# List only proxies you operate.
+# List only proxies you operate — or, for a CDN, use the key below.
 #
 # If a trusted proxy sends no usable X-Forwarded-For, the client is unknowable
 # and the per-address limits are skipped for that request (the per-username
@@ -206,6 +206,58 @@ rate_limit_enabled = true
 #
 # IPv6 clients are limited per /64, not per address.
 trusted_proxies = ["127.0.0.0/8", "::1"]
+
+# Public ranges you are deliberately trusting, and why.
+#
+# A CDN in front of the origin (Cloudflare, CloudFront, Fastly) terminates TLS
+# at an edge node and appends that node's PUBLIC address to X-Forwarded-For.
+# Those edge ranges have to be trusted or every one of your users shares the
+# CDN's rate-limit bucket — so the correct configuration for a CDN-fronted
+# server is a long list of public ranges, which is exactly what the startup
+# warning above is about. Write them here instead and the warning does not
+# fire for them: the server takes this key as you saying you meant it.
+#
+# Entries here are trusted exactly like the ones above — this is the list, not
+# a copy of it. Do not repeat them in trusted_proxies.
+#
+# The reason is required for the acknowledgement to count. Say whose ranges
+# these are and when you last refreshed them; an empty reason leaves them
+# trusted but still warned about, because a list nobody has explained is
+# indistinguishable from one somebody pasted in. Refresh them from the source
+# that publishes them — for Cloudflare, https://www.cloudflare.com/ips-v4 and
+# https://www.cloudflare.com/ips-v6 — and update the date when you do. Nothing
+# in this server fetches them: a copy compiled into the binary would be stale
+# the moment the provider changed it, blessing ranges they had given up and
+# warning about ones they had just added, and it would also mean a third party
+# deciding whose X-Forwarded-For your rate limiter believes.
+#
+# What this key does NOT do:
+#   * It does not silence anything you have not written in it. A public range
+#     added to trusted_proxies next month is still called out.
+#   * It does not acknowledge a range too wide to be a proxy fleet. "0.0.0.0/0",
+#     "::/0", a public /8 and the like keep warning whichever key they are in.
+#   * It does not keep itself current. If your provider adds a range you have
+#     not listed, clients arriving through it share one bucket and the runtime
+#     "X-Forwarded-For from an untrusted peer" warning is what tells you. If
+#     your provider gives a range up, you go on trusting it after somebody else
+#     is issued it — which is the reason for the date in the reason string.
+#
+# BEFORE reaching for this: if your reverse proxy can resolve the real client
+# itself, that is strictly better than trusting the CDN here. nginx with
+# ngx_http_realip_module and `set_real_ip_from <cdn ranges>` +
+# `real_ip_header CF-Connecting-IP` rewrites the client address at the edge of
+# YOUR infrastructure, and this server then only needs to trust nginx. One list
+# to keep current instead of two, and this server never has to believe a public
+# range at all.
+#
+# Example:
+#   trusted_public_proxies = [
+#     "173.245.48.0/20", "103.21.244.0/22", "162.158.0.0/15", "104.16.0.0/13",
+#     # ...the rest of https://www.cloudflare.com/ips-v4 and ips-v6
+#   ]
+#   trusted_public_proxies_reason = "Cloudflare edge, refreshed 2026-09-20"
+trusted_public_proxies = []
+trusted_public_proxies_reason = ""
 
 # Requests per client address per window, counted separately for each of the
 # four endpoints. Successful requests count: this bounds how much password
