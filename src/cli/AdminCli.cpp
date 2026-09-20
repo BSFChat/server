@@ -158,6 +158,57 @@ int cmd_list_users(const CommonArgs& args, std::ostream& out, const ListenProbe&
     return 0;
 }
 
+int cmd_list_orphan_members(const CommonArgs& args, std::ostream& out,
+                            const ListenProbe& probe) {
+    Config config;
+    if (!load_config(args.config_path, config, out)) return 1;
+    // Gated on the stopped-server check like everything else here, and for a
+    // sharper reason than list-users has: this command is read-only, but
+    // OPENING the database is not. SqliteStore::initialize() runs the migration
+    // pass, so pointing this at a live server is a second writer, which is the
+    // stream-position collision the header describes.
+    if (refuse_if_running(config, probe, out)) return 1;
+
+    SqliteStore store(config.database_path);
+    store.initialize();
+
+    auto orphans = store.list_orphan_memberships();
+    if (orphans.empty()) {
+        out << "no phantom memberships in " << config.database_path
+            << ": every room_members row names an account that exists.\n";
+        return 0;
+    }
+
+    out << orphans.size() << " phantom membership row(s) in " << config.database_path
+        << ".\nEach names an account that does not exist:\n\n";
+    for (const auto& row : orphans) {
+        out << "  " << row.room_id << "  " << log_safe(row.user_id)
+            << "  membership=" << row.membership << "  updated_at=" << row.updated_at << "\n";
+    }
+    out << "\nWhere they came from: POST /rooms/{id}/invite, and the same decision through\n"
+           "PUT /rooms/{id}/state/m.room.member/{user}, used to write the membership row\n"
+           "without checking that the id named an account — a mistyped or pasted user id\n"
+           "returned 200 and left a row behind. Both now refuse. A row above was written\n"
+           "before that fix; the timestamp says when.\n"
+           "\nWhat it is doing: it is reported by GET /rooms/{id}/members, so it shows in\n"
+           "the member list with no name and no avatar; a `join` row is also counted in\n"
+           "joined-member totals and walked by the presence sweep. Whoever was MEANT to be\n"
+           "invited is not in the channel.\n"
+           "\nNothing here deletes anything, on purpose. A DELETE is not the repair: every\n"
+           "client that saw the arrival has the ghost in its cached roster and would keep\n"
+           "showing it until a full refetch, so the row has to leave as a membership event\n"
+           "too. Invite the account you actually meant; then raise removing these, so they\n"
+           "go through the audited, sync-mirrored path rather than by hand.\n"
+           "\nServer bans are NOT listed here even for ids with no account: banning an id\n"
+           "before it is registered is a reservation (registration consults the ban list),\n"
+           "not a mistake.\n";
+    // 0, not 1. The command did what it was asked to do, and the exit codes
+    // documented in AdminCli.h say whether it RAN, not what it found — the
+    // finding is the output. A check script wanting a signal should read the
+    // first line.
+    return 0;
+}
+
 int cmd_grant_admin(const CommonArgs& args, std::ostream& out, const ListenProbe& probe) {
     Config config;
     if (!load_config(args.config_path, config, out)) return 1;
@@ -297,7 +348,8 @@ bool default_listen_probe(const std::string& address, int port) {
 }
 
 bool is_admin_subcommand(const std::string& token) {
-    return token == "grant-admin" || token == "list-users";
+    return token == "grant-admin" || token == "list-users" ||
+           token == "list-orphan-members";
 }
 
 void print_admin_usage(std::ostream& out) {
@@ -305,11 +357,14 @@ void print_admin_usage(std::ostream& out) {
            "  list-users  --config <path>\n"
            "      Every account, oldest first, with its roles. Use it to find the\n"
            "      exact user id to grant admin to.\n"
+           "  list-orphan-members --config <path>\n"
+           "      Every membership row that names an account which does not exist.\n"
+           "      Read-only: it reports, it never deletes. A clean server prints one line.\n"
            "  grant-admin --config <path> --user <@user:server>\n"
            "      Give that account the admin role. Idempotent. Goes through the same\n"
            "      audited, sync-mirrored write path the API uses.\n"
            "\n"
-           "Both require --config: they will not guess which database to open.\n";
+           "All of them require --config: they will not guess which database to open.\n";
 }
 
 int run_admin_cli(const std::vector<std::string>& args, std::ostream& out, ListenProbe probe) {
@@ -329,6 +384,7 @@ int run_admin_cli(const std::vector<std::string>& args, std::ostream& out, Liste
 
     try {
         if (command == "list-users") return cmd_list_users(parsed, out, probe);
+        if (command == "list-orphan-members") return cmd_list_orphan_members(parsed, out, probe);
         if (command == "grant-admin") return cmd_grant_admin(parsed, out, probe);
     } catch (const std::exception& e) {
         // A schema too new for this build, an unreadable database, a disk

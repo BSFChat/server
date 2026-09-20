@@ -1690,6 +1690,36 @@ SqliteStore::get_user_memberships(const std::string& user_id) {
     return rows;
 }
 
+std::vector<SqliteStore::OrphanMembership> SqliteStore::list_orphan_memberships() {
+    std::lock_guard lock(mutex_);
+    // NOT NOT IN (SELECT user_id FROM users): `users.user_id` is the primary
+    // key and cannot be NULL, so the two are equivalent here — but NOT IN goes
+    // silently empty the moment a subquery yields one NULL, and a diagnostic
+    // that reports "nothing wrong" by accident is worse than no diagnostic.
+    // NOT EXISTS has no such failure mode and uses the same index.
+    //
+    // Bots count as accounts: bot creation writes a users row with kind='bot',
+    // so a bot's membership is not an orphan. server_bans is deliberately NOT
+    // examined — a ban on an unregistered id is a reservation, not a mistake.
+    auto stmt = prepare(db_, R"(
+        SELECT m.room_id, m.user_id, m.membership, m.updated_at
+        FROM room_members m
+        WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.user_id = m.user_id)
+        ORDER BY m.room_id, m.user_id
+    )");
+
+    std::vector<OrphanMembership> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        OrphanMembership row;
+        row.room_id = column_text_or_empty(stmt.get(), 0);
+        row.user_id = column_text_or_empty(stmt.get(), 1);
+        row.membership = column_text_or_empty(stmt.get(), 2);
+        row.updated_at = sqlite3_column_int64(stmt.get(), 3);
+        out.push_back(std::move(row));
+    }
+    return out;
+}
+
 // Server-wide bans
 
 void SqliteStore::set_server_ban(const std::string& user_id, const std::string& actor,
