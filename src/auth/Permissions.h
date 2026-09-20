@@ -149,8 +149,23 @@ public:
     // and letting a member shed any role they happen to hold would be letting
     // them unmute themselves. You may drop exactly what you were allowed to
     // take.
+    //
+    // `adding` distinguishes taking a role from dropping one, because exactly
+    // one rule differs. The containment rule — a self-assignable role's
+    // permissions must be a subset of @everyone's — is a rule about what
+    // TAKING a role may grant you. Applied to removal it is a trap: a member
+    // holding a role whose permissions drifted outside @everyone's (because
+    // @everyone was narrowed afterwards) could not shed it, and no admin path
+    // helps them, because self-assignment is the only way that role moves.
+    // Dropping a role cannot grant anything, so the check has no work to do
+    // there.
+    //
+    // Everything else still binds both directions, which is the point of the
+    // paragraph above: self_assignable itself is re-checked on removal so a
+    // mute role cannot be shed.
     RoleChangeVerdict may_self_assign_role(const std::string& actor_id,
-                                           const std::string& role_id);
+                                           const std::string& role_id,
+                                           bool adding);
 
 private:
     // Role data is identical for every room in a single request, but compute()
