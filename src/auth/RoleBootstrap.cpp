@@ -26,21 +26,6 @@ std::string server_actor(const Config& config) {
     return "@server:" + config.server_name;
 }
 
-// Room to MIRROR server-wide state into so clients pick it up on sync.
-//
-// This used to be where server-wide state actually LIVED, chosen as
-// list_all_non_category_rooms().front() — an unordered SQLite result. Since
-// delete_room hard-deletes every event in a room, deleting whichever channel
-// happened to come back first destroyed every role definition and assignment
-// server-wide. Authority now lives in the server_state table
-// (SqliteStore::set_server_state); this mirror is presentation only, and it
-// being absent or deleted costs nothing.
-std::string pick_mirror_room(SqliteStore& store) {
-    auto non_cat = store.list_all_non_category_rooms();
-    if (!non_cat.empty()) return non_cat.front();
-    return {};
-}
-
 ServerRolesContent default_roles() {
     ServerRolesContent c;
     ServerRole everyone;
@@ -151,6 +136,21 @@ void write_member_roles(SqliteStore& store, const Config& config,
 
 } // namespace
 
+// Room to MIRROR server-wide state into so clients pick it up on sync.
+//
+// This used to be where server-wide state actually LIVED, chosen as
+// list_all_non_category_rooms().front() — an unordered SQLite result. Since
+// delete_room hard-deletes every event in a room, deleting whichever channel
+// happened to come back first destroyed every role definition and assignment
+// server-wide. Authority now lives in the server_state table
+// (SqliteStore::set_server_state); this mirror is presentation only, and it
+// being absent or deleted costs nothing.
+std::string pick_server_state_mirror_room(SqliteStore& store) {
+    auto non_cat = store.list_all_non_category_rooms();
+    if (!non_cat.empty()) return non_cat.front();
+    return {};
+}
+
 void write_server_scoped_state(SqliteStore& store, const Config& config,
                                 const std::string& evt_type, const std::string& state_key,
                                 const std::string& content_json,
@@ -189,7 +189,7 @@ void bootstrap_roles(SqliteStore& store, SyncEngine& sync_engine, const Config& 
     // deployment now that channel creation itself requires MANAGE_CHANNELS —
     // no rooms meant no roles, no roles meant nobody could create the first
     // room. Server-wide state has its own home now, so this always works.
-    auto canonical = pick_mirror_room(store);
+    auto canonical = pick_server_state_mirror_room(store);
 
     // 1. Seed default server roles if missing OR if the existing event is
     // legacy-shape (pre-permissions, i.e. name/level/color only). Detect the

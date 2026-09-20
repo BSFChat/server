@@ -42,6 +42,7 @@ add_executable(bsfchat-server
     src/api/AuditHandler.cpp
     src/api/AuthHandler.cpp
     src/api/BotHandler.cpp
+    src/api/RoleHandler.cpp
     src/api/RoomHandler.cpp
     src/api/EventHandler.cpp
     src/api/SyncHandler.cpp

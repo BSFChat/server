@@ -5,6 +5,7 @@
 #include "api/AuditHandler.h"
 #include "api/AuthHandler.h"
 #include "api/BotHandler.h"
+#include "api/RoleHandler.h"
 #include "api/RoomHandler.h"
 #include "api/EventHandler.h"
 #include "api/SyncHandler.h"
@@ -320,6 +321,45 @@ void Server::register_routes() {
              [h = bot_handler](const httplib::Request& req, httplib::Response& res) { h->handle_rotate_token(req, res); });
     svr.Delete(R"(/_matrix/client/v3/bsfchat/bots/([^/]+)$)",
                [h = bot_handler](const httplib::Request& req, httplib::Response& res) { h->handle_deactivate_bot(req, res); });
+
+    // Server roles. bsfchat.* namespaced for the same reason the bot routes
+    // above are: Matrix models permissions with m.room.power_levels, which this
+    // server does not use as its authority, so there is no spec path to take.
+    //
+    // These do not replace the `bsfchat.server.roles` state PUT, and they are
+    // not a second authority over it — they hand a DELTA to the server and let
+    // it perform the read-modify-write against the one document, through the
+    // same PermissionsEngine::may_edit_role_definitions and the same
+    // write_server_scoped_state. What they remove is the requirement that the
+    // caller assemble a document containing roles it is forbidden to touch,
+    // which is what made role management unusable from a delegated MANAGE_ROLES
+    // holder such as a bot. See RoleHandler.h.
+    //
+    // The {roleId} patterns are anchored with $ and registered alongside the
+    // bare collection path, which httplib matches by method, so a DELETE on the
+    // collection cannot fall into the per-role route.
+    //
+    // /self_roles is a SEPARATE path rather than a verb on /roles because its
+    // authority is different in kind: no MANAGE_ROLES and no rank check at all,
+    // paid for by the role having declared itself self-assignable and by a
+    // permission-containment rule. Sharing a handler prefix with the admin
+    // routes is how that containment rule would eventually be skipped on one
+    // branch.
+    auto role_handler = std::make_shared<RoleHandler>(*store_, *sync_engine_, config_);
+
+    svr.Get(std::string(api_path::kRoles),
+            [h = role_handler](const httplib::Request& req, httplib::Response& res) { h->handle_list_roles(req, res); });
+    svr.Post(std::string(api_path::kRoles),
+             [h = role_handler](const httplib::Request& req, httplib::Response& res) { h->handle_create_role(req, res); });
+    svr.Patch(R"(/_matrix/client/v3/bsfchat/roles/([^/]+)$)",
+              [h = role_handler](const httplib::Request& req, httplib::Response& res) { h->handle_update_role(req, res); });
+    svr.Delete(R"(/_matrix/client/v3/bsfchat/roles/([^/]+)$)",
+               [h = role_handler](const httplib::Request& req, httplib::Response& res) { h->handle_delete_role(req, res); });
+
+    svr.Put(R"(/_matrix/client/v3/bsfchat/self_roles/([^/]+)$)",
+            [h = role_handler](const httplib::Request& req, httplib::Response& res) { h->handle_add_self_role(req, res); });
+    svr.Delete(R"(/_matrix/client/v3/bsfchat/self_roles/([^/]+)$)",
+               [h = role_handler](const httplib::Request& req, httplib::Response& res) { h->handle_remove_self_role(req, res); });
 
     // Voice routes — handler is kept as a member so start()/stop() can
     // manage the ghost-participant reaper thread.

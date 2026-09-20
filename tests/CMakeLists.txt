@@ -40,6 +40,7 @@ add_executable(server_tests
     test_localpart.cpp
     test_request_hardening.cpp
     test_kick_enforcement.cpp
+    test_role_management.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -100,6 +101,7 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/api/SearchHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/AuditHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/BotHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/RoleHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/audit/AuditLog.cpp
     ${CMAKE_SOURCE_DIR}/src/identity/Localpart.cpp
     ${CMAKE_SOURCE_DIR}/src/identity/Nickname.cpp
