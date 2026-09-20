@@ -7,6 +7,7 @@
 #include <bsfchat/Identifiers.h>
 
 #include <nlohmann/json.hpp>
+#include <chrono>
 #include <thread>
 
 using namespace bsfchat;
@@ -78,14 +79,35 @@ TEST_F(SyncTest, IncrementalSyncNoNewEvents) {
     EXPECT_EQ(resp.next_batch, initial.next_batch);
 }
 
+// This test is named for the WAKE, but for a long time it could not see one.
+// It asserted only that the event came back, and the idle-timeout path at the
+// bottom of handle_sync does a final build_incremental_sync before it
+// returns — so a build with notify_new_event()'s notify_all() removed
+// entirely still passed it, in 5044 ms, having sat out the whole timeout
+// holding an event that was committed the entire time. That is precisely the
+// regression this is here for, and the content assertions are blind to it.
+//
+// The fix is not a tight budget. It is a timeout so long that the two
+// outcomes cannot be confused: a signalled poll returns in ~100 ms, an
+// unsignalled one returns at kTimeoutMs. Half of that is the dividing line,
+// and there is nothing the code can do that lands in between — the condition
+// variable is either notified or it is not. 15 s of slack for a ~100 ms
+// operation is not a budget the machine can fail; a busy box makes the wake
+// take 300 ms instead of 100 ms, not 15 000 ms.
+//
+// It also makes the healthy case FASTER: this used to always cost its full
+// 5 s timeout when the wake was broken, and now a broken wake is what is slow.
 TEST_F(SyncTest, LongPollWakeUp) {
     auto initial = sync->handle_sync("@alice:test", "", 0);
     auto since = initial.next_batch;
 
+    constexpr int kTimeoutMs = 30000;
+
     // Start a sync in a thread with a long timeout
     SyncResponse resp;
+    const auto started = std::chrono::steady_clock::now();
     std::thread sync_thread([&]() {
-        resp = sync->handle_sync("@alice:test", since, 5000);
+        resp = sync->handle_sync("@alice:test", since, kTimeoutMs);
     });
 
     // Wait a bit, then insert an event
@@ -96,10 +118,20 @@ TEST_F(SyncTest, LongPollWakeUp) {
     sync->notify_new_event();
 
     sync_thread.join();
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
 
     // Should have woken up and returned the event
     ASSERT_EQ(resp.rooms.join.count(room_id), 1u);
     EXPECT_EQ(resp.rooms.join[room_id].timeline.events.size(), 1u);
+
+    // ...and should have been WOKEN to do it, not answered by its own
+    // deadline. Without this, removing the notify_all() outright is green.
+    EXPECT_LT(elapsed_ms, kTimeoutMs / 2)
+        << "the poll returned the event only when its " << kTimeoutMs
+        << " ms timeout expired, not when the commit notified it: the "
+           "condition-variable wake in notify_new_event() is not reaching "
+           "the waiter in handle_sync()";
 }
 
 // Was "the token parses as s<N> and N > 0". It no longer does, and that is the

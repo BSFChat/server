@@ -150,7 +150,14 @@ set_tests_properties(e2e_sync_latency PROPERTIES
     # an owner actually feels — send on one connection, watch a parked /sync
     # on another come back — over real sockets with the real binary.
     TIMEOUT 300
-    # Times a latency budget, so it must not share the box with another test.
+    # RUN_SERIAL, but do not mistake it for protection. ctest serialises this
+    # against OTHER CTEST TESTS and nothing else: a concurrent `cmake --build`,
+    # a second agent's ctest run, or anything else on the box is invisible to
+    # it. That is why this test no longer asserts an absolute millisecond
+    # budget — it measures an unwoken poll in the same run and requires the
+    # woken ones to beat it, which is true whatever else the machine is doing.
+    # RUN_SERIAL stays only because a fixed port (18471) genuinely cannot be
+    # shared with a second copy of itself.
     RUN_SERIAL TRUE)
 
 add_test(NAME e2e_profile_shape
@@ -174,7 +181,11 @@ set_tests_properties(e2e_invites PROPERTIES
     # It registers three accounts (bcrypt), restarts the server so role
     # bootstrap runs, and parks two long polls it has to let expire.
     TIMEOUT 300
-    # Fixed port, plus two timing assertions on how long a poll blocks.
+    # Fixed port, so a second copy of itself cannot run alongside. Its two
+    # timing assertions no longer depend on this: T4 is a lower bound (load
+    # can only help it) and T5 is stated as a fraction of the poll timeout it
+    # is distinguishing itself from. See the note on e2e_sync_latency above
+    # for why RUN_SERIAL is not a defence against load in the first place.
     RUN_SERIAL TRUE)
 
 # --- release-channel script --------------------------------------------------
