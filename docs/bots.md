@@ -794,6 +794,139 @@ PUT /_matrix/client/v3/rooms/{roomId}/state/bsfchat.member.roles/@bot_weather:ch
 
 A bot that only reads and replies in one channel does **not** need a role.
 
+### Asking whether somebody may administer *your* bot
+
+Most integrations eventually grow a privileged command — `!reload`, `!mute`,
+`!setchannel`, "leave this server" — and need to decide who may run it. **Do not
+keep an allowlist of user ids in your bot's configuration.** It is a second
+permission model, maintained by hand, and it goes stale in the dangerous
+direction: the person you demoted this morning is still in your config file.
+
+Ask the server instead.
+
+```http
+GET /_matrix/client/v3/bsfchat/permissions/@josh:chat.example.com
+Authorization: Bearer <your bot token>
+```
+```json
+200 {"user_id": "@josh:chat.example.com",
+     "scope": "server",
+     "permissions": "0xa1ff"}
+```
+
+`permissions` is that member's **effective server-scope** permission mask, as a
+lowercase hex string — the same spelling every other permission field on the
+wire uses (§8), because JSON cannot carry 64 bits as a number. It is computed by
+the same code that enforces every permission check on this server, so it is a
+prediction of what the server will actually do, not an approximation.
+
+The natural test for "may this person administer me?" is `MANAGE_BOTS`:
+
+```python
+MANAGE_BOTS   = 0x2000   # bit 13
+ADMINISTRATOR = 0x8000   # bit 15
+
+def may_administer(self, user_id: str) -> bool:
+    r = self._get(f"/_matrix/client/v3/bsfchat/permissions/{quote(user_id)}")
+    if r is None:                 # 403 — see "who you may ask about" below
+        return False
+    return bool(int(r["permissions"], 16) & MANAGE_BOTS)
+```
+
+**You do not need to special-case administrators.** `ADMINISTRATOR` short-
+circuits to every flag inside the server, so an administrator's mask has
+`MANAGE_BOTS` set already. Testing the one bit is the whole check, and it means
+server admins qualify with no new role for an operator to invent. Test
+`ADMINISTRATOR` separately only if you genuinely want "owner, and not the person
+they delegated bot management to".
+
+Three things this deliberately is **not**:
+
+- **Not channel-scoped.** `scope` is always `"server"`. A per-channel override
+  can neither add a flag to this answer nor take one away, which is correct,
+  because the endpoints that enforce `MANAGE_BOTS`, `MANAGE_SERVER` and
+  `ADMINISTRATOR` all evaluate them at server scope too. There is no
+  per-channel variant of this endpoint. If you want to know whether somebody
+  may act **in a channel** — post, delete, mention everyone — you are asking a
+  different question, and the answer is to attempt the action and read the 403.
+- **Not a role list.** The response carries the mask and nothing else. Role ids
+  are not returned; they are more than the question asks for and would name
+  private roles to anyone who shares a channel with their holder.
+- **Not a user directory.** See below.
+
+#### Who you may ask about
+
+You get an answer for:
+
+1. **yourself** — always, even before your bot has been invited anywhere;
+2. **anybody you share at least one channel with**, where your bot can see that
+   channel (i.e. holds `VIEW_CHANNEL` there);
+3. anybody at all, **if your bot holds `MANAGE_ROLES`** at server scope. It
+   almost certainly should not; do not grant it for this.
+
+Everything else is `403 M_FORBIDDEN`. That covers the person who shares no
+channel with you, the person in a channel your bot cannot see, and the account
+that does not exist — **all three give the identical response**, on purpose, so
+this endpoint cannot be used to find out which accounts exist. Do not try to
+read anything into the refusal beyond "not your business".
+
+Being joined to a channel is not enough on its own: every channel on this
+server is created public and force-joined, and a private one is a channel where
+`VIEW_CHANNEL` was denied afterwards. Your bot's claim is that it can *see* a
+channel the person is in.
+
+In practice rule 2 is exactly the situation a bot is in when it matters: it was
+invited into the channel the command was typed in, and the sender is a member of
+that channel. **A bot that only ever authorizes senders of messages it received
+will never see a 403 here.** If you do, treat it as "no" and move on. Do not
+retry, and do not fall back to an allowlist.
+
+Categories do not count as a shared channel, even though everybody is in them.
+
+#### Caching, and how you learn about changes
+
+**Ask at the moment you authorize an action, not at startup.** The endpoint
+holds no cache — it recomputes from the live role document and the live
+assignment on every call — so the call *after* an operator changes something is
+already right. That property is worth nothing if your bot cached the verdict for
+an hour.
+
+There is **no push notification for permission changes, and that is
+deliberate.** Role definitions and assignments are only mirrored into `/sync`
+for one arbitrary channel on the server (see §11), so a bot invited into any
+other channel would never receive them — which is the reason this endpoint
+exists. The correct shape is therefore:
+
+- **Do not cache at all** if your privileged commands are rare. They are typed
+  by a human; one extra HTTP round trip is invisible next to the command itself,
+  and the request costs the server two indexed reads.
+- **If you must cache**, cache for **seconds, not minutes**, key it on the user
+  id, and make the TTL a configuration value an operator can set to zero. Sixty
+  seconds is a generous ceiling. A demoted administrator keeps their power over
+  your bot for exactly as long as your TTL.
+- **Never cache a negative answer longer than a positive one**, and never
+  persist either across a restart. The whole value of asking the server is that
+  the answer changes.
+- **Never cache a `403`.** It reflects where your bot currently is, which
+  changes when it is invited somewhere.
+
+A bot that wants to *display* who can administer it — a `!whoadmin` command —
+should ask about the members of the channel it is in (`GET
+/rooms/{roomId}/members`) at the moment the command is run. Do not walk the
+member list on a timer; there is nothing to keep warm.
+
+#### Errors
+
+| Response | Meaning |
+| --- | --- |
+| `200` | The object above. `permissions` is always present and always a string. |
+| `401 M_MISSING_TOKEN` / `M_UNKNOWN_TOKEN` | As everywhere else (§2). |
+| `403 M_FORBIDDEN` | You may not ask about that account — or it does not exist. Indistinguishable, by design. Treat as "no". |
+| `404 M_NOT_FOUND` | You called the endpoint without a `{userId}`. There is no collection form: `GET /bsfchat/permissions` lists nobody. |
+
+Percent-encode the user id: it contains `@` and `:`. `quote(user_id, safe="")`
+in Python, or the equivalent.
+
 ---
 
 ## 9. Rate limits, backoff, and error handling
@@ -925,12 +1058,29 @@ Honest list, as of this writing:
 - **No structured command framework.** No slash-command registration, no
   autocomplete, no interaction model. A command is a message body your bot
   chooses to match on.
+- **Role state reaches `/sync` for one arbitrary channel only.** Role
+  definitions (`bsfchat.server.roles`) and per-member assignments
+  (`bsfchat.member.roles`) live in a server-side table, and clients see them
+  only because the server *mirrors* those events into a single channel — chosen
+  once, long ago, by an unordered query, and very likely not the channel your
+  bot was invited to. So **do not try to read roles out of `/sync`.** If you see
+  those event types go past, they are for the desktop client's benefit, they may
+  be an old copy, and your bot receiving them at all is an accident of which
+  channel it happens to be in. Ask
+  `GET /bsfchat/permissions/{userId}` instead (§8); that reads the
+  authoritative table and does not care where your bot is. There is currently no
+  endpoint that returns *another* member's role ids, only their effective mask —
+  if you think you need the ids, you are probably asking the wrong question.
+- **No push notification when somebody's permissions change** (§8). Ask at the
+  moment you authorize an action; there is nothing to subscribe to.
 
 Closed since earlier drafts of this guide, noted because you may have read
 around them: `/sync` now has a real `rooms.invite` section (irrelevant to bots —
 inviting a bot still joins it outright, so you still write no invite-handling
 code, see §3); reactions are validated and permissioned (§6, §8); `/redact` is
-idempotent (§6); profile reads return an object and require auth (§1).
+idempotent (§6); profile reads return an object and require auth (§1); a bot can
+now ask what a member may do server-wide instead of guessing or keeping an
+allowlist (§8).
 
 ---
 
@@ -951,6 +1101,7 @@ GET    /_matrix/client/v3/rooms/{room}/state                 channel state
 POST   /_matrix/media/v3/upload?filename=                    upload (raw body)
 GET    /_matrix/media/v3/download/{server}/{id}              download
 GET    /_matrix/client/v3/profile/{user}                     profile
+GET    /_matrix/client/v3/bsfchat/permissions/{user}         what may they do, server-wide
 POST   /_matrix/client/v3/rooms/{room}/kick|ban|unban        moderation
 POST   /_matrix/client/v3/bsfchat/bots                       create a bot (admin)
 GET    /_matrix/client/v3/bsfchat/bots                       list bots (admin)
