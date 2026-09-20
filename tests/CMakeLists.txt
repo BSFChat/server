@@ -47,6 +47,7 @@ add_executable(server_tests
     test_effective_permissions.cpp
     test_mirror_room.cpp
     test_phantom_membership.cpp
+    test_invite_refusal_codes.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

@@ -57,11 +57,17 @@ json direct_marked(json content, bool is_direct) {
 // first place.
 //
 // Returns true (and answers the request) when the room is direct.
+// `reason` is the refusal::k* code to put in `bsfchat.errcode`, and is empty
+// for the three call sites that have no client keying on them yet. Empty means
+// the body is byte-identical to what it has always been, so leaving it off is
+// not a regression — it is the status quo, and the field can be filled in when
+// something needs it.
 bool refuse_on_direct_room(SqliteStore& store, httplib::Response& res,
-                           const std::string& room_id, const char* what) {
+                           const std::string& room_id, const char* what,
+                           std::string_view reason = {}) {
     if (!store.is_direct_room(room_id)) return false;
     res.status = 403;
-    res.set_content(MatrixError::forbidden(what).to_json().dump(), "application/json");
+    res.set_content(MatrixError::forbidden(what, reason).to_json().dump(), "application/json");
     return true;
 }
 
@@ -1428,15 +1434,41 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
     }
 
     auto& room_id = match.params["roomId"];
+    // ── EVERY REFUSAL BELOW CARRIES A refusal::k* CODE ───────────────────
+    //
+    // This endpoint answers seven genuinely different situations with one
+    // status and one errcode, and the client's add-member dialog has to give
+    // seven different pieces of advice. Until now the only thing that told
+    // them apart was the sentence, so ChannelInviteModel::explainFailure
+    // matched SUBSTRINGS of it — which meant a reword here silently changed
+    // client behaviour, and an eighth refusal could be swallowed by an
+    // earlier fragment.
+    //
+    // The sentences below are UNCHANGED, deliberately: an older client is
+    // still matching them and has to keep working against this server. The
+    // code is additive, and a client that does not recognise one falls back
+    // to showing the sentence (protocol/include/bsfchat/ErrorCodes.h).
+    //
+    // NOTHING HERE DISCLOSES MORE THAN IT DID. Each code says exactly what
+    // its own sentence already said, one for one — no refusal that was
+    // byte-identical to another becomes distinguishable. The one that would
+    // matter is the existence check below, and its safety is the ORDERING
+    // (see kNoSuchAccount), which this does not touch: a caller who fails
+    // MANAGE_CHANNELS gets kInviteNoPermission for a real id and a fictional
+    // one alike, as TheRefusalDoesNotSayWhichKindOfWrongIdItWas and
+    // AnUnprivilegedCallerLearnsNothingAboutWhetherAnAccountExists pin.
     if (!store_.is_room_member(room_id, *user_id)) {
         res.status = 403;
-        res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(), "application/json");
+        res.set_content(MatrixError::forbidden("Not a member of this room",
+                                               refusal::kInviteNotInRoom).to_json().dump(),
+                        "application/json");
         return;
     }
     // Even a participant cannot widen a DM: "only the two of us" is the whole
     // guarantee, and a third member would also be handed the entire backlog.
     if (refuse_on_direct_room(store_, res, room_id,
-                              "Cannot invite someone into a direct message")) {
+                              "Cannot invite someone into a direct message",
+                              refusal::kInviteDirectRoom)) {
         return;
     }
 
@@ -1461,7 +1493,9 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
     // Inviting piggybacks on MANAGE_CHANNELS for now — we don't have a separate flag.
     if (!perms.can(*user_id, room_id, permission::kManageChannels)) {
         res.status = 403;
-        res.set_content(MatrixError::forbidden("Insufficient permissions to invite").to_json().dump(), "application/json");
+        res.set_content(MatrixError::forbidden("Insufficient permissions to invite",
+                                               refusal::kInviteNoPermission).to_json().dump(),
+                        "application/json");
         return;
     }
 
@@ -1469,7 +1503,9 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
     auto target_membership = store_.get_membership(room_id, target_user);
     if (target_membership == "ban") {
         res.status = 403;
-        res.set_content(MatrixError::forbidden("User is banned from this room").to_json().dump(), "application/json");
+        res.set_content(MatrixError::forbidden("User is banned from this room",
+                                               refusal::kInviteTargetBannedRoom).to_json().dump(),
+                        "application/json");
         return;
     }
     // The per-room check above is not enough on its own: a channel created AFTER
@@ -1478,7 +1514,8 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
     // knows, and it is the only thing that keeps working as channels come and go.
     if (store_.is_server_banned(target_user)) {
         res.status = 403;
-        res.set_content(MatrixError::forbidden("User is banned from this server").to_json().dump(),
+        res.set_content(MatrixError::forbidden("User is banned from this server",
+                                               refusal::kInviteTargetBannedServer).to_json().dump(),
                         "application/json");
         return;
     }
@@ -1499,7 +1536,12 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
     // actionable of the two.
     if (!store_.user_exists(target_user)) {
         res.status = 403;
-        res.set_content(MatrixError::forbidden(kNoSuchAccount).to_json().dump(),
+        // ONE code for all three shapes of wrong id, exactly as there is one
+        // sentence for all three — see kNoSuchAccount. Three codes would
+        // classify the namespace for whoever wanted that, which is the thing
+        // the single wording exists to refuse.
+        res.set_content(MatrixError::forbidden(kNoSuchAccount,
+                                               refusal::kInviteNoSuchAccount).to_json().dump(),
                         "application/json");
         return;
     }
@@ -1545,7 +1587,8 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
         if (bot && bot->deactivated_at) {
             res.status = 403;
             res.set_content(MatrixError::forbidden(
-                "That bot is deactivated and cannot be added to a channel").to_json().dump(),
+                "That bot is deactivated and cannot be added to a channel",
+                refusal::kInviteTargetDeactivated).to_json().dump(),
                 "application/json");
             return;
         }
