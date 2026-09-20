@@ -135,6 +135,14 @@ void Server::register_routes() {
     // session use this to reconcile their stored user id with the
     // server's canonical one (stale/corrupt stored ids otherwise break
     // every self-identity comparison client-side).
+    // Account linking: one human, one account. POST proves control of the
+    // account (bearer token) and of the identity (id_token in the body) in the
+    // same request — see handle_link_identity for why both halves are
+    // mandatory. GET lists the caller's own links and nobody else's.
+    svr.Post(std::string(api_path::kLinkIdentity),
+             [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_link_identity(req, res); });
+    svr.Get(std::string(api_path::kLinkedIdentities),
+            [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_linked_identities(req, res); });
     svr.Get(std::string(api_path::kWhoami),
             [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_whoami(req, res); });
 

@@ -210,9 +210,10 @@ TEST(MigrationV11, PreExistingV8DatabaseUpgradesAndKeepsItsData) {
     // the server writing it; 18 -> 19 added users.kind, the bots table and
     // access_tokens.token_kind for first-class bot accounts; 19 -> 20 persisted
     // the LiveKit media-key generation, which until then lived in memory and
-    // reverted on every restart. A v8 database still upgrades all the way in
-    // one go.
-    EXPECT_EQ(kTargetSchemaVersion, 27);
+    // reverted on every restart; 27 -> 28 added the linked_identities table, so
+    // one human's identity-provider login and their existing account are one
+    // account. A v8 database still upgrades all the way in one go.
+    EXPECT_EQ(kTargetSchemaVersion, 28);
     std::filesystem::remove(path);
 }
 

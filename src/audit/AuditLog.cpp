@@ -283,6 +283,26 @@ void audit_bot_lifecycle(SqliteStore& store, const std::string& actor,
     store.append_audit_record(record);
 }
 
+void audit_account_link(SqliteStore& store, const std::string& actor,
+                        const std::string& issuer,
+                        const std::string& superseded_user_id) {
+    SqliteStore::AuditRecord record;
+    record.actor = actor;
+    record.action = audit_action::kAccountLink;
+    // The account that gained a sign-in route goes in target_user even though
+    // it is the same as the actor. An investigator asking "everything that
+    // happened to @josh" filters on target_user, and a link is very much
+    // something that happened to that account; leaving it empty would hide the
+    // record from the only query anyone runs.
+    record.target_user = actor;
+    // Deliberately assembled here and not taken from the caller, so the
+    // subject cannot be smuggled in. See audit_action::kAccountLink.
+    nlohmann::json after = {{"issuer", issuer}};
+    if (!superseded_user_id.empty()) after["superseded_user_id"] = superseded_user_id;
+    record.after_json = after.dump();
+    store.append_audit_record(record);
+}
+
 void audit_room_deletion(SqliteStore& store, const std::string& actor,
                          const std::string& room_id) {
     std::string room_type = "text";
