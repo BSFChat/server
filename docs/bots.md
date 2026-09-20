@@ -434,7 +434,7 @@ faster than one polling with `timeout=300000`; it is 300× more requests for
 identical latency.
 
 ```
-GET /_matrix/client/v3/sync?since=s4711&timeout=300000
+GET /_matrix/client/v3/sync?since=t_9f3c1ad2e4b87605c1f3a9d84e2b7c06&timeout=300000
 ```
 
 - Default `timeout`: **30000** ms. Maximum: **300000** ms (5 minutes); larger
@@ -500,7 +500,7 @@ Four things that will bite you:
 
 ```json
 {
-  "next_batch": "s4712",
+  "next_batch": "t_4b1e77c0a9d2f38e5c6071b4ad93e82f",
   "rooms": {
     "join": {
       "!abc:chat.example.com": {
@@ -515,6 +515,12 @@ Four things that will bite you:
   "account_data": {"events": [{"type": "m.direct", "content": {...}}]}
 }
 ```
+
+`prev_batch` is **not** a sync token and keeps the older `s<N>` spelling on
+purpose. It is a position within that one room, which you have already been
+shown, rather than the server-wide head — so it carries none of the cross-room
+information that made the old `next_batch` worth replacing. Feed it to
+`/rooms/{roomId}/messages?from=...` to page backwards; never to `?since=`.
 
 Each timeline event is:
 
