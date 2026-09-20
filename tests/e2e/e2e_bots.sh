@@ -357,12 +357,25 @@ echo "── T4: sync delivery and reply ─────────────
 # Starting position. timeout=0 returns at once; a real bot takes next_batch
 # from this and DISCARDS the events, so a restart does not replay history.
 curl -s -o "$WORK/bot-initial.json" "${BASE}/sync?timeout=0" -H "Authorization: Bearer $BOT_TOKEN"
+# The token is opaque (src/sync/SyncToken.cpp), so the only thing worth
+# asserting is the shape docs/bots.md section 4 publishes: the "t_" prefix plus
+# 32 lowercase hex characters. The length is fixed on both sides — mint hex
+# encodes exactly one 16-byte AES block, and the parser rejects any other
+# length — so pinning it here does not make the check brittle.
+#
+# The legacy "s<n>" spelling is deliberately NOT accepted. The server still
+# reads it, for tokens a bot persisted before September 2026, but it never mints
+# one; a next_batch in that form would be the regression this assertion exists
+# to catch.
+SYNC_TOKEN_RE='^t_[0-9a-f]{32}$'
 SINCE=$(jfield_of "$WORK/bot-initial.json" next_batch)
 [[ -n "$SINCE" ]] || die "bot initial sync returned no next_batch"
-case "$SINCE" in
-  s*) note "initial sync token is s<n>" "$SINCE" ;;
-  *)  fail "initial sync token is s<n>" "got $SINCE" ;;
-esac
+if [[ "$SINCE" =~ $SYNC_TOKEN_RE ]]; then
+  note "initial sync token is opaque (t_)" "$SINCE"
+else
+  fail "initial sync token is opaque (t_)" "got $SINCE"
+fi
+INITIAL_SINCE=$SINCE
 
 # Park the bot's long poll BEFORE the send, which is what a real bot is doing
 # at all times. A 60s timeout with an event-driven wake-up: this returns in
@@ -406,11 +419,14 @@ else
   fail "delivery was event-driven (< 1000 ms)" "${DELIV_MS} ms — /sync is not waking on commit"
 fi
 
+# "Advanced" is an inequality, not arithmetic: the token is opaque and carries
+# no number to subtract. This poll returned because an event landed, so a token
+# equal to the one we sent would mean the position did not move.
 SINCE=$(jfield_of "$WORK/bot-sync.json" next_batch)
-if [[ -n "$SINCE" && "$SINCE" == s* ]]; then
+if [[ "$SINCE" =~ $SYNC_TOKEN_RE && "$SINCE" != "$INITIAL_SINCE" ]]; then
   note "sync token advanced" "$SINCE"
 else
-  fail "sync token advanced" "got '$SINCE'"
+  fail "sync token advanced" "got '$SINCE' (was '$INITIAL_SINCE')"
 fi
 
 # The bot replies: formatted_body plus an m.in_reply_to relation, which is the
