@@ -111,6 +111,45 @@ public:
     SkeletonCollisions count_localpart_skeleton_collisions();
     bool username_exists(const std::string& localpart);
 
+    // ── Linked identity-provider identities ───────────────────────────────
+    //
+    // One human, one account. See migrate_v28 for the shape of the table and
+    // why (issuer, subject) rather than subject alone; see AuthHandler's
+    // handle_link_identity for the two-sided proof that must be presented
+    // before anything here is written.
+    struct LinkedIdentity {
+        std::string issuer;
+        std::string subject;
+        std::string user_id;
+        int64_t linked_at = 0;
+        std::string linked_by;  // the account that performed the link
+    };
+
+    // The account an identity signs in as, or nullopt when it has never been
+    // linked. THIS IS THE READ THE LOGIN PATH MAKES, before it derives an
+    // `oidc_<sub>` id, and it is the whole of the feature from the outside: a
+    // linked identity lands in the account its owner chose, an unlinked one
+    // keeps the old behaviour exactly.
+    std::optional<std::string> find_linked_user(const std::string& issuer,
+                                                const std::string& subject);
+
+    // Records the link. Returns false when this identity is ALREADY linked —
+    // to any account, including this one — and writes nothing.
+    //
+    // The refusal is the table's primary key doing the work rather than a
+    // read-then-write in the handler, so two concurrent link attempts for the
+    // same identity cannot both believe they succeeded. A link is not an
+    // update: re-pointing an identity at a different account is a distinct and
+    // much more dangerous operation (it would move an identity off an account
+    // its owner may no longer control), and it deliberately has no path here.
+    bool link_identity(const std::string& issuer, const std::string& subject,
+                       const std::string& user_id, const std::string& linked_by,
+                       int64_t when_ms);
+
+    // Every identity linked to one account, oldest first. Used to answer the
+    // caller's own GET; never exposed for another user id.
+    std::vector<LinkedIdentity> list_linked_identities(const std::string& user_id);
+
     // Access tokens
     //
     // Tokens are never stored in the clear — only hash_access_token() digests

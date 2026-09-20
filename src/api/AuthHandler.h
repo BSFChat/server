@@ -43,6 +43,21 @@ public:
     // access/refresh pair, rotating both.
     void handle_refresh(const httplib::Request& req, httplib::Response& res);
 
+    // POST /_matrix/client/v3/bsfchat/account/link_identity — attaches an
+    // identity-provider identity to the CALLER's account, so that identity
+    // signs in as this account from now on instead of minting a parallel
+    // `oidc_*` one.
+    //
+    // Requires proof of both sides in the same request: the bearer token for
+    // the account, and a valid id_token for the identity. See the block comment
+    // on the definition for why nothing weaker is acceptable, and for what does
+    // and does not happen to the superseded account.
+    void handle_link_identity(const httplib::Request& req, httplib::Response& res);
+    // GET /_matrix/client/v3/bsfchat/account/linked_identities — the caller's
+    // own links. Issuer and date only; the subject never leaves the database,
+    // and there is no way to ask about another account.
+    void handle_linked_identities(const httplib::Request& req, httplib::Response& res);
+
 private:
     // Configured access-token lifetime, in milliseconds.
     [[nodiscard]] int64_t token_lifetime_ms() const;

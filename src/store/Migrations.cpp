@@ -1650,6 +1650,67 @@ void migrate_v27(sqlite3* db, bool /*fresh_database*/) {
     }
 }
 
+void migrate_v28(sqlite3* db, bool /*fresh_database*/) {
+    // Account linking: which identity-provider identity signs in as which
+    // account.
+    //
+    // Before this table, the m.login.token path derived a user id from the
+    // `sub` claim and created that account if it was missing, every time. One
+    // human with a password account and an identity-provider account therefore
+    // owned two unrelated accounts; on the production deployment, three, one
+    // of them holding admin and the other two holding nothing. This table is
+    // the relationship that was missing.
+    //
+    // KEYED ON (issuer, subject), NOT ON SUBJECT ALONE. `sub` is only unique
+    // within an issuer — it is commonly a short opaque string, and a server
+    // that later adds a second identity provider would otherwise let a subject
+    // minted by the new one collide with an existing link and inherit an
+    // account. The issuer is taken from the VERIFIED token, never from the
+    // request body.
+    //
+    // The primary key is also the security invariant that a linked identity
+    // resolves to exactly one account: a second INSERT for the same identity
+    // fails rather than quietly pointing it somewhere new, so "claim an
+    // identity that is already linked" is refused by the schema and not only
+    // by the handler.
+    exec(db, R"(
+        CREATE TABLE IF NOT EXISTS linked_identities (
+            issuer      TEXT NOT NULL,
+            subject     TEXT NOT NULL,
+            user_id     TEXT NOT NULL REFERENCES users(user_id),
+            linked_at   INTEGER NOT NULL,
+            linked_by   TEXT NOT NULL,
+            PRIMARY KEY (issuer, subject)
+        )
+    )");
+
+    // The reverse lookup, for "which identities does this account sign in
+    // with" — the caller's own listing, and the unlink path when one exists.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_linked_identities_user "
+             "ON linked_identities(user_id)");
+
+    // NOTHING IS BACKFILLED, deliberately, and this is the decision a later
+    // reader is most likely to want explained.
+    //
+    // An existing `@oidc_<sub>:server` account could be matched to its subject
+    // by reversing the localpart sanitiser, and linking it to a local account
+    // automatically would be a guess about which two accounts are the same
+    // human. The only evidence available is the display name — which is
+    // exactly the evidence that is worthless here: on production, "josh" and
+    // "joshb" are the same person, and on a server of any size two accounts
+    // sharing a display name usually are not. A wrong guess merges two
+    // people's histories, roles and DMs, and there is no undo.
+    //
+    // So linking is always an act by the account owner, who proves control of
+    // both sides. Existing duplicates stay separate until their owner links
+    // them. See docs/account-linking.md for the migration story for the three
+    // accounts already on production.
+    get_logger()->info(
+        "Schema v28: identity-provider identities can now be linked to an existing account; "
+        "existing duplicate accounts are untouched and stay separate until their owner links "
+        "them");
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1681,6 +1742,7 @@ const std::vector<Step>& steps() {
         migrate_v25,
         migrate_v26,
         migrate_v27,
+        migrate_v28,
     };
     return kMigrations;
 }

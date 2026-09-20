@@ -1,4 +1,5 @@
 #include "api/AuthHandler.h"
+#include "audit/AuditLog.h"
 #include "auth/AutoJoin.h"
 #include "auth/LocalAuth.h"
 #include "auth/OidcAuth.h"
@@ -51,6 +52,25 @@ std::string sanitize_localpart(const std::string& input) {
         }
     }
     return out;
+}
+
+// The user id an OIDC subject maps to WHEN IT HAS NEVER BEEN LINKED — the
+// "shadow" account the m.login.token path mints on first sign-in. Empty when
+// the subject does not produce a usable id.
+//
+// Factored out because linking has to be able to name the same account the
+// login path would have created, in order to say "this identity currently
+// signs in as @oidc_…, and after this link it will sign in as you". Two copies
+// of this derivation would eventually disagree, and the disagreement would be
+// invisible: the link would be recorded against one id while logins kept
+// landing on another.
+std::string shadow_user_id_for_subject(const std::string& subject,
+                                       const std::string& server_name) {
+    const std::string localpart = "oidc_" + sanitize_localpart(subject);
+    if (localpart == "oidc_") return {};
+    std::string user_id = "@" + localpart + ":" + server_name;
+    if (!UserId::is_valid(user_id)) return {};
+    return user_id;
 }
 
 void send_error(httplib::Response& res, int status, const MatrixError& err) {
@@ -463,14 +483,36 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
             return;
         }
 
-        // Build user_id from the OIDC subject. The subject is provider-chosen
-        // and can contain anything — concatenating it unchecked is how the
-        // "@@josh:" double-@ incident happened. Sanitise to the Matrix
-        // localpart grammar, then validate the assembled id before it reaches
-        // the database.
-        std::string localpart = "oidc_" + sanitize_localpart(claims->sub);
-        std::string user_id = "@" + localpart + ":" + config_.server_name;
-        if (localpart == "oidc_" || !UserId::is_valid(user_id)) {
+        // LINKED IDENTITY FIRST, before any id is derived from the subject.
+        //
+        // This one lookup is the whole of account linking as a signing-in user
+        // experiences it. When the owner of an account has proved control of
+        // both sides (POST /account/link_identity), this identity signs in as
+        // THAT account — with its roles, its DMs and its history — instead of
+        // minting or reusing a parallel `oidc_<sub>` one. When they have not,
+        // the code below runs exactly as it always did.
+        //
+        // Keyed on the VERIFIED issuer from the token, never on the configured
+        // provider URL: the two are normally the same, but a server that
+        // changes provider must not have old links silently start matching
+        // subjects minted by the new one.
+        auto linked = store_.find_linked_user(claims->iss, claims->sub);
+
+        // Unlinked: build user_id from the OIDC subject. The subject is
+        // provider-chosen and can contain anything — concatenating it unchecked
+        // is how the "@@josh:" double-@ incident happened. Sanitise to the
+        // Matrix localpart grammar, then validate the assembled id before it
+        // reaches the database (shadow_user_id_for_subject does both, and
+        // returns empty when the result is unusable).
+        //
+        // Linked: no derivation at all. The id came from a row that was only
+        // written after its owner proved control of the account, the row has a
+        // foreign key to `users`, and the id passed UserId validation when the
+        // account was created.
+        std::string user_id = linked ? *linked
+                                     : shadow_user_id_for_subject(claims->sub,
+                                                                  config_.server_name);
+        if (user_id.empty()) {
             // log_safe: this is the string that just FAILED validation, which is
             // the same shape as the lockout key above and as finding 17's
             // rejected pusher URL. The IdP signed it, but an IdP is not this
@@ -520,8 +562,18 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
             store_.create_user(user_id, ""); // empty hash — cannot log in with password
         }
 
-        // Set display name from claims if available
-        if (claims->name) {
+        // Set display name from claims if available.
+        //
+        // NOT on a linked login, and the omission is deliberate. For a shadow
+        // account the provider's `name` claim is the only profile there is, so
+        // tracking it is right. A LINKED account is somebody's existing
+        // account: they chose its display name here, possibly years ago, and
+        // having it silently overwritten by an IdP directory entry on every
+        // sign-in is both surprising and, on a server where the IdP is
+        // administered by someone else, a way for that administrator to rename
+        // people. The link attaches a sign-in route; it does not hand the
+        // provider the profile.
+        if (!linked && claims->name) {
             store_.set_display_name(user_id, *claims->name);
         }
 
@@ -562,7 +614,18 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
         to_json(resp, login_resp);
         res.set_content(resp.dump(), "application/json");
 
-        get_logger()->info("OIDC user logged in: {} (sub: {})", user_id, claims->sub);
+        // log_safe on the subject, for the reason the rejection path above
+        // already gives: it is provider-chosen bytes, the log pattern is one
+        // record per line, and a signature from the IdP is not a promise about
+        // this server's log format. The success path was the one place it still
+        // reached the log raw.
+        //
+        // "linked" in the line because the single most confusing support
+        // question this feature can produce is "why did signing in with my
+        // BSFChat ID put me in a different account than last week", and the
+        // answer is visible here or nowhere.
+        get_logger()->info("OIDC user logged in: {} (sub: {}){}", user_id,
+                           log_safe(claims->sub), linked ? " [linked]" : "");
 
     } else {
         res.status = 400;
@@ -1068,6 +1131,223 @@ void AuthHandler::handle_whoami(const httplib::Request& req, httplib::Response& 
     if (store_.is_bot(*user_id)) resp[std::string(bot::kProfileKey)] = true;
     res.status = 200;
     res.set_content(resp.dump(), "application/json");
+}
+
+// ── Account linking ───────────────────────────────────────────────────────
+//
+// POST /_matrix/client/v3/bsfchat/account/link_identity
+//   { "type": "m.login.token", "token": "<id_token>" }
+//
+// THE SECURITY PROPERTY, stated once: this endpoint requires the caller to be
+// authenticated as BOTH sides at the same moment. The bearer token proves
+// control of the account that will survive; the id_token in the body, verified
+// against the provider's published keys and this server's own client_id,
+// proves control of the identity being attached. There is no flow in which
+// merely ASSERTING an identity — a subject string, an email, a display name —
+// attaches anything, which is the attack this shape exists to make
+// unrepresentable: if it were enough to name an identity, the first person to
+// name the owner's would inherit the owner's account.
+//
+// Each half alone is already sufficient to sign in as its own side, so holding
+// both is exactly "this is one person with two logins", which is the claim
+// being recorded. Nothing weaker would do, and nothing stronger is available
+// to a self-hosted server with no out-of-band channel to its users.
+//
+// WHAT HAPPENS TO THE ABANDONED ACCOUNT. Nothing is deleted, ever:
+//
+//   * its `users` row stays, so its user id stays TAKEN and can never be
+//     handed to anybody else. Local registration already refuses the `oidc_`
+//     prefix, and create_user would refuse the id anyway — but the row is the
+//     guarantee, not the policy.
+//   * its messages stay exactly where they are, under its own sender id. They
+//     are not rewritten to the surviving account: a rewrite would forge
+//     history (it would make the surviving account appear to have said things
+//     it never said, in rooms it may never have been in) and it would have to
+//     touch every event, redaction, read marker, mention and push record that
+//     names the old sender. Old messages keep showing the old name. That is
+//     honest, and it is the same thing every other account-merge in this
+//     product's category does.
+//   * its live sessions are revoked, because after this request the person has
+//     one account and a still-valid token for the other one is a session they
+//     did not ask to keep.
+//   * it becomes unreachable as a LOGIN: the identity that used to mint it now
+//     resolves through the link table, and the account has an empty password
+//     hash, so no m.login.password will ever authenticate it either.
+void AuthHandler::handle_link_identity(const httplib::Request& req, httplib::Response& res) {
+    // Half one: who is asking. Before anything expensive, and before the body
+    // is parsed at all.
+    auto actor = authenticate(store_, req.get_header_value("Authorization"));
+    if (!actor) {
+        res.status = 401;
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(),
+                        "application/json");
+        return;
+    }
+
+    // Rate-limited on the same per-address budget as /login, because the work
+    // is the same work: an id_token verification, and possibly a JWKS fetch.
+    // An authenticated endpoint is still an endpoint one account can hammer.
+    const auto client = client_key(req);
+    if (over_attempt_limit("link_identity", client, res)) return;
+
+    if (!oidc_auth_) {
+        send_error(res, 400, MatrixError::unknown("This server has no identity provider "
+                                                  "configured, so there is nothing to link"));
+        return;
+    }
+
+    // A bot is not a person and has no identity-provider account. Refused
+    // explicitly rather than left to fail further down, because "a bot token
+    // can attach a human identity to the bot" is the kind of thing that only
+    // looks harmless until somebody notices the bot then signs in as a human.
+    if (store_.is_bot(*actor)) {
+        send_error(res, 403, MatrixError::forbidden("Bot accounts cannot link an identity"));
+        return;
+    }
+
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (...) {
+        send_error(res, 400, MatrixError::bad_json());
+        return;
+    }
+    // `type` is required and must be m.login.token, mirroring /login's body.
+    // Accepting a bare token would leave no room to add a second proof shape
+    // later without guessing what an old client meant.
+    if (!body.is_object() || body.value("type", "") != "m.login.token" ||
+        !body.contains("token") || !body["token"].is_string()) {
+        send_error(res, 400, MatrixError::bad_json(
+            "Expected {\"type\": \"m.login.token\", \"token\": \"<id_token>\"}"));
+        return;
+    }
+
+    // Half two: control of the identity. Verified with the SAME call the login
+    // path makes — same keys, same issuer, same audience — so an id_token that
+    // could not sign anybody in cannot link anything either.
+    const std::string expected_audience =
+        config_.identity ? config_.identity->client_id : std::string();
+    auto claims = oidc_auth_->validate_token(body["token"].get<std::string>(), expected_audience);
+    if (!claims) {
+        record_failure(client, {});
+        send_error(res, 403, MatrixError::forbidden("Invalid identity token"));
+        return;
+    }
+
+    // A banned account cannot acquire a new way to sign in, and a banned
+    // shadow account cannot be laundered into an unbanned one by linking its
+    // identity somewhere else. Both directions, because a ban is on a person
+    // as much as on a row, and linking is the one operation that moves a login
+    // between rows.
+    const std::string shadow = shadow_user_id_for_subject(claims->sub, config_.server_name);
+    if (store_.is_server_banned(*actor) ||
+        (!shadow.empty() && store_.is_server_banned(shadow))) {
+        get_logger()->info("Refused identity link for banned user {}", *actor);
+        send_error(res, 403, MatrixError::forbidden("You are banned from this server"));
+        return;
+    }
+
+    // Already linked? Three distinct answers, and they must stay distinct.
+    if (auto existing = store_.find_linked_user(claims->iss, claims->sub)) {
+        if (*existing == *actor) {
+            // Idempotent. A client retrying a request whose response it lost
+            // must not be told its own link is a conflict.
+            res.status = 200;
+            res.set_content(json{{"user_id", *actor}, {"already_linked", true}}.dump(),
+                            "application/json");
+            return;
+        }
+        // Linked elsewhere. Says so WITHOUT naming the other account: the
+        // caller has just proved control of the identity, not of whatever
+        // account somebody attached it to, and "this identity belongs to
+        // @alice" is not a fact this endpoint gets to disclose. An operator
+        // can read the audit log.
+        get_logger()->warn("Refused identity link for {}: that identity is already linked "
+                           "to another account", *actor);
+        send_error(res, 409, MatrixError::user_in_use(
+            "That identity is already linked to an account on this server. Sign in with it "
+            "to reach that account, or ask an administrator."));
+        return;
+    }
+
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    if (!store_.link_identity(claims->iss, claims->sub, *actor, *actor, now)) {
+        // Lost a race with a concurrent link of the same identity. The row that
+        // won is authoritative; report the conflict rather than reporting
+        // success for a link this request did not make.
+        send_error(res, 409, MatrixError::user_in_use(
+            "That identity was linked to an account while this request was in flight."));
+        return;
+    }
+
+    // The shadow account, if one was ever created for this identity. Revoking
+    // its sessions is the only thing done TO it — see the block comment above
+    // for everything deliberately not done.
+    //
+    // Skipped when the shadow IS the caller: an account linking the identity
+    // it already signs in as would otherwise log itself out mid-request. That
+    // is a legitimate thing to do (it pins the mapping so a later localpart
+    // change cannot move it), just not a reason to end the session.
+    std::string superseded;
+    if (!shadow.empty() && shadow != *actor && store_.user_exists(shadow)) {
+        superseded = shadow;
+        const int revoked = store_.delete_all_tokens_for_user(shadow);
+        get_logger()->info("Identity linked to {}; superseded account {} keeps its user id and "
+                           "its messages, and had {} session(s) revoked",
+                           *actor, shadow, revoked);
+    } else {
+        get_logger()->info("Identity linked to {}", *actor);
+    }
+
+    // Audited. The subject is not passed and cannot be: audit_account_link
+    // takes the pieces and assembles the payload itself. See
+    // audit_action::kAccountLink for why the superseded user id, which is
+    // derived from the subject, is nonetheless the right thing to record.
+    audit_account_link(store_, *actor, claims->iss, superseded);
+
+    json resp = {
+        {"user_id", *actor},
+        {"issuer", claims->iss},
+    };
+    // Named so the client can explain the consequence rather than making the
+    // user discover it: "your old @oidc_… account will no longer be signed
+    // into; its messages stay where they are".
+    if (!superseded.empty()) resp["superseded_user_id"] = superseded;
+    res.status = 200;
+    res.set_content(resp.dump(), "application/json");
+}
+
+void AuthHandler::handle_linked_identities(const httplib::Request& req, httplib::Response& res) {
+    auto actor = authenticate(store_, req.get_header_value("Authorization"));
+    if (!actor) {
+        res.status = 401;
+        res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(),
+                        "application/json");
+        return;
+    }
+
+    // The CALLER's own links, with no way to ask about anybody else's. There is
+    // deliberately no user id parameter and no admin-scoped variant: "which
+    // identity-provider account is @josh?" is a question about a person's
+    // presence on another system, and a chat server that answers it has made
+    // itself into a correlation service for whoever holds MANAGE_SERVER.
+    auto links = store_.list_linked_identities(*actor);
+
+    json out = json::array();
+    for (const auto& link : links) {
+        // The SUBJECT IS NOT RETURNED, even to its own owner. A client has no
+        // use for it — it renders "signed in with <issuer>, linked on <date>" —
+        // and an opaque provider identifier that never leaves the database is
+        // one that cannot leak from a client log, a screenshot or a bug report.
+        out.push_back({
+            {"issuer", link.issuer},
+            {"linked_at", link.linked_at},
+        });
+    }
+    res.status = 200;
+    res.set_content(json{{"identities", out}}.dump(), "application/json");
 }
 
 } // namespace bsfchat

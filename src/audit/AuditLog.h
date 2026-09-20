@@ -87,6 +87,26 @@ constexpr const char* kBotCreate = "bot.create";
 constexpr const char* kBotTokenRotate = "bot.token.rotate";
 constexpr const char* kBotDeactivate = "bot.deactivate";
 
+// An identity-provider identity being attached to an account
+// (POST /account/link_identity). Recorded because it changes WHO CAN SIGN IN
+// as an account — which, for an account holding admin, is the same class of
+// event as handing out the admin role, and the same question gets asked about
+// it six months later.
+//
+// THE OIDC SUBJECT IS NOT RECORDED AS A CLAIM OF ITS OWN, and callers must
+// not put it in the payload. The audit log is readable by every MANAGE_SERVER
+// holder and has no delete path, so a subject written here is a permanent,
+// widely-readable identifier for a person at their identity provider — one
+// this server has no need to keep. Same reasoning as the bot-token rule below.
+//
+// The one thing that looks like an exception and is not: `superseded_user_id`
+// is a user id of the form `@oidc_<sanitised sub>:server`, from which the
+// subject is legible. That is recorded deliberately. It is an account id on
+// THIS server — already in every member list and on every message that account
+// sent — and saying which account lost its sign-in route is the whole content
+// of the record. Omitting it would protect nothing and destroy the entry.
+constexpr const char* kAccountLink = "account.link";
+
 constexpr const char* kChannelDelete = "channel.delete";
 constexpr const char* kCategoryDelete = "category.delete";
 // A change to what KIND of room this is (bsfchat.room.type): text, voice or
@@ -179,6 +199,17 @@ void audit_bot_lifecycle(SqliteStore& store, const std::string& actor,
 // that did not land.
 void audit_voice_rekey(SqliteStore& store, const std::string& actor,
                        const std::string& room_id, uint64_t before, uint64_t after);
+
+// Records one identity link. `actor` is the account that proved control of
+// both sides and is also the account the identity now signs in as; `issuer` is
+// the verified `iss` claim; `superseded_user_id` is the shadow `oidc_*`
+// account this link makes unreachable, or empty when there was none.
+//
+// Takes the pieces rather than a pre-built JSON blob specifically so no call
+// site can pass the subject through by accident. See kAccountLink.
+void audit_account_link(SqliteStore& store, const std::string& actor,
+                        const std::string& issuer,
+                        const std::string& superseded_user_id);
 
 // Records a change to server-scoped state (bsfchat.server.roles /
 // bsfchat.member.roles). Called from write_server_scoped_state, which is the one

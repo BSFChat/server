@@ -713,6 +713,67 @@ bool SqliteStore::username_exists(const std::string& localpart) {
     return sqlite3_step(stmt.get()) == SQLITE_ROW;
 }
 
+// Linked identity-provider identities
+
+std::optional<std::string> SqliteStore::find_linked_user(const std::string& issuer,
+                                                          const std::string& subject) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT user_id FROM linked_identities WHERE issuer = ? AND subject = ?");
+    sqlite3_bind_text(stmt.get(), 1, issuer.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, subject.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        return reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+    }
+    return std::nullopt;
+}
+
+bool SqliteStore::link_identity(const std::string& issuer, const std::string& subject,
+                                 const std::string& user_id, const std::string& linked_by,
+                                 int64_t when_ms) {
+    std::lock_guard lock(mutex_);
+    // Plain INSERT: no ON CONFLICT clause, and that omission is the point. An
+    // upsert here would silently re-point an identity that is already linked
+    // at whichever account asked last, which is the one operation this feature
+    // must never perform — the losing account would keep its roles and history
+    // while quietly losing the only way its owner signs in.
+    auto stmt = prepare(db_,
+        "INSERT OR IGNORE INTO linked_identities "
+        "(issuer, subject, user_id, linked_at, linked_by) VALUES (?, ?, ?, ?, ?)");
+    sqlite3_bind_text(stmt.get(), 1, issuer.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, subject.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 4, when_ms);
+    sqlite3_bind_text(stmt.get(), 5, linked_by.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        throw std::runtime_error(std::string("Failed to link identity: ") + sqlite3_errmsg(db_));
+    }
+    // sqlite3_changes(), not a preceding SELECT: whichever of two racing
+    // callers actually inserted the row is the one told it succeeded, and the
+    // other gets false and reports the conflict.
+    return sqlite3_changes(db_) > 0;
+}
+
+std::vector<SqliteStore::LinkedIdentity>
+SqliteStore::list_linked_identities(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT issuer, subject, user_id, linked_at, linked_by FROM linked_identities "
+        "WHERE user_id = ? ORDER BY linked_at ASC");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    std::vector<LinkedIdentity> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        LinkedIdentity row;
+        row.issuer = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+        row.subject = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 1));
+        row.user_id = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 2));
+        row.linked_at = sqlite3_column_int64(stmt.get(), 3);
+        row.linked_by = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 4));
+        out.push_back(std::move(row));
+    }
+    return out;
+}
+
 // Access tokens
 //
 // Only SHA-256 digests of tokens ever reach the database; see
