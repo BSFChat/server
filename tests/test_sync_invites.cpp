@@ -6,8 +6,13 @@
 // matched no row on any stream they polled: the only way to find out you had
 // been invited was to be told out of band and then guess the room id.
 //
-// (Bots were never affected — inviting a bot joins it outright, so it sees an
-// ordinary join. This is the human path, which keeps plain invite semantics.)
+// (Bots were never affected and stay exempt — inviting a bot joins it outright,
+// so it sees an ordinary join and never holds a row this section could carry.
+// Note that the exemption no longer rests on a bot being unable to SEE an
+// invite, which is what the section below makes possible; it rests on nothing
+// on the bot side accepting one. The reasoning is at RoomHandler.cpp's bot
+// branch in handle_invite. This is the human path, which keeps plain invite
+// semantics.)
 //
 // The properties under test, in the order they appear below:
 //   1. An invite reaches the invitee's /sync, in rooms.invite, and the room
