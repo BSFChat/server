@@ -220,6 +220,19 @@ struct MembershipIntent {
     // before it creates anything, which makes a ban on an unregistered id a
     // reservation rather than a mistake. See kNoSuchAccount.
     bool require_target_exists = false;
+    // An already-joined target means this request has nothing to do, so it
+    // writes nothing and succeeds. Set on the INVITE intent only, and only for
+    // an existing `join`: every other intent here is a DELIBERATE downgrade of
+    // a joined member (kick, ban) and must keep working on one.
+    //
+    // Without it the state route carried the same defect as the dedicated
+    // invite endpoint. classify_transition folds "invite" and "join" into one
+    // intent that asserts nothing about `before`, so
+    // PUT /state/m.room.member/{user} with {"membership":"invite"} fell through
+    // to the unconditional set_membership below and demoted a joined member —
+    // the same bug, the same room, a different URL, reachable by any Matrix
+    // client that writes member state directly instead of using /invite.
+    bool no_op_on_existing_join = false;
     // Stamps kRemovedByKey onto the member event this writes, so /join can tell
     // "a moderator removed you" from every other way a row reads `leave`.
     // See kRemovedByKey for why the sender is not enough on its own.
@@ -280,6 +293,9 @@ MembershipIntent invite_intent() {
     // bug, because an invite row at least stays out of the joined-member counts
     // and the presence sweep while a join does not.
     i.require_target_exists = true;
+    // See the field: this is the only intent that can be asked for a state the
+    // target is already in, and the only one whose write would WEAKEN it.
+    i.no_op_on_existing_join = true;
     i.verb = "invite";
     return i;
 }
@@ -451,6 +467,24 @@ RoomHandler::ModerationResult RoomHandler::apply_membership_moderation(
     ModerationResult ok;
     ok.ok = true;
     ok.status = 200;
+
+    // Nothing to do. Ordered here — after every refusal, before every write —
+    // so an unauthorised caller still gets the refusal it would have got, and
+    // no caller can use this shortcut to skip a check.
+    //
+    // Answers with the id of the member event that ALREADY says so, rather than
+    // an empty string: the state route's contract is "here is the event that
+    // holds the state you asked for", and that event exists. No new event and
+    // no audit record, for the reason the bot invite gives — a duplicate join
+    // event renders as the member arriving twice, and a record of a change that
+    // did not happen is worse than no record.
+    if (intent.no_op_on_existing_join && before == membership::kJoin) {
+        if (auto existing = store_.get_state_event(room_id, std::string(event_type::kRoomMember),
+                                                   target_user)) {
+            ok.event_id = existing->event_id;
+        }
+        return ok;
+    }
 
     if (intent.places_server_ban) {
         // The ban list first, then the sessions, then the projection. Both
@@ -1584,6 +1618,54 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
         res.set_content("{}", "application/json");
         get_logger()->info("User {} invited bot {} to room {}; joined immediately "
                            "(a bot has no human to accept an invite)",
+                           *user_id, target_user, room_id);
+        return;
+    }
+
+    // Idempotent for somebody who is ALREADY IN the channel, for the same reason
+    // the bot branch above is: what the caller asked for already holds, so the
+    // only thing left to decide is what to do with the request.
+    //
+    // Doing the write anyway was the bug, and it was a DEMOTION rather than a
+    // harmless repeat. set_membership is a blind upsert, so an 'invite' written
+    // over a 'join' row took a full member back down to an invitee, and every
+    // projection that reads membership is join-only: the channel left their
+    // /sync rooms.join and came back as a bare invite card with no timeline
+    // (get_joined_rooms / get_invited_rooms), can_read_room started refusing
+    // /state, /state/{type} and /members, sending a message and joining voice
+    // answered "Not a member of this room", they dropped out of the presence
+    // sweep and out of joined_member_count. None of it was audited, because the
+    // human invite path writes no audit record at all — so a member could be
+    // removed from a channel by a moderator clicking "add member", and the only
+    // trace was an m.room.member event saying `invite`.
+    //
+    // The client's add-member dialog has been refusing this case out of its
+    // roster cache since the dialog was built, purely because the server would
+    // not (ChannelInviteModel). That guard is best-effort — a cache miss falls
+    // through to here — so it was never the fix.
+    //
+    // 200 with an empty body, NOT a refusal. "Add this person to this channel"
+    // when they are already in it is not an error in any UI that offers the
+    // gesture over a list of people, which is why the bot branch answers this
+    // way, and answering the same way here is what lets one client path handle
+    // both. A refusal would also have to be a SEVENTH sentence behind this
+    // endpoint's single M_FORBIDDEN errcode, which the client disambiguates by
+    // matching on the text (ChannelInviteModel::explainFailure) — a contract
+    // change for a case that is not a failure.
+    //
+    // JOIN ONLY, and this is the part to get right. Re-inviting is the
+    // documented way to re-admit somebody a moderator kicked, and a kicked
+    // user's row says 'leave', not 'join'. is_room_member() is join-only, so
+    // this cannot fire for them and the write below still happens — which is
+    // precisely what clears the removal, because was_removed_by_moderator reads
+    // the CURRENT m.room.member event and the fresh invite content carries no
+    // kRemovedByKey. Widening this to "has a membership row" or "is not banned"
+    // would make every kick permanent while this endpoint went on answering
+    // 200, with /join's refusal as the only symptom.
+    // KickEnforcement.AnInviteAfterAKickReadmits is the test that says so.
+    if (store_.is_room_member(room_id, target_user)) {
+        res.set_content("{}", "application/json");
+        get_logger()->info("User {} invited {} to room {}; already a member, nothing written",
                            *user_id, target_user, room_id);
         return;
     }
