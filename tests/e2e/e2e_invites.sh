@@ -154,6 +154,25 @@ sync_to() { # sync_to TOKEN SINCE FILE [TIMEOUT]
   curl -s -o "$3" -X GET "${BASE}/sync${q}" -H "Authorization: Bearer $1"
 }
 
+# Same request, but the poll TIMES ITSELF and the span lands in $SPAN_MS.
+#
+# T4 and T5 below both turn on how long a poll blocked, and they used to get
+# that by shelling out to `python3 -c 'import time'` on either side of the
+# call. Two interpreter starts inside the measured interval is tens of
+# milliseconds on an idle box and can be hundreds on a busy one, which is
+# noise the server did not produce. curl's %{time_total} is measured inside
+# the process that made the request, so what comes back is the poll and
+# nothing else. The one python3 call left converts the result afterwards,
+# outside the interval.
+SPAN_MS=0
+sync_to_timed() { # sync_to_timed TOKEN SINCE FILE TIMEOUT -> sets SPAN_MS
+  local q="?timeout=${4}"
+  [[ -n "$2" ]] && q="${q}&since=$2"
+  curl -s -o "$3" -w '%{time_total}' -X GET "${BASE}/sync${q}" \
+    -H "Authorization: Bearer $1" > "$3.t"
+  SPAN_MS=$(python3 -c "print(int(float(open('$3.t').read().strip())*1000))" 2>/dev/null || echo 0)
+}
+
 # The invite assertions all reduce to questions about one /sync body, so they go
 # through one python helper rather than a pile of greps: "grep -q invite" would
 # pass on the word appearing anywhere, including in a join_rule.
@@ -310,16 +329,22 @@ echo "── T4: a restated invite must not turn the long poll into a spin ─�
 
 # An invite counted as payload would return instantly, forever, for as long as
 # it stayed unanswered. This poll must block for its timeout instead.
+#
+# This is a LOWER bound, so a slow or loaded machine cannot break it: load only
+# ever makes a poll take longer. Timing it with curl rather than with clock
+# reads on either side of it removes the interpreter starts that used to pad
+# the figure, which makes the floor a slightly sharper statement about the
+# server than it was before.
 sync_to "$T_BOB" "$HEAD" "$WORK/bob-head2.json"
 HEAD2=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["next_batch"])' "$WORK/bob-head2.json")
-START=$(python3 -c 'import time;print(int(time.time()*1000))')
-sync_to "$T_BOB" "$HEAD2" "$WORK/bob-4.json" 1500
-ELAPSED=$(python3 -c "import time;print(int(time.time()*1000)-$START)")
+T4_TIMEOUT=1500
+sync_to_timed "$T_BOB" "$HEAD2" "$WORK/bob-4.json" "$T4_TIMEOUT"
+T4_IDLE_MS=$SPAN_MS
 CHECKS=$((CHECKS+1))
-if [[ "$ELAPSED" -ge 1200 ]]; then
-  printf 'ok   %-62s %sms\n' "the poll parked rather than returning on the invite" "$ELAPSED"
+if [[ "$T4_IDLE_MS" -ge 1200 ]]; then
+  printf 'ok   %-62s %sms\n' "the poll parked rather than returning on the invite" "$T4_IDLE_MS"
 else
-  printf 'FAIL %-62s returned after %sms\n' "the poll span on a restated invite" "$ELAPSED"
+  printf 'FAIL %-62s returned after %sms\n' "the poll span on a restated invite" "$T4_IDLE_MS"
   FAILURES=$((FAILURES+1))
 fi
 check "...and the idle reply still carries the invite" "yes" \
@@ -333,20 +358,37 @@ ROOM2=$(create_private_room "$T_ALICE" strategy)
 sync_to "$T_BOB" "" "$WORK/bob-5a.json"
 SINCE2=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["next_batch"])' "$WORK/bob-5a.json")
 
-START=$(python3 -c 'import time;print(int(time.time()*1000))')
-sync_to "$T_BOB" "$SINCE2" "$WORK/bob-5.json" 20000 &
+# The property is "woken by the event, not by the clock", and the only two
+# outcomes the code can produce are ~1s (the sleep below, plus a condition
+# variable being signalled) and the full T5_TIMEOUT. There is nothing in
+# between, so the budget does not need to be tight — it needs to sit
+# unambiguously between the two, which is what half the timeout does.
+#
+# The old budget was a flat 6000 ms against a 20000 ms timeout. That is the
+# same shape, but 5s of it was slack over a 1s sleep measured with two
+# interpreter starts stapled on, and it flaked under concurrent load. Half the
+# timeout is expressed against the thing it is actually distinguishing, so it
+# stays correct if the timeout is ever changed, and it leaves 9s of headroom
+# for a busy box instead of 5s. A regression still lands at 20000 ms: 2x over.
+T5_TIMEOUT=20000
+T5_BUDGET_MS=$(( T5_TIMEOUT / 2 ))
+sync_to_timed "$T_BOB" "$SINCE2" "$WORK/bob-5.json" "$T5_TIMEOUT" &
 POLL=$!
 sleep 1
 req POST "/rooms/$ROOM2/invite" "$T_ALICE" "{\"user_id\":\"$B\"}" > /dev/null
 wait $POLL
-ELAPSED=$(python3 -c "import time;print(int(time.time()*1000)-$START)")
+# sync_to_timed ran in a subshell, so SPAN_MS did not survive; read the span
+# curl left behind next to the body instead.
+ELAPSED=$(python3 -c "print(int(float(open('$WORK/bob-5.json.t').read().strip())*1000))" 2>/dev/null || echo 0)
 check "the parked poll came back with the invite" "yes" \
   "$(probe "$WORK/bob-5.json" "$ROOM2" invited)"
 CHECKS=$((CHECKS+1))
-if [[ "$ELAPSED" -lt 6000 ]]; then
-  printf 'ok   %-62s %sms\n' "...promptly, not at the poll timeout" "$ELAPSED"
+if [[ "$ELAPSED" -lt "$T5_BUDGET_MS" ]]; then
+  printf 'ok   %-62s %sms (unwoken poll in T4: %sms)\n' \
+    "...promptly, not at the poll timeout" "$ELAPSED" "$T4_IDLE_MS"
 else
-  printf 'FAIL %-62s took %sms (poll timeout was 20000)\n' "the invite waited out the poll" "$ELAPSED"
+  printf 'FAIL %-62s took %sms (poll timeout was %s)\n' \
+    "the invite waited out the poll" "$ELAPSED" "$T5_TIMEOUT"
   FAILURES=$((FAILURES+1))
 fi
 
