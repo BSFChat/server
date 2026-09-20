@@ -67,13 +67,18 @@ struct MentionFixture {
     }
 
     // Redefines the @everyone role, which is what every user inherits.
-    void set_roles(permission::Flags everyone_flags, permission::Flags mod_flags = 0) {
+    // `mod_mentionable` sets the Moderator role's `mentionable` switch — the one
+    // that used to be inert. `everyone_mentionable` exists only so a test can
+    // prove that flipping it on @everyone is still not a way to ping everyone.
+    void set_roles(permission::Flags everyone_flags, permission::Flags mod_flags = 0,
+                   bool mod_mentionable = false, bool everyone_mentionable = false) {
         ServerRolesContent roles;
         ServerRole everyone;
         everyone.id = permission::role_id::kEveryone;
         everyone.name = "@everyone";
         everyone.position = 0;
         everyone.permissions = everyone_flags;
+        everyone.mentionable = everyone_mentionable;
         roles.roles.push_back(everyone);
         if (mod_flags != 0) {
             ServerRole mod;
@@ -81,12 +86,50 @@ struct MentionFixture {
             mod.name = "Moderator";
             mod.position = 10;
             mod.permissions = mod_flags;
+            mod.mentionable = mod_mentionable;
             roles.roles.push_back(mod);
         }
         json j;
         to_json(j, roles);
         store->set_server_state(std::string(event_type::kServerRoles), "", "@server:test",
                                 j.dump());
+    }
+
+    // Appends a role to whatever set_roles() last wrote. For the cases that
+    // need a role the well-known ids cannot express.
+    void define_role(const std::string& id, bool mentionable) {
+        auto existing = store->get_server_roles();
+        ServerRolesContent roles;
+        roles.roles = std::move(existing);
+        ServerRole r;
+        r.id = id;
+        r.name = id;
+        r.position = 5;
+        r.permissions = permission::kEveryoneDefault;
+        r.mentionable = mentionable;
+        roles.roles.push_back(r);
+        json j;
+        to_json(j, roles);
+        store->set_server_state(std::string(event_type::kServerRoles), "", "@server:test",
+                                j.dump());
+    }
+
+    void grant_exact(const std::string& user_id, const std::vector<std::string>& role_ids) {
+        MemberRolesContent c;
+        c.role_ids = role_ids;
+        json j;
+        to_json(j, c);
+        store->set_server_state(std::string(event_type::kMemberRoles), user_id, "@server:test",
+                                j.dump());
+    }
+
+    // A message naming `role_ids`, in the shape the client sends.
+    static json role_mention(const std::string& body,
+                             const std::vector<std::string>& role_ids) {
+        return {{"msgtype", "m.text"},
+                {"body", body},
+                {"m.mentions",
+                 {{std::string(mention::kRoleIdsKey), json(role_ids)}}}};
     }
 
     void grant(const std::string& user_id, const std::string& role_id) {
@@ -614,4 +657,289 @@ TEST(Mentions, SchemaVersionCoversTheMentionTables) {
     // is only true if the migration ran.
     EXPECT_EQ(store.count_unread_mentions("@nobody:test", "!nowhere:test"), 0);
     EXPECT_TRUE(store.get_event_mentions("$none").empty());
+}
+
+// ── Role mentions ─────────────────────────────────────────────────────────
+//
+// The permission rule under test is Discord's, and it has two halves:
+//   * `mentionable` is the gate for everybody;
+//   * MENTION_EVERYONE is an override for the case the gate exists for.
+// See the block comment above MentionSet in EventHandler.cpp for why that rule
+// and not one of the other three that were available.
+
+TEST(RoleMentions, MentionableRoleBadgesEveryHolder) {
+    MentionFixture f;
+    f.set_roles(permission::kEveryoneDefault, permission::kEveryoneDefault,
+                /*mod_mentionable=*/true);
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+    auto dave = f.add_user("dave");
+    f.grant(bob, permission::role_id::kModerator);
+    f.grant(carol, permission::role_id::kModerator);
+
+    // Alice holds no special permission at all — the role being mentionable is
+    // the whole of her authority to ping it.
+    ASSERT_TRUE(IsOk(f.send("alice",
+                            MentionFixture::role_mention("@Moderator can someone look",
+                                                         {permission::role_id::kModerator}),
+                            "t1")));
+
+    EXPECT_EQ(f.store->count_unread_mentions(bob, MentionFixture::kRoom), 1);
+    EXPECT_EQ(f.store->count_unread_mentions(carol, MentionFixture::kRoom), 1);
+    // Dave holds no role, so nothing was aimed at him.
+    EXPECT_EQ(f.store->count_unread_mentions(dave, MentionFixture::kRoom), 0);
+    // And the sender is never badged by her own message, even via a role.
+    EXPECT_EQ(f.store->count_unread_mentions(alice, MentionFixture::kRoom), 0);
+}
+
+TEST(RoleMentions, ItIsOneStoredRowHoweverManyMembersHoldTheRole) {
+    MentionFixture f;
+    f.set_roles(permission::kEveryoneDefault, permission::kEveryoneDefault,
+                /*mod_mentionable=*/true);
+    f.add_user("alice");
+    for (const char* who : {"bob", "carol", "dave", "erin"}) {
+        f.grant(f.add_user(who), permission::role_id::kModerator);
+    }
+
+    auto res = f.send("alice",
+                      MentionFixture::role_mention("@Moderator", {permission::role_id::kModerator}),
+                      "t1");
+    ASSERT_TRUE(IsOk(res));
+
+    // THE fan-out property. Four holders, one row. If this ever becomes four
+    // rows, a role with five hundred members writes five hundred rows on the
+    // request thread under the store's global mutex, per message.
+    auto rows = f.store->get_event_mentions(MentionFixture::event_id_of(res));
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows[0], std::string("@role/") + permission::role_id::kModerator);
+}
+
+TEST(RoleMentions, ANonMentionableRoleNotifiesNobody) {
+    MentionFixture f;
+    // mentionable defaults to false here, which is the state the switch ships
+    // in for a custom role.
+    f.set_roles(permission::kEveryoneDefault, permission::kEveryoneDefault,
+                /*mod_mentionable=*/false);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+    f.grant(bob, permission::role_id::kModerator);
+
+    // The send SUCCEEDS — the message is not lost and the text is not rewritten.
+    // It simply notifies nobody. (The client renders the token as plain text;
+    // see MentionRenderer.)
+    auto res = f.send("alice",
+                      MentionFixture::role_mention("@Moderator wake up",
+                                                   {permission::role_id::kModerator}),
+                      "t1");
+    ASSERT_TRUE(IsOk(res));
+    EXPECT_EQ(f.store->count_unread_mentions(bob, MentionFixture::kRoom), 0)
+        << "a role with mentionable=false notified a holder";
+    EXPECT_TRUE(f.store->get_event_mentions(MentionFixture::event_id_of(res)).empty());
+    // And the body is untouched, so the mention still reads as words.
+    auto stored = f.store->get_event_by_id(MentionFixture::event_id_of(res));
+    ASSERT_TRUE(stored.has_value());
+    EXPECT_NE(stored->content.data.value("body", "").find("@Moderator"), std::string::npos);
+}
+
+TEST(RoleMentions, MentionEveryoneOverridesTheMentionableFlag) {
+    MentionFixture f;
+    // Alice gets MENTION_EVERYONE; the role stays locked.
+    f.set_roles(permission::kEveryoneDefault | permission::kMentionEveryone,
+                permission::kEveryoneDefault, /*mod_mentionable=*/false);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+    f.grant(bob, permission::role_id::kModerator);
+
+    ASSERT_TRUE(IsOk(f.send("alice",
+                            MentionFixture::role_mention("@Moderator, incident",
+                                                         {permission::role_id::kModerator}),
+                            "t1")));
+    // The override exists so that a locked role is still reachable by someone
+    // who could already ping strictly more people with @room.
+    EXPECT_EQ(f.store->count_unread_mentions(bob, MentionFixture::kRoom), 1);
+}
+
+TEST(RoleMentions, AHolderWithoutViewChannelIsNeverBadged) {
+    MentionFixture f;
+    f.set_roles(permission::kEveryoneDefault, permission::kEveryoneDefault,
+                /*mod_mentionable=*/true);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+    f.grant(bob, permission::role_id::kModerator);
+    f.grant(carol, permission::role_id::kModerator);
+    // Bob holds the role but is shut out of this channel.
+    f.deny_view(bob);
+
+    ASSERT_TRUE(IsOk(f.send("alice",
+                            MentionFixture::role_mention("@Moderator",
+                                                         {permission::role_id::kModerator}),
+                            "t1")));
+
+    // A direct mention is filtered when it is WRITTEN; a role mention cannot be,
+    // because the stored row names nobody. So the filter has to hold at every
+    // point the count is DELIVERED, and /sync is one of them: Bob must not be
+    // told that a message exists in a channel he cannot open.
+    EXPECT_EQ(f.highlight_from_sync(bob), -1)
+        << "a channel Bob cannot view appeared in his sync at all";
+    // Carol, who can see the channel, gets the badge — the test would pass
+    // vacuously if the role mention had simply not worked.
+    EXPECT_EQ(f.highlight_from_sync(carol), 1);
+}
+
+TEST(RoleMentions, TheEveryoneRoleIsNotMentionableAsARole) {
+    MentionFixture f;
+    // The @everyone role with its mentionable switch turned ON — which the role
+    // editor will happily let an admin do once role CRUD lands. That must not
+    // become a way around the MENTION_EVERYONE gate on `room: true`.
+    f.set_roles(permission::kEveryoneDefault, /*mod_flags=*/0, /*mod_mentionable=*/false,
+                /*everyone_mentionable=*/true);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+
+    // The body deliberately avoids the literal "@everyone": that string is
+    // scraped and gated separately (body_mentions_everyone), and a 403 from
+    // THAT check would make this test pass without exercising the role path.
+    auto res = f.send("alice",
+                      MentionFixture::role_mention("hi all",
+                                                   {permission::role_id::kEveryone}),
+                      "t1");
+    ASSERT_TRUE(IsOk(res));
+    EXPECT_EQ(f.store->count_unread_mentions(bob, MentionFixture::kRoom), 0)
+        << "@everyone was pingable as a role, bypassing MENTION_EVERYONE";
+    EXPECT_TRUE(f.store->get_event_mentions(MentionFixture::event_id_of(res)).empty());
+}
+
+TEST(RoleMentions, RoleSentinelCannotBeForgedThroughUserIds) {
+    MentionFixture f;
+    f.set_roles(permission::kEveryoneDefault, permission::kEveryoneDefault,
+                /*mod_mentionable=*/false);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+    f.grant(bob, permission::role_id::kModerator);
+
+    // Alice may not mention the locked role, so she tries to write its storage
+    // key straight into user_ids instead.
+    ASSERT_TRUE(IsOk(f.send(
+        "alice",
+        {{"msgtype", "m.text"},
+         {"body", "sneaky"},
+         {"m.mentions",
+          {{"user_ids", json::array({std::string("@role/") + permission::role_id::kModerator,
+                                     carol})}}}},
+        "t1")));
+
+    EXPECT_EQ(f.store->count_unread_mentions(bob, MentionFixture::kRoom), 0)
+        << "a role sentinel spelled into user_ids pinged the role";
+    // Carol was named legitimately and is still badged — the sentinel was
+    // discarded, not the whole list.
+    EXPECT_EQ(f.store->count_unread_mentions(carol, MentionFixture::kRoom), 1);
+}
+
+TEST(RoleMentions, AnUndefinedRoleIsDropped) {
+    MentionFixture f;
+    f.set_roles(permission::kEveryoneDefault | permission::kMentionEveryone);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+
+    // Even with the override permission, a role that does not exist cannot be
+    // mentioned — otherwise a sender could seed sentinel rows for role ids that
+    // role CRUD might later create, and light up a badge retroactively.
+    auto res = f.send("alice", MentionFixture::role_mention("@Ghosts", {"ghosts"}), "t1");
+    ASSERT_TRUE(IsOk(res));
+    EXPECT_TRUE(f.store->get_event_mentions(MentionFixture::event_id_of(res)).empty());
+    EXPECT_EQ(f.store->count_unread_mentions(bob, MentionFixture::kRoom), 0);
+}
+
+TEST(RoleMentions, ARoleIdContainingAColonIsRefused) {
+    MentionFixture f;
+    f.set_roles(permission::kEveryoneDefault);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+
+    // The role must actually EXIST and be mentionable, or this passes on the
+    // "no such role" branch and proves nothing about the colon check. Its
+    // sentinel would be "@role/evil:test", which UserId::parse accepts as the
+    // user @evil on server "role/evil"... — the sentinel scheme's whole claim is
+    // that a sentinel can never collide with a real account, and a colon is the
+    // one character that breaks it.
+    f.define_role("evil:test", /*mentionable=*/true);
+    f.grant_exact(bob, {std::string(permission::role_id::kEveryone), "evil:test"});
+
+    auto res = f.send("alice", MentionFixture::role_mention("@evil", {"evil:test"}), "t1");
+    ASSERT_TRUE(IsOk(res));
+    EXPECT_TRUE(f.store->get_event_mentions(MentionFixture::event_id_of(res)).empty())
+        << "a role id containing a colon was stored as a sentinel";
+    EXPECT_EQ(f.store->count_unread_mentions(bob, MentionFixture::kRoom), 0);
+}
+
+TEST(RoleMentions, AMentionableRoleWithAnOrdinaryCustomIdWorks) {
+    MentionFixture f;
+    f.set_roles(permission::kEveryoneDefault);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+    // The control for the test above: same shape, no colon. Without this, the
+    // colon test would also pass if define_role()/grant_exact() were broken.
+    f.define_role("raiders", /*mentionable=*/true);
+    f.grant_exact(bob, {std::string(permission::role_id::kEveryone), "raiders"});
+
+    ASSERT_TRUE(IsOk(f.send("alice", MentionFixture::role_mention("@raiders", {"raiders"}), "t1")));
+    EXPECT_EQ(f.store->count_unread_mentions(bob, MentionFixture::kRoom), 1);
+}
+
+TEST(RoleMentions, TooManyRolesIsRejected) {
+    MentionFixture f;
+    f.set_roles(permission::kEveryoneDefault, permission::kEveryoneDefault,
+                /*mod_mentionable=*/true);
+    f.add_user("alice");
+
+    std::vector<std::string> many;
+    for (size_t i = 0; i <= limits::kMaxRoleMentionsPerEvent; ++i) {
+        many.push_back("r" + std::to_string(i));
+    }
+    auto res = f.send("alice", MentionFixture::role_mention("spam", many), "t1");
+    EXPECT_EQ(res.status, 400);
+}
+
+TEST(RoleMentions, EditingAMessageCannotInjectARoleMention) {
+    MentionFixture f;
+    f.set_roles(permission::kEveryoneDefault, permission::kEveryoneDefault,
+                /*mod_mentionable=*/true);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+    f.grant(bob, permission::role_id::kModerator);
+
+    auto first = f.send("alice", {{"msgtype", "m.text"}, {"body", "hello"}}, "t1");
+    ASSERT_TRUE(IsOk(first));
+    auto target = MentionFixture::event_id_of(first);
+    f.store->set_read_marker(bob, MentionFixture::kRoom,
+                             f.store->get_room_max_stream_position(MentionFixture::kRoom));
+    ASSERT_EQ(f.store->count_unread_mentions(bob, MentionFixture::kRoom), 0);
+
+    // Same rule as a user mention, and it falls out of the same skip: an edit
+    // records no mentions at all. A role mention would otherwise be the easier
+    // forgery of the two, because it needs no knowledge of who is in the room.
+    auto edit = MentionFixture::role_mention("* hello @Moderator",
+                                             {permission::role_id::kModerator});
+    edit["m.relates_to"] = {{"rel_type", "m.replace"}, {"event_id", target}};
+    ASSERT_TRUE(IsOk(f.send("alice", edit, "t2")));
+
+    EXPECT_EQ(f.store->count_unread_mentions(bob, MentionFixture::kRoom), 0)
+        << "an edit injected a role mention that fired a fresh notification";
+}
+
+TEST(RoleMentions, ReadingTheBadgeDoesNotMatchTheEveryoneSentinel) {
+    MentionFixture f;
+    auto bob = f.add_user("bob");
+    // The read-side expansion must never include a sentinel for @everyone, or
+    // every member would match a row that the send side refuses to write —
+    // half a bug is still a bug, and this is the half that would survive.
+    f.grant(bob, permission::role_id::kModerator);
+    auto keys = f.store->mention_match_keys(bob);
+    EXPECT_NE(std::find(keys.begin(), keys.end(), bob), keys.end());
+    EXPECT_NE(std::find(keys.begin(), keys.end(), "@room"), keys.end());
+    EXPECT_NE(std::find(keys.begin(), keys.end(), "@role/mod"), keys.end());
+    EXPECT_EQ(std::find(keys.begin(), keys.end(), "@role/everyone"), keys.end());
 }

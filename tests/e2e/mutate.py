@@ -174,6 +174,60 @@ MUTATIONS = [
   "    if (queue.empty()) return 0;\n    // A local INSERT and nothing more. Delivery happens on the worker thread.\n    store_.enqueue_pushes(queue);",
   "    if (queue.empty()) return 0;\n    store_.enqueue_pushes(queue);\n    drain_once();",
   "PushDelivery.SendPathDoesNotWaitOnTheGateway", 45),
+
+ # ── F5 role mentions ────────────────────────────────────────────────────
+ #
+ # Each of these is a guard that, removed, turns `mentionable` back into a
+ # switch that does nothing — or turns a role mention into a way to reach
+ # people it must not reach.
+
+ ("F5 mentionable gate removed (any role pingable by anyone)",
+  "src/api/EventHandler.cpp",
+  "            if (!def->mentionable && !may_mention_any) continue; // the gate",
+  "            // MUTATED",
+  "RoleMentions.ANonMentionableRoleNotifiesNobody", 120),
+
+ ("F5 @everyone acceptable as a role id (MENTION_EVERYONE bypass)",
+  "src/api/EventHandler.cpp",
+  "            if (role_id == permission::role_id::kEveryone) continue;",
+  "            // MUTATED",
+  "RoleMentions.TheEveryoneRoleIsNotMentionableAsARole", 120),
+
+ # NOT LISTED, deliberately: the role-sentinel guard in the user_ids loop
+ # ("if (target.rfind(kRoleMentionPrefix, 0) == 0) continue;"). Removing it is a
+ # mutation that SURVIVES, because UserId::is_valid() two lines later already
+ # rejects "@role/..." for having no colon. It is redundant today and kept as
+ # defence-in-depth, exactly like the @room guard above it — whose mutation is
+ # listed and also survives, for the same reason. Listing a second knowingly
+ # surviving entry would add noise to this report without adding a property.
+ # See the comment at the guard itself.
+
+ ("F5 colon-bearing role id accepted (sentinel becomes a real mxid)",
+  "src/api/EventHandler.cpp",
+  "            if (role_id.find(':') != std::string::npos) continue;",
+  "            // MUTATED",
+  "RoleMentions.ARoleIdContainingAColonIsRefused", 120),
+
+ ("F5 read side matches an @everyone role sentinel",
+  "src/store/SqliteStore.cpp",
+  "        if (role_id.empty() || role_id == permission::role_id::kEveryone) continue;",
+  "        if (role_id.empty()) continue;",
+  "RoleMentions.ReadingTheBadgeDoesNotMatchTheEveryoneSentinel", 120),
+
+ # Same source line as the F2 entry above, pinned separately: a role mention is
+ # the case where this gate is the ONLY visibility filter in the path, because
+ # nothing was filtered when the (single, member-less) row was written.
+ ("F5 VIEW_CHANNEL gate removed (role mention reaches a shut-out holder)",
+  "src/push/PushService.cpp",
+  "            if (!perms.can(user_id, n.room_id, permission::kViewChannel)) return false;",
+  "            // MUTATED",
+  "PushRoleMentions.AHolderWithoutViewChannelIsNeverPushed", 120),
+
+ ("F5 role mention silenced by 'mentions only'",
+  "src/push/PushService.cpp",
+  "            return is_mentioned_here;",
+  "            return n.room_wide_mention || mentioned.count(user_id) > 0;",
+  "PushRoleMentions.MentionsOnlyLetsARoleMentionThroughButNoneSilencesIt", 120),
 ]
 
 

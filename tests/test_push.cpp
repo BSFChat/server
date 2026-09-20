@@ -131,7 +131,7 @@ struct PushFixture {
         set_roles(permission::kEveryoneDefault);
     }
 
-    void set_roles(permission::Flags everyone_flags) {
+    void set_roles(permission::Flags everyone_flags, bool with_mentionable_mod = false) {
         ServerRolesContent roles;
         ServerRole everyone;
         everyone.id = permission::role_id::kEveryone;
@@ -139,10 +139,46 @@ struct PushFixture {
         everyone.position = 0;
         everyone.permissions = everyone_flags;
         roles.roles.push_back(everyone);
+        if (with_mentionable_mod) {
+            ServerRole mod;
+            mod.id = permission::role_id::kModerator;
+            mod.name = "Moderator";
+            mod.position = 10;
+            mod.permissions = permission::kEveryoneDefault;
+            mod.mentionable = true;
+            roles.roles.push_back(mod);
+        }
         json j;
         to_json(j, roles);
         store->set_server_state(std::string(event_type::kServerRoles), "", "@server:test",
                                 j.dump());
+    }
+
+    void grant(const std::string& user_id, const std::string& role_id) {
+        MemberRolesContent c;
+        c.role_ids = {std::string(permission::role_id::kEveryone), role_id};
+        json j;
+        to_json(j, c);
+        store->set_server_state(std::string(event_type::kMemberRoles), user_id, "@server:test",
+                                j.dump());
+    }
+
+    void deny_view(const std::string& user_id, const std::string& room_id = kRoom) {
+        ChannelPermissionOverride ov;
+        ov.deny = permission::kViewChannel;
+        json j;
+        to_json(j, ov);
+        store->insert_event("$deny-" + user_id, room_id, "@server:test",
+                            std::string(event_type::kChannelPermissions), "user:" + user_id,
+                            j.dump(), 1);
+    }
+
+    static json role_mention(const std::string& body,
+                             const std::vector<std::string>& role_ids) {
+        return {{"msgtype", "m.text"},
+                {"body", body},
+                {"m.mentions",
+                 {{std::string(mention::kRoleIdsKey), json(role_ids)}}}};
     }
 
     std::string add_user(const std::string& localpart, bool join = true,
@@ -1217,4 +1253,129 @@ TEST(PushPayload, ExplicitEventIdOnlyBeatsAFullDefault) {
     auto payload = f.gateway.last_payload();
     const auto& n = payload["notification"];
     EXPECT_FALSE(n.contains("content")) << n.dump();
+}
+
+// ── Role mentions ─────────────────────────────────────────────────────────
+//
+// The requirement is that a role mention is INDISTINGUISHABLE from a direct one
+// downstream: same delivery, same priority, same sound. A device must not be
+// able to rank "you, personally" above "the role you are on call for".
+
+TEST(PushRoleMentions, EveryHolderIsPushedAtMentionPriority) {
+    PushFixture f;
+    f.set_roles(permission::kEveryoneDefault, /*with_mentionable_mod=*/true);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+    f.add_user("dave");
+    f.grant(bob, permission::role_id::kModerator);
+    f.grant(carol, permission::role_id::kModerator);
+    f.register_pusher("bob", "bob-device");
+    f.register_pusher("carol", "carol-device");
+    f.register_pusher("dave", "dave-device");
+    // All three are on the CHANNEL DEFAULT, which is "mentions only". Dave is
+    // the control: he holds no role, so the message is not for him.
+
+    ASSERT_TRUE(IsOk(f.send("alice",
+                            PushFixture::role_mention("@Moderator please look",
+                                                      {permission::role_id::kModerator}),
+                            "t1")));
+    EXPECT_EQ(f.store->count_queued_pushes(), 2) << "expected exactly the two holders";
+
+    f.push->drain_once();
+    ASSERT_EQ(f.gateway.call_count(), 2u);
+    // Every delivered payload must carry the mention treatment.
+    std::lock_guard lock(f.gateway.mutex);
+    for (const auto& call : f.gateway.calls) {
+        auto n = json::parse(call.body)["notification"];
+        EXPECT_EQ(n["prio"], "high");
+        ASSERT_TRUE(n["devices"][0].contains("tweaks"));
+        EXPECT_EQ(n["devices"][0]["tweaks"]["sound"], "default");
+        // push.default_payload is event_id_only by default, so this has to work
+        // with no message text at all — and it does: the whole signal is prio,
+        // the sound tweak and the unread count.
+        EXPECT_FALSE(n.contains("content"));
+        EXPECT_FALSE(n.contains("sender"));
+        EXPECT_TRUE(n.contains("event_id"));
+        EXPECT_TRUE(n["counts"].contains("unread"));
+    }
+}
+
+TEST(PushRoleMentions, AHolderWithoutViewChannelIsNeverPushed) {
+    PushFixture f;
+    f.set_roles(permission::kEveryoneDefault, /*with_mentionable_mod=*/true);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+    f.grant(bob, permission::role_id::kModerator);
+    f.grant(carol, permission::role_id::kModerator);
+    f.register_pusher("bob", "bob-device");
+    f.register_pusher("carol", "carol-device");
+    // Bob holds @Moderator but is denied VIEW_CHANNEL here.
+    f.deny_view(bob);
+
+    ASSERT_TRUE(IsOk(f.send("alice",
+                            PushFixture::role_mention("@Moderator incident in here",
+                                                      {permission::role_id::kModerator}),
+                            "t1")));
+
+    // A direct mention is filtered at WRITE time, when the server knows who was
+    // named. A role mention names nobody, so the only place this can be caught
+    // is here — and being buzzed about a message in a channel you cannot open
+    // discloses that the channel exists and that something is happening in it,
+    // whether or not the payload carries any text.
+    ASSERT_EQ(f.store->count_queued_pushes(), 1) << "a role mention pushed a member "
+                                                    "who cannot see the channel";
+    f.push->drain_once();
+    ASSERT_EQ(f.gateway.call_count(), 1u);
+    auto n = f.gateway.last_payload()["notification"];
+    EXPECT_EQ(n["devices"][0]["pushkey"], "carol-device");
+}
+
+TEST(PushRoleMentions, MentionsOnlyLetsARoleMentionThroughButNoneSilencesIt) {
+    PushFixture f;
+    f.set_roles(permission::kEveryoneDefault, /*with_mentionable_mod=*/true);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+    f.grant(bob, permission::role_id::kModerator);
+    f.grant(carol, permission::role_id::kModerator);
+    f.register_pusher("bob", "bob-device");
+    f.register_pusher("carol", "carol-device");
+    f.set_level("bob", PushService::kLevelMentions);
+    f.set_level("carol", PushService::kLevelNone);
+
+    // A plain message first: "mentions only" means Bob gets nothing for it.
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "chatter"}}, "t0")));
+    ASSERT_EQ(f.store->count_queued_pushes(), 0);
+
+    ASSERT_TRUE(IsOk(f.send("alice",
+                            PushFixture::role_mention("@Moderator",
+                                                      {permission::role_id::kModerator}),
+                            "t1")));
+    // Bob asked to be interrupted when somebody is addressing him, and a role he
+    // holds being called for is exactly that. Carol asked for silence in this
+    // room, and a role mention is not an escalation that outranks her choice.
+    ASSERT_EQ(f.store->count_queued_pushes(), 1);
+    f.push->drain_once();
+    auto n = f.gateway.last_payload()["notification"];
+    EXPECT_EQ(n["devices"][0]["pushkey"], "bob-device");
+    EXPECT_EQ(n["prio"], "high");
+}
+
+TEST(PushRoleMentions, ANonMentionableRolePushesNobody) {
+    PushFixture f;
+    // No mentionable mod role defined at all, and Alice has no MENTION_EVERYONE.
+    f.set_roles(permission::kEveryoneDefault, /*with_mentionable_mod=*/false);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+    f.grant(bob, permission::role_id::kModerator);
+    f.register_pusher("bob", "bob-device");
+    f.set_level("bob", PushService::kLevelMentions);
+
+    ASSERT_TRUE(IsOk(f.send("alice",
+                            PushFixture::role_mention("@Moderator",
+                                                      {permission::role_id::kModerator}),
+                            "t1")));
+    EXPECT_EQ(f.store->count_queued_pushes(), 0);
 }
