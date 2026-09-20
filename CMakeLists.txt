@@ -19,6 +19,7 @@ include(cmake/Dependencies.cmake)
 
 add_executable(bsfchat-server
     src/main.cpp
+    src/cli/AdminCli.cpp
     src/core/Server.cpp
     src/core/Config.cpp
     src/core/Logger.cpp

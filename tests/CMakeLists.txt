@@ -41,6 +41,7 @@ add_executable(server_tests
     test_request_hardening.cpp
     test_kick_enforcement.cpp
     test_role_management.cpp
+    test_admin_cli.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -109,6 +110,9 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/auth/AutoJoin.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/OidcAuth.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/RoleBootstrap.cpp
+    # The offline recovery CLI. Compiled in because the whole point of the
+    # command is the write path it takes, which only a real store can show.
+    ${CMAKE_SOURCE_DIR}/src/cli/AdminCli.cpp
     ${CMAKE_SOURCE_DIR}/src/storage/LocalStorage.cpp
     ${CMAKE_SOURCE_DIR}/src/storage/MediaReaper.cpp
     ${CMAKE_SOURCE_DIR}/src/storage/S3Client.cpp

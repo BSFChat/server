@@ -659,9 +659,19 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
     // reservation also runs the other way — BotHandler REQUIRES the prefix — so
     // the two sets are disjoint by construction rather than by inspection.
     //
-    // The word "server" is matched on its SKELETON, so `serv.er` and `s0erver`
-    // are reserved too — a reservation that only covered the literal spelling
-    // was a reservation of one spelling out of many that read the same.
+    // "console" is reserved for the same class of reason, one step removed: it
+    // is the actor the offline admin CLI records its writes under
+    // (@console:<server_name>, see src/cli/AdminCli.cpp). It carries no
+    // permissions of its own, so registering it would not grant anything — what
+    // it would do is make the audit log ambiguous, and the audit log is the only
+    // answer to "how did that account get admin?". A record saying @console
+    // must mean "somebody with shell access on the host", never "a user who
+    // picked a clever name".
+    //
+    // The words "server" and "console" are matched on their SKELETON, so
+    // `serv.er`, `s0erver` and `c0nsole` are reserved too — a reservation that
+    // only covered the literal spelling was a reservation of one spelling out
+    // of many that read the same.
     //
     // The PREFIXES deliberately stay literal matches. Comparing prefixes under
     // the skeleton would fold `oidc_` to `oldc` (separators go) and then refuse
@@ -669,7 +679,8 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
     // among them. The case that actually matters, squatting a name that looks
     // like a REAL identity account, is caught below by the collision check
     // against existing users, which sees `oidc_josh` and refuses `o1dc_josh`.
-    if (skeleton == localpart_skeleton("server") || username.rfind("oidc_", 0) == 0 ||
+    if (skeleton == localpart_skeleton("server") || skeleton == localpart_skeleton("console") ||
+        username.rfind("oidc_", 0) == 0 ||
         username.rfind(std::string(bot::kLocalpartPrefix), 0) == 0) {
         res.status = 400;
         res.set_content(MatrixError::invalid_username("That username is reserved").to_json().dump(),
