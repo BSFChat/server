@@ -1583,15 +1583,37 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
     // Inviting a BOT joins it immediately, rather than leaving an invite nobody
     // will ever accept.
     //
-    // A bot has no human to accept an invite, and — as things stand — cannot even
-    // see one: SyncResponse::rooms carries a `join` map and has no `invite`
-    // section at all, and get_joined_rooms filters on membership = 'join'. So an
-    // invite row for a bot is invisible to the bot and indistinguishable from a
-    // no-op to the operator who sent it. The operator's gesture means "this bot
-    // should be in this channel"; honouring it is the only reading that is not a
-    // silent failure. (A real rooms.invite section is a separate piece of work
-    // for HUMAN invites; this does not pre-empt it, because a bot would still
-    // have nothing to do with an invite it could see.)
+    // VISIBILITY IS NOT THE REASON, though it used to be. This branch was first
+    // justified by a bot being unable to SEE an invite: SyncResponse carried
+    // only a `join` map, so an invite row for a bot was unreachable through
+    // every endpoint it polled. feat/sync-invites has since landed —
+    // SyncResponse has rooms.invite, attach_pending_invites restates the
+    // pending set on each delivered response, and get_events_since hands an
+    // invitee their own m.room.member event — so a bot polling /sync would now
+    // see a pending invite perfectly well. The behaviour is unchanged anyway,
+    // because that was the weaker of the two reasons and the other one holds.
+    //
+    // THE REASON IS THAT NOTHING ACCEPTS. A bot has no human to accept, and no
+    // bot implements acceptance: examples/python-bot's sync loop reads
+    // rooms.join and nothing else, so there is no path by which it could notice
+    // rooms.invite, let alone POST /join off the back of it. That is not an
+    // oversight waiting to be fixed — it is the published contract. docs/bots.md
+    // §3.1 tells bot authors "you write no invite-handling code at all", §11
+    // lists the new rooms.invite section as explicitly irrelevant to bots, and
+    // the SDK README says a bot never has a pending invite to find there.
+    // Writing an invite row here would honour the letter of that promise and
+    // break every bot written to it: the invite would be visible, ignored, and
+    // the bot would simply never arrive — a silent failure for the operator,
+    // which is the thing this branch exists to prevent. Seeing an invite and
+    // acting on one are different capabilities; only the second would change
+    // this decision, so revisit it if a bot SDK ever grows an accept path.
+    //
+    // rooms.invite is therefore empty for a bot in practice, because this is the
+    // only writer of an invite row and it never writes one for a bot. The one
+    // residue is historical: before the user_exists() check above, an invite to
+    // a @bot_* id nobody held left a row behind, and create_bot writes `users`
+    // and `bots` without touching room_members — so a bot created on such a
+    // localpart starts life with a pending invite it will ignore forever.
     //
     // WHY THIS DOES NOT CONTRADICT THE AUTO-JOIN EXCLUSION. It will look like it
     // does, so: AutoJoin::join_user_to_room refuses bots, and must keep refusing
