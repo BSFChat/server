@@ -350,6 +350,58 @@ media_upload_limit = 30
 # All three endpoints share this budget, because they share the amplifier.
 profile_limit = 10
 
+# --- How big one write may be (as opposed to how many) -----------------------
+#
+# The four numbers above are rates: how OFTEN an account may do a thing. The
+# two below are sizes: how BIG one of those things may be. Until these existed
+# there was no bound on a message at all, in this server or in the desktop
+# client, so any member could post a multi-megabyte body — stored, full-text
+# indexed, pushed through /sync to every member of the channel and returned by
+# every backfill of that page from then on. One request from one account, paid
+# for by everyone else in the room, forever.
+#
+# Note these are NOT covered by `enabled` above. Turning the rate limiter off is
+# defensible when something upstream paces requests; nothing upstream can decide
+# how big a row this server's database should hold, so these always apply.
+
+# Ceiling on the plain text of one message — `body`, and `m.new_content.body`
+# for an edit. BYTES, not characters, because bytes are what is stored, indexed
+# and put on the wire.
+#
+# The default is generous on purpose. This is not a style rule about how long a
+# message should be; it is the point past which one member's send becomes
+# everyone else's bandwidth. 16 KiB is far above anything typed and comfortably
+# above a deliberate paste — a stack trace, a config block, ~250 lines of code.
+#
+# Because it counts bytes, non-Latin text gets fewer characters for the same
+# budget (up to 4x fewer). That is answered by setting the number high rather
+# than by counting codepoints: at 16 KiB even worst-case four-byte text gets
+# ~4,000 characters, twice what Discord allows anybody.
+#
+# `formatted_body` — the same message after markup — is allowed 4x this, and is
+# NOT separately configurable. It is legitimately several times larger (a
+# mention is "@alice" in the body and a full anchor tag in the HTML), and two
+# independent knobs would only ever be set inconsistently. A bot posting a
+# formatted roster of fifty names uses about a sixteenth of each.
+#
+# Over the limit is 413 M_TOO_LARGE, naming the field and both numbers.
+max_message_bytes = 16384
+
+# Ceiling on the whole request body of a send, whatever the event type, checked
+# before the JSON is parsed.
+#
+# The limit above covers m.room.message. This one covers everything else the
+# send endpoint accepts — reactions and call signalling — and any field on a
+# message that the server does not read. Without it the same abuse is available
+# under a key nobody parses: a valid 8-byte reaction with 4 MB attached.
+#
+# Keep it comfortably above max_message_bytes * 5 (body + formatted_body) plus
+# the rest of the event, or the ceiling above becomes unreachable. The server
+# raises it for you and says so if you get this wrong. Call signalling wants the
+# headroom too: an SDP offer with a long candidate list is a real several-KB
+# document, and refusing one drops a call.
+max_event_bytes = 131072
+
 # Storage backend for media files
 # type = "local" stores files on disk, "s3" uses S3-compatible object storage
 [storage]

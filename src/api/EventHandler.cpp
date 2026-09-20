@@ -63,27 +63,42 @@ bool body_mentions_everyone(const std::string& body) {
 //
 // Collected rather than checked inline so a text field added later is caught by
 // changing one list, which is the part that kept going wrong.
-std::vector<std::string> renderable_text(const json& content) {
-    std::vector<std::string> out;
-    const auto take = [&out](const json& obj, const char* key) {
+//
+// Each entry carries where it came from and whether it is the HTML variant,
+// because the SIZE ceiling is per-field and the two variants have different
+// ceilings (see the size check in handle_send_event). That is deliberately a
+// third consumer of THIS list rather than a second collector beside it: a
+// separate "fields to measure" list would drift from the "fields to inspect"
+// list on the first message field anybody adds, and the whole reason this
+// function exists is that the drift had already happened once.
+struct RenderableField {
+    std::string_view name; // for the error message: "body", "m.new_content.body", …
+    bool formatted;        // the HTML variant, which gets the larger ceiling
+    std::string text;
+};
+
+std::vector<RenderableField> renderable_text(const json& content) {
+    std::vector<RenderableField> out;
+    const auto take = [&out](const json& obj, const char* key, std::string_view name,
+                             bool formatted) {
         if (!obj.is_object()) return;
         auto it = obj.find(key);
         if (it == obj.end() || !it->is_string()) return;
         auto value = it->get<std::string>();
-        if (!value.empty()) out.push_back(std::move(value));
+        if (!value.empty()) out.push_back(RenderableField{name, formatted, std::move(value)});
     };
-    take(content, "body");
-    take(content, "formatted_body");
+    take(content, "body", "body", false);
+    take(content, "formatted_body", "formatted_body", true);
     if (auto it = content.find("m.new_content"); it != content.end()) {
-        take(*it, "body");
-        take(*it, "formatted_body");
+        take(*it, "body", "m.new_content.body", false);
+        take(*it, "formatted_body", "m.new_content.formatted_body", true);
     }
     return out;
 }
 
-bool any_text(const std::vector<std::string>& fields, bool (*pred)(const std::string&)) {
+bool any_text(const std::vector<RenderableField>& fields, bool (*pred)(const std::string&)) {
     return std::any_of(fields.begin(), fields.end(),
-                       [pred](const std::string& f) { return pred(f); });
+                       [pred](const RenderableField& f) { return pred(f.text); });
 }
 
 void send_error(httplib::Response& res, int status, const MatrixError& err) {
@@ -456,6 +471,37 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
             "You don't have permission to send this here"));
     }
 
+    // Outer size ceiling, on the REQUEST and before the parse.
+    //
+    // Before the parse for two reasons: a hostile payload never reaches the
+    // parser, and this is the only check that can cover event types whose
+    // content nothing here reads. The per-field ceilings below cover
+    // m.room.message, which is the type the gap was found on, but the send
+    // allowlist also admits m.reaction and the call-signalling types, and
+    // `content` on any of them is stored, delivered through /sync and
+    // paginated exactly like a message. A limit on the fields we happen to
+    // parse would leave the amplifier available under a key nobody parses —
+    // a well-formed 8-byte reaction with 4 MB bolted onto `com.evil.payload`.
+    //
+    // Measured on the raw body rather than on content.dump(): it is free, it
+    // runs before the allocation it is protecting against, and it is the
+    // conservative direction (the raw form is never smaller than the reparse
+    // for any payload a client actually sends).
+    //
+    // Note this is NOT the same bound as HttpServer's set_payload_max_length,
+    // which is sized for media uploads (tens of megabytes) and applies to every
+    // route. This is the send route saying that a timeline event is not a file.
+    if (req.body.size() > config_.send_limits.max_event_bytes) {
+        res.status = 413;
+        return res.set_content(
+            MatrixError::too_large(
+                "Event content is " + std::to_string(req.body.size()) + " bytes; the limit is " +
+                std::to_string(config_.send_limits.max_event_bytes))
+                .to_json()
+                .dump(),
+            "application/json");
+    }
+
     json content;
     try {
         content = json::parse(req.body);
@@ -563,6 +609,44 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
         // — see renderable_text() for what that list is and what walked past the
         // old one-field check.
         const auto text_fields = renderable_text(content);
+
+        // Size, before the two content gates below — a regex scan over a
+        // hostile body is itself work worth refusing, and a message that is
+        // going to be rejected for its size should not be told about a
+        // permission it does not have instead.
+        //
+        // Per field, not on the sum. `body` is what the user typed and
+        // `formatted_body` is the same message after markup, so a sum would
+        // make the plain-text budget depend on how much HTML the sending
+        // client chose to generate: the identical paste would be accepted from
+        // a client that sends no formatting and refused from one that does,
+        // and the composer — which can only count what the user typed — could
+        // not tell them in advance which it would be. Separate ceilings keep
+        // "how long a message may be" answerable by the thing typing it.
+        //
+        // The HTML ceiling is derived, not configured, precisely so that the
+        // relation between them cannot be misconfigured; see Constants.h.
+        //
+        // This covers edits without a word about edits, because
+        // m.new_content.body is on the list renderable_text() already returns.
+        // An oversize edit is therefore refused exactly like an oversize send,
+        // and the message everyone already has stays as it was — which is the
+        // right outcome: an edit that is too big to accept must not half-apply.
+        const size_t body_cap = config_.send_limits.max_message_bytes;
+        const size_t html_cap = body_cap * limits::kFormattedBodyMultiplier;
+        for (const auto& field : text_fields) {
+            const size_t cap = field.formatted ? html_cap : body_cap;
+            if (field.text.size() <= cap) continue;
+            res.status = 413;
+            return res.set_content(
+                MatrixError::too_large(std::string(field.name) + " is " +
+                                       std::to_string(field.text.size()) +
+                                       " bytes; the limit is " + std::to_string(cap))
+                    .to_json()
+                    .dump(),
+                "application/json");
+        }
+
         if (any_text(text_fields, body_contains_url) &&
             !permission::has(user_perms, permission::kEmbedLinks)) {
             return send_error(res, 403, MatrixError::forbidden("You don't have permission to post links here"));
