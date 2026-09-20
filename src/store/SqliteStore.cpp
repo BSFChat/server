@@ -7,6 +7,7 @@
 
 #include <bsfchat/Constants.h>
 #include <bsfchat/Identifiers.h>
+#include <bsfchat/Permissions.h>
 
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -2886,23 +2887,69 @@ void SqliteStore::delete_mentions_for_event(const std::string& event_id) {
     sqlite3_step(stmt.get());
 }
 
+// Every "user id" a read of `user_id`'s mentions must match: the user
+// themselves, the @room sentinel, and one sentinel per role they hold.
+//
+// This is the whole of the role-mention fan-out, and it is why a role with 500
+// members costs nothing to mention. The alternative — expanding the role to its
+// holders at SEND time — writes one row per member, on the request thread,
+// while holding the store's global mutex, for a message that most of those
+// members will never come back to read. Here the send writes one row and each
+// reader pays for their own badge, at their own /sync, proportional to the
+// number of roles THEY hold (in practice one to three) rather than to the size
+// of the role.
+//
+// MUST be called before taking mutex_: get_member_role_ids() reads server_state
+// and takes the lock itself, and mutex_ is not recursive.
+std::vector<std::string> SqliteStore::mention_match_keys(const std::string& user_id) {
+    std::vector<std::string> keys;
+    auto role_ids = get_member_role_ids(user_id);
+    keys.reserve(role_ids.size() + 2);
+    keys.push_back(user_id);
+    keys.emplace_back(kRoomMentionSentinel);
+    for (const auto& role_id : role_ids) {
+        // @everyone is every member's role, so a sentinel for it would be an
+        // @room mention that skipped the MENTION_EVERYONE gate. The send path
+        // refuses to record one; matching it here would be the second half of
+        // that bug, so this end declines too.
+        if (role_id.empty() || role_id == permission::role_id::kEveryone) continue;
+        keys.push_back(role_mention_sentinel(role_id));
+    }
+    return keys;
+}
+
+namespace {
+// "?, ?, ?" for an IN list of `n` values.
+std::string placeholders(size_t n) {
+    std::string out;
+    for (size_t i = 0; i < n; ++i) out += (i == 0) ? "?" : ", ?";
+    return out;
+}
+} // namespace
+
 int SqliteStore::count_unread_mentions(const std::string& user_id, const std::string& room_id) {
+    // Before the lock — see mention_match_keys().
+    const auto keys = mention_match_keys(user_id);
+
     std::lock_guard lock(mutex_);
     // Pure index range scan on idx_event_mentions_target — no join back to
     // events, because stream_position is denormalised onto the mention row.
-    // `user_id IN (?, '@room')` picks up both a direct mention and a room-wide
-    // one; `sender != ?` drops mentions the reader made themselves.
+    // The `user_id IN (...)` list picks up a direct mention, a room-wide one,
+    // and a mention of any role the reader holds; `sender != ?` drops mentions
+    // the reader made themselves.
     auto stmt = prepare(db_,
         "SELECT COUNT(*) FROM event_mentions "
-        "WHERE room_id = ? AND user_id IN (?, ?) AND sender != ? "
+        "WHERE room_id = ? AND user_id IN (" + placeholders(keys.size()) + ") AND sender != ? "
         "AND stream_position > COALESCE("
         "  (SELECT last_read_pos FROM read_markers WHERE user_id = ? AND room_id = ?), 0)");
-    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 3, kRoomMentionSentinel, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt.get(), 4, user_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 5, user_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 6, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    int p = 1;
+    sqlite3_bind_text(stmt.get(), p++, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    for (const auto& key : keys) {
+        sqlite3_bind_text(stmt.get(), p++, key.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_text(stmt.get(), p++, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), p++, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), p++, room_id.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         return sqlite3_column_int(stmt.get(), 0);
     }
@@ -2910,21 +2957,42 @@ int SqliteStore::count_unread_mentions(const std::string& user_id, const std::st
 }
 
 std::map<std::string, int> SqliteStore::get_unread_mention_counts(const std::string& user_id) {
+    // Before the lock — see mention_match_keys(). One extra server_state read
+    // per /sync, not per room, so the grouped-query property this function
+    // exists for is preserved.
+    const auto keys = mention_match_keys(user_id);
+
     std::lock_guard lock(mutex_);
     // One grouped query for every room, rather than count_unread_mentions() in a
     // loop: /sync asks about every joined room on every poll, and each of those
     // calls would serialise behind this store's single global mutex.
+    //
+    // NOTE ON VISIBILITY: this answers "what has been aimed at this user",
+    // across every room, with no VIEW_CHANNEL filter — and it must not grow
+    // one, because it has no PermissionsEngine and adding a per-room permission
+    // check here would put the thing this function was written to avoid (a
+    // per-room query under the global mutex) back in. The filter belongs to the
+    // caller, and SyncEngine applies it: a room the reader cannot view is never
+    // in response.rooms.join at all, and a category stub is skipped before
+    // highlight_count is set, so a count for such a room is computed and then
+    // discarded. That matters more for role and @room sentinels than for direct
+    // mentions, because a direct mention is ALSO filtered at write time (the
+    // send path drops a target without VIEW_CHANNEL) whereas a sentinel row
+    // cannot be — it names no one in particular. See the PushService for the
+    // other delivery path, which does its own per-candidate check.
     auto stmt = prepare(db_,
         "SELECT m.room_id, COUNT(*) FROM event_mentions m "
-        "WHERE m.user_id IN (?, ?) AND m.sender != ? "
+        "WHERE m.user_id IN (" + placeholders(keys.size()) + ") AND m.sender != ? "
         "AND m.stream_position > COALESCE("
         "  (SELECT last_read_pos FROM read_markers r "
         "   WHERE r.user_id = ? AND r.room_id = m.room_id), 0) "
         "GROUP BY m.room_id");
-    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 2, kRoomMentionSentinel, -1, SQLITE_STATIC);
-    sqlite3_bind_text(stmt.get(), 3, user_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 4, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    int p = 1;
+    for (const auto& key : keys) {
+        sqlite3_bind_text(stmt.get(), p++, key.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_text(stmt.get(), p++, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), p++, user_id.c_str(), -1, SQLITE_TRANSIENT);
 
     std::map<std::string, int> out;
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {

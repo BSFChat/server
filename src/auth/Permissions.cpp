@@ -178,12 +178,29 @@ const ServerRole* find_role(const std::vector<ServerRole>& roles, const std::str
 // it here, a delegated MANAGE_ROLES holder could flip that one flag on the
 // Admin role, leave its position and permissions untouched so this returned
 // true, and turn "become an administrator" into a button every member has.
-// Cosmetic fields (name, color, hoist, mentionable) are deliberately left out —
-// they confer nothing, and treating a rename of a senior role as an escalation
-// would only teach people to work around this check.
+//
+// `mentionable` IS IN THIS LIST, and the reason is that it stopped being
+// cosmetic. It used to be a flag nothing read, so listing it here would have
+// been superstition; it is now the gate on who may ping a role
+// (EventHandler.cpp, above MentionSet). Flipping it on a role above your rank
+// grants no permission to anybody, which is why it looks like it belongs with
+// name and color — but it removes a protection FROM A ROLE YOU MAY NOT TOUCH,
+// which is the exact thing this predicate exists to prevent. Concretely: a
+// delegated MANAGE_ROLES holder sets mentionable on @Admins, leaves everything
+// else alone, and every member on the server can now ping the administrators
+// at will. "Confers no permission" and "is safe for someone below the rank line
+// to change" are different questions, and this check is asking the second one.
+//
+// Genuinely cosmetic fields (name, color, hoist) stay out: they confer nothing
+// AND take nothing away, and treating a rename of a senior role as an
+// escalation would only teach people to work around this check. Note this is
+// not a tax on the delta endpoints — a caller not changing `mentionable` echoes
+// the same value back and this still returns true. Only an actual flip is
+// refused.
 bool same_role(const ServerRole& a, const ServerRole& b) {
     return a.position == b.position && a.permissions == b.permissions
-        && a.self_assignable == b.self_assignable;
+        && a.self_assignable == b.self_assignable
+        && a.mentionable == b.mentionable;
 }
 
 // The permission bits @everyone carries, which is the ceiling a self-assignable

@@ -44,6 +44,20 @@ inline constexpr int64_t kBotLastSeenIntervalMs = 60LL * 1000;
 // literally called "@room".
 inline constexpr const char* kRoomMentionSentinel = "@room";
 
+// Sentinel "user id" a ROLE mention is stored under: "@role/" + the role id.
+// Safe for the same reason @room is — it carries no colon, so UserId::parse
+// rejects it and no account can collide with it. (A role id containing a colon
+// would break that, so the send path refuses one; see parse_mentions.)
+//
+// A role mention is ONE row, exactly like @room, never one row per holder. The
+// fan-out happens on the READ side, by widening the set of sentinels a reader
+// matches to include the roles they hold. See the mention section in the .cpp.
+inline constexpr const char* kRoleMentionPrefix = "@role/";
+
+inline std::string role_mention_sentinel(const std::string& role_id) {
+    return std::string(kRoleMentionPrefix) + role_id;
+}
+
 class SqliteStore {
 public:
     explicit SqliteStore(const std::string& db_path);
@@ -701,11 +715,22 @@ public:
     // mentioning.
     //
     // `mentioned_user_ids` may contain kRoomMentionSentinel for a room-wide
-    // (`@room`) mention. Entries equal to `sender` are dropped — mentioning
-    // yourself must not badge your own room. Idempotent per (event, user).
+    // (`@room`) mention, and a kRoleMentionPrefix sentinel per mentioned role.
+    // Entries equal to `sender` are dropped — mentioning yourself must not badge
+    // your own room. Idempotent per (event, user).
+    //
+    // A sentinel is one row regardless of how many members it reaches; the
+    // expansion is on the read side, in mention_match_keys().
     void record_mentions(const std::string& event_id, const std::string& room_id,
                          const std::string& sender, int64_t stream_position,
                          const std::vector<std::string>& mentioned_user_ids);
+
+    // Every event_mentions.user_id value that counts as a mention OF this user:
+    // their own id, kRoomMentionSentinel, and a sentinel for each role they
+    // hold. The read-side half of the role-mention fan-out; the two count
+    // functions below are its only callers, and it is public so a test can
+    // assert the expansion directly rather than only through a badge count.
+    std::vector<std::string> mention_match_keys(const std::string& user_id);
 
     // Mentions of `user_id` in `room_id` at a stream position past their read
     // marker, excluding ones they made themselves. This is the number the client

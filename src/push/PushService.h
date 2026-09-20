@@ -63,6 +63,12 @@ public:
         // Users mentioned directly (already validated). May contain
         // kRoomMentionSentinel for a room-wide mention.
         std::vector<std::string> mentioned;
+        // Roles the message mentioned, already through the mentionable /
+        // MENTION_EVERYONE gate. Role IDS, not sentinels and not expanded to
+        // members: evaluate_message() is already iterating the room's pusher
+        // candidates and checks each one's roles as it goes, so expanding here
+        // would build a member list only to intersect it back down again.
+        std::vector<std::string> mentioned_role_ids;
         bool room_wide_mention = false;
         // Message content, forwarded to the gateway unless the pusher asked for
         // `format: "event_id_only"`.

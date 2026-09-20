@@ -79,6 +79,43 @@ int PushService::evaluate_message(const MessageNotification& n, PermissionsEngin
 
     std::set<std::string> mentioned(n.mentioned.begin(), n.mentioned.end());
     mentioned.erase(kRoomMentionSentinel); // room-wide is tracked separately
+    // Role sentinels are not user ids and must never be matched against one.
+    // They cannot appear here — evaluate_message is handed role IDS in their own
+    // field — but `mentioned` comes from the send path's flattened list in some
+    // call shapes, so the same defence @room gets is worth having.
+    for (auto it = mentioned.begin(); it != mentioned.end();) {
+        it = (it->rfind(kRoleMentionPrefix, 0) == 0) ? mentioned.erase(it) : std::next(it);
+    }
+
+    // "Was this user named by the message?" — directly, by @room, or by a role
+    // they hold. Cached per user because a user may have several pushers and
+    // the answer is asked three times per pusher (notify decision, sound tweak,
+    // priority).
+    //
+    // THE ROLE FAN-OUT LIVES HERE, and it is a loop over the room's pusher
+    // candidates rather than over the role's members. That ordering is what
+    // keeps a 500-member role cheap: the work is bounded by "people in this
+    // room with a registered pusher", which is the set this function already
+    // had to walk, and never by the size of the role. perms.roles_of() is a
+    // memoised read — the VIEW_CHANNEL check just above it, for the same user,
+    // has already populated that cache — so a role check costs a small vector
+    // comparison and no query.
+    std::map<std::string, bool> mention_cache;
+    auto is_mentioned = [&](const std::string& user_id) -> bool {
+        auto cached = mention_cache.find(user_id);
+        if (cached != mention_cache.end()) return cached->second;
+        bool hit = n.room_wide_mention || mentioned.count(user_id) > 0;
+        if (!hit && !n.mentioned_role_ids.empty()) {
+            const auto& held = perms.roles_of(user_id);
+            hit = std::any_of(n.mentioned_role_ids.begin(), n.mentioned_role_ids.end(),
+                              [&](const std::string& role_id) {
+                                  return std::find(held.begin(), held.end(), role_id)
+                                         != held.end();
+                              });
+        }
+        mention_cache.emplace(user_id, hit);
+        return hit;
+    };
 
     // Cached per user because a user may have several pushers.
     std::map<std::string, bool> notify_cache;
@@ -91,10 +128,18 @@ int PushService::evaluate_message(const MessageNotification& n, PermissionsEngin
             // messages, whatever their notification level says. This is the same
             // gate /sync applies, so push can't become a side channel that leaks
             // the existence or content of a hidden channel.
+            //
+            // It is the ONLY visibility gate a role mention gets, and it has to
+            // be: a direct mention is filtered when it is written (the send path
+            // drops a target without VIEW_CHANNEL), but a role mention is one
+            // row that names nobody, so nothing can be filtered at write time.
+            // A member who holds @Moderators but is denied VIEW_CHANNEL on this
+            // channel reaches exactly this line and stops here — being told
+            // "there is a message in #leadership" is the disclosure, whether or
+            // not the payload carries any text.
             if (!perms.can(user_id, n.room_id, permission::kViewChannel)) return false;
 
-            const bool is_mentioned =
-                n.room_wide_mention || mentioned.count(user_id) > 0;
+            const bool is_mentioned_here = is_mentioned(user_id);
 
             // Default: everything in a DM (there is no such thing as an
             // uninteresting message in a two-person conversation), mentions only
@@ -106,7 +151,13 @@ int PushService::evaluate_message(const MessageNotification& n, PermissionsEngin
 
             if (level == kLevelNone) return false;
             if (level == kLevelAll) return true;
-            return is_mentioned; // kLevelMentions
+            // kLevelMentions. A role mention IS a mention, so "mentions only"
+            // lets it through — that setting means "interrupt me when somebody
+            // is addressing me", and being one of the @Moderators a message
+            // called for is exactly that. "none" still silences it, because
+            // that setting means "never interrupt me here" and a role mention
+            // is not an escalation that outranks the reader's own choice.
+            return is_mentioned_here;
         }();
 
         notify_cache.emplace(user_id, decision);
@@ -127,15 +178,19 @@ int PushService::evaluate_message(const MessageNotification& n, PermissionsEngin
         };
         auto data = json::parse(pusher.data_json, nullptr, false);
         if (!data.is_discarded() && data.is_object()) device["data"] = std::move(data);
-        if (n.room_wide_mention || mentioned.count(pusher.user_id) > 0) {
+        // A role mention gets the same sound and the same priority a direct
+        // mention does. This is the whole of the "must produce the same
+        // notification behaviour" requirement on the wire: nothing downstream
+        // can tell the two apart, so a device cannot rank one below the other.
+        const bool named = is_mentioned(pusher.user_id);
+        if (named) {
             device["tweaks"] = {{"sound", "default"}};
         }
 
         json notification = {
             {"event_id", n.event_id},
             {"room_id", n.room_id},
-            {"prio", (n.room_wide_mention || mentioned.count(pusher.user_id) > 0 || is_dm)
-                         ? "high" : "low"},
+            {"prio", (named || is_dm) ? "high" : "low"},
             {"counts", {{"unread", store_.count_unread(pusher.user_id, n.room_id)}}},
             {"devices", json::array({std::move(device)})},
         };

@@ -117,13 +117,14 @@ httplib::Response call(Handler& handler, Method method, const std::string& path,
 }
 
 ServerRole role(const std::string& id, int position, permission::Flags flags,
-                bool self_assignable = false) {
+                bool self_assignable = false, bool mentionable = false) {
     ServerRole r;
     r.id = id;
     r.name = id;
     r.position = position;
     r.permissions = flags;
     r.self_assignable = self_assignable;
+    r.mentionable = mentionable;
     return r;
 }
 
@@ -717,6 +718,67 @@ TEST(RoleEscalation, CannotFlipSelfAssignableOnARoleRankedAboveYou) {
     EXPECT_FALSE(f.holds(member, "vip"));
 }
 
+// PATH THREE, part d: the same flip, on the flag THIS feature made load-bearing.
+//
+// `mentionable` was left out of `same_role` when role CRUD landed, on the
+// correct reading at the time that it was cosmetic — nothing read it. Role
+// mentions changed that: it is now the gate deciding who may ping a role. It
+// grants no permission to anybody, which is why it reads like `name` and
+// `color`; but flipping it REMOVES A PROTECTION FROM A ROLE THE ACTOR MAY NOT
+// TOUCH, which is what this predicate is for.
+//
+// The concrete abuse: a delegated builder cannot touch @Admins, but could make
+// it pingable by every member on the server and then have the whole server
+// ping it.
+TEST(RoleEscalation, CannotFlipMentionableOnARoleRankedAboveYou) {
+    Fixture f("mention-flip");
+    // Position 60 — above the builder at 10 — and deliberately NOT mentionable.
+    f.seed_roles({role("vip", 60, permission::kEveryoneDefault,
+                       /*self_assignable=*/false, /*mentionable=*/false)});
+    auto builder = f.add_user("builder", {"builder"});
+
+    auto patched = call(*f.roles, &RoleHandler::handle_update_role, role_path("vip"),
+                        "token-builder", json{{"mentionable", true}}.dump());
+    EXPECT_TRUE(RefusedBecause(patched, 403, "at or above your own"));
+    ASSERT_TRUE(f.find("vip").has_value());
+    EXPECT_FALSE(f.find("vip")->mentionable);
+
+    // And through the wholesale PUT, where the echo test is the only thing
+    // standing between a resubmitted document and a silent flag change.
+    auto room = f.add_channel(builder, "general");
+    ServerRolesContent doc;
+    for (auto r : f.current_roles()) {
+        if (r.id == "vip") r.mentionable = true;
+        doc.roles.push_back(r);
+    }
+    json j;
+    to_json(j, doc);
+    auto via_put = call(*f.rooms, &RoomHandler::handle_set_state,
+                        state_path(room, event_type::kServerRoles), "token-builder", j.dump());
+    EXPECT_TRUE(RefusedBecause(via_put, 403, "at or above your own"));
+    EXPECT_FALSE(f.find("vip")->mentionable);
+}
+
+// The counterpart: adding `mentionable` to same_role must not break the echo
+// that the wholesale PUT depends on. A caller who is not changing the flag
+// resubmits the same value and is waved through, exactly as before.
+TEST(RoleEscalation, EchoingASeniorRolesMentionableFlagUnchangedIsStillFine) {
+    Fixture f("mention-echo");
+    f.seed_roles({role("vip", 60, permission::kEveryoneDefault,
+                       /*self_assignable=*/false, /*mentionable=*/true)});
+    auto builder = f.add_user("builder", {"builder"});
+    auto room = f.add_channel(builder, "general");
+
+    ServerRolesContent doc;
+    for (const auto& r : f.current_roles()) doc.roles.push_back(r);
+    json j;
+    to_json(j, doc);
+    EXPECT_TRUE(IsOk(call(*f.rooms, &RoomHandler::handle_set_state,
+                          state_path(room, event_type::kServerRoles), "token-builder",
+                          j.dump())));
+    EXPECT_TRUE(f.find("vip")->mentionable) << "the echo lost the flag";
+}
+
 // A rename of a senior role is NOT an escalation, and refusing it would only
 // teach people to work around the check. The counterpart to the test above:
 // `same_role` names the fields that confer power and deliberately omits the
@@ -890,3 +952,55 @@ TEST(RoleDocument, ServerMintsTheIdSoACallerCannotCollideWithAWellKnownRole) {
 }
 
 } // namespace
+
+// ══ 6. Self-assignable AND mentionable ═════════════════════════════════════
+//
+// The combination is the point of both features meeting: a role anyone may
+// take and anyone may ping is a Discord notification-role picker — "@Raiders",
+// "@PatchNotes" — which is the shape this whole line of work exists to enable.
+//
+// It has to be legal, and it has to stay legal for the right reason: a
+// self-assignable role may carry no permission @everyone lacks, and
+// `mentionable` is not a permission. If it ever became one, this test fails and
+// the containment rule is the thing to re-read.
+
+TEST(SelfAssignableRoles, AMentionablePickerRoleIsLegalAndTakeable) {
+    Fixture f("picker");
+    // No permission beyond @everyone's, opt-in, and pingable. Position 5 is a
+    // display choice only — a self-assignable role confers no rank.
+    f.seed_roles({role("raiders", 5, permission::kEveryoneDefault,
+                       /*self_assignable=*/true, /*mentionable=*/true)});
+    auto member = f.add_user("member");
+
+    ASSERT_TRUE(IsOk(call(*f.roles, &RoleHandler::handle_add_self_role,
+                          self_role_path("raiders"), "token-member")));
+    EXPECT_TRUE(f.holds(member, "raiders"));
+    // The flag survived the round trip — `mentionable` is not something the
+    // self-assign path may quietly clear.
+    EXPECT_TRUE(f.find("raiders")->mentionable);
+
+    ASSERT_TRUE(IsOk(call(*f.roles, &RoleHandler::handle_remove_self_role,
+                          self_role_path("raiders"), "token-member")));
+    EXPECT_FALSE(f.holds(member, "raiders"));
+}
+
+TEST(SelfAssignableRoles, MentionableDoesNotLetAPickerRoleCarryAPermission) {
+    Fixture f("picker-perms");
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto room = f.add_channel(admin, "general");
+
+    // The containment rule is about PERMISSIONS, and `mentionable` must not be
+    // mistaken for one in either direction: a picker role with a real
+    // permission is still refused, mentionable or not.
+    ServerRolesContent doc;
+    for (const auto& r : f.current_roles()) doc.roles.push_back(r);
+    doc.roles.push_back(role("sneaky", 5,
+                             permission::kEveryoneDefault | permission::kManageMessages,
+                             /*self_assignable=*/true, /*mentionable=*/true));
+    json j;
+    to_json(j, doc);
+    auto res = call(*f.rooms, &RoomHandler::handle_set_state,
+                    state_path(room, event_type::kServerRoles), "token-admin", j.dump());
+    EXPECT_EQ(res.status, 403) << res.body;
+    EXPECT_FALSE(f.find("sneaky").has_value());
+}

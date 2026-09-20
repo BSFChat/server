@@ -31,6 +31,29 @@ public:
         return (compute(user_id, room_id) & p) == p;
     }
 
+    // The server's role definitions, memoised for this request. Same reasoning
+    // as roles_of(): the send path needs to look up a named role's `mentionable`
+    // flag, and this engine has almost certainly already read the roles to
+    // answer a permission question about the same request.
+    const std::vector<ServerRole>& roles() { return server_roles(); }
+
+    // The role ids assigned to `user_id`, memoised for this request.
+    //
+    // Exposed for the mention path, which has to ask "does this member hold one
+    // of the roles the message named?" once per push candidate. Going through
+    // the engine rather than the store directly is the point: the caller has
+    // already asked this engine whether the same user has VIEW_CHANNEL in the
+    // same room, so the role read is a cache hit and the role check is free.
+    // Calling store.get_member_role_ids() in that loop instead would be one
+    // server_state query per candidate, under the store's global mutex, on the
+    // send path.
+    //
+    // Does NOT include @everyone: this is the assignment as stored, not the
+    // effective set. compute() adds @everyone itself.
+    const std::vector<std::string>& roles_of(const std::string& user_id) {
+        return member_role_ids(user_id);
+    }
+
     // Returns the highest role position the user holds. Used for hierarchy
     // checks like "mods can't modify admins." @everyone is position 0.
     //

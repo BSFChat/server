@@ -168,16 +168,65 @@ SendGate send_gate_for(std::string_view evt_type) {
 //      business being reachable in that channel, nor to probe membership.
 //   3. `room` is gated on MENTION_EVERYONE, so a room-wide ping is a permission,
 //      not a client-side choice.
+//
+// ── Role mentions (`m.mentions["bsfchat.role_ids"]`) ──────────────────────
+//
+// Same three rules, plus a fourth gate of their own. THE PERMISSION RULE IS
+// DISCORD'S, deliberately:
+//
+//     a role may be mentioned if the role is `mentionable`,
+//     OR the sender holds MENTION_EVERYONE.
+//
+// Three alternatives were on the table and this one is the only one that leaves
+// `mentionable` meaning what the switch in the role editor says it means.
+//
+//   * Reusing MENTION_EVERYONE as the whole gate would make `mentionable` dead
+//     UI a second time — a role would be pingable by exactly the people who can
+//     already ping the entire server, so the flag would change nothing. It also
+//     gets the blast radius backwards: "@Raiders" is a much smaller interruption
+//     than "@everyone", and requiring the bigger permission for the smaller
+//     action means servers hand out the bigger permission.
+//
+//   * A new MENTION_ROLES flag would need a bit, and a bit allocated here
+//     collides with the role-CRUD work in flight. More to the point it would be
+//     a second switch controlling the same thing as `mentionable`, and an
+//     operator would have to reason about both to answer "can people ping the
+//     mods?". Discord has no such flag.
+//
+//   * `mentionable` alone, with no override, is nearly right and is what the
+//     flag reads like on its face. It is rejected because it leaves no way to
+//     reach a locked role in the case the lock exists for: @Admins is set
+//     non-mentionable so that members cannot ping it, not so that a moderator
+//     cannot. Without the override an admin who needs to raise the other admins
+//     has to flip the switch, post, and flip it back — during which window
+//     everyone can ping it. MENTION_EVERYONE is the right key for that door:
+//     anyone holding it can already ping strictly more people with @room.
+//
+// The flag is the gate for ordinary members; the permission is the override.
+// Neither is a body scrape: as with @room's MENTION_EVERYONE check, what a
+// message SAYS is never rewritten or rejected over a role name in it. A role
+// that may not be mentioned simply records nothing and notifies nobody, and the
+// text stays exactly as typed (the client then renders it as plain text — see
+// MentionRenderer — so a blocked ping reads as words rather than vanishing).
+//
+// Fan-out: a role mention is stored as ONE sentinel row, never one row per
+// holder, exactly like @room. See SqliteStore::mention_match_keys().
 struct MentionSet {
     std::vector<std::string> user_ids; // validated, deduped, sender removed
+    std::vector<std::string> role_ids; // validated against the roles list + gate
     bool room_wide = false;
 
-    [[nodiscard]] bool empty() const { return user_ids.empty() && !room_wide; }
+    [[nodiscard]] bool empty() const {
+        return user_ids.empty() && role_ids.empty() && !room_wide;
+    }
 
-    // Flattened for storage: room-wide becomes the sentinel row.
+    // Flattened for storage: room-wide and each role become sentinel rows.
     [[nodiscard]] std::vector<std::string> to_rows() const {
         auto rows = user_ids;
         if (room_wide) rows.emplace_back(kRoomMentionSentinel);
+        for (const auto& role_id : role_ids) {
+            rows.push_back(role_mention_sentinel(role_id));
+        }
         return rows;
     }
 };
@@ -216,6 +265,60 @@ MentionParse parse_mentions(const json& content, const std::string& sender,
         }
     }
 
+    // Role mentions. Dropped rather than rejected when the gate says no — see
+    // the block comment above the MentionSet for the rule and why. A 403 was
+    // considered and rejected for the same reason a stale user mention does not
+    // fail the send: the sender's idea of which roles are mentionable comes from
+    // a state event that can change between their last sync and this send, and
+    // losing the message over it is worse than not lighting the ping. It is also
+    // what Discord does — the message posts, nobody is notified.
+    //
+    // Unlike `room`, dropping opens no bypass: there is no second, scrape-based
+    // path to a role mention that this one could be played off against.
+    if (auto roles_it = m.find(std::string(mention::kRoleIdsKey));
+        roles_it != m.end() && !roles_it->is_null()) {
+        if (!roles_it->is_array()) {
+            out.error = {400, MatrixError::invalid_param(
+                std::string(mention::kRoleIdsKey) + " must be an array")};
+            return out;
+        }
+        if (roles_it->size() > limits::kMaxRoleMentionsPerEvent) {
+            out.error = {400, MatrixError::invalid_param(
+                std::string(mention::kRoleIdsKey) + " exceeds " +
+                std::to_string(limits::kMaxRoleMentionsPerEvent) + " entries")};
+            return out;
+        }
+        // The override half of the rule, evaluated once.
+        const bool may_mention_any =
+            permission::has(user_perms, permission::kMentionEveryone);
+        const auto& defined = perms.roles();
+
+        std::vector<std::string> accepted;
+        for (const auto& entry : *roles_it) {
+            if (!entry.is_string()) continue;
+            auto role_id = entry.get<std::string>();
+            if (role_id.empty()) continue;
+            // @everyone is not a role you mention — it is every member of the
+            // server, which is what `room: true` is for and what MENTION_EVERYONE
+            // gates. Accepting it here would be a route around that gate for
+            // anyone who could get `mentionable` set on it, which the role-CRUD
+            // surface makes an ordinary edit rather than an impossibility.
+            if (role_id == permission::role_id::kEveryone) continue;
+            // A colon would make the stored sentinel "@role/<id>" parse as a
+            // Matrix user id and stop being unspellable. Role ids are opaque
+            // and ours; one containing a colon is refused rather than escaped.
+            if (role_id.find(':') != std::string::npos) continue;
+            if (std::find(accepted.begin(), accepted.end(), role_id) != accepted.end()) continue;
+
+            auto def = std::find_if(defined.begin(), defined.end(),
+                                    [&](const ServerRole& r) { return r.id == role_id; });
+            if (def == defined.end()) continue;           // no such role
+            if (!def->mentionable && !may_mention_any) continue; // the gate
+            accepted.push_back(std::move(role_id));
+        }
+        out.mentions.role_ids = std::move(accepted);
+    }
+
     auto users_it = m.find("user_ids");
     if (users_it == m.end() || users_it->is_null()) return out;
     if (!users_it->is_array()) {
@@ -243,6 +346,19 @@ MentionParse parse_mentions(const json& content, const std::string& sender,
         // user literally named "@room" — belt and braces on top of the sentinel
         // being unspellable as a real Matrix id.
         if (target == kRoomMentionSentinel) continue;
+        // Same belt-and-braces for role sentinels: a client must not be able to
+        // ping a role — least of all a non-mentionable one — by spelling its
+        // storage key into user_ids.
+        //
+        // REDUNDANT TODAY, and knowingly so: UserId::is_valid() on the next line
+        // already rejects "@role/..." because it carries no colon, so deleting
+        // this line changes no behaviour and no test (mutate.py says as much,
+        // and says the same about the @room guard above). It is here because the
+        // thing making it redundant is a property of the SENTINEL SPELLING, and
+        // this loop should not silently depend on that: if the prefix ever gains
+        // a colon, or UserId ever accepts a colonless id, the hole opens here
+        // and nothing else in this function would notice.
+        if (target.rfind(kRoleMentionPrefix, 0) == 0) continue;
         if (!UserId::is_valid(target)) continue;
         // Self-mentions must not badge your own room.
         if (target == sender) continue;
@@ -636,6 +752,7 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
         notification.sender = *user_id;
         notification.event_type = evt_type;
         notification.mentioned = mentions.user_ids;
+        notification.mentioned_role_ids = mentions.role_ids;
         notification.room_wide_mention = mentions.room_wide;
         notification.content = content;
         try {
