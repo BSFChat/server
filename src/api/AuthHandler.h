@@ -60,7 +60,16 @@ private:
     // and returns true when any of them is locked.
     bool locked_out(const std::string& key_a, const std::string& key_b,
                     httplib::Response& res);
-    void record_failure(const std::string& key_a, const std::string& key_b);
+    // Records a failed attempt against up to two failure-tracker keys, and logs
+    // a line when either trips the lockout.
+    //
+    // The parameters are NOT interchangeable and the names are the contract.
+    // `ip_key` is client_key()'s "ip:<address>" and is redacted to its network
+    // before it is logged; `id_key` is a "user:"/"pwchange:" key built from the
+    // submitted identifier, which is not an address and must reach the log
+    // intact. Either may be empty, meaning "not applicable". See the comment on
+    // redact_ip_key in the .cpp for what goes wrong when they are treated alike.
+    void record_failure(const std::string& ip_key, const std::string& id_key);
 
     SqliteStore& store_;
     SyncEngine& sync_engine_;

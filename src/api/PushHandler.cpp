@@ -1,5 +1,6 @@
 #include "api/PushHandler.h"
 
+#include "auth/Permissions.h"
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
@@ -8,6 +9,7 @@
 #include "store/SqliteStore.h"
 
 #include <bsfchat/ErrorCodes.h>
+#include <bsfchat/Permissions.h>
 
 #include <nlohmann/json.hpp>
 
@@ -27,6 +29,38 @@ namespace {
 void send_error(httplib::Response& res, int status, const MatrixError& err) {
     res.status = status;
     res.set_content(err.to_json().dump(), "application/json");
+}
+
+// The gate on both notify_level endpoints. Writes the refusal and returns true
+// when the caller must stop.
+//
+// Membership WAS the whole gate, on the reasoning that a notification
+// preference is per-(user, room) and leaks nothing about the channel — which is
+// true of the response body, and is why finding 5 of
+// docs/membership-vs-visibility.md was deprioritised. What it leaks is the room
+// ID: membership is not an access check on this server (everyone is
+// force-joined into every channel), so a 200 here said "this room exists and
+// you are in it" for a channel the caller is denied, and any other room id said
+// 403. A room-id existence oracle, negligible only because the /joined_rooms
+// fix removed the index that made room ids enumerable in the first place.
+//
+// THE REFUSALS MUST BE IDENTICAL. Every reason to stop — not a member, room
+// does not exist, member but denied VIEW_CHANNEL — answers with the same status
+// and the same body, because a distinguishable refusal is the oracle. That is
+// why this is one function and not two checks inline: they cannot drift.
+//
+// kViewChannel directly rather than can_view_room(), for the usual reason: that
+// helper exempts categories, which is the LISTING rule. These endpoints act.
+bool notify_level_refused(SqliteStore& store, const Config& config, const std::string& user_id,
+                          const std::string& room_id, httplib::Response& res) {
+    const auto refuse = [&] {
+        send_error(res, 403, MatrixError::forbidden("Not a member of this room"));
+        return true;
+    };
+    if (!store.is_room_member(room_id, user_id)) return refuse();
+    PermissionsEngine perms(store, config);
+    if (!perms.can(user_id, room_id, permission::kViewChannel)) return refuse();
+    return false;
 }
 
 // ── Gateway URL validation ─────────────────────────────────────────────────
@@ -562,9 +596,7 @@ void PushHandler::handle_get_notify_level(const httplib::Request& req, httplib::
         return send_error(res, 404, MatrixError::not_found());
     }
     auto& room_id = match.params["roomId"];
-    if (!store_.is_room_member(room_id, *user_id)) {
-        return send_error(res, 403, MatrixError::forbidden("Not a member of this room"));
-    }
+    if (notify_level_refused(store_, config_, *user_id, room_id, res)) return;
 
     auto level = store_.get_room_notify_level(*user_id, room_id);
     const bool is_dm = store_.is_direct_room(room_id);
@@ -587,11 +619,7 @@ void PushHandler::handle_put_notify_level(const httplib::Request& req, httplib::
         return send_error(res, 404, MatrixError::not_found());
     }
     auto& room_id = match.params["roomId"];
-    // Membership is the gate: a notification preference is per-(user, room), and
-    // there is no reason to let anyone record one for a room they are not in.
-    if (!store_.is_room_member(room_id, *user_id)) {
-        return send_error(res, 403, MatrixError::forbidden("Not a member of this room"));
-    }
+    if (notify_level_refused(store_, config_, *user_id, room_id, res)) return;
 
     json body;
     try {

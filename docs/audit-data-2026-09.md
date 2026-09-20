@@ -86,11 +86,12 @@ on `main` — see "Must land before the RC".
 
 ---
 
-## Status of findings 10–28, as of 19 September 2026
+## Status of findings 10–28, as of 20 September 2026
 
 Branch `harden/audit-data-path`, off `main` @ `ad993a2`, plus `harden/audit-final`
-(findings 10 and 28). Each finding below carries a **RESOLUTION** or **DECISION**
-block with the reasoning; this is the index.
+(findings 10 and 28) and `harden/ip-and-membership` (finding 16's call sites).
+Each finding below carries a **RESOLUTION** or **DECISION** block with the
+reasoning; this is the index.
 
 | # | Status | Note |
 |---|--------|------|
@@ -100,7 +101,7 @@ block with the reasoning; this is the index.
 | 13 | Already fixed | `deploy` repo. |
 | 14 | Already fixed (server) | nginx half is in the `deploy` repo, still commented out. |
 | 15 | Already fixed | `deploy/setup.sh`. |
-| 16 | **Partly fixed** | `redact_ip_for_log()` landed + tested; 2 call sites in `AuthHandler` handed to `harden/audit-request-path`. |
+| 16 | **Fixed** | Helper landed 19 Sep with zero callers; both `AuthHandler` call sites wired 20 Sep in `harden/ip-and-membership`. The `ip:` key only — see its block. |
 | 17 | Already fixed | Merge train. |
 | 18 | **Fixed** | Presence filtered to joined, non-server-banned. |
 | 19 | **Fixed** | And the finding **understated it** — see its block. |
@@ -873,10 +874,13 @@ hardcoded at `src/main.cpp:18` and not configurable at all, so both fire in prod
 **Fix.** Hash or truncate the address (`/24`, `/64`) in the lockout line; log a count
 rather than the address in the XFF warning.
 
-> ### RESOLUTION — helper landed and tested; the two call sites are handed off.
-> `harden/audit-data-path`, 19 Sep 2026. New:
-> `bsfchat::redact_ip_for_log()` in `src/http/ClientAddress.{h,cpp}`, four tests
-> in `tests/test_auth.cpp`.
+> ### RESOLUTION — FIXED. `harden/ip-and-membership`, 20 Sep 2026.
+> The helper landed in `harden/audit-data-path` on 19 Sep with tests and **zero
+> callers**, and shipped that way: `bsfchat::redact_ip_for_log()` in
+> `src/http/ClientAddress.{h,cpp}`, four tests in `tests/test_auth.cpp`, and
+> nothing whatsoever calling it. The log stream was byte-for-byte what it had
+> been before the "fix". Both call sites are now wired, with three tests that
+> drive the real handler and read the real sink rather than the helper.
 >
 > `203.0.113.42` → `203.0.113.0/24`; `2001:db8::1:2:3` → `2001:db8::/64`;
 > anything it cannot parse → the constant `"unparseable"`. The /64 matches what
@@ -884,39 +888,56 @@ rather than the address in the XFF warning.
 > for the same reason: a subscriber routinely controls a whole /64, so it is the
 > smallest unit that names a customer rather than a device.
 >
-> The last of those four behaviours is the one worth stating. It **never echoes
-> its input**. A call site hands this whatever it was given, and if a malformed
-> header value fell through to a pass-through branch, an attacker-chosen string
-> — possibly a full address in a form the parser missed — would land in the log
-> verbatim, which is the bug this function exists to prevent. Tested against
-> empty, junk, an out-of-range quad, an injection-shaped string and two addresses
-> in one field.
+> It **never echoes its input**. A call site hands this whatever it was given,
+> and if a malformed header value fell through to a pass-through branch, an
+> attacker-chosen string — possibly a full address in a form the parser missed —
+> would land in the log verbatim, which is the bug this function exists to
+> prevent. Tested against empty, junk, an out-of-range quad, an injection-shaped
+> string and two addresses in one field.
 >
-> **What is NOT done:** the two call sites. `AuthHandler.cpp` is owned by
-> `harden/audit-request-path` and this branch was scoped out of it.
+> **The two call sites, and what was deliberately left alone at each.**
 >
-> That branch has since merged (`main` @ `c0aecdd`) and it **did not fix this**.
-> It wrapped both lockout lines in a new `log_safe()`, which is a log-INJECTION
-> guard for a different finding — the submitted login identifier is arbitrary
-> unauthenticated bytes and could forge whole log records. Worth having, and
-> orthogonal: the address is still printed in full.
+>   * `AuthHandler::client_key` — the untrusted-`X-Forwarded-For` warning now
+>     names `redact_ip_for_log(req.remote_addr)` once instead of
+>     `req.remote_addr` twice, and the advice was reworded from "add {} to
+>     auth.trusted_proxies" to "add its address", so the message does not read as
+>     an instruction to trust a whole /24. Worth recording that this line was
+>     already the weaker of the two: `looks_like_untrusted_proxy` only fires for
+>     a peer inside private or loopback space, so what it printed was the
+>     operator's own reverse-proxy address, not a subscriber. It is redacted
+>     anyway — this line and the lockout line are the only two places any address
+>     reaches the log, and leaving one exact makes the pair depend on that
+>     private-range gate never widening.
 >
-> So, against `main` as it now stands:
+>   * `AuthHandler::record_failure` — `log_safe(key_a)` became
+>     `log_safe(redact_ip_key(ip_key))`, and `log_safe(key_b)` was **left exactly
+>     as it was**. This was the trap and it is worth restating: `key_b` is
+>     `user_failure_key()`, `"user:"` + the login identifier as submitted, keyed
+>     on what was typed rather than on an account that exists so a lockout is not
+>     an existence oracle. It is not an address, and `redact_ip_for_log` would
+>     flatten it to `"unparseable"` — deleting the only half of the lockout line
+>     an operator can act on. `log_safe` stays on both: it is the log-INJECTION
+>     guard from the request-path branch, a different guard for a different
+>     problem, and the two compose rather than replace one another. The
+>     parameters are now named `ip_key` / `id_key` and the header states the
+>     contract, because "key_a" and "key_b" is what made them look alike.
 >
->   * `AuthHandler.cpp:124` — the untrusted-`X-Forwarded-For` warning prints
->     `req.remote_addr` twice, at `warn`, rate-limited to once a minute. It
->     should name the redacted network, or log a count.
->   * `AuthHandler.cpp:177`/`:180` — `log_safe(key_a)` / `log_safe(key_b)`
->     should become `log_safe(redact_ip_for_log(...))` **for the `ip:` key
->     only**. This is the trap: the two keys are not the same kind of thing.
->     `key_a` is `"ip:" + address`; `key_b` is `"user:" + the login identifier
->     exactly as submitted`, which is not an address at all and which
->     `redact_ip_for_log` would flatten to `"unparseable"`, destroying the only
->     useful half of the lockout line. Redact the address key, leave the user
->     key to `log_safe`.
+> **A second trap, found by a test that passed before the change.** The IPv6
+> lockout key is already `"ip:2001:db8:0:1::/64"` — `resolve()` collapses IPv6 to
+> a /64 before the key is built. `redact_ip_for_log` parses bare addresses only,
+> so the naive substitution would have turned a correct line into
+> `"ip:unparseable"`. `redact_ip_key` strips any prefix length before delegating
+> and lets the helper re-derive it. It also fails CLOSED if the `"ip:"` prefix is
+> ever missing, rather than passing the string through.
 >
-> A few lines and one include, against a helper that is already tested.
-> **Hand-off item.**
+> Tests: `IpInLogs.LockoutLineRedactsTheAddressKeyAndKeepsTheIdentifierKey`,
+> `IpInLogs.LockoutLineRedactsIpv6ToTheSubscriberPrefix`,
+> `IpInLogs.UntrustedProxyWarningNamesTheNetworkNotTheHost`, all in
+> `tests/test_auth.cpp`. The first two were confirmed failing against `main`
+> before the change (the IPv6 one passes either way by accident of the /64
+> collapse and is kept as the regression guard for the trap above).
+> `LogForgery.ALoginIdentifierCannotWriteExtraLogRecords` still passes unchanged,
+> which is the assertion that the injection guard survived.
 
 ## 17. Push payloads default to full plaintext rather than `event_id_only` — MEDIUM
 

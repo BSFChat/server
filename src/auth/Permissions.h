@@ -78,12 +78,16 @@ private:
     // the lifetime of this engine, which is a single request.
     const std::vector<ServerRole>& server_roles();
     const std::vector<std::string>& member_role_ids(const std::string& user_id);
+    // Memoised for the same reason: a sync pass calls compute() repeatedly for
+    // the same rooms, and a room does not change kind mid-request.
+    bool is_direct_room(const std::string& room_id);
 
     SqliteStore& store_;
     const Config& config_;
 
     std::optional<std::vector<ServerRole>> server_roles_cache_;
     std::unordered_map<std::string, std::vector<std::string>> member_roles_cache_;
+    std::unordered_map<std::string, bool> direct_room_cache_;
 };
 
 } // namespace bsfchat

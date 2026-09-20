@@ -59,6 +59,13 @@ const std::vector<std::string>& PermissionsEngine::member_role_ids(const std::st
     return inserted->second;
 }
 
+bool PermissionsEngine::is_direct_room(const std::string& room_id) {
+    auto it = direct_room_cache_.find(room_id);
+    if (it != direct_room_cache_.end()) return it->second;
+    auto [inserted, _] = direct_room_cache_.emplace(room_id, store_.is_direct_room(room_id));
+    return inserted->second;
+}
+
 permission::Flags PermissionsEngine::compute(const std::string& user_id, const std::string& room_id) {
     if (is_server_actor(user_id, config_)) return permission::kAllFlags;
 
@@ -84,6 +91,28 @@ permission::Flags PermissionsEngine::compute(const std::string& user_id, const s
     if (room_id.empty()) return base; // server-level check, no channel context
 
     auto overrides = store_.get_channel_overrides(room_id);
+
+    // A DM has no channel access control, so it has no channel overrides —
+    // enforced here rather than assumed. Its access control is that exactly two
+    // people are in it and nobody is ever force-joined into one, which is what
+    // lets m.direct be derived straight from membership and left unfiltered
+    // (docs/membership-vs-visibility.md). An override on a DM is a second,
+    // contradictory rule: a VIEW_CHANNEL deny would hide the room from
+    // /joined_rooms and /sync while m.direct kept listing it.
+    //
+    // handle_set_state now refuses to WRITE one, which stops new ones. This is
+    // the other half, and it is not belt-and-braces: a DM that already carries
+    // an override from a build without that refusal could not be repaired once
+    // it landed, because clearing an override means writing an empty one
+    // through the route that now refuses. Enforcing the invariant where it is
+    // READ makes every consumer — sync, listing, reading, voice, typing —
+    // agree at once, instead of each one remembering the DM case.
+    //
+    // Ordered after get_channel_overrides so the extra lookup only happens for
+    // a room that has overrides at all — which a DM never does once this holds,
+    // and an ordinary public channel or a category never does either. A private
+    // channel does, and pays one memoised indexed read per engine.
+    if (!overrides.empty() && is_direct_room(room_id)) overrides.clear();
 
     auto apply = [&](const std::string& key) {
         auto it = overrides.find(key);

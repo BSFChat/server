@@ -723,8 +723,29 @@ void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Resp
     }
 
     auto& room_id = match.params["roomId"];
+    // Membership AND VIEW_CHANNEL. Membership alone is not an access check on
+    // this server: every user is force-joined into every channel, private ones
+    // included, so "is a member" was letting a denied user write a read position
+    // into a channel they cannot read. Finding 4 of
+    // docs/membership-vs-visibility.md.
+    //
+    // kViewChannel asked directly, NOT through can_view_room(): that helper
+    // exempts categories because the sidebar has to render a container it
+    // cannot open, which is a rule about LISTING. This is a write into a room,
+    // so it gets the reading/acting rule — see the comment above can_read_room
+    // in RoomHandler.cpp.
     if (!store_.is_room_member(room_id, *user_id)) {
         return send_error(res, 403, MatrixError::forbidden("Not a member of this room"));
+    }
+    {
+        PermissionsEngine perms(store_, config_);
+        if (!perms.can(*user_id, room_id, permission::kViewChannel)) {
+            // The same status and the same message as the membership refusal
+            // above, deliberately: telling the two apart would say "this room
+            // exists and you are in it", which is the oracle the sibling
+            // finding is about.
+            return send_error(res, 403, MatrixError::forbidden("Not a member of this room"));
+        }
     }
 
     json body;

@@ -3,9 +3,11 @@
 Audit accompanying the `/joined_rooms` disclosure fix (`fix/joined-rooms-leak`),
 and a design recommendation on the thing that caused it.
 
-Status: findings 1–3 and the two `/joined_rooms` disclosures are fixed in this
-branch. Findings 4–6 are reported for triage and deliberately left. The design
-recommendation at the end is **not started**.
+Status: findings 1–3 and the two `/joined_rooms` disclosures were fixed in
+`fix/joined-rooms-leak`. Findings 4–6, reported for triage and deliberately
+left at the time, are closed in `harden/ip-and-membership` (20 Sep 2026) — see
+their section below. The design recommendation at the end is **still not
+started**, and findings 4–6 are three more instances of the argument for it.
 
 ## The shape of the bug
 
@@ -89,27 +91,85 @@ the real binary, passes unchanged.
 - **`list_public_rooms()`** — used only by auto-join. It is not reachable from
   any HTTP route; there is no public-rooms directory endpoint.
 
-### Membership-only, not fixed
+### Findings 4–6 — closed in `harden/ip-and-membership`, 20 Sep 2026
 
-Numbering follows the original audit; 1–3 are in the table above.
+Numbering follows the original audit; 1–3 are in the table above. All three
+were correctly deprioritised at the time: none of them discloses channel
+content, and the surrounding work had not landed. They are closed now.
 
-4. **`POST /rooms/{id}/read_marker` — no VIEW_CHANNEL check.** A denied user can
-   write a read position into a channel they cannot read. Harmless in itself;
-   listed because it is the same pattern and will be copied.
+Each asks `kViewChannel` directly rather than going through `can_view_room()`.
+These are **acting** paths, and that helper exempts categories — which is the
+LISTING rule, for a sidebar that has to draw a container it cannot open. The
+distinction is recorded in `auth/RoomVisibility.h` and above `can_read_room` in
+`RoomHandler.cpp`; reinstating the exemption on a path that acts is how an
+exemption becomes a hole.
 
-5. **`GET`/`PUT /bsfchat/rooms/{id}/notify_level` — no VIEW_CHANNEL check.**
-   Returns only the caller's own setting, so nothing about the channel leaks,
-   but it distinguishes "room exists and you are in it" from "not found". A
-   room-id existence oracle. Negligible on its own — room ids are random and the
-   index that made them guessable is what this branch closed — but it is only
-   negligible *because* of that fix.
+4. **`POST /rooms/{id}/read_marker`** — membership **and** `kViewChannel`, in
+   `EventHandler::handle_read_marker`. A denied user no longer writes a read
+   position into a channel they cannot read, and the test asserts the row is
+   absent rather than only that the request was refused. The refusal reuses the
+   membership refusal's status and message verbatim; see 5 for why.
 
-6. **`bsfchat.channel.permissions` is not in the DM structural-refusal list** in
-   `handle_set_state`, so a DM participant holding MANAGE_ROLES can write a
-   channel override onto their own DM. Only the two participants can reach it,
-   so it is self-inflicted. Noted because denying VIEW_CHANNEL there now hides
-   the DM from `/joined_rooms` and `/sync` while it still appears in `m.direct`
-   — a pre-existing inconsistency this change makes symmetric rather than worse.
+5. **`GET`/`PUT /bsfchat/rooms/{id}/notify_level`** — the gate is now one
+   function, `notify_level_refused()`, shared by both handlers. The response
+   body never leaked anything (it is the caller's own setting), so what is being
+   closed is the **room-id existence oracle**: a 200 said "this room exists and
+   you are in it" for a channel the caller is denied, while any other room id
+   said 403.
+
+   That makes the property to assert an unusual one. It is not "it refuses" —
+   it is that **every** reason to stop answers identically: not a member, room
+   does not exist, and member-but-denied all produce the same status and the
+   same body, byte for byte. A distinguishable refusal is the oracle. The two
+   checks live in one function specifically so they cannot drift apart later.
+   Both tests compare a denied room against an invented room id rather than
+   against a literal.
+
+6. **`bsfchat.channel.permissions` on a DM** — fixed in **two** places, and the
+   second one is the point.
+
+   *The write.* The key is added to the structural-refusal list in
+   `handle_set_state`, beside `bsfchat.room.category`, `bsfchat.room.type` and
+   `m.room.join_rules`. A DM has no channel access control: its access control
+   is that exactly two people are in it and nobody is ever force-joined into
+   one, which is precisely why `m.direct` is derived straight from membership
+   and deliberately left unfiltered.
+
+   *Why a deny-list entry and not an allow-list for DMs.* This file argues the
+   other way for `state_gate_for` — "allowing by default is what produced the
+   hole" — and the obvious broader fix is to refuse every state type on a DM
+   except a named few. It is wrong here, for a concrete reason: four of the
+   types this route accepts are **not scoped to the room they are written in**
+   (`bsfchat.server.info`, `.roles`, `.screenshare`, `bsfchat.member.roles`).
+   `bsfchat.server.screenshare` in particular is a server-wide setting that the
+   client writes into whichever room happens to be active
+   (`ServerConnection::setScreenSharePolicy` takes `m_activeRoomId`), and that
+   can be a DM. A default-refuse rule on DMs would break server administration
+   from a DM window. What is wrong is specifically per-**channel** configuration
+   on a room that is not a channel, and that is what is refused.
+
+   *The read.* `PermissionsEngine::compute()` now clears channel overrides for a
+   direct room. Refusing the write stops new ones; it does **not** repair a DM
+   that already carries an override from a build without the refusal — and
+   after the refusal nothing can, because clearing an override means writing an
+   empty one through the route that now refuses. So the invariant this document
+   already asserts ("DMs carry no overrides") is enforced where it is READ, and
+   sync, listing, reading, voice and typing agree at once instead of each
+   remembering the DM case. The lookup is ordered after `get_channel_overrides`
+   and memoised per engine, so a room with no overrides pays nothing.
+
+   This is the same lesson as the recommendation at the end of this document,
+   one size down: `auth/RoomVisibility.h` "is a convention, not an invariant".
+   For DMs specifically, it now is one.
+
+**Tests.** Eleven in `tests/test_room_visibility.cpp`. Five were confirmed
+failing first. Six are controls, and they are the half that would hurt: an
+ordinary member holding only `kEveryoneDefault` must still mark a channel read
+and set a notify level, a user-specific ALLOW override must still reinstate a
+denied user, a real channel must still accept the override that is how a channel
+is made private, and a DM must still answer `notify_level` (its default differs
+from a channel's). Asserting any of these with an admin would prove nothing,
+because ADMINISTRATOR short-circuits every flag.
 
 ### Deliberately left alone
 
@@ -193,9 +253,10 @@ defence in depth rather than the only defence. Unaudited code fails closed.
 
 ### Recommended sequence
 
-1. Ship this branch. It closes the disclosure.
+1. Ship this branch. It closes the disclosure. **Done.**
 2. Triage findings 1–3 as ordinary bugs against the current model — they are
    one-line VIEW_CHANNEL checks each, and none of them needs the redesign.
+   **Done**, and findings 4–6 with them (`harden/ip-and-membership`).
 3. Make `get_joined_rooms()` hard to misuse: either move it behind
    `RoomVisibility`, or rename it to something that cannot be mistaken for an
    authorization answer.

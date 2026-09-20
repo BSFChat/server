@@ -1470,9 +1470,32 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     // DM guards on /category and /order have to hold here too — otherwise a
     // participant with MANAGE_CHANNELS re-files their DM into a category, or
     // reopens its join rules, by writing the state event directly.
+    //
+    // bsfchat.channel.permissions joins them (finding 6 of
+    // docs/membership-vs-visibility.md). A DM has no channel access control:
+    // its access control is that exactly two people are in it and nobody is
+    // ever force-joined into one, which is the reason m.direct is derived
+    // straight from membership and deliberately left unfiltered. An override
+    // written onto a DM is not a weaker version of that rule, it is a second,
+    // contradictory one — denying VIEW_CHANNEL on a DM hides it from
+    // /joined_rooms and /sync while m.direct goes on listing it.
+    //
+    // A DENY-LIST ENTRY RATHER THAN AN ALLOW-LIST FOR DMs, deliberately, even
+    // though this file argues the opposite way for state_gate_for below. The
+    // two are not the same shape. A state type is scoped to the room it is
+    // written in, so "refuse unless named" is safe there. Four of the types
+    // this route accepts are NOT scoped to their room (bsfchat.server.info,
+    // .roles, .screenshare and bsfchat.member.roles) —
+    // bsfchat.server.screenshare in particular is a server-wide setting that
+    // the client writes into whichever room happens to be active, which can be
+    // a DM (ServerConnection::setScreenSharePolicy takes m_activeRoomId) — so
+    // refusing everything unnamed on a DM would break server administration
+    // from a DM window. What is wrong here is specifically per-CHANNEL
+    // configuration on a room that is not a channel.
     if ((evt_type == std::string(event_type::kRoomCategory) ||
          evt_type == std::string(event_type::kRoomType) ||
-         evt_type == std::string(event_type::kRoomJoinRules)) &&
+         evt_type == std::string(event_type::kRoomJoinRules) ||
+         evt_type == std::string(event_type::kChannelPermissions)) &&
         refuse_on_direct_room(store_, res, room_id,
                               "A direct message is not a channel and its structure cannot be changed")) {
         return;
