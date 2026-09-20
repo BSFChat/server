@@ -1004,3 +1004,52 @@ TEST(SelfAssignableRoles, MentionableDoesNotLetAPickerRoleCarryAPermission) {
     EXPECT_EQ(res.status, 403) << res.body;
     EXPECT_FALSE(f.find("sneaky").has_value());
 }
+
+// @everyone cannot be narrowed out from under an opt-in role, and a drifted
+// role would still be droppable if one ever existed.
+//
+// Two rules, and the interesting part is that the first makes the second nearly
+// unreachable. A client agent predicted a trap: narrow @everyone after an
+// opt-in role is created, and every holder is stuck with a role they cannot
+// shed, because removal ran the same containment check as addition and
+// self-assignment is the only path that moves the role.
+//
+// The trap turns out to be blocked one level up — validate_role_document
+// refuses the narrowing itself, so the API cannot produce a drifted role at
+// all. What remains is the case may_self_assign_role's own comment names: a
+// future path that writes the role document without going through
+// may_edit_role_definitions. The add/remove split is defence for that, and
+// costs one bool.
+TEST(BotRoleManagement, EveryoneCannotBeNarrowedOutFromUnderAnOptInRole) {
+    Fixture f("optin-containment");
+    f.seed_roles();
+    auto builder = f.add_user("builder", {"builder"});
+    auto member = f.add_user("member");
+
+    // Legal at creation: EMBED_LINKS is in @everyone's default set.
+    auto created = call(*f.roles, &RoleHandler::handle_create_role, kRolesPath,
+                        "token-builder",
+                        create_body("Boss pings", 5, permission::kEmbedLinks, true));
+    ASSERT_TRUE(IsOk(created)) << created.body;
+    const std::string role_id = created_id(created);
+    ASSERT_FALSE(role_id.empty());
+
+    ASSERT_TRUE(IsOk(call(*f.roles, &RoleHandler::handle_add_self_role,
+                          self_role_path(role_id), "token-member", "")));
+
+    // The narrowing is REFUSED, naming the role and the bit it would strand.
+    // This is the protection: drift is prevented, not merely detected later.
+    auto narrowed = call(*f.roles, &RoleHandler::handle_update_role,
+                         role_path(std::string(permission::role_id::kEveryone)),
+                         "token-builder", json{{"permissions", "0x0"}}.dump());
+    EXPECT_FALSE(IsOk(narrowed))
+        << "narrowing @everyone below an opt-in role must be refused, or every "
+           "holder is stranded with a role only self-assignment can move";
+    EXPECT_EQ(narrowed.status, 403);
+
+    // And the holder is unaffected: still holding it, still able to drop it.
+    PermissionsEngine perms(*f.store, f.config);
+    EXPECT_TRUE(perms.may_self_assign_role(member, role_id, /*adding=*/false));
+    EXPECT_TRUE(IsOk(call(*f.roles, &RoleHandler::handle_remove_self_role,
+                          self_role_path(role_id), "token-member", "")));
+}

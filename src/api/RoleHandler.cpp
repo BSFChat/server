@@ -346,7 +346,7 @@ void RoleHandler::change_self_role(const httplib::Request& req, httplib::Respons
     }
 
     PermissionsEngine perms(store_, config_);
-    auto verdict = perms.may_self_assign_role(*actor, role_id);
+    auto verdict = perms.may_self_assign_role(*actor, role_id, add);
     if (!verdict) {
         // 404 for an id that does not exist, 403 for one that does but is not
         // on offer. There is nothing to leak by distinguishing them: the role

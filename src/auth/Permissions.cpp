@@ -312,7 +312,7 @@ PermissionsEngine::RoleChangeVerdict PermissionsEngine::validate_role_document(
 }
 
 PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_self_assign_role(
-    const std::string& actor_id, const std::string& role_id) {
+    const std::string& actor_id, const std::string& role_id, bool adding) {
     const auto& all = server_roles();
     const ServerRole* role = find_role(all, role_id);
     if (!role) return {false, "Unknown role: " + role_id};
@@ -333,8 +333,13 @@ PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_self_assign_role(
     // without going through may_edit_role_definitions. The second reason is why
     // this is not redundant belt-and-braces: it is the check that is actually
     // standing between a member and a dangerous role, and it is one line.
+    //
+    // ...and only when TAKING the role. Dropping one cannot grant anything, so
+    // enforcing containment on removal only strands whoever already holds a
+    // role that drifted — with no other way out, since self-assignment is the
+    // only path that moves it.
     const permission::Flags extra = role->permissions & ~everyone_permissions(all);
-    if (extra != 0) {
+    if (adding && extra != 0) {
         return {false,
                 "That role grants permissions beyond @everyone and cannot be self-assigned"};
     }
