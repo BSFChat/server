@@ -1947,3 +1947,37 @@ TEST(BotEscalation, ALowRankedHolderCannotGrantTheirNewBotAHigherRole) {
     EXPECT_FALSE(perms.can(bot_id, "", permission::kAdministrator));
     EXPECT_FALSE(perms.can(bot_id, "", permission::kManageBots));
 }
+
+// createRoom's `invite` array must join a bot, exactly as
+// POST /rooms/{id}/invite does.
+//
+// The bot auto-join rule was added to handle_invite and not here, so the two
+// diverged silently — and createRoom's own comment still claimed it "matched
+// handle_invite". A caller creating a channel with a bot in `invite` got a bot
+// sitting pending while the bot documentation said inviting one joins it
+// immediately. Found by a bot author whose freshly created channel was empty.
+TEST(BotInvite, CreateRoomWithABotInTheInviteArrayJoinsIt) {
+    Fixture fx("createroom-bot-invite");
+    fx.seed_roles();
+    auto admin = fx.add_user("admin", {"botmod", "everything_else"});
+    auto human = fx.add_user("carol", {});
+    auto [bot_id, token] = fx.make_bot("token-admin", "bot_ci");
+
+    httplib::Response res;
+    auto req = make_request("/_matrix/client/v3/createRoom", "token-admin",
+                            json{{"name", "ci"},
+                                 {"invite", json::array({bot_id, human})}}.dump());
+    fx.rooms->handle_create_room(req, res);
+    ASSERT_TRUE(IsOk(res)) << res.body;
+    const auto room_id = json::parse(res.body).value("room_id", std::string{});
+    ASSERT_FALSE(room_id.empty());
+
+    EXPECT_EQ(fx.store->get_membership(room_id, bot_id), membership::kJoin)
+        << "a bot named in createRoom's invite array must join outright: it has "
+           "no human to accept, which is the whole reason handle_invite joins it";
+
+    // The control. This rule is about bots, not about createRoom — a human
+    // keeps ordinary invite semantics and stays pending until they accept.
+    EXPECT_EQ(fx.store->get_membership(room_id, human), membership::kInvite)
+        << "a human must still be merely invited";
+}

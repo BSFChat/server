@@ -604,7 +604,16 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
         // row for the ban projection to have touched.
         if (store_.is_server_banned(invitee)) continue;
 
-        const auto state = is_direct ? membership::kJoin : membership::kInvite;
+        // A bot named here JOINS, exactly as POST /rooms/{id}/invite makes it
+        // join. That rule exists because a bot has no human to accept an
+        // invite, and it was added to handle_invite without being added here —
+        // so creating a channel with a bot in `invite` left it sitting pending
+        // while the documentation said inviting a bot joins it immediately.
+        // The comment above still claimed this path "matched handle_invite"
+        // after the two had diverged.
+        const bool invitee_is_bot = bot::is_bot_user_id(invitee);
+        const auto state = (is_direct || invitee_is_bot) ? membership::kJoin
+                                                         : membership::kInvite;
         store_.set_membership(room_id, invitee, std::string(state));
 
         // member_event_content fills profile fields for join AND invite; the
