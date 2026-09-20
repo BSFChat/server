@@ -49,6 +49,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -87,6 +88,13 @@ httplib::Response call(Handler& handler, Method method, const std::string& path,
     httplib::Response res;
     (handler.*method)(req, res);
     return res;
+}
+
+// httplib leaves status at -1 until the response is written, so a handler that
+// succeeded typically never touches it.
+::testing::AssertionResult IsOk(const httplib::Response& res) {
+    if (res.status == -1 || res.status == 200) return ::testing::AssertionSuccess();
+    return ::testing::AssertionFailure() << "status " << res.status << ", body: " << res.body;
 }
 
 ::testing::AssertionResult HasStatus(const httplib::Response& res, int expected) {
@@ -270,6 +278,15 @@ TEST(BotScoping, AnOrdinaryMemberIsUnaffected) {
 
     EXPECT_EQ(fx.effective(bob, kServerScope), permission::kEveryoneDefault);
     EXPECT_EQ(fx.effective(bob, channel), permission::kEveryoneDefault);
+
+    // And IMPLICITLY, which is the half the assertions above cannot see:
+    // add_user writes ["everyone"] into the assignment, so they would pass just
+    // as well on a server where @everyone had stopped being implicit and was
+    // merely usually listed. A member whose assignment does not name it still
+    // has it — that is what makes it the default role, and it is what a bot is
+    // now excluded from.
+    fx.assign(bob, {});
+    EXPECT_EQ(fx.effective(bob, kServerScope), permission::kEveryoneDefault);
 }
 
 TEST(BotScoping, CreationRecordsAnExplicitEmptyAssignment) {
@@ -406,7 +423,7 @@ TEST(BotScoping, ABotCannotSelfAssignARole) {
     auto bob = fx.add_user("bob");
     auto ok = call(*fx.roles, &RoleHandler::handle_add_self_role,
                    std::string(api_path::kSelfRoles) + "/pings", "token-bob");
-    EXPECT_TRUE(HasStatus(ok, 200));
+    EXPECT_TRUE(IsOk(ok));
     auto held = fx.store->get_member_role_ids(bob);
     EXPECT_NE(std::find(held.begin(), held.end(), "pings"), held.end());
 }
@@ -489,3 +506,124 @@ TEST(BotScoping, TheBackfillDoesNotTouchABotCreatedAfterTheUpgrade) {
     EXPECT_TRUE(fx.store->get_member_role_ids(bot).empty());
 }
 
+// ── 7. GET /bsfchat/bots/{id}/access ────────────────────────────────────────
+
+TEST(BotAccess, ReportsTheBotsEffectivePermissionsPerChannel) {
+    Fixture fx("access-report");
+    fx.seed_roles();
+    auto admin = fx.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto releases = fx.add_channel(admin, "releases");
+    auto other = fx.add_channel(admin, "general");
+    auto [bot, _token] = fx.make_bot("token-alice", "bot_deploy");
+
+    const permission::Flags grant = permission::kViewChannel | permission::kSendMessages;
+    fx.set_override(releases, "user:" + bot, grant);
+
+    auto res = call(*fx.bots, &BotHandler::handle_get_bot_access, access_path(bot),
+                    "token-alice");
+    ASSERT_TRUE(IsOk(res));
+    auto body = json::parse(res.body);
+
+    EXPECT_EQ(body.value("user_id", ""), bot);
+    EXPECT_EQ(body.value("server_permissions", ""), permission::flags_to_hex(0));
+
+    // Both channels are reported — the picker has to offer the ones the bot
+    // cannot see, or there is no way to grant them.
+    ASSERT_TRUE(body.contains("channels"));
+    std::map<std::string, json> by_id;
+    for (const auto& c : body["channels"]) by_id[c.value("room_id", "")] = c;
+    ASSERT_EQ(by_id.count(releases), 1u);
+    ASSERT_EQ(by_id.count(other), 1u);
+
+    EXPECT_EQ(by_id[releases].value("permissions", ""), permission::flags_to_hex(grant));
+    EXPECT_EQ(by_id[other].value("permissions", ""), permission::flags_to_hex(0));
+
+    // The override is echoed so the editor can tell "granted here" from
+    // "inherited from nowhere", and it is present only where one exists.
+    ASSERT_TRUE(by_id[releases].contains("override"));
+    EXPECT_EQ(by_id[releases]["override"].value("allow", ""),
+              permission::flags_to_hex(grant));
+    EXPECT_FALSE(by_id[other].contains("override"));
+}
+
+TEST(BotAccess, IsGatedOnManageBotsAtServerScope) {
+    // The same gate every other bot-administration endpoint carries: a
+    // per-channel override granting MANAGE_BOTS inside one channel must
+    // unlock nothing here.
+    Fixture fx("access-gate");
+    fx.seed_roles();
+    auto admin = fx.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto channel = fx.add_channel(admin, "general");
+    auto [bot, _token] = fx.make_bot("token-alice", "bot_deploy");
+
+    auto mallory = fx.add_user("mallory");
+    fx.set_override(channel, "user:" + mallory, permission::kManageBots);
+
+    auto res = call(*fx.bots, &BotHandler::handle_get_bot_access, access_path(bot),
+                    "token-mallory");
+    EXPECT_TRUE(RefusedBecause(res, 403, "permissions"));
+}
+
+TEST(BotAccess, RefusesForABotThatOutranksTheCaller) {
+    // Reading a bot's access is reading where a credential you may rotate can
+    // go. It gets the rank rule the rest of bot administration gets.
+    Fixture fx("access-rank");
+    fx.seed_roles({role("senior", 50, permission::kEveryoneDefault)});
+    fx.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto botmod = fx.add_user("bob", {"botmod"});
+    auto [bot, _token] = fx.make_bot("token-alice", "bot_deploy");
+    fx.assign(bot, {"senior"});
+
+    auto res = call(*fx.bots, &BotHandler::handle_get_bot_access, access_path(bot),
+                    "token-bob");
+    EXPECT_TRUE(RefusedBecause(res, 403, "ranks at or above"));
+}
+
+TEST(BotAccess, ShowsOnlyChannelsTheCallerMayBeToldAbout) {
+    // MANAGE_BOTS is not a licence to enumerate the server. A delegated bot
+    // administrator who cannot see #leadership must not learn it exists, or
+    // how its overrides are shaped, by asking about a bot.
+    Fixture fx("access-caller-filter");
+    fx.seed_roles();
+    auto admin = fx.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto open = fx.add_channel(admin, "general");
+    auto secret = fx.add_channel(admin, "leadership");
+    fx.set_override(secret, std::string("role:") + permission::role_id::kEveryone, 0,
+                    permission::kViewChannel);
+    fx.add_user("bob", {"botmod"});
+    auto [bot, _token] = fx.make_bot("token-alice", "bot_deploy");
+
+    auto res = call(*fx.bots, &BotHandler::handle_get_bot_access, access_path(bot),
+                    "token-bob");
+    ASSERT_TRUE(IsOk(res));
+    auto body = json::parse(res.body);
+
+    std::vector<std::string> ids;
+    for (const auto& c : body["channels"]) ids.push_back(c.value("room_id", ""));
+    EXPECT_NE(std::find(ids.begin(), ids.end(), open), ids.end());
+    EXPECT_EQ(std::find(ids.begin(), ids.end(), secret), ids.end());
+    EXPECT_EQ(res.body.find("leadership"), std::string::npos);
+
+    // The control: an administrator asking the same question sees both, or the
+    // filter above is indistinguishable from the endpoint being broken.
+    auto full = call(*fx.bots, &BotHandler::handle_get_bot_access, access_path(bot),
+                     "token-alice");
+    ASSERT_TRUE(IsOk(full));
+    EXPECT_NE(full.body.find("leadership"), std::string::npos);
+}
+
+TEST(BotAccess, IsNotAnExistenceOracleForNonBotAccounts) {
+    // The path takes a user id. Asking about a person must answer the same way
+    // asking about a bot that does not exist does.
+    Fixture fx("access-not-oracle");
+    fx.seed_roles();
+    fx.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = fx.add_user("bob");
+
+    auto person = call(*fx.bots, &BotHandler::handle_get_bot_access, access_path(bob),
+                       "token-alice");
+    auto missing = call(*fx.bots, &BotHandler::handle_get_bot_access,
+                        access_path("@bot_nope:test"), "token-alice");
+    EXPECT_EQ(person.status, 404);
+    EXPECT_EQ(person.body, missing.body);
+}

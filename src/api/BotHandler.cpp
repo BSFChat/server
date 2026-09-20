@@ -3,6 +3,7 @@
 #include "audit/AuditLog.h"
 #include "auth/Permissions.h"
 #include "auth/RoleBootstrap.h"
+#include "auth/RoomVisibility.h"
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
@@ -394,6 +395,83 @@ void BotHandler::handle_deactivate_bot(const httplib::Request& req, httplib::Res
     }
 
     res.set_content("{}", "application/json");
+}
+
+void BotHandler::handle_get_bot_access(const httplib::Request& req, httplib::Response& res) {
+    auto match = match_route(std::string(api_path::kBots) + "/{userId}/access", req.path);
+    if (!match.matched) return send_error(res, 404, MatrixError::not_found());
+    const auto& user_id = match.params.at("userId");
+
+    // The same gate rotation and deactivation get, for the reason on the
+    // declaration: this is reconnaissance for a rotation. It also settles the
+    // "is this a bot" question — a person's id takes the 404 branch, byte for
+    // byte identical to a bot id nobody has ever created.
+    auto ctx = authorize_bot_admin(req, res, user_id, "read a bot's access");
+    if (!ctx) return;
+    const auto& actor = ctx->actor;
+
+    // ONE engine across both questions and every channel, so the server role
+    // document and both accounts' assignments are each read once. Constructing
+    // one per room is the N+1 that RoomVisibility.h warns about, behind the
+    // store's global mutex, on a server with a few hundred channels.
+    PermissionsEngine perms(store_, config_);
+
+    // The CALLER's directory. See the declaration: MANAGE_BOTS does not confer
+    // the right to enumerate channels, and this is the filter that already
+    // decides what a caller may be told exists.
+    const auto directory = visible_channel_directory(store_, perms, actor);
+
+    json channels = json::array();
+    for (const auto& entry : directory) {
+        json c = {
+            {"room_id", entry.room_id},
+            {"name", entry.name},
+            {"type", entry.type},
+            // The BOT's membership, not the caller's — the directory computed
+            // that field about the caller and it would be the wrong answer to
+            // the only question worth asking here. A bot must be in a channel
+            // to post in it, so a tab that has just granted VIEW_CHANNEL still
+            // has to tell the operator the bot is not in there yet.
+            {"joined", store_.is_room_member(entry.room_id, user_id)},
+            // THE authority, asked about the bot, in this channel. Not derived
+            // from the override below, which is only one of the four terms that
+            // produce it.
+            {"permissions", permission::flags_to_hex(perms.compute(user_id, entry.room_id))},
+        };
+        if (!entry.category_id.empty()) c["category_id"] = entry.category_id;
+
+        // The override as stored, so an editor can tell "granted here" from
+        // "arrived from a role", and so it can round-trip an edit without
+        // inventing the half it did not read. Emitted only where one exists:
+        // an absent key is "nothing is written for this bot in this channel",
+        // which is a different state from allow=0 deny=0 and is the state an
+        // operator undoing a grant should end up in.
+        auto overrides = store_.get_channel_overrides(entry.room_id);
+        auto it = overrides.find("user:" + user_id);
+        if (it != overrides.end()) {
+            c["override"] = {{"allow", permission::flags_to_hex(it->second.allow)},
+                             {"deny", permission::flags_to_hex(it->second.deny)}};
+        }
+        channels.push_back(std::move(c));
+    }
+
+    json role_ids = json::array();
+    for (const auto& id : perms.roles_of(user_id)) role_ids.push_back(id);
+
+    res.set_content(json{
+        {"user_id", user_id},
+        // Repeated from the bot list so a tab rendering this page does not have
+        // to hold the two responses side by side to grey the controls out.
+        {"deactivated", ctx->bot.deactivated_at.has_value()},
+        // What it was GIVEN, and separately what that amounts to. The role ids
+        // are the editable document; the mask is what the server will actually
+        // enforce, ADMINISTRATOR already short-circuited into kAllFlags — so a
+        // tab can render "this bot is an administrator" without knowing which
+        // role did it.
+        {"role_ids", std::move(role_ids)},
+        {"server_permissions", permission::flags_to_hex(perms.compute(user_id, kServerScope))},
+        {"channels", std::move(channels)},
+    }.dump(), "application/json");
 }
 
 } // namespace bsfchat
