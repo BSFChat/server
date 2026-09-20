@@ -305,9 +305,9 @@ void audit_account_link(SqliteStore& store, const std::string& actor,
 
 void audit_room_deletion(SqliteStore& store, const std::string& actor,
                          const std::string& room_id) {
-    std::string room_type = "text";
+    std::string type{room_type::kText};
     if (auto type_content = room_state_content(store, room_id, event_type::kRoomType)) {
-        room_type = type_content->value("type", room_type);
+        type = type_content->value("type", type);
     }
 
     std::string name;
@@ -322,8 +322,8 @@ void audit_room_deletion(SqliteStore& store, const std::string& actor,
 
     SqliteStore::AuditRecord record;
     record.actor = actor;
-    record.action = room_type == "category" ? audit_action::kCategoryDelete
-                                            : audit_action::kChannelDelete;
+    record.action = type == room_type::kCategory ? audit_action::kCategoryDelete
+                                                 : audit_action::kChannelDelete;
     record.target_room = room_id;
     // Everything below is read while the room still exists. A record that only
     // held the room id would be almost useless the instant the deletion landed:
@@ -331,7 +331,7 @@ void audit_room_deletion(SqliteStore& store, const std::string& actor,
     // had been called.
     record.before_json = json{
         {"name", name},
-        {"type", room_type},
+        {"type", type},
         {"parent_id", parent_id},
         {"is_direct", store.is_direct_room(room_id)},
         {"members", joined_member_count(store, room_id)},

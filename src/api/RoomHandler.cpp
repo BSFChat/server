@@ -777,16 +777,16 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
 
     // Emit bsfchat.room.type state event
     {
-        std::string room_type;
+        std::string type;
         if (body.value("is_category", false)) {
-            room_type = "category";
+            type = room_type::kCategory;
         } else if (body.value("voice", false)) {
-            room_type = "voice";
+            type = room_type::kVoice;
         } else {
-            room_type = "text";
+            type = room_type::kText;
         }
         emit_state_event(room_id, *user_id, std::string(event_type::kRoomType), "",
-                         json{{"type", room_type}});
+                         json{{"type", type}});
     }
 
     // Emit bsfchat.room.category if parent_id is provided
@@ -2192,7 +2192,8 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
             return;
         }
 
-        if (new_room_type == "category" && previous_room_type != "category") {
+        if (new_room_type == room_type::kCategory &&
+            previous_room_type != room_type::kCategory) {
             // A category is a container, so an empty room can become one
             // freely. A room with a conversation in it is a channel, and
             // turning a channel into a container is not a reorganisation —
