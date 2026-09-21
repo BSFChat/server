@@ -47,6 +47,25 @@ public:
         // joined to and then wakes every parked /sync on the server. Separate
         // buckets would just triple the ceiling on the same amplifier.
         kProfile,
+        // POST /_matrix/client/v3/createRoom.
+        //
+        // The odd one out here, because it is the only bucket on a route that
+        // is NOT gated by a permission for every caller. Creating a CHANNEL
+        // needs MANAGE_CHANNELS, so the people who can do it are already
+        // trusted and already few; opening a DM needs nothing at all, which is
+        // correct — a DM is a per-user capability — and it means every account
+        // on the server can reach this handler. Room creation is also the most
+        // expensive write the server has: a room row, five or six state
+        // events, a membership row and an m.room.member event per participant,
+        // and a sync wake for each of them.
+        //
+        // A ceiling on a loop, not a pace for a human — the same reading as
+        // kSend, and for the same reason: an operator making a category and
+        // eight channels in a minute must not be refused. It is the last line
+        // of defence behind the shape rules in handle_create_room rather than
+        // the first; see direct_room_shape_refusal there for why those come
+        // first, and why this is charged below them.
+        kRoomCreate,
     };
 
     SendLimiter(const SendLimitsConfig& config, LimiterClock clock = limiter_steady_now_ms);
@@ -69,6 +88,7 @@ private:
     RateLimiter redact_;
     RateLimiter media_upload_;
     RateLimiter profile_;
+    RateLimiter room_create_;
 };
 
 } // namespace bsfchat

@@ -7,6 +7,7 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
+#include "http/RateLimitResponse.h"
 #include "http/Router.h"
 #include "identity/Nickname.h"
 #include "store/SqliteStore.h"
@@ -38,6 +39,109 @@ const std::string kServerScope;
 int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// Does this POST /createRoom body actually DESCRIBE a direct message?
+// Returns the refusal sentence when it does not, and nullptr when it does.
+//
+// WHY THIS EXISTS. `is_direct` arrives in the request body and, before this,
+// it was the thing that decided whether handle_create_room ran its
+// MANAGE_CHANNELS check at all. A caller-supplied boolean was therefore the
+// only gate on the endpoint's only gate: any account holding nothing but
+// @everyone could send `{"is_direct": true, "invite": [...]}` and get a room,
+// with the invite loop force-JOINING everyone named in it. That is finding F3
+// of docs/audit-permissions-2026-09.md, and it was the one finding in that
+// audit reachable from a default account.
+//
+// The bypass was not the worst of it. A room created that way is a DM to
+// every predicate on the server, and four separate decisions elsewhere are
+// written against "a DM is two people who both chose to be there":
+//
+//   * PermissionsEngine::compute() CLEARS channel overrides on a direct room,
+//     so a VIEW_CHANNEL deny written onto it is silently discarded and
+//     nothing can hide the room from the people dragged into it.
+//   * list_room_directory_rows() excludes direct rooms in SQL, before any
+//     permission is evaluated, so it never appears in the channel directory.
+//   * handle_delete_room admits only participants of a direct room.
+//   * apply_membership_moderation refuses a kick in one.
+//
+// Each of those is right about a real DM and each becomes a shield around a
+// manufactured one. docs/membership-vs-visibility.md rests three decisions on
+// the two sentences "a DM's privacy is its membership" and "nobody is ever
+// force-joined into one"; both were false while `is_direct` was a claim
+// nobody checked.
+//
+// SO THE FIX IS TO MAKE THE CLAIM CHECKABLE, not to add a second permission.
+// `is_direct` stays ungated — opening a DM really is a per-user capability and
+// really should need no grant — but it now has to be TRUE. A request that does
+// not describe a two-person conversation is not a DM claim the server will
+// honour, and it is refused rather than quietly downgraded to a channel: a
+// caller who asked for a DM and silently got a public channel force-joined by
+// the whole server base is a worse outcome than a 403, for them and for
+// everyone else on the instance.
+//
+// WHY EXACTLY ONE INVITEE — i.e. why no group DMs. Established by reading the
+// client rather than assumed: ServerConnection::createDirectMessage takes a
+// single scalar QString, MatrixClient::createDirectMessageRoom does one
+// push_back onto `invite`, every UI entry point (the New DM dialog, the
+// profile card's Message button, the member-list context menu, the /dm slash
+// command) passes exactly one user id, and DirectRooms stores
+// QMap<roomId, peer> — one peer per room — while every DM header renders that
+// one peer's name. The server agrees: get_direct_rooms() reports (room, peer)
+// PAIRS and /sync turns them into an m.direct keyed by peer, so a three-person
+// direct room would list itself under two different people. There is no group
+// DM in this product to break, in the client, the protocol or the store.
+//
+// The refusals below are ordered cheapest-first and none of them consults the
+// store, so this says nothing about who exists — see the note on the invite
+// loop for why createRoom must not become an account oracle.
+const char* direct_room_shape_refusal(const CreateRoomRequest& req, const json& body,
+                                      const std::string& creator) {
+    // THE ONE THAT CLOSES F3. Every other DM guard in the server is written
+    // against "exactly two people"; this is where that sentence is finally
+    // enforced rather than assumed by five separate readers.
+    //
+    // Note it is `!= 1`, so it catches the empty list too. A DM with nobody in
+    // it is not a self-chat feature this product has — nothing in the client
+    // can open one — it is a direct room with a single member, which is
+    // undeletable by anyone but its creator and invisible to the directory for
+    // no benefit to anybody.
+    if (req.invite.size() != 1) {
+        return "A direct message is a conversation between exactly two people";
+    }
+    // A room whose only invitee is the caller is the same one-member room by
+    // another spelling, and it would also defeat the dedup below: the pair
+    // (me, me) can never match an existing DM, so every request would mint a
+    // fresh one.
+    if (req.invite.front() == creator) {
+        return "A direct message needs someone else in it";
+    }
+    // A DM is not server structure, and the rest of the server already says so
+    // for every LATER edit — handle_set_state refuses bsfchat.room.category,
+    // bsfchat.room.type, m.room.join_rules and bsfchat.channel.permissions on a
+    // direct room. Creation was the hole in that: the fields below were being
+    // written into a direct room at creation time by a caller who, one request
+    // later, would have needed MANAGE_CHANNELS to write any of them. Refusing
+    // them here makes the two agree.
+    //
+    // `name` and `topic` are included even though handle_set_state does not
+    // refuse them, and the reason is the same one: setting either on an
+    // existing DM already costs MANAGE_CHANNELS at that route, so allowing a
+    // caller with no permissions to set them at creation was a way to do the
+    // ungated thing first. A DM is titled by who is in it — the client renders
+    // the peer's name and never reads m.room.name for a direct room.
+    if (req.name) return "A direct message cannot be named";
+    if (req.topic) return "A direct message cannot have a topic";
+    if (body.value("is_category", false)) {
+        return "A direct message cannot be a category";
+    }
+    if (body.contains("parent_id")) {
+        return "A direct message cannot live inside a category";
+    }
+    if (body.value("voice", false)) {
+        return "A direct message cannot be a voice channel";
+    }
+    return nullptr;
 }
 
 // Stamps `is_direct` onto an m.room.member content when the room is a DM. See
@@ -418,7 +522,7 @@ MembershipIntent classify_transition(MembershipAction declared, const std::strin
 } // namespace
 
 RoomHandler::RoomHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config)
-    : store_(store), sync_engine_(sync_engine), config_(config) {}
+    : store_(store), sync_engine_(sync_engine), config_(config), limits_(config.send_limits) {}
 
 std::string RoomHandler::emit_state_event(const std::string& room_id, const std::string& sender,
                                            const std::string& event_type, const std::string& state_key,
@@ -680,17 +784,66 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
     // base via auto_join_all_users, emitting a membership event per user per
     // channel — an amplification primitive.
     const bool is_direct = room_req.is_direct.value_or(false);
-    if (!is_direct) {
+    if (is_direct) {
+        // `is_direct` skips the MANAGE_CHANNELS check below, so it is a
+        // capability claim and not a hint, and a claim has to be checked. See
+        // direct_room_shape_refusal for the whole argument; the short version
+        // is that this boolean used to be the only thing standing between an
+        // account holding nothing but @everyone and a room that no
+        // administrator could see, moderate or delete.
+        //
+        // ORDERED ABOVE THE PERMISSION CHECK, deliberately, and it is the one
+        // ordering decision here worth arguing. Everywhere else in this file a
+        // structural rule sits above a permission test only when the caller
+        // has already proven membership, so the refusal tells them nothing
+        // they did not know (see apply_membership_moderation). Here the caller
+        // has proven nothing at all — but neither does the refusal say
+        // anything: every sentence direct_room_shape_refusal can return is a
+        // statement about the REQUEST BODY the caller just wrote, and none of
+        // them touches the store. There is nothing to learn from being told
+        // that the body you sent is not a DM.
+        //
+        // Below the permission check it would be worse than useless: a caller
+        // WITH MANAGE_CHANNELS would sail past and create the multi-party
+        // direct room anyway, and an unmanageable room is unmanageable whoever
+        // made it.
+        if (const char* refusal = direct_room_shape_refusal(room_req, body, *user_id)) {
+            res.status = 403;
+            res.set_content(MatrixError::forbidden(refusal).to_json().dump(),
+                            "application/json");
+            return;
+        }
+    } else {
         // Server-scope check (empty room_id): a new room has no channel
         // context yet, so per-channel overrides must not apply.
         PermissionsEngine perms(store_, config_);
-        if (!perms.can(*user_id, "", permission::kManageChannels)) {
+        if (!perms.can(*user_id, kServerScope, permission::kManageChannels)) {
             res.status = 403;
             res.set_content(MatrixError::forbidden(
                 "Insufficient permissions to create channels").to_json().dump(),
                 "application/json");
             return;
         }
+    }
+
+    // The budget, and it is charged LAST of the three gates on purpose.
+    //
+    // Above a refusal it would be an oracle: a caller could spend it probing
+    // which bodies are accepted and read the answer off the 429 boundary
+    // instead of the 403s. Below them it only meters work the server was
+    // actually going to do, which is what a rate limit is for. That is the
+    // same order EventHandler::handle_send uses and for the same reason.
+    //
+    // It is not a substitute for either check above. A rate limit bounds how
+    // FAST something can be done and never whether it can be done at all; the
+    // reason there is one here is that this is the most expensive write on the
+    // server AND — uniquely — a route every authenticated account can reach,
+    // because opening a DM is correctly ungated. Before this the invite loop
+    // below would join an unbounded list of accounts, unmetered, as fast as
+    // the socket allowed.
+    if (const auto wait = limits_.acquire(SendLimiter::Bucket::kRoomCreate, *user_id)) {
+        return send_rate_limited(res, wait,
+                                 SendLimiter::message_for(SendLimiter::Bucket::kRoomCreate));
     }
 
     // One DM per pair. A client can only de-duplicate against what it has
@@ -700,6 +853,12 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
     // existing direct room with the same single peer is handed back instead of
     // minting a twin. Both sides must still be joined: returning a room the
     // caller has left would drop them into a conversation they cannot read.
+    //
+    // `invite.size() == 1` and `invite.front() != *user_id` are now guaranteed
+    // by direct_room_shape_refusal above, and they are still spelled out here.
+    // Not as belt and braces: this block reads `invite.front()`, and a reader
+    // checking whether that is safe should not have to go and find a different
+    // function to learn that the list is non-empty.
     if (is_direct && room_req.invite.size() == 1 && room_req.invite.front() != *user_id) {
         if (auto existing = store_.find_direct_room(*user_id, room_req.invite.front())) {
             CreateRoomResponse existing_resp;
@@ -812,8 +971,30 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
     // SyncResponse carries joined rooms only — there is no invite delivery
     // channel — so members of a direct room are joined outright. Non-direct
     // rooms keep plain invite semantics, matching handle_invite.
+    //
+    // FORCE-JOINING IS WHY THE SHAPE RULE ABOVE IS NOT OPTIONAL. This loop is
+    // the only place on the server that puts an account into a room without
+    // asking it, and `is_direct` is one of the two things that make it do so.
+    // With the list capped at one peer it is what it has always claimed to be
+    // — the other half of a two-person conversation, whose consent is that
+    // either side can leave. Uncapped it was a fan-out primitive: one request,
+    // an arbitrary number of memberships, member events and sync wakes, from
+    // an account holding nothing. The cap is enforced where the room is MADE,
+    // because no later guard can reach this: handle_invite and the state route
+    // both refuse to add a third person to an existing DM
+    // (MembershipIntent::direct_room_refusal), so createRoom was the only door
+    // and closing it closes the hole rather than narrowing it.
     for (const auto& invitee : room_req.invite) {
         if (invitee == *user_id) continue;
+        // SILENTLY SKIPPED, NOT REFUSED, and that is a decision rather than
+        // laziness. This route needs no permission for a DM, so any caller can
+        // reach it with any user id; answering "no such account" or "that
+        // account is banned" would turn createRoom into an account-existence
+        // and ban-status oracle for the whole instance. The same reasoning
+        // orders kNoSuchAccount below the permission checks in
+        // apply_membership_moderation. The cost is that a DM to a nonexistent
+        // id yields a room with one member in it; the alternative cost is a
+        // user directory nobody asked to publish.
         if (!store_.user_exists(invitee)) continue;
         // Creating a room with a banned user in `invite` is otherwise a way to
         // hand them a fresh channel: the room is new, so there is no membership
@@ -987,13 +1168,77 @@ void RoomHandler::handle_delete_room(const httplib::Request& req, httplib::Respo
     // endpoint has no membership check at all — deliberately, because deleting
     // a channel is a moderator act performed from outside it — which meant a
     // role that runs the server could destroy any two people's conversation,
-    // and audit_room_deletion below would record its member list on the way
+    // and audit_room_deletion below would record its member count on the way
     // out. Participants only.
+    //
+    // THE ONE EXCEPTION, AND ITS BOUNDARY. A direct room whose joined
+    // membership is not exactly two people is not a direct message. It is the
+    // residue of finding F3 (docs/audit-permissions-2026-09.md): until
+    // handle_create_room started checking the `is_direct` claim, any account
+    // holding nothing but @everyone could manufacture a room that force-joined
+    // an arbitrary list and was then protected by every DM predicate on the
+    // server at once — invisible to the channel directory, unhideable (compute()
+    // clears channel overrides on a direct room), unkickable, and undeletable
+    // by this very check. The only remedy left was a server-wide ban on the
+    // creator, which does not remove the room either.
+    //
+    // WHY IT IS SCOPED TO THE BROKEN SHAPE AND NOT TO ADMINISTRATORS. The
+    // audit's own proof for this half (F3b) asserts that an ADMINISTRATOR can
+    // delete the room an unprivileged account made — but it builds that room
+    // with ONE invitee, so once the shape rule lands it is an ordinary
+    // two-person DM and the assertion generalises to "an administrator can
+    // delete anybody's DM". That is the exact regression
+    // DirectRoomIsolation.AnAdminOutsideADmCannotDeleteIt pins, with an
+    // incident behind it, and buying the remedy at that price is not a trade
+    // this product should make: a DM whose contents an operator may destroy at
+    // will is a different promise from the one m.direct is derived against.
+    //
+    // Scoping it to the shape costs nothing and closes the gap completely.
+    // After the creation rule, a direct room with a member count other than two
+    // CANNOT BE MADE — so every one that exists is either manufactured by the
+    // hole or left over from a database that ran the vulnerable code, and both
+    // want removing. A genuine DM keeps exactly the protection it had.
+    //
+    // And the residual case for a real DM has a remedy that already exists and
+    // is correctly scoped: harassment inside a two-person conversation is
+    // answered by BANNING the sender, which apply_membership_moderation
+    // deliberately lets reach a direct room and projects across every room they
+    // have a row in — or by leaving, which also still works. Neither requires
+    // anybody outside the conversation to be able to destroy it.
+    //
+    // ENUMERATION IS UNTOUCHED, which is the part that would have made this a
+    // different product. list_room_directory_rows() still excludes direct rooms
+    // in SQL, /sync still serves each account only its own, and nothing here or
+    // anywhere else lists the direct rooms on an instance. An operator acts on
+    // an id a participant handed them. Deletion is also not disclosure: it
+    // removes the room without reading it, and audit_room_deletion records the
+    // id, the actor and a member COUNT — never a member list, never content.
+    //
+    // SERVER scope (kServerScope), not room scope. compute() clears channel
+    // overrides on a direct room so the two agree today, which is exactly the
+    // kind of coincidence findings F1 and F2 are about: this must not become
+    // reachable from a per-channel grant if that ever changes.
     if (store_.is_direct_room(room_id) && !store_.is_room_member(room_id, *user_id)) {
-        res.status = 403;
-        res.set_content(MatrixError::forbidden(
-            "Not a participant in this direct message").to_json().dump(), "application/json");
-        return;
+        size_t joined = 0;
+        for (const auto& [uid, state] : store_.get_room_members(room_id)) {
+            (void)uid;
+            if (state == membership::kJoin) ++joined;
+        }
+        PermissionsEngine dm_perms(store_, config_);
+        const bool is_a_real_dm = (joined == 2);
+        if (is_a_real_dm ||
+            !dm_perms.can(*user_id, kServerScope, permission::kManageChannels)) {
+            res.status = 403;
+            res.set_content(MatrixError::forbidden(
+                "Not a participant in this direct message").to_json().dump(),
+                "application/json");
+            return;
+        }
+        get_logger()->warn(
+            "Direct room {} removed by {}, who is not a participant: it has {} joined "
+            "members rather than two, so it is not a direct message. Rooms in this state "
+            "predate the is_direct check on POST /createRoom (audit F3).",
+            room_id, *user_id, joined);
     }
 
     PermissionsEngine perms(store_, config_);

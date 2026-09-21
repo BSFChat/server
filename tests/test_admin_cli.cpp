@@ -420,3 +420,121 @@ TEST(AdminCli, ListOrphanMembersRefusesBehindARunningServer) {
     EXPECT_EQ(r.code, 1);
     EXPECT_NE(r.output.find("still running"), std::string::npos) << r.output;
 }
+
+// ── list-fake-dms ─────────────────────────────────────────────────────────
+//
+// The other report an existing deployment needs, and it has the same shape as
+// the one above for the same reason: POST /createRoom read `is_direct` out of
+// the request body and skipping the MANAGE_CHANNELS check was the only thing it
+// did, so any account holding nothing but @everyone could manufacture a room
+// that force-joined an arbitrary list and was then exempt from the channel
+// directory, from channel overrides, from kick and from deletion by anyone
+// outside it. Closing the write path (finding F3) does not clean up after it.
+//
+// The constraint that shapes this command is the one it must NOT do. An
+// operator who can enumerate direct messages is a different product
+// (docs/membership-vs-visibility.md), so the query is written to surface the
+// broken rooms WITHOUT surfacing the ordinary ones, and it is reachable only
+// from this offline CLI — which already requires the database file and the
+// server stopped, so it hands an operator nothing sqlite3 would not.
+
+TEST(AdminCli, ListFakeDmsSaysSoWhenThereAreNone) {
+    Fixture f("fakedm-clean");
+    const auto alice = f.add_user("alice", {std::string(permission::role_id::kEveryone)});
+    const auto bob = f.add_user("bob", {std::string(permission::role_id::kEveryone)});
+    auto dm = generate_room_id("test");
+    f.store->create_room(dm, alice, /*is_direct=*/true);
+    f.store->set_membership(dm, alice, std::string(membership::kJoin));
+    f.store->set_membership(dm, bob, std::string(membership::kJoin));
+
+    auto r = run({"list-fake-dms", "--config", f.config_path}, server_stopped());
+    EXPECT_EQ(r.code, 0);
+    EXPECT_NE(r.output.find("no malformed direct rooms"), std::string::npos) << r.output;
+}
+
+TEST(AdminCli, ListFakeDmsFindsAMultiPartyRoomAndNotTheRealOne) {
+    // THE ASSERTION THIS COMMAND EXISTS FOR, and both halves are load-bearing:
+    // the manufactured room is reported, and the genuine DM beside it is not.
+    // A report that listed every DM would be an enumeration route wearing a
+    // diagnostic's clothes, which is the thing this must never become.
+    Fixture f("fakedm-found");
+    const auto alice = f.add_user("alice", {std::string(permission::role_id::kEveryone)});
+    const auto bob = f.add_user("bob", {std::string(permission::role_id::kEveryone)});
+    const auto mallory = f.add_user("mallory", {std::string(permission::role_id::kEveryone)});
+
+    auto real_dm = generate_room_id("test");
+    f.store->create_room(real_dm, alice, /*is_direct=*/true);
+    f.store->set_membership(real_dm, alice, std::string(membership::kJoin));
+    f.store->set_membership(real_dm, bob, std::string(membership::kJoin));
+
+    // Exactly what the unguarded handler wrote.
+    auto fake = generate_room_id("test");
+    f.store->create_room(fake, mallory, /*is_direct=*/true);
+    for (const auto& uid : {mallory, alice, bob}) {
+        f.store->set_membership(fake, uid, std::string(membership::kJoin));
+    }
+
+    auto r = run({"list-fake-dms", "--config", f.config_path}, server_stopped());
+    EXPECT_EQ(r.code, 0);
+    EXPECT_NE(r.output.find(fake), std::string::npos) << r.output;
+    EXPECT_NE(r.output.find(mallory), std::string::npos) << r.output;
+    EXPECT_EQ(r.output.find(real_dm), std::string::npos)
+        << "a genuine two-person DM was listed to an operator:\n" << r.output;
+}
+
+TEST(AdminCli, ListFakeDmsDoesNotListADmSomebodyLeft) {
+    // The false positive that would make the report useless. Leaving a DM is
+    // ordinary and it is a `leave` row, not a deletion, so the room still holds
+    // two membership rows and one joined one. Counting JOINED rows is what
+    // makes this a one-member room rather than a two-member one — so it IS
+    // listed, and the test says which way round that is on purpose: a direct
+    // room that never had two people is broken, and a report has to be able to
+    // say so. What must not happen is the OTHER side of it being listed.
+    Fixture f("fakedm-left");
+    const auto alice = f.add_user("alice", {std::string(permission::role_id::kEveryone)});
+    const auto bob = f.add_user("bob", {std::string(permission::role_id::kEveryone)});
+    auto dm = generate_room_id("test");
+    f.store->create_room(dm, alice, /*is_direct=*/true);
+    f.store->set_membership(dm, alice, std::string(membership::kJoin));
+    f.store->set_membership(dm, bob, std::string(membership::kLeave));
+
+    auto rows = f.store->list_malformed_direct_rooms();
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_EQ(rows.front().joined, 1u);
+}
+
+TEST(AdminCli, ListFakeDmsDoesNotListOrdinaryChannels) {
+    // A channel holds any number of people and is not marked is_direct, so it
+    // must never appear here however many members it has. The control that says
+    // the query is about the FLAG and not about the count.
+    Fixture f("fakedm-channels");
+    const auto alice = f.add_user("alice", {std::string(permission::role_id::kEveryone)});
+    f.store->set_membership(f.mirror_room, alice, std::string(membership::kJoin));
+
+    auto r = run({"list-fake-dms", "--config", f.config_path}, server_stopped());
+    EXPECT_EQ(r.code, 0);
+    EXPECT_EQ(r.output.find(f.mirror_room), std::string::npos) << r.output;
+}
+
+TEST(AdminCli, ListFakeDmsDeletesNothing) {
+    // A report, like list-orphan-members, and for a sharper reason here:
+    // removal has to go through DELETE /rooms/{id} so it is audited and wakes
+    // the participants' syncs. A delete against the file by hand does neither.
+    Fixture f("fakedm-readonly");
+    const auto mallory = f.add_user("mallory", {std::string(permission::role_id::kEveryone)});
+    auto fake = generate_room_id("test");
+    f.store->create_room(fake, mallory, /*is_direct=*/true);
+    f.store->set_membership(fake, mallory, std::string(membership::kJoin));
+
+    run({"list-fake-dms", "--config", f.config_path}, server_stopped());
+
+    EXPECT_TRUE(f.store->room_exists(fake));
+    EXPECT_EQ(f.store->list_malformed_direct_rooms().size(), 1u);
+}
+
+TEST(AdminCli, ListFakeDmsRefusesBehindARunningServer) {
+    Fixture f("fakedm-running");
+    auto r = run({"list-fake-dms", "--config", f.config_path}, server_running());
+    EXPECT_EQ(r.code, 1);
+    EXPECT_NE(r.output.find("still running"), std::string::npos) << r.output;
+}

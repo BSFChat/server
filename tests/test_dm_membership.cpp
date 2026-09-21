@@ -139,11 +139,19 @@ struct Fixture {
     std::unique_ptr<RoomHandler> rooms;
     int64_t ts = 1000;
 
-    explicit Fixture(const std::string& name) {
+    // `room_create_limit` is a ctor parameter rather than a poke at `config`
+    // after the fact, because RoomHandler builds its SendLimiter FROM the
+    // config in its own constructor — a later assignment would not reach it.
+    // The rate-limit tests pass a small number so they exercise the MECHANISM
+    // and not the configured default: at the shipped 30 they would have to
+    // register 33 accounts and bcrypt each one, and they would silently stop
+    // testing anything the day somebody tuned the number.
+    explicit Fixture(const std::string& name, int room_create_limit = 0) {
         db_path = temp_db_path(name);
         remove_db(db_path);
         config = Config::defaults();
         config.server_name = "test";
+        if (room_create_limit > 0) config.send_limits.room_create_limit = room_create_limit;
         store = std::make_unique<SqliteStore>(db_path);
         store->initialize();
         sync = std::make_unique<SyncEngine>(*store, config);
@@ -280,6 +288,31 @@ struct Fixture {
     httplib::Response leave(const std::string& room_id, const std::string& token) {
         return call(&RoomHandler::handle_leave,
                     "/_matrix/client/v3/rooms/" + room_id + "/leave", token, "{}");
+    }
+
+    // ── the door a DM is BORN through ────────────────────────────────────
+    //
+    // Everything above acts on a DM the fixture built directly in the store.
+    // These go through POST /createRoom, because that is the only place on the
+    // server that decides what a direct room IS — and, before
+    // fix/direct-room-guard, the only place it could be decided wrongly.
+    httplib::Response create(const std::string& token, const json& body) {
+        return call(&RoomHandler::handle_create_room,
+                    "/_matrix/client/v3/createRoom", token, body.dump());
+    }
+
+    httplib::Response create_dm(const std::string& token, const std::string& peer) {
+        return create(token, json{{"is_direct", true}, {"invite", json::array({peer})}});
+    }
+
+    httplib::Response destroy(const std::string& room_id, const std::string& token) {
+        return call(&RoomHandler::handle_delete_room,
+                    "/_matrix/client/v3/rooms/" + room_id, token, "");
+    }
+
+    static std::string room_id_of(const httplib::Response& res) {
+        if (res.body.empty()) return "";
+        return json::parse(res.body).value("room_id", "");
     }
 
     // ── what actually landed ─────────────────────────────────────────────
@@ -611,4 +644,467 @@ TEST(DirectRoomMembership, KickingFromAnOrdinaryChannelStillWorksAtBothDoors) {
     EXPECT_TRUE(IsOk(f.set_member_state(channel, "token-alice", carol,
                                         std::string(membership::kLeave))));
     EXPECT_EQ(f.store->get_membership(channel, carol), std::string(membership::kLeave));
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────
+// 6. THE SHAPE OF A DM IS DECIDED WHERE IT IS CREATED
+//
+// Everything above this line enforces "a DM stays two people" against a DM
+// that already exists. None of it could say anything about one that was born
+// with five, and POST /createRoom would make you one: `is_direct` came
+// straight out of the request body and skipping the MANAGE_CHANNELS check was
+// the only thing it did, so `{"is_direct": true, "invite": [a, b, c]}` from an
+// account holding nothing but @everyone produced a room that
+//
+//   * force-JOINED all three (this file's invite loop, `is_direct` => kJoin),
+//   * could not be hidden from them (compute() clears overrides on a DM),
+//   * no administrator could find (the directory excludes DMs in SQL),
+//   * no administrator could delete (participants only), and
+//   * nobody could be kicked from (the rule at the top of this file).
+//
+// That is finding F3 of docs/audit-permissions-2026-09.md and the only finding
+// in it reachable from a default account. Its proofs are in
+// tests/test_permission_audit_2026_09.cpp; what is below is the rest of the
+// property, including the controls that say the fix is not broader than it.
+//
+// WHY EXACTLY TWO, established rather than assumed — this is the question the
+// audit deliberately left for an owner, because capping `invite` at one breaks
+// any client that opens a group DM. There is no such client. The desktop
+// client's only DM path is ServerConnection::createDirectMessage(QString), a
+// single scalar user id, reached from four UI affordances that each pass one
+// person (the New DM dialog's single text field, the profile card's Message
+// button, the member-list context menu, and /dm); MatrixClient::
+// createDirectMessageRoom does one push_back onto `invite`; DirectRooms keeps
+// QMap<roomId, peer> — one peer per room — and every DM header renders that
+// one peer. The server never modelled anything else either: get_direct_rooms()
+// returns (room, peer) PAIRS and /sync turns them into an m.direct keyed by
+// peer, so a three-person direct room lists itself under two different people.
+// "Group DM" appears nowhere in the client, the protocol or this repo outside
+// the audit's own note. Nothing is being taken away.
+// ─────────────────────────────────────────────────────────────────────────
+
+TEST(DirectRoomMembership, AnOrdinaryMemberCanStillOpenAOneToOneDm) {
+    // THE CONTROL, and it is first on purpose. Everything else in this section
+    // is a refusal, and a suite of refusals cannot tell a fix from a blanket
+    // ban on the feature — which is the failure mode mutate_dm_membership.py's
+    // M4 exists to provoke. Opening a DM must go on costing NO permission at
+    // all: that is what `is_direct` is for and the reason it was ungated.
+    Fixture f("create-dm-control");
+    auto alice = f.add_user("alice");   // @everyone only. No moderator role.
+    auto bob = f.add_user("bob");
+
+    auto res = f.create_dm("token-alice", bob);
+    ASSERT_TRUE(IsOk(res)) << res.body;
+    const auto dm = Fixture::room_id_of(res);
+    ASSERT_FALSE(dm.empty());
+
+    EXPECT_TRUE(f.store->is_direct_room(dm));
+    EXPECT_EQ(f.store->get_membership(dm, alice), std::string(membership::kJoin));
+    // The peer is JOINED, not invited: there is no invite delivery channel in
+    // /sync, so this is how a DM reaches the other side at all.
+    EXPECT_EQ(f.store->get_membership(dm, bob), std::string(membership::kJoin));
+}
+
+TEST(DirectRoomMembership, AMemberStillCannotCreateAChannel) {
+    // The check `is_direct` used to walk around, pinned here so that a fix
+    // which accidentally made createRoom permissive for everyone is visible in
+    // this file rather than only in the audit's.
+    Fixture f("create-channel-control");
+    f.add_user("alice");
+    auto res = f.create("token-alice", json{{"name", "general"}});
+    EXPECT_EQ(res.status, 403) << res.body;
+}
+
+TEST(DirectRoomMembership, IsDirectWithMoreThanOneInviteeIsRefused) {
+    // F3 itself. Mallory holds @everyone and nothing else.
+    Fixture f("create-dm-three");
+    f.add_user("mallory");
+    auto v1 = f.add_user("victim1");
+    auto v2 = f.add_user("victim2");
+    auto v3 = f.add_user("victim3");
+
+    auto res = f.create("token-mallory",
+                        json{{"is_direct", true},
+                             {"invite", json::array({v1, v2, v3})}});
+
+    EXPECT_EQ(res.status, 403) << res.body;
+    EXPECT_TRUE(mentions_direct_message(res)) << res.body;
+    // The status is the symptom; what matters is that nothing was written. No
+    // room, so no membership row, no m.room.member event and no sync wake for
+    // three people who never asked for any of it.
+    EXPECT_TRUE(f.store->get_direct_rooms(v1).empty());
+    EXPECT_TRUE(f.store->get_direct_rooms(v2).empty());
+    EXPECT_TRUE(f.store->get_direct_rooms(v3).empty());
+}
+
+TEST(DirectRoomMembership, IsDirectIsRefusedForAModeratorToo) {
+    // The rule is STRUCTURAL, not a permission the right role gets to skip —
+    // the same shape as the refusals at the top of this file. A room that no
+    // directory lists, no override can hide and no kick can empty is
+    // unmanageable whoever made it, so MANAGE_CHANNELS is not a licence to
+    // manufacture one. Without this, the fix would only have moved F3 from
+    // "@everyone can do it" to "a channel moderator can do it".
+    Fixture f("create-dm-three-mod");
+    f.add_user("alice", {kModeratorRole});
+    auto b = f.add_user("bob");
+    auto c = f.add_user("carol");
+
+    auto res = f.create("token-alice",
+                        json{{"is_direct", true}, {"invite", json::array({b, c})}});
+    EXPECT_EQ(res.status, 403) << res.body;
+}
+
+TEST(DirectRoomMembership, IsDirectWithNoInviteesIsRefused) {
+    // The empty list is the same room by another spelling: one member, no
+    // directory entry, no remedy. Nothing in the client can open one, so
+    // nothing is lost by refusing it.
+    Fixture f("create-dm-empty");
+    f.add_user("alice");
+    EXPECT_EQ(f.create("token-alice", json{{"is_direct", true}}).status, 403);
+    EXPECT_EQ(f.create("token-alice",
+                       json{{"is_direct", true}, {"invite", json::array()}}).status, 403);
+}
+
+TEST(DirectRoomMembership, IsDirectWithOnlySelfIsRefused) {
+    // And this one would also defeat the dedup in handle_create_room — the pair
+    // (me, me) can never match an existing direct room, so every request would
+    // mint a fresh one. An unbounded supply of undeletable rooms, one request
+    // each, with a single user id needed to ask.
+    Fixture f("create-dm-self");
+    auto alice = f.add_user("alice");
+    EXPECT_EQ(f.create("token-alice",
+                       json{{"is_direct", true}, {"invite", json::array({alice})}}).status,
+              403);
+}
+
+TEST(DirectRoomMembership, ADuplicatedInviteeIsNotAWayAroundTheCap) {
+    // `{"invite": [bob, bob]}` is two entries naming one person, and the loop
+    // that consumes it would have skipped the second as a no-op — so a cap
+    // written as "the list must name at most two DISTINCT accounts" would let
+    // this through and then have to decide what it meant. The rule is about the
+    // LIST, not about who survives it, which is the version a reader can check.
+    Fixture f("create-dm-dupe");
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+    EXPECT_EQ(f.create("token-alice",
+                       json{{"is_direct", true}, {"invite", json::array({bob, bob})}}).status,
+              403);
+}
+
+TEST(DirectRoomMembership, ADirectRoomCannotBeCreatedAsServerStructure) {
+    // A DM is not part of the channel tree, and handle_set_state already
+    // refuses bsfchat.room.category, bsfchat.room.type, m.room.join_rules and
+    // bsfchat.channel.permissions on one. Creation was the hole in that rule:
+    // every field below could be written into a direct room, at creation, by a
+    // caller who would have needed MANAGE_CHANNELS to write it one request
+    // later. Doing the ungated thing first is not a different act.
+    Fixture f("create-dm-structure");
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto parent = f.add_channel("@alice:test", "category");
+
+    auto with = [&](const json& extra) {
+        json body{{"is_direct", true}, {"invite", json::array({bob})}};
+        body.update(extra);
+        return f.create("token-alice", body).status;
+    };
+
+    EXPECT_EQ(with(json{{"name", "not a dm"}}), 403);
+    EXPECT_EQ(with(json{{"topic", "not a dm"}}), 403);
+    EXPECT_EQ(with(json{{"is_category", true}}), 403);
+    EXPECT_EQ(with(json{{"voice", true}}), 403);
+    EXPECT_EQ(with(json{{"parent_id", parent}}), 403);
+}
+
+TEST(DirectRoomMembership, RefusingTheShapeSaysNothingAboutWhoExists) {
+    // The shape rules sit ABOVE the permission check, which everywhere else in
+    // RoomHandler.cpp is only safe once the caller has proven membership. It is
+    // safe here for a different reason, and the reason is worth pinning: every
+    // sentence the rule can return is a statement about the body the caller
+    // just wrote, and none of them reads the store. So a well-formed DM request
+    // naming an account that does not exist must NOT be refused — createRoom
+    // needs no permission, so a refusal there would answer "does @x exist?" for
+    // anyone who asked.
+    Fixture f("create-dm-oracle");
+    f.add_user("alice");
+    auto real = f.add_user("bob");
+
+    auto ghost = f.create_dm("token-alice", "@nobody:test");
+    auto present = f.create_dm("token-alice", real);
+    EXPECT_TRUE(IsOk(ghost)) << ghost.body;
+    EXPECT_TRUE(IsOk(present)) << present.body;
+    // Same answer either way, which is the property. The cost is a one-member
+    // room; the alternative cost is a user directory nobody published.
+    EXPECT_EQ(ghost.status, present.status);
+}
+
+TEST(DirectRoomMembership, CreatingRoomsIsRateLimited) {
+    // The fan-out half of F3, and it is separate from the cap. The cap bounds
+    // one request; this bounds the requests. createRoom is the most expensive
+    // write the server has — a room row, half a dozen state events, a
+    // membership row plus a member event plus a sync wake per participant — and
+    // it is the ONLY such route every authenticated account can reach, because
+    // opening a DM is deliberately ungated. Before this it had no limiter at
+    // all: SendLimiter had buckets for send, redact, media upload and profile,
+    // and RoomHandler held none.
+    Fixture f("create-rate", /*room_create_limit=*/3);
+    f.add_user("alice");
+    std::vector<std::string> peers;
+    for (int i = 0; i < f.config.send_limits.room_create_limit + 3; ++i) {
+        peers.push_back(f.add_user("peer" + std::to_string(i)));
+    }
+
+    int refused = 0;
+    for (const auto& peer : peers) {
+        if (f.create_dm("token-alice", peer).status == 429) ++refused;
+    }
+    EXPECT_GT(refused, 0) << "POST /createRoom has no rate limit";
+}
+
+TEST(DirectRoomMembership, TheRateLimitIsChargedBelowTheRefusals) {
+    // Ordering, and it is the same one EventHandler::handle_send uses. A budget
+    // spent above a refusal is an oracle: a caller could probe which bodies are
+    // accepted by watching where the 429 boundary falls instead of reading the
+    // 403s. A budget spent below one only meters work the server was going to
+    // do. So a wall of refused requests must not exhaust the bucket.
+    Fixture f("create-rate-order", /*room_create_limit=*/3);
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+
+    for (int i = 0; i < f.config.send_limits.room_create_limit * 4; ++i) {
+        ASSERT_EQ(f.create("token-alice", json{{"is_direct", true}}).status, 403);
+    }
+    // The first request that describes a real DM still gets one.
+    EXPECT_TRUE(IsOk(f.create_dm("token-alice", bob)));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 7. THE OTHER SIDE OF THE PAIR RULE: find_direct_room
+// ─────────────────────────────────────────────────────────────────────────
+
+TEST(DirectRoomMembership, AManufacturedMultiPartyRoomIsNotHandedBackAsSomebodysDm) {
+    // THE CONFUSED DEPUTY, and the reason the pair rule is enforced where a DM
+    // is READ as well as where it is written.
+    //
+    // find_direct_room() answers "the oldest direct room these two are both
+    // joined to", which stopped being the same question as "their DM" the
+    // moment a direct room could hold three people. Given a room holding
+    // {mallory, alice, bob} — which any account could manufacture before the
+    // cap landed — the next time alice opened a DM with bob, handle_create_room
+    // deduped against it and handed back MALLORY'S room, and the two of them
+    // held a private conversation in front of him. Oldest-first ordering means
+    // the manufactured room beats a real one created later.
+    //
+    // Refusing the write stops NEW ones and does nothing for a database that
+    // already carries one, exactly as PermissionsEngine::compute() argues for
+    // clearing channel overrides on a direct room rather than trusting the
+    // route that refuses to write them. So the room simply stops matching, and
+    // alice and bob get a clean two-person room minted instead: the repair
+    // happens by itself, on the next attempt, with nothing to migrate.
+    Fixture f("dedup-poisoned");
+    auto mallory = f.add_user("mallory");
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+
+    // Built in the store, because the handler will no longer make one.
+    auto poisoned = f.add_dm(mallory, alice);
+    f.store->set_membership(poisoned, bob, std::string(membership::kJoin));
+    ASSERT_TRUE(f.store->is_direct_room(poisoned));
+
+    auto res = f.create_dm("token-alice", bob);
+    ASSERT_TRUE(IsOk(res)) << res.body;
+    const auto dm = Fixture::room_id_of(res);
+    ASSERT_FALSE(dm.empty());
+    EXPECT_NE(dm, poisoned) << "alice and bob were handed a room mallory is sitting in";
+    EXPECT_EQ(f.store->get_membership(dm, mallory), std::string(membership::kLeave));
+}
+
+TEST(DirectRoomMembership, OpeningTheSameDmTwiceStillReturnsTheSameRoom) {
+    // The control for the one above. The dedup exists because a client can only
+    // de-duplicate against what it has already synced, which loses to a second
+    // device and to both people clicking at once; a member-count rule that
+    // broke it would replace one bug with another.
+    Fixture f("dedup-control");
+    f.add_user("alice");
+    auto bob = f.add_user("bob");
+
+    auto first = f.create_dm("token-alice", bob);
+    ASSERT_TRUE(IsOk(first));
+    auto second = f.create_dm("token-alice", bob);
+    ASSERT_TRUE(IsOk(second));
+    EXPECT_EQ(Fixture::room_id_of(first), Fixture::room_id_of(second));
+    // And from the other side, which is the case a per-client dedup cannot see.
+    auto third = f.create_dm("token-bob", "@alice:test");
+    ASSERT_TRUE(IsOk(third));
+    EXPECT_EQ(Fixture::room_id_of(first), Fixture::room_id_of(third));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 8. THE ADMINISTRATION REMEDY, AND WHY IT IS NARROWER THAN THE AUDIT ASKED
+//
+// F3's other half: with the four DM predicates composed, a room marked
+// `is_direct` had no moderation remedy at all — invisible to the channel
+// directory, unhideable by an override, unkickable, and undeletable by anyone
+// outside it. An unprivileged account could manufacture one.
+//
+// The audit's proof for this (F3b, tests/test_permission_audit_2026_09.cpp)
+// asserts that an ADMINISTRATOR can delete the room such an account made. It
+// is left DISABLED, and this is the argument, recorded here because the next
+// person to read that test will ask.
+//
+// F3b builds its room with ONE invitee. Before the creation rule that was
+// still a bypass — `is_direct` skipped the permission check whatever the list
+// looked like — so the room was an artefact of the hole and deleting it was
+// obviously right. After the creation rule it is an ordinary two-person DM,
+// indistinguishable from any other, and no predicate exists that could tell
+// them apart. So satisfying F3b now means "an administrator can delete
+// anybody's DM", which
+//
+//   * is not what the audit argued for anywhere in its text,
+//   * reverses DirectRoomIsolation.AnAdminOutsideADmCannotDeleteIt in
+//     test_regressions.cpp — an enabled test with a prior incident behind it,
+//     and the two cannot both be green, and
+//   * changes what m.direct is derived against. A DM's privacy is its
+//     membership; an operator who can destroy one at will is a different
+//     promise, and reopening a closed privacy finding to close an abuse
+//     finding is a bad trade even when both are real.
+//
+// What ships instead is scoped to the SHAPE rather than to the actor: a direct
+// room whose joined membership is not exactly two people is not a direct
+// message, and MANAGE_CHANNELS at SERVER scope may remove it. That closes the
+// gap completely, because after the creation rule a room in that state cannot
+// be made — every one that exists is manufactured by the hole or left over
+// from a database that ran the vulnerable code. A genuine DM keeps exactly the
+// protection it had, and the residual case for one has remedies that already
+// exist and are correctly scoped: ban the sender (a ban is an act on the
+// ACCOUNT and deliberately reaches a DM), or leave.
+//
+// Enumeration is untouched either way, and that is the limit that matters
+// most — it is pinned last in this section.
+// ─────────────────────────────────────────────────────────────────────────
+
+TEST(DirectRoomMembership, AnAdministratorCanDeleteAManufacturedMultiPartyDirectRoom) {
+    // The remedy, aimed at the thing that needed one. This room cannot be
+    // created any more; a database that ran the vulnerable code still has them.
+    Fixture f("dm-delete-manufactured");
+    f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto mallory = f.add_user("mallory");
+    auto v1 = f.add_user("victim1");
+    auto v2 = f.add_user("victim2");
+    auto fake = f.add_dm(mallory, v1);
+    f.store->set_membership(fake, v2, std::string(membership::kJoin));
+
+    EXPECT_TRUE(IsOk(f.destroy(fake, "token-admin"))) << "no remedy for a reported room";
+    EXPECT_FALSE(f.store->room_exists(fake));
+}
+
+TEST(DirectRoomMembership, AnAdministratorStillCannotDeleteAGenuineTwoPersonDm) {
+    // THE LINE, and the assertion that says the remedy above is scoped to a
+    // broken shape rather than handed to a role. Same actor, same route, same
+    // is_direct flag; the only difference is that this room is what it claims
+    // to be. DirectRoomIsolation.AnAdminOutsideADmCannotDeleteIt pins the same
+    // property from the regression suite — it is restated here because this is
+    // the file where somebody will come looking for it after reading F3b.
+    Fixture f("dm-delete-genuine");
+    f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto dm = f.add_dm(alice, bob);
+
+    EXPECT_EQ(f.destroy(dm, "token-admin").status, 403);
+    EXPECT_TRUE(f.store->room_exists(dm));
+    EXPECT_TRUE(f.store->is_room_member(dm, bob));
+}
+
+TEST(DirectRoomMembership, AParticipantOfAManufacturedRoomDoesNotNeedTheException) {
+    // The exception is about people OUTSIDE the room; the participant path is
+    // untouched, and a participant without MANAGE_CHANNELS is refused by the
+    // ordinary permission check below it exactly as before.
+    Fixture f("dm-delete-participant");
+    auto mallory = f.add_user("mallory");
+    auto v1 = f.add_user("victim1");
+    auto v2 = f.add_user("victim2");
+    auto fake = f.add_dm(mallory, v1);
+    f.store->set_membership(fake, v2, std::string(membership::kJoin));
+
+    EXPECT_EQ(f.destroy(fake, "token-victim2").status, 403);
+    EXPECT_TRUE(f.store->room_exists(fake));
+}
+
+TEST(DirectRoomMembership, AnOrdinaryMemberCannotDeleteAnyDirectRoom) {
+    // The floor, both shapes. MANAGE_CHANNELS at server scope is the gate for
+    // the exception, so @everyone is exactly where it was.
+    Fixture f("dm-delete-member");
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+    f.add_user("mallory");
+    auto dm = f.add_dm(alice, bob);
+    auto fake = f.add_dm(alice, carol);
+    f.store->set_membership(fake, bob, std::string(membership::kJoin));
+
+    EXPECT_EQ(f.destroy(dm, "token-mallory").status, 403);
+    EXPECT_EQ(f.destroy(fake, "token-mallory").status, 403);
+    EXPECT_TRUE(f.store->room_exists(dm));
+    EXPECT_TRUE(f.store->room_exists(fake));
+}
+
+TEST(DirectRoomMembership, DeletingAManufacturedRoomIsAuditedAndNamesNobody) {
+    // The remedy has to leave a trace — that is most of what makes it a
+    // guardrail rather than a hole. And the record must stay a record: it names
+    // the room, the actor and a member COUNT, never a member list and never a
+    // line of content, which is what keeps a delete from being a read.
+    Fixture f("dm-delete-audit");
+    f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto mallory = f.add_user("mallory");
+    auto v1 = f.add_user("victim1");
+    auto v2 = f.add_user("victim2");
+    auto fake = f.add_dm(mallory, v1);
+    f.store->set_membership(fake, v2, std::string(membership::kJoin));
+
+    ASSERT_TRUE(IsOk(f.destroy(fake, "token-admin")));
+    SqliteStore::AuditFilter only_this_room;
+    only_this_room.target_room = fake;
+    auto page = f.store->list_audit_records(100, std::nullopt, only_this_room);
+    bool found = false;
+    for (const auto& rec : page.records) {
+        found = true;
+        EXPECT_EQ(rec.actor, "@admin:test");
+        for (const auto& participant : {mallory, v1, v2}) {
+            EXPECT_EQ(rec.before_json.find(participant), std::string::npos)
+                << "the audit record names a participant: " << rec.before_json;
+        }
+    }
+    EXPECT_TRUE(found) << "deleting a direct room left no audit record";
+}
+
+TEST(DirectRoomMembership, NothingLetsAnAdministratorDiscoverDirectRoomsToDelete) {
+    // THE LIMIT that matters most, and the assertion that keeps the judgement
+    // above honest. The remedy is report-driven: it acts on an id somebody
+    // handed over. Nothing added here hands ids over. If this test ever goes
+    // red, the product changed, and this comment is the place that said so.
+    Fixture f("dm-delete-no-enumeration");
+    f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+    auto dm = f.add_dm(alice, bob);
+    auto fake = f.add_dm(alice, carol);
+    f.store->set_membership(fake, bob, std::string(membership::kJoin));
+    auto channel = f.add_channel("@admin:test", "general");
+
+    auto res = f.call(&RoomHandler::handle_channel_directory,
+                      "/_matrix/client/v3/bsfchat/channels", "token-admin", "");
+    ASSERT_TRUE(IsOk(res)) << res.body;
+    EXPECT_EQ(res.body.find(dm), std::string::npos)
+        << "the channel directory is listing a direct room to an administrator";
+    // Including the broken-shaped one. Being deletable once reported must not
+    // become being listed.
+    EXPECT_EQ(res.body.find(fake), std::string::npos)
+        << "the channel directory is listing a manufactured direct room";
+    EXPECT_NE(res.body.find(channel), std::string::npos) << "control: the channel is listed";
+
+    // And the administrator's own m.direct is their own DMs only.
+    EXPECT_TRUE(f.store->get_direct_rooms("@admin:test").empty());
 }

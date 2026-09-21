@@ -215,6 +215,103 @@ because ADMINISTRATOR short-circuits every flag.
   on the least-settled part of the codebase, and getting it wrong drops people
   mid-call — worth doing deliberately rather than alongside this fix.
 
+## Update: "exactly two people, nobody force-joined" is now enforced
+
+`fix/direct-room-guard` (audit-permissions-2026-09 finding **F3**).
+
+Three decisions in this document rest on two sentences about a DM — *"a DM's
+privacy is its membership"* and *"nobody is ever force-joined into one"* — and
+both were **false** for as long as `POST /createRoom` trusted `is_direct`.
+
+The flag arrived in the request body and the only thing it did was skip the
+`MANAGE_CHANNELS` check. So any account holding nothing but `@everyone` could
+send `{"is_direct": true, "invite": [a, b, c]}`, and the invite loop joined all
+three **outright** — `is_direct` force-joins, because `SyncResponse` carries no
+invite delivery channel for a DM. The resulting room was then protected by every
+DM rule at once: `compute()` cleared its channel overrides so no `VIEW_CHANNEL`
+deny could hide it, `list_room_directory_rows()` excluded it in SQL so no
+administrator could find it, `handle_delete_room` admitted participants only,
+and `handle_kick` refused. A room nobody consented to join and nobody could
+leave anybody else out of.
+
+Fixed where the room is **made**, because no later guard can reach it:
+`handle_invite` and the state route already refuse to add a third person to an
+existing DM (`MembershipIntent::direct_room_refusal`), so `createRoom` was the
+only door. `is_direct` stays ungated — opening a DM really is a per-user
+capability — but the claim must now be **true**: exactly one invitee, not the
+caller, and no `name`, `topic`, `parent_id`, `is_category` or `voice`, since a
+DM is not server structure and `handle_set_state` already says so for every
+later edit.
+
+**No group DM was removed, and that was checked rather than assumed.** The
+client's only DM path is `ServerConnection::createDirectMessage(QString)` — one
+scalar user id, reached from four affordances that each pass one person;
+`DirectRooms` keeps `QMap<roomId, peer>`; every DM header renders that one peer.
+The server never modelled anything else: `get_direct_rooms()` returns
+`(room, peer)` **pairs** and `/sync` turns them into an `m.direct` keyed by
+peer, so a three-person direct room would list itself under two different
+people. "Group DM" appears nowhere in the client, the protocol or this repo.
+
+Three things came with it, and the third is the one to argue about.
+
+1. **The pair rule is enforced where a DM is READ as well**, in
+   `find_direct_room()`, for the same reason finding 6 above gives for clearing
+   overrides in `compute()`: refusing the write stops new ones and does nothing
+   for a database that already carries one. Without it that function answers
+   *"the oldest direct room these two are both joined to"*, which stopped being
+   *"their DM"* the moment a direct room could hold three people — so given a
+   manufactured `{mallory, alice, bob}` room, the next DM alice opened with bob
+   deduped straight into it and the two of them talked in front of him. It now
+   simply stops matching and a clean two-person room is minted, so the repair
+   happens by itself with nothing to migrate.
+
+2. **`POST /createRoom` has a rate-limit bucket** (`[limits]
+   room_create_limit`). It is the most expensive write on the server and the
+   only one every authenticated account can reach, precisely because opening a
+   DM is ungated. Charged **below** the refusals, so the budget cannot be used
+   as an oracle for which bodies are accepted.
+
+3. **A direct room whose joined membership is not exactly two may be deleted by
+   `MANAGE_CHANNELS` at server scope.** The audit's own proof for this half
+   (`F3b`) asks for something wider — that an *administrator* can delete the
+   room an unprivileged account made — but it builds that room with one
+   invitee, so once the creation rule lands it is an ordinary DM and the
+   assertion generalises to *"an administrator can delete anybody's DM"*. That
+   reverses `DirectRoomIsolation.AnAdminOutsideADmCannotDeleteIt`, which has an
+   incident behind it, and it retires the first of this document's two
+   sentences. Scoping the remedy to the broken **shape** instead costs nothing:
+   after the creation rule a room in that state cannot be made, so every one
+   that exists is manufactured or legacy, and a genuine DM keeps exactly the
+   protection it had. `F3b` is left **disabled**, with the argument written next
+   to it, because it is a product question and the owner may answer it
+   differently.
+
+   **Enumeration is untouched, and that is the line.** Nothing here lists the
+   direct rooms on an instance: the directory still excludes them in SQL, and
+   `/sync` still serves each account only its own. An operator acts on an id a
+   participant handed them. An operator who could *find* DMs would be a
+   different product; one who can remove a reported room is not.
+
+   **Finding them, without being able to find DMs.** The remedy needs a room
+   id, so `bsfchat-server admin list-fake-dms --config <path>` reports every
+   room marked `is_direct` whose joined membership is not exactly two — and by
+   construction never a genuine DM. It is an offline command like
+   `list-orphan-members`: it requires the database file and the server stopped,
+   so it hands an operator nothing `sqlite3` would not, and **no HTTP route
+   exposes it**. It reports; removal goes through `DELETE /rooms/{id}`, which
+   is audited and wakes the participants' syncs.
+
+**Tests.** Seventeen in `tests/test_dm_membership.cpp` §6–8, eleven confirmed
+failing first, six more for `list-fake-dms` in `tests/test_admin_cli.cpp`, plus the audit's `F3` proof enabled in
+`tests/test_permission_audit_2026_09.cpp`. Six are controls and they are the
+half that would hurt: an ordinary member with no permissions must still open a
+one-to-one DM, opening the same DM twice must still return the same room from
+either side, a refusal must still say nothing about who exists, an ordinary
+member must still be refused a channel, an administrator must still be refused a
+genuine DM, and the channel directory must still list channels. Mutation
+coverage is `tests/e2e/mutate_direct_room_shape.py`, whose M2 is the blanket
+refusal — "no DMs at all" passes every refusal test in the suite.
+
 ## Update: kick is now enforced at `/join`
 
 `fix/kick-enforceable` (audit-requests finding 6) closed the hole this document's

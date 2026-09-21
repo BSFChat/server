@@ -338,8 +338,11 @@ public:
     // has left is still that person's conversation. This is what /sync turns
     // into m.direct.
     std::vector<std::pair<std::string, std::string>> get_direct_rooms(const std::string& user_id);
-    // The direct room both users are currently joined to, if any — oldest
-    // first, so the answer is stable when legacy duplicates exist.
+    // The direct room both users are currently joined to AND WHOSE ONLY TWO
+    // JOINED MEMBERS THEY ARE, if any — oldest first, so the answer is stable
+    // when legacy duplicates exist. The member count is part of the question,
+    // not an optimisation: see the implementation for the confused deputy it
+    // closes.
     std::optional<std::string> find_direct_room(const std::string& user_a,
                                                 const std::string& user_b);
     // Remove a room and everything that references it (events, members,
@@ -442,6 +445,42 @@ public:
     //
     // Ordered by room then user so a repeated run is diffable.
     std::vector<OrphanMembership> list_orphan_memberships();
+
+    struct MalformedDirectRoom {
+        std::string room_id;
+        std::string creator;
+        size_t joined = 0;
+    };
+    // Every room marked `is_direct` whose JOINED membership is not exactly two.
+    //
+    // A direct message is a conversation between exactly two people; that is
+    // the sentence PermissionsEngine::compute(), list_room_directory_rows(),
+    // handle_delete_room and handle_kick are each written against. Until
+    // handle_create_room started checking the `is_direct` claim (finding F3 of
+    // docs/audit-permissions-2026-09.md), any account holding nothing but
+    // @everyone could send `{"is_direct": true, "invite": [a, b, c]}` and get a
+    // room that force-joined all three and was then protected by all four of
+    // those rules at once. No such room can be made now, so every row this
+    // returns is either manufactured through that hole or left over from a
+    // database that ran the vulnerable code.
+    //
+    // GENUINE DMs ARE NEVER RETURNED, and that is the whole design of this
+    // query rather than a side effect. It exists so an operator can find the
+    // rooms that need removing without being handed a list of everyone's
+    // private conversations — an operator who can enumerate DMs is a different
+    // product (docs/membership-vs-visibility.md), and no route exposes this.
+    // It is reachable only from the offline admin CLI, which already requires
+    // the database file and the server stopped, so it adds no capability an
+    // operator did not have with sqlite3.
+    //
+    // A ONE-MEMBER row is included too: a direct room somebody left is normal
+    // and not listed, because the row it left behind still counts the peer —
+    // it is a `leave`, not a deletion — so a count of one means the room never
+    // had two. A REPORT, with no matching delete: removal goes through
+    // DELETE /rooms/{id}, which is audited and wakes the participants' syncs.
+    //
+    // Ordered by room id so a repeated run is diffable.
+    std::vector<MalformedDirectRoom> list_malformed_direct_rooms();
 
     // ── Server-wide bans (schema v15) ─────────────────────────────────────
     //
