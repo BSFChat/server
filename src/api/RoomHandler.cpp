@@ -1919,7 +1919,6 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     // scope half is no longer expressed here — see state_gate_for.
     const bool is_room_type_change = evt_type == std::string(event_type::kRoomType);
 
-
     // Moderation-by-membership-write. This route will happily set another user's
     // m.room.member to "ban", which makes it a second route to the same act as
     // POST /rooms/{id}/ban — and Matrix clients legitimately use it, so it cannot
@@ -1969,6 +1968,7 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     // Severity of what this closes is low on its own — it needs MANAGE_CHANNELS,
     // and the worst outcome is attacker-shaped JSON in the state of a channel
     // you can already administer — but it is the shape that gets copied.
+    //
     // EVERY SETTABLE TYPE NAMES FOUR THINGS, and there is no default for any of
     // them. `allowed` is the closed table described above. `required` is the
     // flag. `scope` is WHERE that flag is evaluated. `home` is where the
@@ -2043,8 +2043,11 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         if (type == event_type::kChannelPermissions) {
             return {true, permission::kManageRoles, Scope::kRoom, Home::kRoomState};
         }
-        // Who may do what ON THE SERVER. Server scope, and the authoritative
-        // copy lives in server_state.
+        // Who may do what ON THE SERVER. Server scope — a per-channel override
+        // granting MANAGE_ROLES in one unimportant channel once let that user
+        // rewrite every role on the server, including granting themselves
+        // ADMINISTRATOR, because the role reader ignores room_id entirely — and
+        // the authoritative copy lives in server_state.
         if (type == event_type::kServerRoles || type == event_type::kMemberRoles) {
             return {true, permission::kManageRoles, Scope::kServer, Home::kServerState};
         }
