@@ -1913,59 +1913,11 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         return;
     }
 
-    // Server-SCOPED state: these describe the whole server, not this channel.
-    // Gating them on a per-channel permission check was a privilege-escalation
-    // hole — a per-channel override granting MANAGE_ROLES in one unimportant
-    // channel let that user rewrite every role on the server, including
-    // granting themselves ADMINISTRATOR, because the role reader ignored
-    // room_id entirely. The check below passes an empty room_id so channel
-    // overrides cannot contribute.
-    const bool is_server_scoped =
-        evt_type == std::string(event_type::kServerRoles) ||
-        evt_type == std::string(event_type::kMemberRoles);
-
-    // Changing an existing room's KIND is an act on the server's channel tree,
-    // not an edit inside one channel, and it is the lever that made the
-    // category exemption a privilege escalation: at room scope, an allow
-    // override on a single channel — the natural way to give someone their own
-    // channel — was enough to retype any channel as a category and inherit the
-    // exemption. `may_edit_role_definitions` already states the principle for
-    // MANAGE_ROLES ("must not be a one-request path to owning the server"); it
-    // is the same sentence about MANAGE_CHANNELS and reading every channel.
-    //
-    // Only the permission SCOPE moves. Unlike the two types above, the event
-    // still belongs to the room and is still written as ordinary room state,
-    // which is why this is a separate flag and not folded into
-    // `is_server_scoped`. Room CREATION is unaffected: handle_create_room
-    // writes the initial type itself, behind its own server-scope
-    // MANAGE_CHANNELS check, on a room that is empty by construction.
+    // Changing an existing room's KIND is an act on the server's channel tree
+    // rather than an edit inside one channel, so it carries rules of its own
+    // below (the conversion gate) as well as a server SCOPE in the table. The
+    // scope half is no longer expressed here — see state_gate_for.
     const bool is_room_type_change = evt_type == std::string(event_type::kRoomType);
-
-    // The server-wide screen-share ceiling, which gets the same scope-only
-    // treatment for the same reason.
-    //
-    // `bsfchat.server.screenshare` is the maximum screen-share quality FOR THE
-    // DEPLOYMENT. The client writes it into whichever room happens to be active
-    // — ServerConnection::setScreenSharePolicy takes m_activeRoomId and falls
-    // back to the first room in the list — and every client applies whichever
-    // copy reaches it through /sync, whatever room it arrived in. Nothing
-    // scopes it to a channel. Gating it on MANAGE_CHANNELS at ROOM scope
-    // therefore meant an allow override in one unimportant channel was a lever
-    // on a server-wide media setting: the same shape as the bsfchat.room.type
-    // bug above, and the same sentence may_edit_role_definitions already
-    // writes down. Finding 21 of docs/audit-requests-2026-09.md.
-    //
-    // NOT folded into `is_server_scoped`, deliberately. That flag means more
-    // than "server-wide": it moves the AUTHORITATIVE copy into server_state and
-    // routes the write through write_server_scoped_state, whose rank checks
-    // parse the body as a role document. Nothing reads a screen-share cap from
-    // server_state — the only reader in the system is the client, off the sync
-    // mirror — so taking that branch would write a row no read path consults,
-    // audit it as a role change, and leave the copy clients actually obey
-    // exactly where it is now. Scope-only is the whole of the defect and the
-    // whole of the fix.
-    const bool is_server_wide_media_setting =
-        evt_type == std::string(event_type::kServerScreenShare);
 
     // Moderation-by-membership-write. This route will happily set another user's
     // m.room.member to "ban", which makes it a second route to the same act as
@@ -2016,38 +1968,98 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     // Severity of what this closes is low on its own — it needs MANAGE_CHANNELS,
     // and the worst outcome is attacker-shaped JSON in the state of a channel
     // you can already administer — but it is the shape that gets copied.
+    //
+    // EVERY SETTABLE TYPE NAMES FOUR THINGS, and there is no default for any of
+    // them. `allowed` is the closed table described above. `required` is the
+    // flag. `scope` is WHERE that flag is evaluated. `home` is where the
+    // authoritative copy of the event lands.
+    //
+    // SCOPE IS IN THE TABLE BECAUSE THE SAME BUG HAPPENED THREE TIMES.
+    //
+    // A type whose effect is server-wide must be gated at server scope,
+    // because `perms.can(user, room_id, FLAG)` lets that channel's overrides
+    // contribute and `perms.can(user, kServerScope, FLAG)` does not — so a
+    // per-channel ALLOW override, which is the natural way to give somebody
+    // their own channel, is otherwise a lever on the whole deployment. That
+    // sentence was written here twice already, as two named exceptions with
+    // two long comments: `bsfchat.room.type`, whose room scope let one channel
+    // grant be enough to retype any channel as a category, and
+    // `bsfchat.server.screenshare` (finding 21 of
+    // docs/audit-requests-2026-09.md), a server-wide media setting the client
+    // writes into whichever room happens to be active.
+    //
+    // Both fixes were correct and neither generalised, so the third instance
+    // was still here when the September 2026 permissions audit looked: F1,
+    // `bsfchat.server.info`, evaluated in the room it was written in, which
+    // made a channel-scoped MANAGE_SERVER override enough to rename the
+    // deployment and replace its icon for every connected client. The comment
+    // at the top of this function had NAMED `bsfchat.server.info` among the
+    // types "NOT scoped to the room they are written in" since before the
+    // second fix landed; the scope expression twelve lines below it simply did
+    // not include it. A list of exceptions is a structure that has to be
+    // remembered. A column is a structure that has to be filled in.
+    //
+    // `home` is the other axis and it is NOT the same question, which is why
+    // the two were conflated for so long. kServerState means the write is
+    // routed through write_server_scoped_state, which moves the authoritative
+    // copy into server_state and audits it as a role change after parsing the
+    // body as a role document. That is right for the role types and wrong for
+    // `server.info` and `server.screenshare`: nothing reads server identity or
+    // a screen-share cap out of server_state — the only reader in the system
+    // is the client, off the sync mirror — so taking that branch would write a
+    // row no read path consults and leave the copy clients actually obey
+    // exactly where it is now. Server-WIDE and server-STORED are different
+    // properties and every row below states both.
+    enum class Scope { kRoom, kServer };
+    enum class Home { kRoomState, kServerState };
     struct StateGate {
         bool allowed = false;
         permission::Flags required = 0;
+        Scope scope = Scope::kRoom;
+        Home home = Home::kRoomState;
     };
     const auto state_gate_for = [](const std::string& type) -> StateGate {
-        // Channel structure and presentation. MANAGE_CHANNELS, evaluated in the
-        // room (except bsfchat.room.type, whose SCOPE is moved to the server by
-        // is_room_type_change above — the flag is the same one).
+        // Channel structure and presentation: an edit INSIDE one channel,
+        // evaluated in that channel, stored on it.
         if (type == event_type::kRoomName || type == event_type::kRoomTopic ||
             type == event_type::kRoomAvatar || type == event_type::kRoomJoinRules ||
             type == event_type::kRoomCanonicalAlias ||
             type == event_type::kRoomHistoryVisibility ||
             type == event_type::kRoomPowerLevels || type == event_type::kRoomPinnedEvents ||
             type == event_type::kRoomVoice || type == event_type::kRoomCategory ||
-            type == event_type::kRoomType || type == event_type::kChannelSettings) {
-            return {true, permission::kManageChannels};
+            type == event_type::kChannelSettings) {
+            return {true, permission::kManageChannels, Scope::kRoom, Home::kRoomState};
         }
-        // Who may do what. MANAGE_ROLES, and for the two server-scoped ones the
-        // scope moves too (is_server_scoped, above).
-        if (type == event_type::kChannelPermissions || type == event_type::kServerRoles ||
-            type == event_type::kMemberRoles) {
-            return {true, permission::kManageRoles};
+        // The room's KIND. Same flag as its siblings above, server scope: it
+        // is a decision about the server's channel tree and about who may read
+        // the conversation inside, not a presentation change.
+        if (type == event_type::kRoomType) {
+            return {true, permission::kManageChannels, Scope::kServer, Home::kRoomState};
         }
-        // Server identity.
+        // Who may do what IN THIS CHANNEL. Room scope is correct here — this
+        // is the one type whose entire subject is the channel it is written in
+        // — and it is exactly why it needs rules of its own beyond the flag:
+        // see PermissionsEngine::may_write_channel_override, applied below.
+        if (type == event_type::kChannelPermissions) {
+            return {true, permission::kManageRoles, Scope::kRoom, Home::kRoomState};
+        }
+        // Who may do what ON THE SERVER. Server scope — a per-channel override
+        // granting MANAGE_ROLES in one unimportant channel once let that user
+        // rewrite every role on the server, including granting themselves
+        // ADMINISTRATOR, because the role reader ignores room_id entirely — and
+        // the authoritative copy lives in server_state.
+        if (type == event_type::kServerRoles || type == event_type::kMemberRoles) {
+            return {true, permission::kManageRoles, Scope::kServer, Home::kServerState};
+        }
+        // Server identity — the name and icon every client renders, which
+        // ServerConnection writes into whichever room happens to be active and
+        // applies from whichever room it arrives in. Server scope. F1.
         if (type == event_type::kServerInfo) {
-            return {true, permission::kManageServer};
+            return {true, permission::kManageServer, Scope::kServer, Home::kRoomState};
         }
-        // The server-wide screen-share ceiling. MANAGE_CHANNELS, evaluated at
-        // SERVER scope — see is_server_wide_media_setting above for why, and
-        // for why it is not in is_server_scoped.
+        // The deployment's screen-share ceiling. Same shape as server identity.
         if (type == event_type::kServerScreenShare) {
-            return {true, permission::kManageChannels};
+            return {true, permission::kManageChannels, Scope::kServer, Home::kRoomState};
         }
         return {};
     };
@@ -2057,17 +2069,13 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     const auto gate = state_gate_for(evt_type);
 
     PermissionsEngine perms(store_, config_);
-    // `is_server_scoped` also decides WHERE the write lands (server_state vs room
-    // state), which is why it is not folded into the scope expression below.
-    //
-    // The other two move the permission SCOPE and nothing else: the event stays
-    // ordinary room state and is delivered exactly as it was. Both are acts on
-    // the server rather than edits inside one channel, so a per-channel
-    // override — allow OR deny — must have no say over them in either
-    // direction.
-    const bool is_scope_only_server_act = is_room_type_change || is_server_wide_media_setting;
-    const std::string perm_scope =
-        (is_server_scoped || is_scope_only_server_act) ? kServerScope : room_id;
+    // Both read straight off the table, so neither can disagree with it and
+    // neither can be forgotten for a type added later. A server-scoped check
+    // passes kServerScope, which is the empty room id: PermissionsEngine
+    // applies no channel override to it, in either direction, so a per-channel
+    // allow cannot grant the act and a per-channel deny cannot block it.
+    const bool is_server_scoped = gate.home == Home::kServerState;
+    const std::string perm_scope = gate.scope == Scope::kServer ? kServerScope : room_id;
 
     json content;
     try {
@@ -2303,6 +2311,48 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     if (is_channel_override) {
         auto existing = store_.get_state_event(room_id, evt_type, state_key);
         if (existing) previous_state = existing->content.data.dump();
+
+        // ── THE CONTAINMENT RULE, applied to the third way this server hands
+        //    out permissions ──
+        //
+        // MANAGE_ROLES at room scope used to be the WHOLE gate on this event,
+        // and this event is a permission grant to a named principal. The other
+        // two routes that do that — the role document and the role assignment
+        // — have both carried a "you cannot grant what you do not hold" rule
+        // and a rank rule for a while, for reasons written out at length in
+        // auth/Permissions.h. This one carried neither, so F2 of
+        // docs/audit-permissions-2026-09.md was: a delegated "builder" holding
+        // MANAGE_ROLES in one channel wrote itself every channel-scoped flag
+        // in that channel (delete it, redact anybody's messages, ping
+        // @everyone), and wrote a DENY against accounts that outranked it.
+        // Chained with F1 above it was a two-request path to renaming the
+        // server, which is the exact sentence may_edit_role_definitions' own
+        // comment says MANAGE_ROLES must not be.
+        //
+        // The rules live on PermissionsEngine rather than here, deliberately.
+        // This is currently the only writer, and a rule that lives at its only
+        // call site is a rule the second call site does not get — which is the
+        // history of this whole function.
+        //
+        // The previous override is read HERE rather than inside the engine
+        // because the audit capture two lines up has already paid for that
+        // read. `before` defaults to allow = 0, deny = 0, which is exactly
+        // what "there is no override" means to compute().
+        ChannelPermissionOverride before;
+        if (existing) from_json(existing->content.data, before);
+        ChannelPermissionOverride proposed;
+        from_json(content, proposed);
+
+        auto verdict = perms.may_write_channel_override(*user_id, room_id, state_key, before,
+                                                        proposed);
+        if (!verdict.allowed) {
+            get_logger()->warn("Refused channel override by {} on {} ({}): {}", *user_id,
+                               room_id, state_key, verdict.reason);
+            res.status = 403;
+            res.set_content(MatrixError::forbidden(verdict.reason).to_json().dump(),
+                            "application/json");
+            return;
+        }
     }
 
     // Echo back the id that was actually stored — this used to generate a

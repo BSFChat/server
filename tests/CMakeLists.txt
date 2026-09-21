@@ -52,6 +52,7 @@ add_executable(server_tests
     test_invite_refusal_codes.cpp
     test_dm_membership.cpp
     test_permission_audit_2026_09.cpp
+    test_permission_containment.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

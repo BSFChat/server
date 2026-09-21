@@ -122,16 +122,20 @@ std::optional<BotHandler::BotAdminContext> BotHandler::authorize_bot_admin(
     // position as the bot is refused, because equal rank means the bot's roles
     // are not already theirs to hold. That is the same rule may_assign_roles
     // applies to a human target ("at or above you").
+    //
+    // And since F6 it also answers for the bot's CHANNEL access, which for a
+    // scoped bot is the whole of what the credential is worth — see
+    // BotHandler.h and PermissionsEngine::channel_access_excess.
     const bool exempt = perms.can(*actor, kServerScope, permission::kAdministrator);
     if (!exempt && !perms.outranks(*actor, bot_user_id)) {
         get_logger()->warn(
             "Refused attempt by {} to {} for bot {}, which ranks at or above them "
-            "(bot credentials confer the bot's roles)",
+            "(bot credentials confer the bot's roles and its channel access)",
             *actor, action, bot_user_id);
         send_error(res, 403, MatrixError::forbidden(
             std::string("You cannot ") + action +
             " for a bot that ranks at or above you: its token would grant you the "
-            "bot's roles"));
+            "bot's roles and its access to channels"));
         return std::nullopt;
     }
 

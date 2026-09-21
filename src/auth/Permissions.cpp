@@ -6,6 +6,7 @@
 #include <bsfchat/Constants.h>
 
 #include <algorithm>
+#include <cstring>
 #include <limits>
 #include <set>
 #include <string>
@@ -178,9 +179,49 @@ int PermissionsEngine::highest_role_position(const std::string& user_id) {
     return highest;
 }
 
+const std::vector<std::string>& PermissionsEngine::override_rooms() {
+    if (!override_rooms_cache_) override_rooms_cache_ = store_.rooms_with_channel_overrides();
+    return *override_rooms_cache_;
+}
+
+permission::Flags PermissionsEngine::channel_access_excess(const std::string& subject_id,
+                                                           const std::string& actor_id) {
+    // A SHORT-CIRCUIT FOR COST, NOT FOR CORRECTNESS, and worth labelling as
+    // such so nobody defends it with a test that cannot exist. compute()
+    // already returns kAllFlags for an administrator and for @server in every
+    // room, so the loop below would reach zero on its own for both — these two
+    // lines only stop it asking the database first. Deleting them changes no
+    // answer, which is exactly why tests/e2e/mutate_containment.py does not
+    // carry a mutation for them.
+    if (is_server_actor(actor_id, config_)) return 0;
+    if (can(actor_id, std::string(), permission::kAdministrator)) return 0;
+
+    // The ROLE half of the difference, which this function is not about — see
+    // the header. Subtracting it is what keeps "a moderator holding
+    // KICK_MEMBERS may moderate a member holding MANAGE_MESSAGES" true, which
+    // is the arrangement `position` exists to express.
+    const permission::Flags role_gap =
+        compute(subject_id, std::string()) & ~compute(actor_id, std::string());
+
+    permission::Flags excess = 0;
+    for (const auto& room_id : override_rooms()) {
+        excess |= (compute(subject_id, room_id) & ~compute(actor_id, room_id)) & ~role_gap;
+        // Nothing below can retract a bit, so stop as soon as every flag the
+        // server defines is already accounted for. Mostly this just means the
+        // common answer — a scoped bot with one channel — costs one query.
+        if (excess == permission::kAllFlags) break;
+    }
+    return excess;
+}
+
 bool PermissionsEngine::outranks(const std::string& actor_id, const std::string& target_id) {
     if (is_server_actor(actor_id, config_)) return true;
-    return highest_role_position(actor_id) > highest_role_position(target_id);
+    // The role half first: it is two in-memory lookups against data this
+    // engine has almost certainly already read, and it is the half that
+    // refuses most often. The channel half costs one query per configured
+    // channel, so it is only asked once the cheap answer is "yes".
+    if (highest_role_position(actor_id) <= highest_role_position(target_id)) return false;
+    return channel_access_excess(target_id, actor_id) == 0;
 }
 
 namespace {
@@ -472,6 +513,111 @@ PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_edit_role_definition
         }
     }
 
+    return {};
+}
+
+PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_write_channel_override(
+    const std::string& actor_id, const std::string& room_id, const std::string& state_key,
+    const ChannelPermissionOverride& before, const ChannelPermissionOverride& proposed) {
+    // FIRST, and before any exemption — the two rules about what an override
+    // is ALLOWED TO SAY, which bind administrators and the synthetic @server
+    // actor as well, in the same way and for the same reason
+    // validate_role_document binds them.
+
+    // 1. It has to name somebody. compute() applies exactly two key shapes,
+    //    "role:<id>" and "user:<id>", so anything else is a row that is stored,
+    //    mirrored to every client through /sync, shown in the audit log as a
+    //    permission change, and read by nothing. This route already refuses an
+    //    unlisted EVENT TYPE rather than storing attacker-shaped state it does
+    //    not understand; an unlisted STATE KEY on the one event whose whole
+    //    content is a permission grant deserves the same closed table.
+    if (state_key.rfind("user:", 0) != 0 && state_key.rfind("role:", 0) != 0) {
+        return {false, "A channel override must name a user (\"user:<id>\") or a role "
+                       "(\"role:<id>\")"};
+    }
+
+    // 2. ADMINISTRATOR is not a thing a channel can say. compute() takes the
+    //    administrator short-circuit from the ROLE BASE, before a single
+    //    override is applied, so the bit is inert here whoever writes it — its
+    //    presence in an override is always either a misunderstanding of the
+    //    model or somebody probing it. Refused only when the write ADDS it, so
+    //    an override stored by an older build can still be edited or cleared
+    //    and no channel is left unfixable.
+    if (permission::has(proposed.allow, permission::kAdministrator) &&
+        !permission::has(before.allow, permission::kAdministrator)) {
+        return {false, "A channel override cannot grant the Administrator permission; it is a "
+                       "role-level flag and a channel has no say over it"};
+    }
+
+    if (is_server_actor(actor_id, config_)) return {};
+    if (can(actor_id, std::string(), permission::kAdministrator)) return {};
+
+    // The gate the caller has already applied, applied again. Deliberate
+    // duplication: this function is THE authority for a channel override (see
+    // the header), and an authority that trusts its caller to have done the
+    // first half is an authority that loses the first half the day a second
+    // caller appears. It is one memoised comparison.
+    if (!can(actor_id, room_id, permission::kManageRoles)) {
+        return {false, "You need Manage Roles in this channel to change its permissions"};
+    }
+
+    // ── Rule 1: containment ──
+    //
+    // Every bit this write TOUCHES, in either direction, measured against what
+    // the actor holds in this very channel. See the header for why it is a
+    // symmetric difference and not "what the edit adds": removing a deny is a
+    // grant wearing a removal's clothes, and it was the one of the four edits
+    // most likely to be missed.
+    const permission::Flags held = compute(actor_id, room_id);
+    const permission::Flags changed =
+        (proposed.allow ^ before.allow) | (proposed.deny ^ before.deny);
+    if (const permission::Flags beyond = changed & ~held; beyond != 0) {
+        return {false, "You cannot change a permission you do not hold in this channel ("
+                           + permission::flags_to_hex(beyond) + ")"};
+    }
+
+    // ── Rule 2: rank ──
+    //
+    // Only for the direction that takes access away. Handing a principal MORE
+    // access in a channel takes nothing from anybody and is what this route is
+    // for; refusing it on rank would stop a channel's own manager from letting
+    // their own administrators in.
+    const permission::Flags taken =
+        (proposed.deny & ~before.deny) | (before.allow & ~proposed.allow);
+    if (taken == 0) return {};
+
+    if (state_key.rfind("user:", 0) == 0) {
+        const std::string target = state_key.substr(std::strlen("user:"));
+        // The same test may_assign_roles applies to rewriting this person's
+        // roles and handle_put_nickname applies to relabelling them. A DENY is
+        // a moderation action against a named account — muting somebody is not
+        // a lesser act than kicking them — so it answers to the same rule.
+        if (!outranks(actor_id, target)) {
+            return {false, "You cannot take permissions away from a user ranked at or above "
+                           "you in this channel"};
+        }
+        return {};
+    }
+
+    const std::string role_id = state_key.substr(std::strlen("role:"));
+    // @everyone is the floor rather than a principal above anyone, and
+    // "@everyone DENY VIEW_CHANNEL" is literally how a private channel is made
+    // on this server (docs/membership-vs-visibility.md) — a rank test here
+    // would refuse the feature. Containment above still binds it, which is the
+    // half that matters: you cannot deny a channel a permission you do not
+    // hold in it.
+    if (role_id == permission::role_id::kEveryone) return {};
+
+    const ServerRole* role = find_role(server_roles(), role_id);
+    // An override naming a role that no longer exists confers and removes
+    // nothing — resolve_user_roles cannot match it — so it is treated as
+    // rankless rather than refused, exactly as highest_role_position treats an
+    // assignment naming one.
+    const int role_pos = role ? role->position : 0;
+    if (role_pos >= highest_role_position(actor_id)) {
+        return {false, "You cannot take permissions away from a role ranked at or above your "
+                       "own"};
+    }
     return {};
 }
 
