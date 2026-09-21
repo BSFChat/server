@@ -71,6 +71,13 @@ private:
     // any room where one survives. Uploader and profile-avatar are the two
     // explicit exceptions; everything else with no room recorded is refused,
     // because "unattached" must never be read as "public".
+    //
+    // A forwarder to MediaAccess::may_read (auth/MediaAccess.h), which is where
+    // the rule lives since audit finding F5 — because the WRITE side, the index
+    // this read consults, now has to ask the identical question of an event's
+    // author before it will record a reference. A read rule and a write rule
+    // that merely agree are two rules, and F5 is what happened when they
+    // disagreed.
     bool may_download(const std::string& user_id, const std::string& media_id,
                       const SqliteStore::MediaMeta& meta);
 

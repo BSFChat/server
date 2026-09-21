@@ -29,6 +29,7 @@
 #include "api/MediaHandler.h"
 #include "api/MediaPolicy.h"
 #include "auth/LocalAuth.h"
+#include "auth/MediaAccess.h"
 #include "core/Config.h"
 #include "storage/LocalStorage.h"
 #include "storage/MediaReaper.h"
@@ -455,10 +456,14 @@ struct AclFixture {
     }
 
     // Post it as an ordinary attachment message.
+    // Through insert_event_vetted, which is what every production send path
+    // uses: since audit F5 the binding is created only for a sender who could
+    // already read the object, so a fixture that wrote the row unconditionally
+    // would be testing a door the server no longer has.
     std::string post(const std::string& room_id, const std::string& sender,
                      const std::string& mxc_uri) {
         auto event_id = generate_event_id("test");
-        store->insert_event(event_id, room_id, sender,
+        insert_event_vetted(*store, config, event_id, room_id, sender,
                             std::string(event_type::kRoomMessage), std::nullopt,
                             json{{"msgtype", "m.image"}, {"body", "p.png"},
                                  {"url", mxc_uri},
@@ -658,7 +663,8 @@ TEST(MediaAcl, TheReferenceIndexFollowsTheUriWhereverItAppears) {
     auto thumb = f.upload(alice);
     auto nested = f.upload(alice);
 
-    f.store->insert_event(
+    insert_event_vetted(
+        *f.store, f.config,
         generate_event_id("test"), room, alice, std::string(event_type::kRoomMessage),
         std::nullopt,
         json{{"msgtype", "m.image"},

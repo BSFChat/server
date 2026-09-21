@@ -33,6 +33,7 @@ add_executable(bsfchat-server
     src/auth/AutoJoin.cpp
     src/auth/LocalAuth.cpp
     src/auth/OidcAuth.cpp
+    src/auth/MediaAccess.cpp
     src/auth/Permissions.cpp
     src/auth/PowerLevels.cpp
     src/auth/RoleBootstrap.cpp
@@ -62,6 +63,7 @@ add_executable(bsfchat-server
     src/storage/MediaReaper.cpp
     src/storage/S3Client.cpp
     src/storage/S3Storage.cpp
+    src/store/MediaReferences.cpp
     src/store/SqliteStore.cpp
     src/store/Migrations.cpp
     src/sync/SyncEngine.cpp

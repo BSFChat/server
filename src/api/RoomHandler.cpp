@@ -1,4 +1,5 @@
 #include "api/RoomHandler.h"
+#include "auth/MediaAccess.h"
 #include "audit/AuditLog.h"
 #include "auth/AutoJoin.h"
 #include "auth/Permissions.h"
@@ -528,7 +529,14 @@ std::string RoomHandler::emit_state_event(const std::string& room_id, const std:
                                            const std::string& event_type, const std::string& state_key,
                                            const json& content) {
     auto event_id = generate_event_id(config_.server_name);
-    store_.insert_event(event_id, room_id, sender, event_type, state_key, content.dump(), now_ms());
+    // Every state write in this handler funnels through here, including
+    // handle_set_state, whose `content` is the caller's request body — a
+    // channel icon, a server icon, and whatever else a client decides to put
+    // in a state event. So the same vetting the send path runs applies here:
+    // an icon may be set to an object the writer can read, and not to one they
+    // cannot. See auth/MediaAccess.h.
+    insert_event_vetted(store_, config_, event_id, room_id, sender, event_type, state_key,
+                        content.dump(), now_ms());
     sync_engine_.notify_new_event();
     return event_id;
 }

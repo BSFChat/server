@@ -28,6 +28,7 @@
 #include "api/MediaHandler.h"
 #include "api/MediaTicket.h"
 #include "auth/LocalAuth.h"
+#include "auth/MediaAccess.h"
 #include "core/Config.h"
 #include "storage/LocalStorage.h"
 #include "store/SqliteStore.h"
@@ -164,9 +165,11 @@ struct TicketFixture {
         return id;
     }
 
+    // insert_event_vetted, like the production send path — see the same
+    // helper in test_media_security.cpp.
     void post(const std::string& room_id, const std::string& sender,
               const std::string& mxc_uri) {
-        store->insert_event(generate_event_id("test"), room_id, sender,
+        insert_event_vetted(*store, config, generate_event_id("test"), room_id, sender,
                             std::string(event_type::kRoomMessage), std::nullopt,
                             json{{"msgtype", "m.image"}, {"body", "p.png"},
                                  {"url", mxc_uri}}.dump(),

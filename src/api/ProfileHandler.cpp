@@ -1,4 +1,5 @@
 #include "api/ProfileHandler.h"
+#include "auth/MediaAccess.h"
 #include "audit/AuditLog.h"
 #include "auth/Permissions.h"
 #include "core/Config.h"
@@ -278,7 +279,54 @@ void ProfileHandler::handle_put_avatar_url(const httplib::Request& req, httplib:
 
     if (profile_flood(*user_id, res)) return;
 
-    store_.set_avatar_url(*user_id, body["avatar_url"].get<std::string>());
+    const auto avatar_url = body["avatar_url"].get<std::string>();
+
+    // The avatar has to be an object THIS account uploaded. Audit F5's worst
+    // variant, and the reason the test is "uploaded" and not "can read":
+    //
+    // MediaAccess rule 3 makes a room-less object readable by every
+    // authenticated account when it is somebody's avatar — right, because an
+    // avatar is drawn next to its owner's name in every channel and /profile
+    // already discloses the URI. Rule 3 is reached only when `media_refs` is
+    // EMPTY, and emptying `media_refs` is exactly what a redaction does. So
+    // before this check, setting your own avatar_url to a string you copied out
+    // of a redacted message promoted that object from channel-scoped to
+    // server-public, and a moderator's deletion was the thing that made it
+    // possible.
+    //
+    // "Can read" would not close it. Anyone who can see #general can read what
+    // is posted there; if that were the test, they could adopt a colleague's
+    // attachment as their avatar and, the moment it was redacted, it would
+    // become readable by the whole server. Laundering channel-scoped media into
+    // server-public media is the act being refused, so the test has to be
+    // ownership, which laundering cannot manufacture.
+    //
+    // The cost is a real, deliberate narrowing: an avatar must be uploaded with
+    // the credential that wears it. A bot's avatar is uploaded with the bot's
+    // own token, not handed to it as an id by its operator.
+    //
+    // An empty string clears the avatar and is always allowed.
+    if (!avatar_url.empty()) {
+        const std::string prefix = "mxc://" + config_.server_name + "/";
+        std::optional<SqliteStore::MediaMeta> meta;
+        if (avatar_url.rfind(prefix, 0) == 0) {
+            meta = store_.get_media(avatar_url.substr(prefix.size()));
+        }
+        // ONE refusal for "not on this server", "no such object" and "not
+        // yours", byte for byte, for the reason handle_download and
+        // handle_ticket answer 404 the same way in both cases: a media id is
+        // 128 random bits and this endpoint must not become the oracle that
+        // tells someone whether one they guessed or overheard is real.
+        if (!meta || meta->uploader != *user_id) {
+            res.status = 403;
+            res.set_content(MatrixError::forbidden(
+                "avatar_url must be an image you uploaded to this server").to_json().dump(),
+                "application/json");
+            return;
+        }
+    }
+
+    store_.set_avatar_url(*user_id, avatar_url);
     broadcastMemberUpdate(*user_id);
 
     get_logger()->info("User {} updated avatar URL", *user_id);
@@ -464,7 +512,12 @@ void ProfileHandler::broadcastMemberUpdate(const std::string& user_id)
         // once would turn both participants' DM back into a plain channel.
         auto room_content = content;
         if (store_.is_direct_room(room_id)) room_content["is_direct"] = true;
-        store_.insert_event(event_id, room_id, user_id,
+        // Vetted like everything else, which for a member event means vetted
+        // against its SUBJECT — here the same account as the sender. The avatar
+        // in this content is one handle_put_avatar_url has already established
+        // the user uploaded, so this binds it in every room they are in, which
+        // is what makes an avatar readable to the people who see it rendered.
+        insert_event_vetted(store_, config_, event_id, room_id, user_id,
                             std::string(event_type::kRoomMember),
                             user_id, room_content.dump(), now_ms());
     }

@@ -1,4 +1,6 @@
 #include "api/MediaHandler.h"
+
+#include "auth/MediaAccess.h"
 #include "api/MediaPolicy.h"
 #include "api/MediaTicket.h"
 #include "auth/Permissions.h"
@@ -459,52 +461,21 @@ void MediaHandler::handle_ticket(const httplib::Request& req, httplib::Response&
 bool MediaHandler::may_download(const std::string& user_id,
                                 const std::string& media_id,
                                 const SqliteStore::MediaMeta& meta) {
-    // 1. The uploader. They supplied the bytes, and this is also what keeps a
-    //    freshly uploaded object fetchable in the window between POST /upload
-    //    and the PUT /send that attaches it to a room.
-    if (meta.uploader == user_id) return true;
-
-    // The whole URI, not the bare id — see SqliteStore::get_media_rooms().
-    const std::string mxc_uri = "mxc://" + config_.server_name + "/" + media_id;
-
-    // 2. VIEW_CHANNEL in any room where a surviving event names this object.
-    //    One object can legitimately be in several rooms (a forward, a repost),
-    //    and access to any one of those rooms is access to the bytes, because
-    //    that room's timeline already shows them.
-    auto rooms = store_.get_media_rooms(mxc_uri);
-    if (!rooms.empty()) {
-        PermissionsEngine perms(store_, config_);
-        for (const auto& room_id : rooms) {
-            // Membership AND VIEW_CHANNEL, the same pair can_read_room() uses.
-            //
-            // Neither half is redundant. Everyone is force-joined into every
-            // public channel, so membership alone is not authorization — that
-            // is the bug can_read_room's own comment describes. And VIEW_CHANNEL
-            // alone is not either: a DM has no channel overrides, so @everyone's
-            // default VIEW_CHANNEL evaluates true for a user who has never been
-            // near it, which would have made every DM attachment on the server
-            // world-readable.
-            //
-            // Deliberately NOT mirroring can_read_room's is_category_room()
-            // short-circuit: that exemption is an unbounded VIEW_CHANNEL bypass
-            // (audit A3/B2, work package P2) and reproducing it here would carry
-            // it into the media path too.
-            if (store_.is_room_member(room_id, user_id) &&
-                perms.can(user_id, room_id, permission::kViewChannel)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    // 3. Room-less media. This is the case the fix turns on: "no room recorded"
-    //    must mean "nobody", not "everybody", or the backfill gap and every
-    //    future ingestion path become the bypass.
+    // The rule itself moved to MediaAccess (auth/MediaAccess.h) when audit
+    // finding F5 was closed. It did not change: uploader, then VIEW_CHANNEL in
+    // a room where a surviving event names the object, then the avatar
+    // fall-through for room-less media, in that order and with the same
+    // reasoning about why neither half of rule 2 is redundant.
     //
-    //    The one legitimate room-less class is a profile avatar, which is shown
-    //    next to its owner's name everywhere and is already disclosed by
-    //    /profile, so any authenticated caller may have it.
-    return store_.is_avatar_media(mxc_uri);
+    // What changed is that it has a second caller. The WRITE side —
+    // insert_event's media_refs index, which is what this read consults — now
+    // asks the same question of the event's author before creating a binding,
+    // so an id can only be attached to a room by somebody who could already
+    // read it. That only works if the two are literally the same function; a
+    // read rule and a write rule that merely agree today are two rules, and
+    // this package exists because they disagreed.
+    MediaAccess access(store_, config_);
+    return access.may_read(user_id, media_id, meta);
 }
 
 void MediaHandler::handle_download(const httplib::Request& req, httplib::Response& res) {

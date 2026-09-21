@@ -1,4 +1,5 @@
 #include "api/EventHandler.h"
+#include "auth/MediaAccess.h"
 #include "auth/Permissions.h"
 #include "core/Config.h"
 #include "core/Logger.h"
@@ -774,8 +775,15 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
     }
 
     auto event_id = generate_event_id(config_.server_name);
-    int64_t stream_pos = store_.insert_event(event_id, room_id, *user_id, evt_type,
-                                             std::nullopt, content.dump(), now_ms());
+    // insert_event_vetted, not insert_event: this is the path audit finding F5
+    // was proven against. `content` is whatever the caller sent, at any depth,
+    // and the ATTACH_FILES gate above does not stand in the way of a media URI
+    // because it keys off `msgtype` — an `m.text` message with an `mxc://` in
+    // an unrecognised key passes it. Vetting binds only the objects this sender
+    // could already read, so quoting, replying and forwarding still work and
+    // naming a revoked or redacted id grants nothing.
+    int64_t stream_pos = insert_event_vetted(store_, config_, event_id, room_id, *user_id,
+                                             evt_type, std::nullopt, content.dump(), now_ms());
 
     // Record mentions — but NEVER for an edit.
     //
@@ -1077,6 +1085,13 @@ void EventHandler::handle_redact(const httplib::Request& req, httplib::Response&
     }
 
     auto event_id = generate_event_id(config_.server_name);
+    // Bare insert_event, so this event binds NOTHING — and here that is the
+    // stricter choice, not the lazier one. `reason` is free text, and vetting
+    // it would let the redactor re-create the very binding redact_event() just
+    // deleted by naming the id in the reason: the uploader redacting their own
+    // message passes rule 1 every time. A redaction is the one event whose
+    // whole purpose is to REMOVE a media grant, so it must never be able to
+    // create one.
     store_.insert_event(event_id, room_id, *user_id,
                         std::string(event_type::kRoomRedaction),
                         std::nullopt, content.dump(), now_ms());
