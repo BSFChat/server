@@ -2511,10 +2511,9 @@ void SqliteStore::record_redaction_transaction(const RedactionKey& key,
     sqlite3_step(stmt.get());
 }
 
-std::optional<std::string> SqliteStore::set_server_state(const std::string& event_type,
-                                                          const std::string& state_key,
-                                                          const std::string& sender,
-                                                          const std::string& content_json) {
+SqliteStore::ServerStateWrite SqliteStore::set_server_state(
+    const std::string& event_type, const std::string& state_key, const std::string& sender,
+    const std::string& content_json, const ExpectedServerState* expected) {
     std::lock_guard lock(mutex_);
 
     // The content about to be replaced, read under the same lock as the write so
@@ -2532,6 +2531,17 @@ std::optional<std::string> SqliteStore::set_server_state(const std::string& even
         }
     }
 
+    // The compare half, still under the same lock as the read above and the
+    // write below — which is the whole of the guarantee. Compared as raw text
+    // rather than as parsed JSON: every writer of this table serialises through
+    // the same nlohmann to_json/dump, so a semantically identical document is
+    // byte-identical, and a caller that somehow produced different key ordering
+    // gets a spurious conflict and a retry rather than a lost update. Failing
+    // in that direction is the only acceptable way to be wrong here.
+    if (expected != nullptr && previous != *expected) {
+        return {/*applied=*/false, std::move(previous)};
+    }
+
     auto stmt = prepare(db_,
         "INSERT INTO server_state (event_type, state_key, sender, content, updated_at) "
         "VALUES (?, ?, ?, ?, strftime('%s','now') * 1000) "
@@ -2542,7 +2552,7 @@ std::optional<std::string> SqliteStore::set_server_state(const std::string& even
     sqlite3_bind_text(stmt.get(), 3, sender.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 4, content_json.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt.get());
-    return previous;
+    return {/*applied=*/true, std::move(previous)};
 }
 
 std::optional<std::string> SqliteStore::get_server_state(const std::string& event_type,

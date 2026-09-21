@@ -40,17 +40,50 @@ class SqliteStore;
 // administrator reading the log therefore learns that "#staff-only" existed
 // and was deleted, whether or not they could see it while it lived.
 //
-// That is the point of an audit log. The holder of kManageServer can grant
-// themselves VIEW_CHANNEL on any channel on the server in one request, so
-// filtering the log against it withholds nothing they cannot trivially take —
-// it only makes the record incomplete, and an incomplete record of who deleted
-// what is worse than no record, because it reads as authoritative. An admin
-// who cannot audit hidden channels cannot audit; the deletion of a private
-// channel is precisely the event somebody asks about six months later.
+// That is the point of an audit log. Filtering it against the reader's
+// VIEW_CHANNEL only makes the record incomplete, and an incomplete record of
+// who deleted what is worse than no record, because it reads as authoritative:
+// a page with holes in it and no marks where the holes are is a page somebody
+// draws a conclusion from. An admin who cannot audit hidden channels cannot
+// audit; the deletion of a private channel is precisely the event somebody
+// asks about six months later, and a filter would remove exactly that entry
+// for exactly the reader asking.
+//
+// ── one argument that used to be here and was wrong ─────────────────────
+//
+// This paragraph previously also said that "the holder of kManageServer can
+// grant themselves VIEW_CHANNEL on any channel on the server in one request,
+// so filtering withholds nothing they cannot trivially take". THAT IS FALSE,
+// and it is left named here rather than quietly deleted because it is a
+// plausible thing to re-derive.
+//
+// kManageServer gates exactly two things in this server, and they are the
+// whole of its footprint: reading this log (AuditHandler.cpp), and writing
+// bsfchat.server.info — the deployment's name and icon (RoomHandler.cpp's
+// state_gate_for). Grep for it; there is no third site. Handing somebody
+// VIEW_CHANNEL means writing bsfchat.channel.permissions or
+// bsfchat.member.roles, and BOTH are kManageRoles, which kManageServer neither
+// is nor implies. A delegated kManageServer holder therefore genuinely cannot
+// see into a channel they are denied, and the log genuinely tells them things
+// they could not otherwise obtain.
+//
+// The decision does not change, because it never rested on that sentence: it
+// rests on completeness. But the honest statement of the trade is that reading
+// this log IS a read of every channel's shape, so kManageServer is in practice
+// "may see the whole server's administrative history", and it should be
+// delegated on that understanding rather than on the strength of the word
+// "server" in its name. If that is ever too much to delegate, the answer is to
+// narrow WHO may read the log — a separate flag, or ADMINISTRATOR — and not to
+// hand a delegate a redacted one.
+//
+// (Raised twice: audit data-path finding 27, and permissions audit F12,
+// September 2026. Examined and declined both times. F12 also noted that `total`
+// is a whole-table count and would be an oracle beside a filtered page — true,
+// and a reason filtering would have to be done properly or not at all; with no
+// filter there is nothing for it to be an oracle about.)
 //
 // The boundary that IS load-bearing is the one above: server scope, checked
 // once, before anything else. Do not add per-record VIEW_CHANNEL filtering.
-// (Audit data-path finding 27, September 2026 — examined and declined.)
 namespace audit_action {
 
 // Action names are a stable part of the read API — an operator greps these, and a

@@ -733,16 +733,47 @@ public:
     // arbitrary channel, so deleting that channel wiped every role on the
     // server. Room events are now only a mirror for client sync.
     //
+    // What a caller believes is currently stored under a key, for the optional
+    // compare-and-swap below. An engaged optional is "this exact content"; a
+    // disengaged one is "no row at all". Passing no expectation (a null
+    // pointer) makes the write unconditional, which is what bootstrap and the
+    // admin CLI want.
+    using ExpectedServerState = std::optional<std::string>;
+
+    // The outcome of one server-scoped state write.
+    struct ServerStateWrite {
+        // False ONLY when an expectation was supplied and the stored content
+        // had already moved. Nothing was written in that case.
+        bool applied = true;
+        // What was in the row when the write was attempted: the content this
+        // write replaced if it applied, or the content that beat it if it did
+        // not. nullopt for a key that was unset.
+        std::optional<std::string> previous;
+    };
+
     // Returns the content this write REPLACED, or nullopt if the key was unset.
     // Read inside the same lock as the write, which is what lets the audit log
     // record a before/after pair that no concurrent writer can have already
     // superseded — reading it with a separate get_server_state() call first would
     // leave a window where two simultaneous role edits both report the same
     // "before".
-    std::optional<std::string> set_server_state(const std::string& event_type,
-                                               const std::string& state_key,
-                                               const std::string& sender,
-                                               const std::string& content_json);
+    //
+    // WITH AN EXPECTATION, the same lock makes it a compare-and-swap, and that
+    // is a correctness requirement rather than a nicety. The role document is a
+    // single row that every caller read-modify-writes wholesale, so without one
+    // a stale proposal silently reverts whatever landed between its read and
+    // its write — including a revocation. Worse, the authorisation is computed
+    // from a FRESH read (RoleHandler::commit_roles builds a new
+    // PermissionsEngine), so a proposal built from document A is approved
+    // against document B and then overwrites it: "cannot grant what you do not
+    // hold" sees the revoked bit as newly added, the actor does hold it, and
+    // the revocation is undone by an unrelated rename. Permissions audit F8,
+    // September 2026; RoleHandler.h had claimed this was already safe.
+    ServerStateWrite set_server_state(const std::string& event_type,
+                                      const std::string& state_key,
+                                      const std::string& sender,
+                                      const std::string& content_json,
+                                      const ExpectedServerState* expected = nullptr);
     std::optional<std::string> get_server_state(const std::string& event_type,
                                                  const std::string& state_key);
 

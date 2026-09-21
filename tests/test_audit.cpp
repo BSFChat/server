@@ -1898,3 +1898,88 @@ TEST(AuditEndpoint, PerChannelOverrideDoesNotGrantFilteredAccessEither) {
     ASSERT_TRUE(IsOk(ok));
     EXPECT_EQ(json::parse(ok.body).at("records").size(), 1u);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Permissions audit, September 2026 — F12: the log is not filtered by channel
+// visibility.
+//
+// DECLINED, for the second time (audit data-path finding 27 was the first), and
+// this is the regression guard for that decision rather than a proof of a
+// defect. The argument is recorded in full at the head of src/audit/AuditLog.h;
+// the short form is that an audit log with holes in it and no marks where the
+// holes are is worse than no audit log, because it still reads as
+// authoritative, and the deletion of a private channel is precisely the entry
+// somebody asks about six months later.
+//
+// What F12 got RIGHT, and what the first decision got wrong, is the shape of
+// the trade. AuditLog.h used to justify the position by saying a MANAGE_SERVER
+// holder "can grant themselves VIEW_CHANNEL on any channel in one request", so
+// the filter would withhold nothing. That is false — kManageServer gates
+// exactly two things on this server and neither is a permission grant — and the
+// second test below pins it false, so nobody restores the comfortable version
+// of the argument. The decision stands on completeness alone, and a deployment
+// delegating kManageServer should know it is delegating a read of every
+// channel's administrative shape.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST(AuditEndpoint, RecordsAboutAChannelTheReaderCannotSeeAreStillReturned) {
+    Fixture f("f12-visibility");
+    f.seed_roles();
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto ops = f.add_user("ops", {"serveradmin"});  // MANAGE_SERVER, no ADMINISTRATOR
+    auto secret = f.add_channel(admin, "leadership");
+    f.store->set_membership(secret, ops, std::string(membership::kJoin));
+    f.set_override(secret, "user:" + ops, 0, permission::kViewChannel);
+
+    // Precondition: ops genuinely cannot see this channel. Membership is not
+    // visibility here, so the membership row above is not the gate.
+    {
+        PermissionsEngine perms(*f.store, f.config);
+        ASSERT_FALSE(perms.can(ops, secret, permission::kViewChannel));
+    }
+
+    // The channel is deleted, which is the record type that carries the most:
+    // the name, the type, the parent and the member count of a channel that no
+    // longer exists to be asked about.
+    audit_room_deletion(*f.store, admin, secret);
+
+    AuditHandler handler(*f.store, f.config);
+    auto res = call(handler, &AuditHandler::handle_get_audit_log,
+                    std::string(api_path::kAuditLog), "token-ops");
+    ASSERT_TRUE(IsOk(res));
+    auto body = json::parse(res.body);
+    ASSERT_EQ(body.at("records").size(), 1u) << res.body;
+
+    const auto& record = body.at("records")[0];
+    EXPECT_EQ(record.at("target_room"), secret)
+        << "an administrator who cannot audit hidden channels cannot audit";
+    ASSERT_TRUE(record.contains("before"));
+    EXPECT_EQ(record.at("before").value("name", ""), "leadership")
+        << "the name is the only thing that makes a deleted room id mean anything later";
+}
+
+// The fact the declined decision actually rests on, pinned so the false version
+// of the argument cannot come back. kManageServer is NOT a route to
+// kViewChannel: handing somebody VIEW_CHANNEL means writing
+// bsfchat.channel.permissions or bsfchat.member.roles, and both are
+// kManageRoles. So the log really does tell a delegated reader things they
+// could not otherwise obtain, and that is an accepted cost rather than a
+// technicality.
+TEST(AuditEndpoint, ManageServerIsNotAPathToSeeingTheChannelsItReportsOn) {
+    Fixture f("f12-not-a-path");
+    f.seed_roles();
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto ops = f.add_user("ops", {"serveradmin"});
+    auto secret = f.add_channel(admin, "leadership");
+    f.store->set_membership(secret, ops, std::string(membership::kJoin));
+    f.set_override(secret, "user:" + ops, 0, permission::kViewChannel);
+
+    PermissionsEngine perms(*f.store, f.config);
+    ASSERT_TRUE(perms.can(ops, "", permission::kManageServer)) << "precondition";
+
+    EXPECT_FALSE(perms.can(ops, secret, permission::kViewChannel));
+    EXPECT_FALSE(perms.can(ops, secret, permission::kManageRoles))
+        << "if this were true, MANAGE_SERVER really would be one request away from "
+           "VIEW_CHANNEL and the old justification in AuditLog.h would hold";
+    EXPECT_FALSE(perms.can(ops, "", permission::kManageRoles));
+}

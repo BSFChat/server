@@ -206,14 +206,32 @@ because ADMINISTRATOR short-circuits every flag.
 - **`POST /rooms/{id}/voice/leave`** is membership-only and stays that way.
   Hanging up must never be refused — gating it would strand a user in a call
   they had just lost permission to be in.
+
+  **Re-raised and declined again** as permissions audit F9 (September 2026),
+  which recommended adding the `kViewChannel` pair for symmetry with the other
+  four voice endpoints. Two things were added rather than the check: the
+  argument in full at `handle_voice_leave` — leaving is monotone, it only ever
+  clears the caller's own row, and the "stranded" case above is now measured
+  (the heartbeat comes from endpoints that *are* gated, so the ghost clears
+  itself in up to `kHeartbeatTtl + kReapInterval`, about forty seconds, which is
+  forty seconds of a locked-out member still listed in the call) — and two tests
+  in `test_voice.cpp` that fail if somebody adds the gate. A comment in
+  `handle_voice_state` that wrongly claimed `voice/leave` already had the pair
+  was the thing that made the divergence read as an oversight; it now says what
+  is actually true.
 - **`PUT /rooms/{id}/voice/state`** authorises on "is an active call member"
-  rather than on a permission. It is now closed at the entrance, since
-  `voice/join` is the only endpoint that makes someone an active member. One
-  narrow window remains: a user whose VIEW_CHANNEL is revoked **while already in
-  a call** keeps updating mute/deafen/screen-share until the heartbeat reaper
-  expires them. Adding a check there is a one-liner, but it is a live-call path
-  on the least-settled part of the codebase, and getting it wrong drops people
-  mid-call — worth doing deliberately rather than alongside this fix.
+  rather than on a permission. It is closed at the entrance, since `voice/join`
+  is the only endpoint that makes someone an active member.
+
+  **The narrow window this section used to describe is closed.** A user whose
+  VIEW_CHANNEL was revoked *while already in a call* could keep updating
+  mute/deafen/screen-share indefinitely — and worse than the "until the reaper
+  expires them" written here, because the handler's own `record_heartbeat()` on
+  the way out refreshed the liveness the reaper expires on, so a client that
+  kept PUTting held its roster entry forever. `handle_voice_state` now runs the
+  membership and `kViewChannel` pair, and both refusals return *before*
+  `record_heartbeat`. Pinned by four tests in `test_voice.cpp`, including one
+  asserting that a refused PUT does not refresh the heartbeat.
 
 ## Update: kick is now enforced at `/join`
 

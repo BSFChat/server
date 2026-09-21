@@ -1274,6 +1274,38 @@ protected:
         return res;
     }
 
+    // A channel with no bsfchat.room.voice event at all — an ordinary text
+    // channel. The caller is joined, because membership is not visibility here
+    // and the tests below are about what happens AFTER the membership check.
+    std::string add_text_channel(const std::string& creator) {
+        auto room_id = generate_room_id("test");
+        store->create_room(room_id, creator);
+        store->set_membership(room_id, creator, std::string(membership::kJoin));
+        return room_id;
+    }
+
+    httplib::Response join(const std::string& room_id, const std::string& token) {
+        httplib::Request req;
+        req.method = "POST";
+        req.path = "/_matrix/client/v3/rooms/" + room_id + "/voice/join";
+        if (!token.empty()) req.set_header("Authorization", "Bearer " + token);
+        httplib::Response res;
+        handler->handle_voice_join(req, res);
+        return res;
+    }
+
+    httplib::Response leave(const std::string& room_id, const std::string& token,
+                            const std::string& body = "") {
+        httplib::Request req;
+        req.method = "POST";
+        req.path = "/_matrix/client/v3/rooms/" + room_id + "/voice/leave";
+        if (!token.empty()) req.set_header("Authorization", "Bearer " + token);
+        req.body = body;
+        httplib::Response res;
+        handler->handle_voice_leave(req, res);
+        return res;
+    }
+
     httplib::Response rekey(const std::string& room_id, const std::string& token) {
         httplib::Request req;
         req.method = "POST";
@@ -2177,4 +2209,165 @@ TEST_F(VoiceHandlerTest, StartupSweepLeavesFreshSignallingAlone) {
     handler->stop_reaper();
 
     EXPECT_TRUE(store->get_event_by_id(fresh).has_value());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Permissions audit, September 2026 — the voice findings (F9, F11).
+//
+// docs/audit-permissions-2026-09.md raised three things about this file and
+// left all three "reasoned" rather than proven, so these are the proofs. F10
+// (roomAdmin without a rank check) is answered in a comment at the grant site
+// in VoiceHandler.cpp and by the existing RoomAdminGrantFollowsManageChannels
+// above; it needed no behaviour change and therefore no new test.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── F11: pre-permission refusals leaked channel voice configuration ────────
+//
+// handle_voice_join, handle_livekit_token and handle_livekit_rekey each used to
+// answer "is this room voice-capable?" and "is its voice switched on?" BEFORE
+// asking whether the caller may see the room at all. Those two refusals are
+// distinguishable from each other and from the visibility one, so a caller
+// holding nothing but a room id could read a private channel's voice
+// configuration straight out of the error bodies.
+//
+// Small — it is two bits about a channel, not its contents — and still a read
+// of exactly the state a DENY VIEW_CHANNEL override exists to withhold. The
+// server already holds itself to the opposite standard where two refusals could
+// be told apart: see PermissionsHandler's kRefusal, one body for "no such
+// account", "not visible to you" and "not a member of anything you share".
+//
+// The fix is ordering and nothing else, so the tests are written as an
+// INDISTINGUISHABILITY property rather than as "assert the new message": the
+// three refusals must be byte-identical for a caller who cannot see the
+// channel. An implementation that merely reworded one message cannot satisfy
+// that by accident, and a future reordering that reintroduces the leak fails
+// here rather than somewhere subtle.
+
+TEST_F(LiveKitTokenTest, JoinRefusalSaysNothingAboutAnUnseenChannelsVoiceConfig) {
+    auto text = add_text_channel(alice);            // not voice-capable at all
+    auto disabled = add_voice_channel(alice, false); // voice-capable, switched off
+    for (const auto& r : {room, text, disabled}) {
+        deny(r, "user:" + alice, permission::kViewChannel);
+    }
+
+    auto seen = join(room, "token-alice");
+    ASSERT_EQ(status_of(seen), 403) << seen.body;
+
+    // Precondition: alice IS a member of all three, so the membership check
+    // above is not what any of these refusals are.
+    for (const auto& r : {room, text, disabled}) {
+        ASSERT_TRUE(store->is_room_member(r, alice));
+    }
+
+    EXPECT_EQ(status_of(join(text, "token-alice")), 403);
+    EXPECT_EQ(join(text, "token-alice").body, seen.body)
+        << "a caller who cannot see the channel learned it is not a voice channel";
+    EXPECT_EQ(status_of(join(disabled, "token-alice")), 403);
+    EXPECT_EQ(join(disabled, "token-alice").body, seen.body)
+        << "a caller who cannot see the channel learned its voice is switched off";
+}
+
+// The same property on the SFU token endpoint. Worth its own test rather than a
+// loop: the "LiveKit is not configured" 404 sits above all of this and is
+// deliberately NOT part of the property — it is a fact about the deployment,
+// identical for every room and every caller.
+TEST_F(LiveKitTokenTest, LiveKitTokenRefusalSaysNothingAboutAnUnseenChannelsVoiceConfig) {
+    auto text = add_text_channel(alice);
+    auto disabled = add_voice_channel(alice, false);
+    for (const auto& r : {room, text, disabled}) {
+        deny(r, "user:" + alice, permission::kViewChannel);
+    }
+
+    auto seen = request(room, "token-alice");
+    ASSERT_EQ(status_of(seen), 403) << seen.body;
+    EXPECT_EQ(request(text, "token-alice").body, seen.body);
+    EXPECT_EQ(request(disabled, "token-alice").body, seen.body);
+}
+
+TEST_F(LiveKitTokenTest, RekeyRefusalSaysNothingAboutAnUnseenChannelsVoiceConfig) {
+    config.voice.livekit.room_encryption = true;
+    auto text = add_text_channel(alice);
+    auto disabled = add_voice_channel(alice, false);
+
+    // alice holds no kManageChannels anywhere, so she is refused by the rekey
+    // gate whatever else is true — which is the point. Before the reordering
+    // the two capability answers were handed to her in front of that refusal.
+    auto seen = rekey(room, "token-alice");
+    ASSERT_EQ(status_of(seen), 403) << seen.body;
+    EXPECT_EQ(rekey(text, "token-alice").body, seen.body);
+    EXPECT_EQ(rekey(disabled, "token-alice").body, seen.body);
+}
+
+// The reordering must not have cost the answers a legitimate caller needs. A
+// member who CAN see the channel still gets the two capability refusals told
+// apart, and deliberately so: they already receive bsfchat.room.voice for it
+// through /sync, so there is nothing to withhold, and the client needs to tell
+// "this is a text channel" from "the owner turned voice off".
+TEST_F(LiveKitTokenTest, AMemberWhoCanSeeTheChannelStillLearnsWhyVoiceIsUnavailable) {
+    auto text = add_text_channel(alice);
+    auto disabled = add_voice_channel(alice, false);
+
+    auto not_capable = join(text, "token-alice");
+    auto switched_off = join(disabled, "token-alice");
+    ASSERT_EQ(status_of(not_capable), 403);
+    ASSERT_EQ(status_of(switched_off), 403);
+    EXPECT_NE(not_capable.body, switched_off.body);
+    EXPECT_NE(not_capable.body.find("not voice-capable"), std::string::npos) << not_capable.body;
+    EXPECT_NE(switched_off.body.find("disabled"), std::string::npos) << switched_off.body;
+}
+
+// ── F9: voice/leave is gated on membership alone, and stays that way ───────
+//
+// This is the regression guard for a DECLINED finding, which is why it asserts
+// that leaving still WORKS rather than that it is refused. The audit found no
+// escalation through this endpoint and recommended adding the kViewChannel
+// check anyway, for symmetry with its four siblings. Declined: leaving is the
+// one voice act that takes access away, it only ever clears the caller's own
+// row, and the gate would strand exactly the user a revocation has just
+// created. The full argument is at handle_voice_leave.
+//
+// Without a test, the next reader sees four gated endpoints and one ungated one
+// and "fixes" it. With one, they have to argue with a red build.
+
+TEST_F(LiveKitTokenTest, AMemberLockedOutMidCallCanStillLeaveIt) {
+    ASSERT_EQ(status_of(join(room, "token-alice")), 200);
+    ASSERT_TRUE(is_active(room, alice));
+
+    deny(room, "user:" + alice, permission::kViewChannel);
+
+    // Precondition: the revocation really did land. If joining were still
+    // permitted this test would prove nothing about the ungated leave.
+    ASSERT_EQ(status_of(join(room, "token-alice")), 403);
+
+    auto res = leave(room, "token-alice");
+    EXPECT_EQ(status_of(res), 200) << res.body;
+    EXPECT_TRUE(json::parse(res.body).value("changed", false));
+    EXPECT_FALSE(is_active(room, alice))
+        << "a user who has just been locked out of a channel is still listed in its call";
+}
+
+// And the other half of why the missing gate costs nothing: for a caller who
+// cannot see the channel and was never in the call, the answer is a constant.
+// It is the same "not_active" whether the channel is busy, empty, voice-capable
+// or a text channel, and no row is written on the way out — so there is nothing
+// here for an unprivileged caller to difference.
+TEST_F(LiveKitTokenTest, LeavingAChannelYouCannotSeeIsAConstantAnswerAndNoSideEffect) {
+    deny(room, "user:" + alice, permission::kViewChannel);
+
+    // Somebody else is genuinely in the call, so a leak-by-timing or a
+    // leak-by-roster would have something to reveal.
+    mark_in_voice(room, mod);
+
+    auto text = add_text_channel(alice);
+    deny(text, "user:" + alice, permission::kViewChannel);
+
+    auto busy = leave(room, "token-alice");
+    auto plain = leave(text, "token-alice");
+    EXPECT_EQ(status_of(busy), 200);
+    EXPECT_EQ(busy.body, plain.body);
+    EXPECT_FALSE(json::parse(busy.body).value("changed", true));
+    EXPECT_EQ(json::parse(busy.body).value("reason", ""), "not_active");
+
+    EXPECT_FALSE(is_active(room, alice));
+    EXPECT_TRUE(is_active(room, mod)) << "leave touched a row that was not the caller's";
 }
