@@ -1514,7 +1514,7 @@ std::vector<SqliteStore::RoomDirectoryRow> SqliteStore::list_room_directory_rows
         "           ORDER BY stream_position DESC LIMIT 1), 0)"
         " FROM rooms r WHERE r.is_direct = 0";
 
-    auto stmt = prepare(db_, sql.c_str());
+    auto stmt = prepare(db_, sql);
     std::vector<RoomDirectoryRow> rows;
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         // COALESCE guarantees a non-NULL column, but json_extract on a
