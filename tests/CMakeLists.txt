@@ -51,6 +51,7 @@ add_executable(server_tests
     test_invite_idempotency.cpp
     test_invite_refusal_codes.cpp
     test_dm_membership.cpp
+    test_permission_containment.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

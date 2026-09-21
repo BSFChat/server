@@ -802,6 +802,21 @@ public:
     std::vector<std::string> get_member_role_ids(const std::string& user_id);
     // All per-channel allow/deny overrides for the room, keyed by target ("role:..." / "user:...").
     std::map<std::string, ChannelPermissionOverride> get_channel_overrides(const std::string& room_id);
+    // Every room that carries a bsfchat.channel.permissions event, in no
+    // particular order.
+    //
+    // For PermissionsEngine::channel_access_excess, which has to ask "is there
+    // a channel where this account can do something the actor cannot" and
+    // would otherwise have to walk every room on the server. A room with no
+    // override evaluates identically for everybody, so it can never be the
+    // answer — see the comment on that function for the full argument.
+    //
+    // DELIBERATELY A SUPERSET: it names a room whose only override has since
+    // been emptied out, because "has ever carried one" is one indexed scan and
+    // "carries a non-empty one now" is the same group-by get_channel_overrides
+    // already does per room. The caller computes the real answer anyway and an
+    // extra room costs it one query and yields nothing.
+    std::vector<std::string> rooms_with_channel_overrides();
     // Per-channel slowmode, in seconds. 0 = disabled.
     int get_channel_slowmode(const std::string& room_id);
     // Timestamp (origin_server_ts, ms) of the user's most recent m.room.message in the room, 0 if none.

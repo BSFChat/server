@@ -130,6 +130,25 @@ private:
     // exactly that property, so it gets exactly that treatment, reusing
     // outranks() rather than inventing a parallel notion of rank.
     //
+    // THAT REUSE WAS RIGHT AND THE THING IT REUSED WAS NOT. F6 of
+    // docs/audit-permissions-2026-09.md: outranks() measured ROLE POSITION
+    // ONLY, and the paragraph below about there being no write sibling is
+    // exactly why that made it inert here. A bot is scoped with a per-channel
+    // override and `handle_create_bot` writes it an empty role assignment, so
+    // a correctly scoped bot sat at position 0 forever and every delegated
+    // MANAGE_BOTS holder at position >= 1 "outranked" it — buying them a
+    // non-expiring credential for an account that reads channels they are
+    // themselves denied, with `handle_list_bots` supplying the ids to try.
+    // The rank check was a comparison of 0 against 0 for precisely the
+    // configuration this file documents.
+    //
+    // The fix is in outranks(), not here, and that is the point: rank now has
+    // a channel half as well as a role half (auth/Permissions.h, "THE
+    // CONTAINMENT RULE"). This file goes on asking the one question it should
+    // ask — "is this principal below me?" — and the answer has stopped being
+    // wrong. A second, bot-shaped notion of containment living in this handler
+    // is what the paragraph above about write siblings warns against.
+    //
     // Exemptions match may_assign_roles: the synthetic @server actor and holders
     // of ADMINISTRATOR pass. The ADMINISTRATOR exemption is load-bearing rather
     // than a convenience — an admin bot sits at the admin role's position, so a

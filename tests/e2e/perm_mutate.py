@@ -57,10 +57,17 @@ MUTATIONS = [
      'if (false) {',
      'StatePutBypass.CannotModerateAUserOfHigherRankThroughStatePut'),
 
+    # Re-anchored on fix/perm-containment. handle_set_state's three ad-hoc
+    # "this one is server-scoped" booleans became a `scope` column in
+    # state_gate_for (see F1 in docs/audit-permissions-2026-09.md), so the
+    # expression this used to mutate no longer exists. The property is
+    # unchanged and so is the test that catches it; only the line that states
+    # it moved. A stale anchor here would have SKIPped and reported a guard as
+    # covered when nothing had been mutated at all.
     ("T1 server-wide screenshare cap back to channel scope (finding 21)",
      'src/api/RoomHandler.cpp', 'api/RoomHandler.cpp.o',
-     '        (is_server_scoped || is_scope_only_server_act) ? kServerScope : room_id;',
-     '        (is_server_scoped || is_room_type_change) ? kServerScope : room_id;',
+     '        if (type == event_type::kServerScreenShare) {\n            return {true, permission::kManageChannels, Scope::kServer, Home::kRoomState};',
+     '        if (type == event_type::kServerScreenShare) {\n            return {true, permission::kManageChannels, Scope::kRoom, Home::kRoomState};',
      'ServerScopedSettings.PerChannelManageChannelsDoesNotSetTheScreenShareCap'),
 
     ("T2 own-nickname gate uses a flag everyone has",

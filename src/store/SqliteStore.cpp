@@ -3186,6 +3186,20 @@ std::vector<std::string> SqliteStore::get_member_role_ids(const std::string& use
     return content.role_ids;
 }
 
+std::vector<std::string> SqliteStore::rooms_with_channel_overrides() {
+    std::lock_guard lock(mutex_);
+    std::string type(event_type::kChannelPermissions);
+    auto stmt = prepare(db_,
+        "SELECT DISTINCT room_id FROM events WHERE event_type = ? AND state_key IS NOT NULL");
+    sqlite3_bind_text(stmt.get(), 1, type.c_str(), -1, SQLITE_TRANSIENT);
+
+    std::vector<std::string> rooms;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        rooms.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)));
+    }
+    return rooms;
+}
+
 std::map<std::string, ChannelPermissionOverride>
 SqliteStore::get_channel_overrides(const std::string& room_id) {
     std::lock_guard lock(mutex_);
