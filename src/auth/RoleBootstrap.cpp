@@ -233,18 +233,29 @@ std::string pick_server_state_mirror_room(SqliteStore& store) {
     return chosen;
 }
 
-void write_server_scoped_state(SqliteStore& store, const Config& config,
+bool write_server_scoped_state(SqliteStore& store, const Config& config,
                                 const std::string& evt_type, const std::string& state_key,
                                 const std::string& content_json,
                                 const std::string& mirror_room,
-                                const std::string& sender) {
+                                const std::string& sender,
+                                const SqliteStore::ExpectedServerState* expected) {
     const std::string actor = sender.empty() ? server_actor(config) : sender;
 
     // Authoritative write — survives deletion of every room on the server. The
     // content it replaced comes back from the same locked write, so the audit
     // record below cannot name a "before" that a concurrent role edit had already
     // overwritten.
-    auto previous = store.set_server_state(evt_type, state_key, actor, content_json);
+    //
+    // With an expectation it is a compare-and-swap, and NOTHING BELOW RUNS when
+    // it loses: no audit record for a change that did not happen, no mirror
+    // event telling clients about a document that was never stored. That
+    // ordering is the reason the expectation is threaded through this function
+    // rather than applied at the call sites — a caller that did its own CAS and
+    // then called this would have to remember not to audit, and a caller that
+    // forgot would write a log entry for an edit the database rejected.
+    auto write = store.set_server_state(evt_type, state_key, actor, content_json, expected);
+    if (!write.applied) return false;
+    auto previous = std::move(write.previous);
 
     // Audited HERE rather than in the handler, because this is the one choke point
     // every role definition and role assignment write passes through — the
@@ -263,6 +274,7 @@ void write_server_scoped_state(SqliteStore& store, const Config& config,
         store.insert_event(event_id, mirror_room, actor,
                            evt_type, state_key, content_json, now_ms());
     }
+    return true;
 }
 
 void bootstrap_roles(SqliteStore& store, SyncEngine& sync_engine, const Config& config) {

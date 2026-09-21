@@ -258,22 +258,6 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
         return;
     }
 
-    // Check if room is voice-capable
-    auto voice_state = store_.get_state_event(room_id, std::string(event_type::kRoomVoice), "");
-    if (!voice_state) {
-        res.status = 403;
-        res.set_content(MatrixError::forbidden("Room is not voice-capable").to_json().dump(), "application/json");
-        return;
-    }
-
-    VoiceChannelContent voice_channel;
-    from_json(voice_state->content.data, voice_channel);
-    if (!voice_channel.enabled) {
-        res.status = 403;
-        res.set_content(MatrixError::forbidden("Voice is disabled in this room").to_json().dump(), "application/json");
-        return;
-    }
-
     // Membership is not visibility. Everyone on this server is force-joined
     // into every channel — that is how a private channel is built, see
     // auth/RoomVisibility.h — so the check above admits a user who has been
@@ -291,6 +275,25 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
     // "is an active call member": this is the only endpoint that makes someone
     // one.
     //
+    // FIRST, AND BEFORE THE VOICE-CAPABILITY TESTS BELOW. It used to sit under
+    // them, which made the pair of refusals above it a read of channel
+    // configuration by a caller who may not see the channel: "Room is not
+    // voice-capable" and "Voice is disabled in this room" are distinguishable
+    // bodies, and between them they answer "is #private a voice channel, and is
+    // its voice switched on?" for somebody holding nothing but the room id.
+    // Small, but it is a read of state the deny override exists to withhold,
+    // and the ordering costs nothing (permissions audit F11, September 2026).
+    // The same reordering was applied to handle_livekit_token and
+    // handle_livekit_rekey, which had the same shape.
+    //
+    // The two capability refusals stay DISTINGUISHABLE from each other, and
+    // that is deliberate rather than an oversight: a caller who reaches them
+    // has passed kViewChannel, so it already receives bsfchat.room.voice for
+    // this channel through /sync and can read both answers there. Collapsing
+    // them into one body — the PermissionsHandler kRefusal pattern — would
+    // hide nothing from anybody and would cost the client the one thing it
+    // needs to tell "this is a text channel" from "the owner turned voice off".
+    //
     // PermissionsEngine memoises per instance and is documented as
     // request-scoped — construct it here, do not cache it on the handler.
     PermissionsEngine perms(store_, config_);
@@ -299,6 +302,22 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
         res.set_content(
             MatrixError::forbidden("You do not have permission to view this channel").to_json().dump(),
             "application/json");
+        return;
+    }
+
+    // Check if room is voice-capable
+    auto voice_state = store_.get_state_event(room_id, std::string(event_type::kRoomVoice), "");
+    if (!voice_state) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Room is not voice-capable").to_json().dump(), "application/json");
+        return;
+    }
+
+    VoiceChannelContent voice_channel;
+    from_json(voice_state->content.data, voice_channel);
+    if (!voice_channel.enabled) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("Voice is disabled in this room").to_json().dump(), "application/json");
         return;
     }
 
@@ -434,6 +453,52 @@ void VoiceHandler::handle_voice_leave(const httplib::Request& req, httplib::Resp
     }
 
     auto& room_id = match.params["roomId"];
+
+    // ── Membership, AND DELIBERATELY NOTHING ELSE ───────────────────────────
+    //
+    // Every sibling in this file — join, members, state, livekit_token,
+    // livekit_rekey — follows the membership test with kViewChannel, because
+    // membership is not visibility here (auth/RoomVisibility.h). This endpoint
+    // does not, and that is a decision rather than the omission it looks like.
+    // It is written down in docs/membership-vs-visibility.md, under the heading
+    // "Deliberately left alone", and was raised again as permissions audit F9
+    // (September 2026) by an audit that cites that document as its authority
+    // and did not reach that section. Declined both times, for two reasons that
+    // pull in the same direction.
+    //
+    // 1. THE ACT IS MONOTONE, AND LOCAL. Everything below writes active=false
+    //    to exactly one row, m.call.member with state_key == the authenticated
+    //    caller. There is no body field, URL parameter or header that redirects
+    //    it at anybody else — hard-wired at the one use site, the same way
+    //    handle_voice_state hard-wires its own. So the worst a caller with no
+    //    permission at all can do here is remove THEMSELVES from a roster they
+    //    could only have got onto through handle_voice_join, which is gated.
+    //
+    //    This is NOT the reasoning handle_voice_state rejects for itself. That
+    //    handler authorises ON a cached row ("you are an active member, so you
+    //    may write") — a permission inferred from state, which is the thing its
+    //    comment refuses to trust. This one authorises nothing and grants
+    //    nothing; it de-escalates. A gate on a de-escalation protects no asset.
+    //
+    // 2. GATING IT WOULD STRAND EXACTLY THE USER A REVOCATION CREATES. Consider
+    //    the case the gate is supposedly for: a member is in a call and a
+    //    moderator then denies them kViewChannel. With the gate, their client's
+    //    teardown POST is refused and they stay in the roster — listed to
+    //    everyone who CAN see the channel, still flagged screen_sharing or
+    //    camera-on — until the reaper expires them. Their heartbeat comes from
+    //    voice/members, voice/join and voice/state, all of which are gated, so
+    //    the revocation stops the heartbeat and the row does clear on its own;
+    //    but kHeartbeatTtl + kReapInterval is up to forty seconds of ghost.
+    //    Ungated, the client clears it in one request. The gate would make the
+    //    moderator's own action look, for those forty seconds, like it had not
+    //    worked.
+    //
+    // The audit is right that no escalation is reachable through this endpoint;
+    // it looked and found none, and so did this. Where it is wrong is in
+    // treating the absence of a check as necessarily a defect. Leaving a call
+    // is the one voice act that takes access away, and the gate would cost more
+    // than it buys. test_voice.cpp pins this so a later reader "fixing" the
+    // asymmetry has to argue with a failing test rather than a comment.
     if (!store_.is_room_member(room_id, *user_id)) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(), "application/json");
@@ -620,10 +685,15 @@ void VoiceHandler::handle_voice_state(const httplib::Request& req, httplib::Resp
     // can no longer see, for as long as they care to keep PUTting. Both
     // refusals below therefore return BEFORE that call.
     //
-    // Same pair and same order as voice/join and voice/leave: membership
-    // first, because it is one indexed lookup, then kViewChannel, because
-    // membership means nothing about access on this data model
-    // (auth/RoomVisibility.h).
+    // Same pair and same order as voice/join: membership first, because it is
+    // one indexed lookup, then kViewChannel, because membership means nothing
+    // about access on this data model (auth/RoomVisibility.h).
+    //
+    // NOT voice/leave, which this comment used to claim as well and which has
+    // only the membership half. That was a comment asserting an invariant the
+    // code next to it did not hold, and it is how permissions audit F9 got
+    // written; the divergence is deliberate and the reasoning is recorded at
+    // handle_voice_leave. Leaving is the only voice act that takes access away.
     if (!store_.is_room_member(room_id, *user_id)) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(),
@@ -883,6 +953,33 @@ void VoiceHandler::handle_livekit_token(const httplib::Request& req, httplib::Re
         return;
     }
 
+    // THE security gate. Room membership is server-wide in this data model
+    // (channels are Matrix rooms, but a member of the server is a member of
+    // its channels); visibility is what per-channel permissions control. A
+    // user denied kViewChannel here can see neither the channel nor its
+    // member list, so they must not be able to obtain a token that would put
+    // them inside its SFU room and let them hear everyone in it.
+    //
+    // Ahead of the voice-capability tests, which used to run first: see the
+    // long note in handle_voice_join for why that ordering leaked channel
+    // configuration to a caller who may not see the channel (permissions audit
+    // F11, September 2026). The "LiveKit is not configured" 404 above is not
+    // part of that — it is a property of the deployment, identical for every
+    // room and every caller, and it is answered before any store access on
+    // purpose.
+    //
+    // PermissionsEngine memoises per instance and is documented as
+    // request-scoped — construct it here, do not cache it on the handler.
+    PermissionsEngine perms(store_, config_);
+    const permission::Flags flags = perms.compute(*user_id, room_id);
+    if (!permission::has(flags, permission::kViewChannel)) {
+        res.status = 403;
+        res.set_content(
+            MatrixError::forbidden("You do not have permission to view this channel").to_json().dump(),
+            "application/json");
+        return;
+    }
+
     // Same voice-capability gate as handle_voice_join: a token for a
     // non-voice or voice-disabled channel should not exist.
     auto voice_state = store_.get_state_event(room_id, std::string(event_type::kRoomVoice), "");
@@ -896,25 +993,6 @@ void VoiceHandler::handle_livekit_token(const httplib::Request& req, httplib::Re
     if (!voice_channel.enabled) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Voice is disabled in this room").to_json().dump(), "application/json");
-        return;
-    }
-
-    // THE security gate. Room membership is server-wide in this data model
-    // (channels are Matrix rooms, but a member of the server is a member of
-    // its channels); visibility is what per-channel permissions control. A
-    // user denied kViewChannel here can see neither the channel nor its
-    // member list, so they must not be able to obtain a token that would put
-    // them inside its SFU room and let them hear everyone in it.
-    //
-    // PermissionsEngine memoises per instance and is documented as
-    // request-scoped — construct it here, do not cache it on the handler.
-    PermissionsEngine perms(store_, config_);
-    const permission::Flags flags = perms.compute(*user_id, room_id);
-    if (!permission::has(flags, permission::kViewChannel)) {
-        res.status = 403;
-        res.set_content(
-            MatrixError::forbidden("You do not have permission to view this channel").to_json().dump(),
-            "application/json");
         return;
     }
 
@@ -969,6 +1047,41 @@ void VoiceHandler::handle_livekit_token(const httplib::Request& req, httplib::Re
     grants.can_publish_sources = {"microphone", "camera", "screen_share", "screen_share_audio"};
     // Voice moderation (server-side mute, removing a participant) is gated on
     // the existing channel-management permission rather than a new bit.
+    //
+    // NO RANK CHECK, AND THAT IS DECIDED RATHER THAN FORGOTTEN. Permissions
+    // audit F10 (September 2026) called this "the only moderation grant in the
+    // codebase with no outranks() test" and asked for it to be either withheld
+    // or written down. Written down, because the premise is wrong and the
+    // conclusion does not follow from it:
+    //
+    //   * It is not the only one. handle_delete_room is kManageChannels at room
+    //     scope with no rank check either (RoomHandler.cpp), and it does
+    //     strictly more: it destroys the channel, its timeline and everyone's
+    //     access to it permanently, owner included. A moderator who can delete
+    //     the room out from under a call cannot coherently be refused the
+    //     lesser power of ending one participant's connection to it.
+    //
+    //   * outranks() is not the rule it is being measured against. Every call
+    //     site of it — kick and ban (RoomHandler.cpp:533), nickname
+    //     (ProfileHandler.cpp:376), role assignment (Permissions.cpp:250), bot
+    //     administration (BotHandler.cpp:126) — gates a PERSISTENT act against
+    //     a PERSON, server-wide, that the target cannot undo. kManageChannels
+    //     gates acts against a CHANNEL, bounded to that channel, and carries no
+    //     rank semantics anywhere on the server. An SFU eject is the second
+    //     kind: it is scoped to one channel's live call, it is transient, and
+    //     the target rejoins by asking for another token. Borrowing the rank
+    //     rule here would be the only place a channel-scoped bit consulted it.
+    //
+    // What is genuinely awkward is that room_admin is a JWT claim evaluated by
+    // the SFU, so even if a rank rule were wanted it could not be expressed
+    // per-target inside it — the claim says "may moderate this room", not "may
+    // moderate these participants". IF server-mute-with-rank is ever wanted,
+    // the shape is a server endpoint that applies outranks() and then calls
+    // LiveKit's RoomService with a server-minted admin token, and this grant
+    // comes out of the participant's token at that point. Until something
+    // actually drives SFU moderation, that endpoint would be a gate on a door
+    // nobody uses. Pinned by LiveKitTokenTest.RoomAdminGrantFollowsManageChannels
+    // and by mutation M7 in tests/e2e/mut2.py.
     grants.room_admin = permission::has(flags, permission::kManageChannels);
 
     std::string token;
@@ -1075,6 +1188,32 @@ void VoiceHandler::handle_livekit_rekey(const httplib::Request& req, httplib::Re
         return;
     }
 
+    // Rotating is a moderation action, not a user action: it interrupts
+    // every participant still holding the old key until they re-fetch. Gate
+    // it on channel management, the same bit that grants LiveKit roomAdmin.
+    // kViewChannel is implied — the permission engine cannot grant
+    // kManageChannels on a channel the user cannot see — but check it
+    // explicitly anyway rather than relying on that.
+    //
+    // Ahead of the voice-capability tests below, which used to run first. Same
+    // reason as handle_voice_join and handle_livekit_token, and it matters
+    // slightly more here: the refusal this endpoint hands an unprivileged
+    // caller is already one shared body for "cannot see it" and "may not
+    // manage it", so leaking the two capability answers in front of it was the
+    // only thing on this path that distinguished anything at all
+    // (permissions audit F11, September 2026).
+    PermissionsEngine perms(store_, config_);
+    const permission::Flags flags = perms.compute(*user_id, room_id);
+    if (!permission::has(flags, permission::kViewChannel) ||
+        !permission::has(flags, permission::kManageChannels)) {
+        res.status = 403;
+        res.set_content(
+            MatrixError::forbidden("You do not have permission to rotate this channel's media key")
+                .to_json().dump(),
+            "application/json");
+        return;
+    }
+
     auto voice_state = store_.get_state_event(room_id, std::string(event_type::kRoomVoice), "");
     if (!voice_state) {
         res.status = 403;
@@ -1086,24 +1225,6 @@ void VoiceHandler::handle_livekit_rekey(const httplib::Request& req, httplib::Re
     if (!voice_channel.enabled) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Voice is disabled in this room").to_json().dump(), "application/json");
-        return;
-    }
-
-    // Rotating is a moderation action, not a user action: it interrupts
-    // every participant still holding the old key until they re-fetch. Gate
-    // it on channel management, the same bit that grants LiveKit roomAdmin.
-    // kViewChannel is implied — the permission engine cannot grant
-    // kManageChannels on a channel the user cannot see — but check it
-    // explicitly anyway rather than relying on that.
-    PermissionsEngine perms(store_, config_);
-    const permission::Flags flags = perms.compute(*user_id, room_id);
-    if (!permission::has(flags, permission::kViewChannel) ||
-        !permission::has(flags, permission::kManageChannels)) {
-        res.status = 403;
-        res.set_content(
-            MatrixError::forbidden("You do not have permission to rotate this channel's media key")
-                .to_json().dump(),
-            "application/json");
         return;
     }
 

@@ -1,10 +1,13 @@
 #pragma once
 
+// Complete type, not a forward declaration: write_server_scoped_state takes a
+// SqliteStore::ExpectedServerState, which is a nested type.
+#include "store/SqliteStore.h"
+
 #include <string>
 
 namespace bsfchat {
 
-class SqliteStore;
 class SyncEngine;
 struct Config;
 
@@ -63,10 +66,25 @@ void bootstrap_roles(SqliteStore& store, SyncEngine& sync_engine, const Config& 
 // GET /bsfchat/roles. See docs/bots.md §11.
 std::string pick_server_state_mirror_room(SqliteStore& store);
 
-void write_server_scoped_state(SqliteStore& store, const Config& config,
+// The one choke point every role-definition and role-assignment write passes
+// through: authoritative write, audit record, sync mirror, in that order.
+//
+// `expected` is an optional compare-and-swap against the stored content, for a
+// caller that built `content_json` by modifying something it read earlier. When
+// it is supplied and the row has moved since, NOTHING happens — no write, no
+// audit record, no mirror event — and this returns false so the caller can
+// re-read and try again. Without it the write is unconditional, which is right
+// for bootstrap and the admin CLI (both authoritative rather than derived) and
+// wrong for anything that read first: see SqliteStore::set_server_state for
+// what a stale wholesale write costs on this schema.
+//
+// Returns true when the write landed. A caller that passes no expectation can
+// ignore the result; it is always true.
+bool write_server_scoped_state(SqliteStore& store, const Config& config,
                                 const std::string& evt_type, const std::string& state_key,
                                 const std::string& content_json,
                                 const std::string& mirror_room,
-                                const std::string& sender = std::string());
+                                const std::string& sender = std::string(),
+                                const SqliteStore::ExpectedServerState* expected = nullptr);
 
 } // namespace bsfchat

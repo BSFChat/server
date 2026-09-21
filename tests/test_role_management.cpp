@@ -1053,3 +1053,365 @@ TEST(BotRoleManagement, EveryoneCannotBeNarrowedOutFromUnderAnOptInRole) {
     EXPECT_TRUE(IsOk(call(*f.roles, &RoleHandler::handle_remove_self_role,
                           self_role_path(role_id), "token-member", "")));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Permissions audit, September 2026 — the role findings (F7, F8).
+//
+// docs/audit-permissions-2026-09.md reported both as "reasoned" rather than
+// proven — there is no DISABLED_ proof for either in
+// test_permission_audit_2026_09.cpp — so these are the proofs, written against
+// the fixed behaviour and verified to fail without it.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── F7: GET /bsfchat/roles published the whole document to any account ────
+//
+// The endpoint is authentication-only, which is right and stays right: the
+// member rendering an opt-in role picker holds no role permission by
+// definition, and a bot scoped to one channel has no other authoritative read.
+// What was wrong was the RESPONSE — every role's permission bitfield, to every
+// caller — resting on a premise that does not hold for the two callers who most
+// need this endpoint. A scoped bot is excluded from channel auto-join and a
+// member can be denied kViewChannel on the mirror room, so neither ever
+// receives bsfchat.server.roles through /sync; "they have it already" was true
+// only of the callers who did not need asking.
+//
+// What is withheld is one field on the roles where it is a map of who can do
+// what. @everyone's bits and a self-assignable role's bits stay, because the
+// containment rule makes them bits the reader already holds — see
+// permissions_are_public() in RoleHandler.cpp.
+
+TEST(RoleListDisclosure, AMemberDoesNotLearnWhichRoleCarriesWhichPermission) {
+    Fixture f("f7-member");
+    f.seed_roles({role("pings", 5, 0, /*self_assignable=*/true)});
+    f.add_user("member");
+
+    auto res = call(*f.roles, &RoleHandler::handle_list_roles, kRolesPath, "token-member");
+    ASSERT_TRUE(IsOk(res));
+    auto roles = json::parse(res.body)["roles"];
+    ASSERT_EQ(roles.size(), 5u) << "every role is still listed; only a field is withheld";
+
+    std::map<std::string, json> by_id;
+    for (const auto& r : roles) by_id[r.value("id", "")] = r;
+
+    // The escalation map: which role is administrator, which can ban, where
+    // the ladder sits. Withheld.
+    for (const char* id : {"builder", "senior", "admin"}) {
+        ASSERT_TRUE(by_id.count(id)) << id;
+        EXPECT_FALSE(by_id[id].contains("permissions"))
+            << "role '" << id << "' handed its permission bitfield to an ordinary member: "
+            << by_id[id].dump();
+    }
+
+    // Still published, because neither tells the reader anything they do not
+    // already have: @everyone is what every account holds, and a
+    // self-assignable role is refused storage unless its bits are a subset of
+    // @everyone's (validate_role_document).
+    ASSERT_TRUE(by_id[std::string(permission::role_id::kEveryone)].contains("permissions"));
+    ASSERT_TRUE(by_id["pings"].contains("permissions"))
+        << "the opt-in picker computes its own containment ceiling from these two, and a "
+           "member who cannot read them sees every trap role as safe";
+}
+
+// The narrowing must cost the member nothing they render. This is the half
+// that would make the fix unacceptable if it failed, so it is asserted
+// field by field rather than by eyeballing the payload.
+TEST(RoleListDisclosure, EveryPresentationFieldSurvivesForAMember) {
+    Fixture f("f7-presentation");
+    ServerRole hoisted = role("senior", 50, permission::kEveryoneDefault | permission::kBanMembers,
+                              /*self_assignable=*/false, /*mentionable=*/true);
+    hoisted.name = "Senior Moderator";
+    hoisted.color = "#ff8800";
+    hoisted.hoist = true;
+    {
+        // Replace the fixture's plain "senior" with the decorated one.
+        ServerRolesContent content;
+        content.roles.push_back(
+            role(permission::role_id::kEveryone, 0, permission::kEveryoneDefault));
+        content.roles.push_back(hoisted);
+        json j;
+        to_json(j, content);
+        f.store->set_server_state(std::string(event_type::kServerRoles), "", "@server:test",
+                                  j.dump());
+    }
+    f.add_user("member");
+
+    auto res = call(*f.roles, &RoleHandler::handle_list_roles, kRolesPath, "token-member");
+    ASSERT_TRUE(IsOk(res));
+    // Named, not `json::parse(res.body)["roles"]` inline: the parsed document
+    // is a temporary and a range-for binding into it dangles.
+    const auto listed = json::parse(res.body);
+    json senior;
+    for (const auto& r : listed["roles"]) {
+        if (r.value("id", "") == "senior") senior = r;
+    }
+    ASSERT_FALSE(senior.is_null()) << res.body;
+
+    EXPECT_EQ(senior.value("name", ""), "Senior Moderator");
+    EXPECT_EQ(senior.value("color", ""), "#ff8800");
+    EXPECT_EQ(senior.value("position", -1), 50);
+    EXPECT_TRUE(senior.value("hoist", false));
+    EXPECT_TRUE(senior.value("mentionable", false));
+    EXPECT_FALSE(senior.value("self_assignable", true));
+    // ...and only the bitfield is gone.
+    EXPECT_FALSE(senior.contains("permissions"));
+}
+
+// The invariant that makes the narrowing safe rather than merely quieter:
+// anybody who can WRITE the document reads it whole. Both halves ask
+// kManageRoles at server scope of the same engine, so there is no caller that
+// could do a read-modify-write against a truncated document and write
+// permissions=0 over every role it echoed back.
+TEST(RoleListDisclosure, AnyoneWhoCanEditRolesStillReadsTheWholeDocument) {
+    Fixture f("f7-builder");
+    f.seed_roles({role("pings", 5, 0, /*self_assignable=*/true)});
+    f.add_user("builder", {"builder"});
+
+    auto res = call(*f.roles, &RoleHandler::handle_list_roles, kRolesPath, "token-builder");
+    ASSERT_TRUE(IsOk(res));
+    const auto listed = json::parse(res.body);
+    for (const auto& r : listed["roles"]) {
+        EXPECT_TRUE(r.contains("permissions"))
+            << "a MANAGE_ROLES holder must see the whole document or read-modify-write is a "
+               "silent permission wipe: " << r.dump();
+    }
+    // And it is the real value, not a placeholder.
+    for (const auto& r : listed["roles"]) {
+        if (r.value("id", "") != "senior") continue;
+        EXPECT_EQ(permission::flags_from_hex(r.value("permissions", "0x0")),
+                  permission::kEveryoneDefault | permission::kBanMembers);
+    }
+}
+
+// MANAGE_ROLES granted inside one channel must not widen the read either — the
+// same server-scope question the write endpoints ask.
+TEST(RoleListDisclosure, AChannelOverrideGrantingManageRolesDoesNotWidenTheRead) {
+    Fixture f("f7-scope");
+    f.seed_roles();
+    auto member = f.add_user("member");
+    auto room = f.add_channel(member, "mine");
+    {
+        ChannelPermissionOverride ov;
+        ov.allow = permission::kManageRoles;
+        json j;
+        to_json(j, ov);
+        f.store->insert_event(generate_event_id("test"), room, "@server:test",
+                              std::string(event_type::kChannelPermissions), "user:" + member,
+                              j.dump(), 1003);
+    }
+    {
+        PermissionsEngine perms(*f.store, f.config);
+        ASSERT_TRUE(perms.can(member, room, permission::kManageRoles))
+            << "the override must actually grant it in-channel, or this proves nothing";
+    }
+
+    auto res = call(*f.roles, &RoleHandler::handle_list_roles, kRolesPath, "token-member");
+    ASSERT_TRUE(IsOk(res));
+    const auto listed = json::parse(res.body);
+    for (const auto& r : listed["roles"]) {
+        if (r.value("id", "") == "admin") EXPECT_FALSE(r.contains("permissions"));
+    }
+}
+
+// ── F8: the delta endpoints were a read-modify-write with no compare-and-swap
+//
+// RoleHandler.h claimed the server performed the read-modify-write "under the
+// store's own lock, against the document as it stands at that moment". It did
+// not: the read, the authorisation and the write were three separate lock
+// acquisitions, and commit_roles built a FRESH PermissionsEngine, so the
+// proposal was built from one document and approved against another.
+//
+// The consequence is worse than a lost edit. "You cannot grant a role a
+// permission you do not hold yourself" measures what the proposal ADDS relative
+// to the document it reads, so a bit somebody had just revoked reads as a bit
+// this edit is adding — and passes, because the actor does hold it. A
+// revocation is reverted by an unrelated rename, and the person who performed
+// the revocation got a 200.
+//
+// The fix is a compare-and-swap in SqliteStore::set_server_state, threaded
+// through write_server_scoped_state so that a write which lost is also not
+// audited and not mirrored. These tests drive that primitive and that choke
+// point directly rather than racing two threads through the handlers: a race
+// test that only fails sometimes is not a proof, and what has to be true here
+// is a property of the write, which can be asserted exactly. The handlers'
+// USE of it is pinned separately by mutations F8a-F8c in tests/e2e/mutate.py.
+
+TEST(ServerStateCompareAndSwap, AStaleWriteIsRefusedAndTheNewerContentSurvives) {
+    Fixture f("f8-cas");
+    f.seed_roles();
+
+    const auto original =
+        f.store->get_server_state(std::string(event_type::kServerRoles), "");
+    ASSERT_TRUE(original.has_value());
+
+    // Somebody else edits the document. This is the revocation.
+    auto narrowed = f.current_roles();
+    for (auto& r : narrowed) {
+        if (r.id == "senior") r.permissions &= ~permission::kBanMembers;
+    }
+    {
+        ServerRolesContent content;
+        content.roles = narrowed;
+        json j;
+        to_json(j, content);
+        f.store->set_server_state(std::string(event_type::kServerRoles), "", "@someone:test",
+                                  j.dump());
+    }
+    ASSERT_FALSE(permission::has(f.find("senior")->permissions, permission::kBanMembers));
+
+    // Our stale proposal — built from `original`, which still carries the bit,
+    // with an innocuous rename on top. Exactly the shape the audit describes.
+    auto stale = f.current_roles();
+    for (auto& r : stale) {
+        if (r.id == "senior") {
+            r.permissions |= permission::kBanMembers;  // as it was when we read
+            r.name = "Renamed";
+        }
+    }
+    ServerRolesContent content;
+    content.roles = stale;
+    json j;
+    to_json(j, content);
+
+    // THE CONTROL, and the proof that the finding was real rather than
+    // theoretical: the same stale write WITHOUT an expectation — which is
+    // exactly what every role write on this server used to be — applies, and
+    // the revoked bit comes back.
+    f.store->set_server_state(std::string(event_type::kServerRoles), "", "@builder:test",
+                              j.dump());
+    ASSERT_TRUE(permission::has(f.find("senior")->permissions, permission::kBanMembers))
+        << "the control did not reproduce the defect, so the assertion below proves nothing";
+    ASSERT_EQ(f.find("senior")->name, "Renamed");
+
+    // Put the revocation back and replay the same stale write, this time
+    // naming what it believed it was superseding.
+    {
+        ServerRolesContent revoked;
+        revoked.roles = narrowed;
+        json rj;
+        to_json(rj, revoked);
+        f.store->set_server_state(std::string(event_type::kServerRoles), "", "@someone:test",
+                                  rj.dump());
+    }
+
+    auto write = f.store->set_server_state(std::string(event_type::kServerRoles), "",
+                                           "@builder:test", j.dump(), &original);
+    EXPECT_FALSE(write.applied);
+    EXPECT_FALSE(permission::has(f.find("senior")->permissions, permission::kBanMembers))
+        << "a stale wholesale write reverted a revocation that had already landed";
+    EXPECT_NE(f.find("senior")->name, "Renamed")
+        << "the rename is the carrier: it is what makes the stale document look like an edit";
+}
+
+TEST(ServerStateCompareAndSwap, AWriteThatMatchesWhatIsStoredApplies) {
+    Fixture f("f8-cas-ok");
+    f.seed_roles();
+    const auto expected =
+        f.store->get_server_state(std::string(event_type::kServerRoles), "");
+    ASSERT_TRUE(expected.has_value());
+
+    auto proposed = f.current_roles();
+    for (auto& r : proposed) {
+        if (r.id == "senior") r.name = "Renamed";
+    }
+    ServerRolesContent content;
+    content.roles = proposed;
+    json j;
+    to_json(j, content);
+
+    auto write = f.store->set_server_state(std::string(event_type::kServerRoles), "",
+                                           "@builder:test", j.dump(), &expected);
+    EXPECT_TRUE(write.applied);
+    EXPECT_EQ(write.previous, expected);
+    EXPECT_EQ(f.find("senior")->name, "Renamed");
+}
+
+// "Expect no row at all" is a distinct expectation from "expect this content",
+// and it is the one a first write makes. Getting it wrong in the permissive
+// direction would let a first write clobber a concurrent first write.
+TEST(ServerStateCompareAndSwap, ExpectingAnAbsentRowFailsOnceSomebodyHasWrittenOne) {
+    Fixture f("f8-cas-absent");
+    const SqliteStore::ExpectedServerState absent;  // nullopt
+    ASSERT_TRUE(f.store
+                    ->set_server_state(std::string(event_type::kMemberRoles), "@a:test",
+                                       "@server:test", R"({"role_ids":["everyone"]})", &absent)
+                    .applied);
+    EXPECT_FALSE(f.store
+                     ->set_server_state(std::string(event_type::kMemberRoles), "@a:test",
+                                        "@server:test", R"({"role_ids":["admin"]})", &absent)
+                     .applied);
+    EXPECT_EQ(f.store->get_member_role_ids("@a:test"),
+              std::vector<std::string>{"everyone"});
+}
+
+// Passing no expectation at all leaves the write unconditional, which is what
+// bootstrap and the admin CLI rely on — they are authoritative rather than
+// derived from a read.
+TEST(ServerStateCompareAndSwap, WithoutAnExpectationTheWriteIsUnconditional) {
+    Fixture f("f8-cas-none");
+    f.seed_roles();
+    auto write = f.store->set_server_state(std::string(event_type::kServerRoles), "",
+                                           "@server:test", R"({"roles":[]})");
+    EXPECT_TRUE(write.applied);
+    EXPECT_TRUE(write.previous.has_value());
+    EXPECT_TRUE(f.current_roles().empty());
+}
+
+// A lost write must leave NO trace: no audit record claiming a change that did
+// not happen, and no mirror event telling clients about a document that was
+// never stored. This is the reason the expectation is threaded through
+// write_server_scoped_state rather than applied at each call site.
+TEST(ServerStateCompareAndSwap, ALostWriteIsNotAuditedAndNotMirrored) {
+    Fixture f("f8-no-trace");
+    f.seed_roles();
+    auto owner = f.add_user("owner", {std::string(permission::role_id::kAdmin)});
+    auto mirror = f.add_channel(owner, "general");
+
+    const SqliteStore::ExpectedServerState stale{R"({"roles":[]})"};  // never stored
+    const size_t audit_before = f.records().size();
+    const size_t events_before = f.store->get_room_events(mirror, 1000, "f").size();
+
+    ServerRolesContent content;
+    content.roles = f.current_roles();
+    json j;
+    to_json(j, content);
+    EXPECT_FALSE(write_server_scoped_state(*f.store, f.config,
+                                           std::string(event_type::kServerRoles), "", j.dump(),
+                                           mirror, owner, &stale));
+
+    EXPECT_EQ(f.records().size(), audit_before)
+        << "the audit log recorded a role change that was never written";
+    EXPECT_EQ(f.store->get_room_events(mirror, 1000, "f").size(), events_before)
+        << "clients were told about a role document that was never stored";
+}
+
+// The endpoints must still work normally — a compare-and-swap that refuses
+// uncontended writes would be a much worse bug than the one it fixes. This is
+// the "it still does the ordinary thing" control for all four call sites.
+TEST(ServerStateCompareAndSwap, TheDeltaEndpointsStillApplyUncontendedEdits) {
+    Fixture f("f8-uncontended");
+    f.seed_roles({role("pings", 5, 0, /*self_assignable=*/true)});
+    auto builder = f.add_user("builder", {"builder"});
+    f.add_user("member");
+    f.add_channel(builder, "general");
+
+    auto created = call(*f.roles, &RoleHandler::handle_create_role, kRolesPath, "token-builder",
+                        create_body("Announcements", 5));
+    ASSERT_EQ(created.status, 201) << created.body;
+    const auto id = created_id(created);
+    ASSERT_FALSE(id.empty());
+
+    ASSERT_TRUE(IsOk(call(*f.roles, &RoleHandler::handle_update_role, role_path(id),
+                          "token-builder", json{{"name", "Renamed"}}.dump())));
+    EXPECT_EQ(f.find(id)->name, "Renamed");
+
+    ASSERT_TRUE(IsOk(call(*f.roles, &RoleHandler::handle_add_self_role,
+                          self_role_path("pings"), "token-member", "")));
+    EXPECT_TRUE(f.holds("@member:test", "pings"));
+    ASSERT_TRUE(IsOk(call(*f.roles, &RoleHandler::handle_remove_self_role,
+                          self_role_path("pings"), "token-member", "")));
+    EXPECT_FALSE(f.holds("@member:test", "pings"));
+
+    ASSERT_TRUE(IsOk(call(*f.roles, &RoleHandler::handle_delete_role, role_path(id),
+                          "token-builder")));
+    EXPECT_FALSE(f.find(id).has_value());
+}
