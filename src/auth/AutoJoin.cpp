@@ -1,4 +1,5 @@
 #include "auth/AutoJoin.h"
+#include "auth/MediaAccess.h"
 
 #include "core/Config.h"
 #include "core/Logger.h"
@@ -93,7 +94,7 @@ void join_user_to_room(SqliteStore& store, SyncEngine& sync_engine,
     // force-join its members under their global names and quietly undo it.
     auto content = member_event_content(store, user_id, std::string(membership::kJoin));
     auto event_id = generate_event_id(config.server_name);
-    store.insert_event(event_id, room_id, user_id,
+    insert_event_vetted(store, config, event_id, room_id, user_id,
                         std::string(event_type::kRoomMember),
                         user_id, content.dump(), now_ms());
 
@@ -163,6 +164,9 @@ void publicize_legacy_channels(SqliteStore& store, const Config& config) {
 
         auto event_id = generate_event_id(config.server_name);
         nlohmann::json content = {{"join_rule", "public"}};
+        // Bare insert_event: `{"join_rule": "public"}` is composed right here
+        // and names no media, and there is no principal to vet it against
+        // anyway — @server is a synthetic actor with no access of its own.
         store.insert_event(event_id, room_id, "@server:" + config.server_name,
             std::string(event_type::kRoomJoinRules), "",
             content.dump(), now_ms());

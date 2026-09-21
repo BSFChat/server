@@ -21,6 +21,7 @@ add_executable(server_tests
     test_permissions.cpp
     test_media.cpp
     test_media_security.cpp
+    test_media_reference_authz.cpp
     test_media_tickets.cpp
     test_voice.cpp
     test_typing.cpp
@@ -82,9 +83,11 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/core/SendLimiter.cpp
     ${CMAKE_SOURCE_DIR}/src/http/ClientAddress.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/LocalAuth.cpp
+    ${CMAKE_SOURCE_DIR}/src/auth/MediaAccess.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/Permissions.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/RoomVisibility.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/PowerLevels.cpp
+    ${CMAKE_SOURCE_DIR}/src/store/MediaReferences.cpp
     ${CMAKE_SOURCE_DIR}/src/store/SqliteStore.cpp
     ${CMAKE_SOURCE_DIR}/src/store/Migrations.cpp
     ${CMAKE_SOURCE_DIR}/src/sync/SyncEngine.cpp

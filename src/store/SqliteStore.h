@@ -1,5 +1,7 @@
 #pragma once
 
+#include "store/MediaReferences.h"
+
 #include <bsfchat/MatrixTypes.h>
 #include <sqlite3.h>
 
@@ -510,10 +512,23 @@ public:
     ServerBanPage list_server_bans(int limit, const std::optional<std::string>& after);
 
     // Events
+    //
+    // `media` is the set of media URIs this event's author may bind to this
+    // room; see MediaReferences and auth/MediaAccess.h. Only URIs that are BOTH
+    // named by `content_json` and permitted by `media` reach `media_refs`, so
+    // the extraction rule stays here on the door where no call site can drift
+    // from it, and the authorisation rule — which cannot run under this mutex —
+    // is supplied by the caller.
+    //
+    // The default binds NOTHING, which is the right answer for the handful of
+    // server-composed events that name no media and the fail-closed answer for
+    // anything else. Production paths with a principal behind them call
+    // insert_event_vetted() instead of choosing here.
     int64_t insert_event(const std::string& event_id, const std::string& room_id,
                          const std::string& sender, const std::string& event_type,
                          const std::optional<std::string>& state_key,
-                         const std::string& content_json, int64_t origin_server_ts);
+                         const std::string& content_json, int64_t origin_server_ts,
+                         const MediaReferences& media = MediaReferences::none());
 
     // Returns (events, next_from_token). next_from_token is the stream
     // position of the oldest row in this batch for dir="b" / newest for
@@ -1186,11 +1201,22 @@ public:
     /// "public". Whole URIs, not bare ids: see media_uris_in_content().
     std::vector<std::string> get_media_rooms(const std::string& mxc_uri);
 
-    /// True when this URI is some account's current profile avatar. Avatars
-    /// are the one legitimately room-less media class — they are shown next to
-    /// a name in every channel and in profile cards — so they are readable by
+    /// True when this URI is `user_id`'s current profile avatar. Avatars are
+    /// the one legitimately room-less media class — they are shown next to a
+    /// name in every channel and in profile cards — so they are readable by
     /// any authenticated caller, matching what /profile already discloses.
-    bool is_avatar_media(const std::string& mxc_uri);
+    ///
+    /// Takes the account rather than answering "is this ANYBODY's avatar",
+    /// which is what it used to do. The caller passes the object's UPLOADER,
+    /// so the question this really answers is "is this object its own
+    /// uploader's avatar". The difference is audit F5's worst variant: this
+    /// rule is reached only when media_refs is empty, and emptying media_refs
+    /// is exactly what a redaction does, so "anybody's avatar" meant that
+    /// wearing a redacted attachment you did not upload made it readable by
+    /// every account on the server. handle_put_avatar_url refuses such a write
+    /// now; this is the second, independent gate, and it is the one that also
+    /// covers rows written before that check existed.
+    bool is_avatar_of(const std::string& mxc_uri, const std::string& user_id);
 
     /// Objects nothing references any more: no surviving event names them, no
     /// account wears them as an avatar, no server-scoped document mentions
@@ -1221,7 +1247,7 @@ public:
     /// Reference sources, and why these three are all of them: media_refs
     /// (every event that names an object, maintained by insert_event and
     /// shrunk by redact_event and delete_room), users.avatar_url (the one
-    /// legitimately room-less class, see is_avatar_media), and server_state,
+    /// legitimately room-less class, see is_avatar_of), and server_state,
     /// which holds server-scoped documents that are NOT events and so are not
     /// in media_refs. The last is scanned in C++ with media_uris_in_content(),
     /// the same extractor insert_event indexes with, so the two cannot drift.

@@ -74,6 +74,10 @@ void emit_state_event(SqliteStore& store, SyncEngine& sync_engine, const std::st
                       const std::string& event_type, const std::string& state_key,
                       const json& content) {
     auto event_id = generate_event_id(server_name);
+    // Bare insert_event: every caller of this helper emits m.call.member, whose
+    // content is booleans the handler copied field by field out of the request
+    // plus a server-generated session id. No string the caller chose reaches
+    // it, so there is no media here to bind and no principal question to ask.
     store.insert_event(event_id, room_id, sender, event_type, state_key, content.dump(), now_ms());
     sync_engine.notify_new_event();
 }

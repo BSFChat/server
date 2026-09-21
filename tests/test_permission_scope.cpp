@@ -944,14 +944,24 @@ TEST(NicknameStorage, SurvivesAnUnrelatedProfileChange) {
     // rewrites the displayname of every joined room from the profile. Stored in
     // room state alone, the nickname would be erased right here by a user changing
     // their avatar.
+    // A real object, uploaded by this account: since audit F5, handle_put_
+    // avatar_url refuses an avatar the caller did not upload, because the
+    // avatar fall-through in MediaAccess is what makes a room-less object
+    // readable server-wide and an unvalidated write there launders a redacted
+    // attachment into a public one. Nothing about THIS test changes — it is
+    // about the nickname surviving an unrelated profile write — but the
+    // profile write now has to be one the server would accept.
+    const std::string avatar_id = "000000000000000000000000000000a1";
+    const std::string avatar = "mxc://test/" + avatar_id;
+    f.store->insert_media(avatar_id, member, "image/png", "p.png", 8, "/x/" + avatar_id);
     ASSERT_TRUE(IsOk(call(handler, &ProfileHandler::handle_put_avatar_url,
                           "/_matrix/client/v3/profile/" + member + "/avatar_url",
-                          "token-member", json{{"avatar_url", "mxc://test/pic"}}.dump())));
+                          "token-member", json{{"avatar_url", avatar}}.dump())));
 
     EXPECT_EQ(f.store->get_nickname(member).value_or(""), "Nick");
     auto content = f.member_content(room, member);
     EXPECT_EQ(content.value("displayname", ""), "Nick");
-    EXPECT_EQ(content.value("avatar_url", ""), "mxc://test/pic");
+    EXPECT_EQ(content.value("avatar_url", ""), avatar);
 
     // And a later global-name change does not become the rendered name.
     ASSERT_TRUE(IsOk(call(handler, &ProfileHandler::handle_put_displayname,

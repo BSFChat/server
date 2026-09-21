@@ -1,5 +1,6 @@
 #include "store/SqliteStore.h"
 #include "store/CallSignalling.h"
+#include "store/MediaReferences.h"
 #include "auth/LocalAuth.h"
 #include "core/Logger.h"
 #include "identity/Localpart.h"
@@ -116,66 +117,6 @@ std::optional<std::string> replacement_target(const std::string& content_json) {
     if (target.empty()) return std::nullopt;
     return target;
 }
-
-// Every media id this event's content names, so the event row and the media
-// ACL can never disagree about what the event grants access to.
-//
-// A full recursive walk for any string beginning with `mxc://`, rather than a
-// list of known keys (`$.url`, `$.info.thumbnail_url`, `$.m.new_content.url`,
-// …). That is not laziness — it is the exact invariant we want to index:
-//
-//   a reader of this event can learn every mxc id printed anywhere in it,
-//   so a reader of this event may fetch every one of them.
-//
-// Keyed extraction would under-collect the moment a new message shape puts a
-// URI somewhere unanticipated, and an under-collected id is a working image
-// that suddenly 404s for everyone but its uploader. Over-collecting is
-// impossible by construction: a string that is not in the content cannot be
-// collected, and a string that IS in the content is already visible to anyone
-// who can read the event.
-// Whole `mxc://host/id` URIs are indexed, never the bare id. The host is
-// load-bearing: with only the id in the table, posting
-// `mxc://anything/<id-from-a-private-channel>` into a channel you control
-// would bind that id to your channel and hand you the object. The download
-// path looks up the URI it builds from its own configured server name, so a
-// foreign host simply never matches.
-std::vector<std::string> media_uris_in_content(const std::string& content_json) {
-    std::vector<std::string> uris;
-    auto j = nlohmann::json::parse(content_json, nullptr, false);
-    if (j.is_discarded()) return uris;
-
-    // Iterative rather than recursive: content is attacker-supplied, and
-    // nlohmann will happily parse a few thousand levels of nesting, which a
-    // recursive walker would turn into a stack overflow — a remote crash from
-    // one PUT /send. A worklist has no such ceiling.
-    std::vector<const nlohmann::json*> todo{&j};
-    while (!todo.empty()) {
-        const nlohmann::json* node = todo.back();
-        todo.pop_back();
-        if (node->is_string()) {
-            const auto& s = node->get_ref<const std::string&>();
-            if (s.rfind("mxc://", 0) != 0 || s.size() > 512) continue;
-            auto slash = s.find('/', 6);
-            if (slash == std::string::npos || slash == 6) continue; // no host
-            auto id = s.substr(slash + 1);
-            // A media id is lowercase hex (MediaHandler::generate_media_id).
-            // Refusing anything else keeps a crafted `mxc://host/../..` out of
-            // the table entirely rather than relying on downstream checks.
-            if (id.empty() || id.size() > 128 ||
-                id.find_first_not_of("0123456789abcdef") != std::string::npos) {
-                continue;
-            }
-            uris.push_back(s);
-        } else if (node->is_object() || node->is_array()) {
-            for (const auto& child : *node) todo.push_back(&child);
-        }
-    }
-
-    std::sort(uris.begin(), uris.end());
-    uris.erase(std::unique(uris.begin(), uris.end()), uris.end());
-    return uris;
-}
-
 
 // Stamps `bsfchat.bot` onto an m.room.member event's content, DERIVED from the
 // member's user id rather than read back from what was stored.
@@ -1848,7 +1789,8 @@ int64_t SqliteStore::claim_stream_position_locked() {
 int64_t SqliteStore::insert_event(const std::string& event_id, const std::string& room_id,
                                    const std::string& sender, const std::string& event_type,
                                    const std::optional<std::string>& state_key,
-                                   const std::string& content_json, int64_t origin_server_ts) {
+                                   const std::string& content_json, int64_t origin_server_ts,
+                                   const MediaReferences& media) {
     std::lock_guard lock(mutex_);
 
     // ONE TRANSACTION over the event row, the stream-position head and the search
@@ -1963,7 +1905,29 @@ int64_t SqliteStore::insert_event(const std::string& event_id, const std::string
         // State events go in too, not just messages: a channel icon set by
         // PUT /state is read through the same VIEW_CHANNEL gate as the rest of
         // that room's state, so binding it to the room is exactly right.
+        //
+        // TWO conditions now, and they are enforced in two different places on
+        // purpose (audit F5):
+        //
+        //   * the content NAMES the uri — media_uris_in_content(), here, on the
+        //     door, exactly as before, so no caller can bind an object the
+        //     event does not mention; and
+        //   * the event's author MAY READ it — `media`, computed before this
+        //     call by MediaAccess::vet() via insert_event_vetted().
+        //
+        // The second one cannot live here. It needs PermissionsEngine, which
+        // reads this store, and we are inside its mutex and inside BEGIN
+        // IMMEDIATE — the transaction comment above promises no callback into a
+        // handler from in here, and it is worth keeping. So the door keeps the
+        // half it can enforce and is handed the half it cannot.
+        //
+        // An event inserted through the bare insert_event() binds nothing. That
+        // is deliberate and it is the fail-closed direction: a future ingestion
+        // path that does not vet its content produces attachments that 404 for
+        // everyone but their uploader, not a revocation bypass. Before F5 the
+        // default was the other way round and it was a value the caller wrote.
         for (const auto& uri : media_uris_in_content(content_json)) {
+            if (!media.permits(uri)) continue;
             auto ref = prepare(db_,
                 "INSERT OR IGNORE INTO media_refs (mxc_uri, room_id, event_id) "
                 "VALUES (?, ?, ?)");
@@ -4115,10 +4079,12 @@ std::vector<std::string> SqliteStore::get_media_rooms(const std::string& mxc_uri
     return rooms;
 }
 
-bool SqliteStore::is_avatar_media(const std::string& mxc_uri) {
+bool SqliteStore::is_avatar_of(const std::string& mxc_uri, const std::string& user_id) {
     std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "SELECT 1 FROM users WHERE avatar_url = ? LIMIT 1");
-    sqlite3_bind_text(stmt.get(), 1, mxc_uri.c_str(), -1, SQLITE_TRANSIENT);
+    auto stmt = prepare(db_,
+        "SELECT 1 FROM users WHERE user_id = ? AND avatar_url = ? LIMIT 1");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, mxc_uri.c_str(), -1, SQLITE_TRANSIENT);
     return sqlite3_step(stmt.get()) == SQLITE_ROW;
 }
 
@@ -4145,6 +4111,13 @@ std::vector<SqliteStore::MediaMeta> SqliteStore::find_orphaned_media(
 
     const std::string prefix = "mxc://" + server_name + "/";
 
+    // `u.user_id = m.uploader` in the avatar clause is not an optimisation: it
+    // is the same rule is_avatar_of() applies on the read side, and the two
+    // have to agree or this sweep either deletes bytes that are still being
+    // served or spares bytes that are not. An avatar worn by somebody who did
+    // not upload it grants nothing (audit F5's laundering variant), so it must
+    // not protect anything either.
+    //
     // The two NOT EXISTS clauses are correlated subqueries over indexed
     // columns: media_refs' primary key leads with mxc_uri, and users.avatar_url
     // is compared whole. `limit` bounds the work per sweep so a deployment with
@@ -4155,7 +4128,8 @@ std::vector<SqliteStore::MediaMeta> SqliteStore::find_orphaned_media(
         "FROM media m "
         "WHERE m.created_at < ? "
         "  AND NOT EXISTS (SELECT 1 FROM media_refs r WHERE r.mxc_uri = ? || m.media_id) "
-        "  AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_url = ? || m.media_id) "
+        "  AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_url = ? || m.media_id "
+        "                     AND u.user_id = m.uploader) "
         "ORDER BY m.created_at "
         "LIMIT ?");
     sqlite3_bind_int64(stmt.get(), 1, created_before_ms);

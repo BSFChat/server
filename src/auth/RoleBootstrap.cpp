@@ -260,6 +260,13 @@ void write_server_scoped_state(SqliteStore& store, const Config& config,
     // consults these events any more.
     if (!mirror_room.empty() && store.room_exists(mirror_room)) {
         auto event_id = generate_event_id(config.server_name);
+        // Bare insert_event. Role documents carry no media — no role has an
+        // icon — and the authoritative copy lives in server_state, which
+        // find_orphaned_media() scans directly with the same extractor, so
+        // nothing depends on this mirror to keep an object alive. If a role
+        // ever gains an icon this becomes an under-collection (the icon 404s
+        // for anyone but its uploader) rather than a bypass, and this comment
+        // is where to fix it.
         store.insert_event(event_id, mirror_room, actor,
                            evt_type, state_key, content_json, now_ms());
     }

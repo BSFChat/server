@@ -373,6 +373,10 @@ void BotHandler::handle_deactivate_bot(const httplib::Request& req, httplib::Res
     int left = 0;
     for (const auto& room_id : store_.get_joined_rooms(user_id)) {
         store_.set_membership(room_id, user_id, std::string(membership::kLeave));
+        // Bare insert_event: the content is this literal and nothing else. A
+        // leave event deliberately carries no profile fields — see
+        // member_event_content, which returns early for anything but join and
+        // invite — so there is nothing here to bind.
         store_.insert_event(generate_event_id(config_.server_name), room_id, user_id,
                             std::string(event_type::kRoomMember), user_id,
                             json{{"membership", membership::kLeave}}.dump(), now_ms());
