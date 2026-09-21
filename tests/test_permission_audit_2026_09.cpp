@@ -409,7 +409,10 @@ TEST(PermissionAudit2026_09, DISABLED_F2c_NoRankCheckOnAUserOverride) {
 // delete.
 // ─────────────────────────────────────────────────────────────────────────────
 
-TEST(PermissionAudit2026_09, DISABLED_F3_IsDirectBypassesCreateRoomPermission) {
+// ── ENABLED on fix/direct-room-guard, and the ONE piece of scaffolding that
+// had to move is called out below rather than quietly edited. Everything the
+// audit actually asserts is kept and strengthened; nothing is relaxed.
+TEST(PermissionAudit2026_09, F3_IsDirectBypassesCreateRoomPermission) {
     Fixture f("f3-isdirect");
     f.seed_roles();
     auto mallory = f.add_user("mallory");       // @everyone only
@@ -434,10 +437,34 @@ TEST(PermissionAudit2026_09, DISABLED_F3_IsDirectBypassesCreateRoomPermission) {
     };
     auto res = call(rooms, &RoomHandler::handle_create_room,
                     "/_matrix/client/v3/createRoom", "token-mallory", body.dump());
-    ASSERT_TRUE(IsOk(res)) << "expected the bypass to succeed so the rest can be asserted";
 
-    const auto room_id = json::parse(res.body).value("room_id", "");
-    ASSERT_FALSE(room_id.empty());
+    // THE ONE LINE THIS TEST CHANGED WHEN IT WAS ENABLED, and it is a
+    // STRENGTHENING, which is why it is recorded here instead of in a commit
+    // message nobody will read next to this code.
+    //
+    // The audit wrote `ASSERT_TRUE(IsOk(res)) << "expected the bypass to
+    // succeed so the rest can be asserted"` — scaffolding, to reach a room id
+    // so the real assertions below could run against it. But the audit's own
+    // recommended fix is "refuse is_direct with invite.size() != 1", and under
+    // that fix this request is a 403 and never yields a room id: the proof as
+    // written could not pass against the fix it was written for. So the
+    // scaffolding asserts the refusal instead.
+    //
+    // 403 is strictly stronger than what it replaced. "The room is created but
+    // nobody is force-joined" would have satisfied the original line; "the
+    // request is refused outright" satisfies it and also leaves no room, no
+    // membership row and no event behind. The substantive assertions below are
+    // untouched and still run.
+    EXPECT_TRUE(IsForbidden(res))
+        << "an account holding nothing but @everyone must not be able to create a "
+           "room by claiming three people are a direct message";
+
+    // Whatever the call did make — a room on the unfixed server, nothing on the
+    // fixed one — is what the audit's assertions are evaluated against. They are
+    // kept rather than deleted on purpose: if a later change turns the refusal
+    // back into a 200, these are what catch the force-join again.
+    const auto room_id = IsOk(res) ? json::parse(res.body).value("room_id", "")
+                                   : std::string();
 
     // THE ASSERTIONS THAT FAIL TODAY.
     //
@@ -450,9 +477,17 @@ TEST(PermissionAudit2026_09, DISABLED_F3_IsDirectBypassesCreateRoomPermission) {
     EXPECT_NE(f.store->get_membership(room_id, victim2), std::string(membership::kJoin));
     EXPECT_NE(f.store->get_membership(room_id, victim3), std::string(membership::kJoin));
 
+    // ADDED when this was enabled, and it is the assertion a "create it but
+    // only invite them" fix would fail: no room was manufactured for any of
+    // the three at all, so there is nothing for them to accept, decline or
+    // find in their sync.
+    EXPECT_TRUE(f.store->get_direct_rooms(victim1).empty());
+    EXPECT_TRUE(f.store->get_direct_rooms(victim2).empty());
+    EXPECT_TRUE(f.store->get_direct_rooms(victim3).empty());
+
     // And the room is a DM to every predicate that matters, which is what makes
     // the invariant break load-bearing rather than cosmetic.
-    if (f.store->is_direct_room(room_id)) {
+    if (!room_id.empty() && f.store->is_direct_room(room_id)) {
         PermissionsEngine perms(*f.store, f.config);
         // Nothing can hide it from the people dragged into it: compute() clears
         // channel overrides on a direct room, so a VIEW_CHANNEL deny is inert.
@@ -472,6 +507,43 @@ TEST(PermissionAudit2026_09, DISABLED_F3_IsDirectBypassesCreateRoomPermission) {
 
 // F3b — the multi-party fake DM is invisible to the channel directory AND
 // undeletable by an administrator, so there is no moderation remedy.
+//
+// ── DELIBERATELY LEFT DISABLED ON fix/direct-room-guard. ────────────────────
+//
+// This is the one assertion in the audit that the F3 fix does not make true,
+// and the reason is that fixing F3 dissolves its premise. Read the room this
+// test builds: `{"is_direct": true, "invite": [victim]}` — ONE invitee. On the
+// unfixed server that was still a bypass, because `is_direct` skipped the
+// permission check whatever the list looked like, so the room was an artefact
+// of the hole and deleting it was plainly right. With the creation rule in
+// place it is an ORDINARY TWO-PERSON DM, and no predicate can tell it from any
+// other. Making this pass therefore means "an administrator can delete
+// anybody's direct message", which:
+//
+//   * the audit does not argue for anywhere in its text — its recommended fix
+//     for F3 is the invite cap, and the moderation remedy is described as a
+//     consequence of the cap rather than a change to make on its own;
+//   * directly reverses DirectRoomIsolation.AnAdminOutsideADmCannotDeleteIt in
+//     test_regressions.cpp, an ENABLED test with an incident behind it. The two
+//     cannot both be green, and preferring an audit proof to a regression is
+//     how a closed privacy finding gets reopened to close an abuse one;
+//   * changes what m.direct is derived against. "A DM's privacy is its
+//     membership" (docs/membership-vs-visibility.md) does not survive an
+//     operator who can destroy one at will.
+//
+// WHAT SHIPPED INSTEAD, and why the finding is still closed. The remedy is
+// scoped to the SHAPE rather than to the actor: handle_delete_room admits
+// server-scoped MANAGE_CHANNELS for a direct room whose joined membership is
+// not exactly two. That is precisely the set of rooms F3 could manufacture,
+// and after the creation rule no more can be made — so the rooms with no
+// remedy get one, and the rooms that are what they claim to be keep the
+// protection they had. See section 8 of tests/test_dm_membership.cpp, where
+// both halves are pinned along with the assertion that nothing became
+// enumerable.
+//
+// LEFT HERE, AND LEFT RUNNABLE, because it is a real question about the
+// product and the owner may answer it differently. Run it with
+// --gtest_also_run_disabled_tests to see exactly what the other answer costs.
 TEST(PermissionAudit2026_09, DISABLED_F3b_FakeDmHasNoModerationRemedy) {
     Fixture f("f3b-remedy");
     f.seed_roles();

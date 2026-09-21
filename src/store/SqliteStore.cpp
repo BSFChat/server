@@ -1096,12 +1096,40 @@ std::vector<std::pair<std::string, std::string>> SqliteStore::get_direct_rooms(
 std::optional<std::string> SqliteStore::find_direct_room(const std::string& user_a,
                                                          const std::string& user_b) {
     std::lock_guard lock(mutex_);
+    // The joined-member count is part of the predicate, and it is the READ half
+    // of the rule handle_create_room now enforces on the write side.
+    //
+    // Without it this function answers "the oldest direct room these two are
+    // both in", which is not the same question as "their DM" the moment a
+    // direct room can hold three people — and before the shape rule landed, any
+    // account could manufacture one that did. That made this a confused deputy
+    // rather than a missing feature: given a direct room holding {mallory,
+    // alice, bob}, the next time alice opened a DM with bob this handed back
+    // MALLORY'S room, and the two of them would have held a private
+    // conversation in it. Ordered oldest-first, so the manufactured room wins
+    // against a real one created later.
+    //
+    // Enforcing it here as well as at creation is the same argument
+    // PermissionsEngine::compute() makes for clearing channel overrides on a
+    // direct room: refusing the write stops NEW ones, and does nothing for a
+    // database that already carries one from a build without the refusal. A
+    // three-person direct room simply stops matching, so alice and bob get a
+    // clean two-person room minted instead — the repair happens by itself, on
+    // the next attempt, with nothing to migrate.
+    //
+    // It counts JOINED members only, and deliberately does not constrain
+    // get_direct_rooms() the same way: that function reports the peer whatever
+    // their own membership is, because a DM the other side has left is still
+    // that person's conversation, and a count rule there would delete it from
+    // their m.direct. The two are asking different questions.
     auto stmt = prepare(db_, R"(
         SELECT r.room_id
         FROM rooms r
         JOIN room_members a ON a.room_id = r.room_id AND a.user_id = ? AND a.membership = 'join'
         JOIN room_members b ON b.room_id = r.room_id AND b.user_id = ? AND b.membership = 'join'
         WHERE r.is_direct = 1
+          AND (SELECT COUNT(*) FROM room_members m
+               WHERE m.room_id = r.room_id AND m.membership = 'join') = 2
         ORDER BY r.rowid LIMIT 1
     )");
     sqlite3_bind_text(stmt.get(), 1, user_a.c_str(), -1, SQLITE_TRANSIENT);
@@ -1688,6 +1716,33 @@ SqliteStore::get_user_memberships(const std::string& user_id) {
         );
     }
     return rows;
+}
+
+std::vector<SqliteStore::MalformedDirectRoom> SqliteStore::list_malformed_direct_rooms() {
+    std::lock_guard lock(mutex_);
+    // The count is of JOINED rows only, matching the predicate
+    // handle_delete_room applies and the one find_direct_room now requires.
+    // Counting every row instead would list every DM either side ever left,
+    // which is the opposite of the point: this must surface the broken rooms
+    // WITHOUT surfacing the ordinary ones.
+    auto stmt = prepare(db_, R"(
+        SELECT r.room_id, r.creator,
+               (SELECT COUNT(*) FROM room_members m
+                WHERE m.room_id = r.room_id AND m.membership = 'join') AS joined
+        FROM rooms r
+        WHERE r.is_direct = 1 AND joined != 2
+        ORDER BY r.room_id
+    )");
+
+    std::vector<MalformedDirectRoom> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        MalformedDirectRoom row;
+        row.room_id = column_text_or_empty(stmt.get(), 0);
+        row.creator = column_text_or_empty(stmt.get(), 1);
+        row.joined = static_cast<size_t>(sqlite3_column_int64(stmt.get(), 2));
+        out.push_back(std::move(row));
+    }
+    return out;
 }
 
 std::vector<SqliteStore::OrphanMembership> SqliteStore::list_orphan_memberships() {

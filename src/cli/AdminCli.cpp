@@ -209,6 +209,55 @@ int cmd_list_orphan_members(const CommonArgs& args, std::ostream& out,
     return 0;
 }
 
+int cmd_list_fake_dms(const CommonArgs& args, std::ostream& out, const ListenProbe& probe) {
+    Config config;
+    if (!load_config(args.config_path, config, out)) return 1;
+    // Same stopped-server gate as list-orphan-members, and for the same reason:
+    // the command is read-only but SqliteStore::initialize() runs the migration
+    // pass, so pointing it at a live server is a second writer.
+    if (refuse_if_running(config, probe, out)) return 1;
+
+    SqliteStore store(config.database_path);
+    store.initialize();
+
+    auto rooms = store.list_malformed_direct_rooms();
+    if (rooms.empty()) {
+        out << "no malformed direct rooms in " << config.database_path
+            << ": every room marked is_direct holds exactly two joined members.\n";
+        return 0;
+    }
+
+    out << rooms.size() << " malformed direct room(s) in " << config.database_path
+        << ".\nEach claims to be a direct message and is not:\n\n";
+    for (const auto& row : rooms) {
+        out << "  " << row.room_id << "  created_by=" << log_safe(row.creator)
+            << "  joined_members=" << row.joined << "\n";
+    }
+    out << "\nWhere they came from: POST /createRoom read `is_direct` straight out of the\n"
+           "request body and skipping the MANAGE_CHANNELS check was the only thing it did,\n"
+           "so any account holding nothing but @everyone could send\n"
+           "  {\"is_direct\": true, \"invite\": [a, b, c]}\n"
+           "and the invite loop JOINED all three outright. That is finding F3 of\n"
+           "docs/audit-permissions-2026-09.md. It now refuses; a room above predates the\n"
+           "fix or was made through it.\n"
+           "\nWhat they are doing: a direct room is exempt from four separate rules that\n"
+           "each assume it holds two people who chose to be there. It is excluded from the\n"
+           "channel directory in SQL, channel permission overrides are discarded on it, a\n"
+           "kick is refused in it, and only participants may delete it. So nobody dragged\n"
+           "into one of these can be removed from it and nothing can hide it from them.\n"
+           "\nWhat to do: DELETE /_matrix/client/v3/rooms/{id} as an account holding\n"
+           "MANAGE_CHANNELS at server scope. That route now admits a non-participant for\n"
+           "exactly the rooms listed here and for no others, so it is audited and it wakes\n"
+           "the participants' syncs — which a DELETE against this file by hand would not.\n"
+           "Nothing here deletes anything, on purpose.\n"
+           "\nGENUINE TWO-PERSON DMs ARE NOT LISTED AND CANNOT BE. This command exists so\n"
+           "an operator can find the broken rooms WITHOUT being handed a list of everyone's\n"
+           "private conversations, and no HTTP route exposes it at all.\n";
+    // 0, not 1: the exit codes say whether the command RAN. The finding is the
+    // output, and a check script wanting a signal reads the first line.
+    return 0;
+}
+
 int cmd_grant_admin(const CommonArgs& args, std::ostream& out, const ListenProbe& probe) {
     Config config;
     if (!load_config(args.config_path, config, out)) return 1;
@@ -349,7 +398,7 @@ bool default_listen_probe(const std::string& address, int port) {
 
 bool is_admin_subcommand(const std::string& token) {
     return token == "grant-admin" || token == "list-users" ||
-           token == "list-orphan-members";
+           token == "list-orphan-members" || token == "list-fake-dms";
 }
 
 void print_admin_usage(std::ostream& out) {
@@ -360,6 +409,10 @@ void print_admin_usage(std::ostream& out) {
            "  list-orphan-members --config <path>\n"
            "      Every membership row that names an account which does not exist.\n"
            "      Read-only: it reports, it never deletes. A clean server prints one line.\n"
+           "  list-fake-dms --config <path>\n"
+           "      Every room marked is_direct that does not hold exactly two joined\n"
+           "      members, so is not a direct message however it is flagged. Read-only,\n"
+           "      and it never lists a genuine DM. A clean server prints one line.\n"
            "  grant-admin --config <path> --user <@user:server>\n"
            "      Give that account the admin role. Idempotent. Goes through the same\n"
            "      audited, sync-mirrored write path the API uses.\n"
@@ -385,6 +438,7 @@ int run_admin_cli(const std::vector<std::string>& args, std::ostream& out, Liste
     try {
         if (command == "list-users") return cmd_list_users(parsed, out, probe);
         if (command == "list-orphan-members") return cmd_list_orphan_members(parsed, out, probe);
+        if (command == "list-fake-dms") return cmd_list_fake_dms(parsed, out, probe);
         if (command == "grant-admin") return cmd_grant_admin(parsed, out, probe);
     } catch (const std::exception& e) {
         // A schema too new for this build, an unreadable database, a disk

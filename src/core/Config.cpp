@@ -140,6 +140,8 @@ Config Config::load(const std::string& path) {
                 sl.media_upload_limit = v->value_or(sl.media_upload_limit);
             if (auto v = limits_tbl->get("profile_limit"))
                 sl.profile_limit = v->value_or(sl.profile_limit);
+            if (auto v = limits_tbl->get("room_create_limit"))
+                sl.room_create_limit = v->value_or(sl.room_create_limit);
             if (auto v = limits_tbl->get("window_seconds"))
                 sl.window_seconds = v->value_or(sl.window_seconds);
             // Sizes, not rates. Read as int64 and clamped in validate(): toml++

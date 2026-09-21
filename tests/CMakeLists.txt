@@ -32,6 +32,7 @@ add_executable(server_tests
     test_search.cpp
     test_audit.cpp
     test_permission_scope.cpp
+    test_permission_audit_2026_09.cpp
     test_room_visibility.cpp
     test_category_visibility.cpp
     test_server_ban.cpp

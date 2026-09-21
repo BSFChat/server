@@ -350,9 +350,20 @@ media_upload_limit = 30
 # All three endpoints share this budget, because they share the amplifier.
 profile_limit = 10
 
+# Rooms created (POST /createRoom) per account per window, covering both
+# channels and DMs. Like send_limit above, this is a ceiling on a loop and not
+# a pace for a person: an operator setting up a fresh deployment makes a
+# category and eight channels in about a minute, and a tighter number would
+# refuse them. The only budget here an account with NO permissions can spend,
+# since opening a direct message is deliberately ungated while creating a
+# channel needs MANAGE_CHANNELS. One request writes a room row, half a dozen
+# state events, and a membership row plus an m.room.member event plus a sync
+# wake per participant.
+room_create_limit = 30
+
 # --- How big one write may be (as opposed to how many) -----------------------
 #
-# The four numbers above are rates: how OFTEN an account may do a thing. The
+# The five numbers above are rates: how OFTEN an account may do a thing. The
 # two below are sizes: how BIG one of those things may be. Until these existed
 # there was no bound on a message at all, in this server or in the desktop
 # client, so any member could post a multi-megabyte body — stored, full-text

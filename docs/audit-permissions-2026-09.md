@@ -261,6 +261,20 @@ scoped bot it is a comparison of 0 against 0.
 
 ## F3 — `is_direct` is a caller-controlled bypass of the only check on `POST /createRoom` (Medium-High)
 
+> **STATUS: fixed on `fix/direct-room-guard`, 21 Sep 2026.** Recommendations 1,
+> 2 and 3 all landed. Group DMs were established not to exist — in the client,
+> the protocol or the store — so the behavioural risk named below is not real;
+> the evidence is in `docs/membership-vs-visibility.md` and in §6 of
+> `tests/test_dm_membership.cpp`. `F3` below is **enabled**, with the one line
+> of its scaffolding that the recommended fix makes impossible called out in
+> place. `F3b` is **left disabled**: fixing F3 dissolves its premise, because
+> the room it builds has one invitee and is therefore an ordinary DM once the
+> cap lands, so passing it now means "an administrator can delete anybody's
+> DM" — which this audit never argued for and which reverses an enabled
+> regression. The remedy shipped is scoped to the broken **shape** instead. The
+> argument is written next to the test.
+
+
 **This is the only finding reachable by an account holding nothing but
 `@everyone`, with no prior grant of any kind.**
 

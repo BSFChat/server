@@ -251,6 +251,29 @@ struct SendLimitsConfig {
     // work is 50 event inserts and a server-wide poll storm. Nobody renames
     // themselves ten times a minute; anything that does is a loop.
     int profile_limit = 10;
+    // Room creation (POST /createRoom), for both channels and DMs.
+    //
+    // Same philosophy as send_limit and deliberately not tighter: this is here
+    // to stop a loop, not to pace a person. An operator setting up a fresh
+    // deployment creates a category and eight channels in about a minute, and
+    // a number that refused them would be a bug reported as "the server broke
+    // while I was making channels". Thirty a minute is one every two seconds
+    // sustained; nobody reaches it by clicking.
+    //
+    // It is the only write budget here an account holding NO permissions can
+    // spend, because opening a DM is deliberately ungated and creating a
+    // channel is not — so this is the ceiling on the one expensive route
+    // @everyone can reach. The unit of work behind each request is a room row,
+    // half a dozen state events, and a membership row plus an m.room.member
+    // event plus a sync wake per participant.
+    //
+    // It does NOT replace the shape rules in handle_create_room, and the
+    // distinction matters: a rate limit bounds how FAST the wrong thing can be
+    // done, never whether it can be done. The invite-list rule lives in the
+    // handler and this sits behind it. The real ceiling on DM abuse is the
+    // per-pair dedup — one room per pair, so an attacker is bounded by the
+    // number of accounts however long they run — and this bounds the burst.
+    int room_create_limit = 30;
 
     int window_seconds = 60;
 

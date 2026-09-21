@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/SendLimiter.h"
+
 #include <httplib.h>
 #include <nlohmann/json_fwd.hpp>
 
@@ -145,6 +147,11 @@ private:
     SqliteStore& store_;
     SyncEngine& sync_engine_;
     const Config& config_;
+    // POST /createRoom only. Built from config.send_limits like every other
+    // handler's, so the constructor signature is unchanged and no call site or
+    // test had to move — see SendLimiter::Bucket::kRoomCreate for why this
+    // handler needed one at all when the rest of it had gone without.
+    SendLimiter limits_;
 };
 
 } // namespace bsfchat
