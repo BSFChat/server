@@ -1022,3 +1022,32 @@ TEST(PermissionContainment, AChannelManagerAtPositionZeroMayStillDenyEveryone) {
     // the @everyone one, which is the ordering compute() documents.
     EXPECT_TRUE(perms.can(owner, room, permission::kViewChannel));
 }
+
+// The door refuses an ADMINISTRATOR override; this pins the other half of that
+// pair, which is older and more important: an override carrying the bit — one
+// stored by a build before the refusal, or written by the synthetic @server
+// actor — CONFERS NOTHING. compute() takes the administrator short-circuit
+// from the ROLE base, before a single override is applied.
+//
+// Kept as a test in its own right precisely because the write is now refused:
+// the day the door-level rule is the only thing pinning this, somebody will
+// relax the door and discover the model never protected them. Written straight
+// into the store for that reason, bypassing the route entirely.
+TEST(PermissionContainment, AnAdministratorOverrideStoredByAnOlderBuildConfersNothing) {
+    Fixture f("inert-admin-override");
+    f.seed_roles();
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto member = f.add_user("member");
+    auto room = f.add_channel(admin, "general");
+    f.join(room, member);
+    f.set_override(room, "user:" + member, permission::kAdministrator);
+
+    PermissionsEngine perms(*f.store, f.config);
+    EXPECT_FALSE(perms.can(member, room, permission::kManageServer));
+    EXPECT_FALSE(perms.can(member, room, permission::kManageChannels));
+    EXPECT_FALSE(perms.can(member, room, permission::kManageBots));
+    EXPECT_FALSE(perms.can(member, std::string(), permission::kAdministrator));
+    // And it confers no RANK either, which is the F6 half of the same question.
+    EXPECT_EQ(perms.highest_role_position(member), 0);
+    EXPECT_FALSE(perms.outranks(member, admin));
+}

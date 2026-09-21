@@ -354,29 +354,42 @@ grep -q "M_FORBIDDEN" "$WORK/audit.json" || fail "403 did not carry M_FORBIDDEN"
 pass "a plain member gets 403 on the filtered endpoint, with no records"
 
 # The escalation shape: a per-channel override granting MANAGE_SERVER (bit 10 =
-# 0x400) and ADMINISTRATOR (bit 15 = 0x8000) inside ONE channel must not unlock
-# the server-wide log — with or without filters, and least of all when the filter
-# names that very channel.
+# 0x400) inside ONE channel must not unlock the server-wide log — with or
+# without filters, and least of all when the filter names that very channel.
 #
-# MANAGE_CHANNELS (bit 5 = 0x20) is granted alongside them purely so the positive
-# control below has something channel-scoped to demonstrate. It is needed because
-# PermissionsEngine::compute() applies the ADMINISTRATOR short-circuit to the ROLE
-# base only, BEFORE overrides — so an ADMINISTRATOR bit arriving through an
-# override does not expand to every flag. 0x20|0x400|0x8000 = 0x8420.
+# MANAGE_CHANNELS (bit 5 = 0x20) is granted alongside it purely so the positive
+# control below has something channel-scoped to demonstrate. 0x20|0x400 = 0x420.
+#
+# ADMINISTRATOR (bit 15 = 0x8000) USED TO BE IN THIS GRANT and is now refused
+# at the door, which is a fix rather than a regression — see
+# PermissionsEngine::may_write_channel_override on fix/perm-containment. The
+# bit was always inert in an override, because compute() takes the
+# ADMINISTRATOR short-circuit from the ROLE base BEFORE overrides are applied,
+# and that inertness is still pinned as a unit test
+# (PermissionContainment.AnAdministratorOverrideStoredByAnOlderBuildConfers
+# Nothing, which writes one straight into the store). What has changed is that
+# the server no longer ACCEPTS the write, from anybody, because a channel has
+# no say over a role-level flag and the grant is always either a
+# misunderstanding or an attempt. Asserted in both directions here.
 OUT=$(api PUT "/_matrix/client/v3/rooms/$ROOM_A_ENC/state/bsfchat.channel.permissions/$(urlenc "user:@carol:$HOST")" \
     "$ALICE_TOKEN" '{"allow":"0x8420","deny":"0x0"}')
+[ "$(status "$OUT")" = "403" ] || { echo "$OUT"; fail "an override granting ADMINISTRATOR was accepted"; }
+pass "even an administrator cannot put ADMINISTRATOR into a channel override"
+
+OUT=$(api PUT "/_matrix/client/v3/rooms/$ROOM_A_ENC/state/bsfchat.channel.permissions/$(urlenc "user:@carol:$HOST")" \
+    "$ALICE_TOKEN" '{"allow":"0x420","deny":"0x0"}')
 [ "$(status "$OUT")" = "200" ] || { echo "$OUT"; fail "could not write the per-channel override"; }
-pass "alice granted carol MANAGE_SERVER+ADMINISTRATOR+MANAGE_CHANNELS inside $ROOM_A only"
+pass "alice granted carol MANAGE_SERVER+MANAGE_CHANNELS inside $ROOM_A only"
 
 OUT=$(api GET "/_matrix/client/v3/rooms/$ROOM_A_ENC/state/bsfchat.channel.permissions/$(urlenc "user:@carol:$HOST")" \
     "$ALICE_TOKEN")
 [ "$(status "$OUT")" = "200" ] || { echo "$OUT"; fail "the override was not stored"; }
-echo "$OUT" | grep -q 0x8420 || fail "the stored override is not the one we wrote"
+echo "$OUT" | grep -q 0x420 || fail "the stored override is not the one we wrote"
 
 # Positive control: the override really IS in effect at channel scope. Without
 # this, every 403 below could be passing because the override silently failed to
 # apply, and the test would prove nothing at all. Carol can now rename ROOM_A
-# (MANAGE_CHANNELS, which her ADMINISTRATOR grant covers) — and could not before,
+# (MANAGE_CHANNELS, which the override grants her) — and could not before,
 # which is asserted against ROOM_B, where she has no override.
 OUT=$(api PUT "/_matrix/client/v3/rooms/$ROOM_A_ENC/state/m.room.name/" "$CAROL_TOKEN" \
     '{"name":"carol-was-here"}')
@@ -398,7 +411,7 @@ for Q in "" \
     grep -q "M_FORBIDDEN" "$WORK/audit.json" || fail "'$Q' was refused, but not by the permission gate: $(cat "$WORK/audit.json")"
     grep -q "audit log" "$WORK/audit.json" || fail "'$Q' was refused for the wrong reason: $(cat "$WORK/audit.json")"
 done
-pass "a per-channel MANAGE_SERVER+ADMINISTRATOR override grants NO access to the server-wide audit log, filtered or not"
+pass "a per-channel MANAGE_SERVER override grants NO access to the server-wide audit log, filtered or not"
 
 # And the same filters do work for someone holding the flag at server scope, so
 # the refusals above are about carol and not about the filters being broken.
