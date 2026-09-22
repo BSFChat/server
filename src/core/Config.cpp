@@ -49,6 +49,7 @@ Config Config::load(const std::string& path) {
         // [server]
         if (auto server = tbl["server"].as_table()) {
             if (auto v = server->get("name")) cfg.server_name = v->value_or(cfg.server_name);
+            if (auto v = server->get("public_url")) cfg.public_url = v->value_or(cfg.public_url);
             if (auto v = server->get("bind_address")) cfg.bind_address = v->value_or(cfg.bind_address);
             if (auto v = server->get("port")) cfg.port = v->value_or(cfg.port);
             if (auto v = server->get("workers")) cfg.workers = v->value_or(cfg.workers);
@@ -264,6 +265,12 @@ Config Config::load(const std::string& path) {
 
     validate(cfg);
     return cfg;
+}
+
+std::string expected_identity_audience(const Config& cfg) {
+    const std::string configured =
+        cfg.public_url.empty() ? "https://" + cfg.server_name : cfg.public_url;
+    return canonical_audience_url(configured).value_or(std::string());
 }
 
 bool turn_credentials_are_shared(const VoiceConfig& voice) {
@@ -617,10 +624,31 @@ void Config::validate(Config& cfg) {
         }
     }
 
-    if (cfg.identity && cfg.identity->client_id.empty()) {
-        log->warn("identity.client_id is empty — identity tokens will be accepted regardless of "
-                  "their audience, so a token minted for any other OAuth client registered with "
-                  "the same provider will be accepted as a chat login.");
+    if (cfg.identity) {
+        // Fail closed, loudly. An audience that cannot be derived refuses
+        // every identity token (AuthHandler never falls back to "unchecked"),
+        // and one that is merely wrong refuses them too — both look like
+        // "sign-in with BSFChat ID is broken", so say which URL is expected.
+        const std::string audience = expected_identity_audience(cfg);
+        if (audience.empty()) {
+            log->error("Cannot derive this server's public URL from server.public_url = '{}' / "
+                       "server.name = '{}'. Every BSFChat ID sign-in will be REFUSED until "
+                       "server.public_url is set to the URL clients connect to "
+                       "(e.g. \"https://chat.example\"). Password sign-in is unaffected.",
+                       cfg.public_url, cfg.server_name);
+        } else {
+            log->info("Identity tokens are accepted only when audienced to {} — the URL clients "
+                      "must connect to. Set server.public_url if that is not it.", audience);
+            if (!audience_url_is_secure(audience)) {
+                log->warn("server.public_url {} is plain http on a non-loopback host. The "
+                          "identity provider refuses to mint tokens for such a URL, so BSFChat "
+                          "ID sign-in will not work here.", audience);
+            }
+        }
+        if (cfg.identity->client_id.empty()) {
+            log->warn("identity.client_id is empty — identity tokens will be accepted whichever "
+                      "OAuth client they were issued to (the `azp` check is off).");
+        }
     }
 
     if (cfg.push.worker_poll_ms < 50) cfg.push.worker_poll_ms = 50;

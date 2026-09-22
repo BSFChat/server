@@ -473,13 +473,12 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
 
         if (locked_out(client, {}, res)) return;
 
-        const std::string expected_audience =
-            config_.identity ? config_.identity->client_id : std::string();
-        auto claims = oidc_auth_->validate_token(login_req.token, expected_audience);
+        std::string refusal;
+        auto claims = verify_identity_token(login_req.token, refusal);
         if (!claims) {
             record_failure(client, {});
             res.status = 403;
-            res.set_content(MatrixError::forbidden("Invalid identity token").to_json().dump(), "application/json");
+            res.set_content(MatrixError::forbidden(refusal).to_json().dump(), "application/json");
             return;
         }
 
@@ -1144,6 +1143,69 @@ void AuthHandler::handle_whoami(const httplib::Request& req, httplib::Response& 
     res.set_content(resp.dump(), "application/json");
 }
 
+// ── Identity tokens ───────────────────────────────────────────────────────
+
+std::optional<JwtClaims> AuthHandler::verify_identity_token(const std::string& token,
+                                                            std::string& refusal) {
+    auto log = get_logger();
+    refusal = "Invalid identity token";
+    if (!oidc_auth_ || !config_.identity) return std::nullopt;
+
+    // Fail closed. jwt_verify treats an empty audience as "do not check",
+    // which is exactly the hole C1 was, so an underivable audience refuses
+    // everything rather than reaching it. Config::validate has already said
+    // why at startup.
+    const std::string audience = expected_identity_audience(config_);
+    if (audience.empty()) {
+        log->error("Refused an identity token: this server has no usable public URL "
+                   "(set server.public_url)");
+        return std::nullopt;
+    }
+
+    auto claims = oidc_auth_->validate_token(token, audience);
+    if (!claims) {
+        // Worth one more look, because the commonest failure right after this
+        // change ships is not an attack: it is somebody on a desktop client
+        // from before the fix, whose token still carries the legacy client-id
+        // audience. Telling them to update beats a bare "invalid". The token
+        // is still refused — that audience is precisely the replayable one.
+        auto unbound = oidc_auth_->validate_token(token, std::string());
+        // A URL audience that is not ours is a token for another server: no
+        // hint, it is either a mistake or an attack.
+        if (unbound && !canonical_audience_url(unbound->aud)) {
+            refusal = "This sign-in token is not bound to this server. Your BSFChat app is out "
+                      "of date: update it and sign in again.";
+        }
+        return std::nullopt;
+    }
+
+    // Issued to the client we expect. A token some OTHER registered relying
+    // party obtained for this server — with the user's consent to that
+    // party, not to this app — does not sign anybody in here.
+    const std::string& client_id = config_.identity->client_id;
+    if (!client_id.empty() && claims->azp.value_or(std::string()) != client_id) {
+        log->warn("Refused an identity token issued to another client");
+        return std::nullopt;
+    }
+
+    // One use per token. The nonce is generated per authorization by the
+    // client and echoed by the provider, so it names this token; a second
+    // presentation is a copy. The +60 matches jwt_verify's leeway, so the
+    // record outlives every moment at which the token could still verify.
+    if (!claims->nonce || claims->nonce->empty()) {
+        refusal = "This sign-in token carries no nonce. Update your BSFChat app and sign in again.";
+        return std::nullopt;
+    }
+    if (!oidc_auth_->first_presentation(claims->iss, claims->sub, *claims->nonce,
+                                        claims->exp + 60)) {
+        log->warn("Refused a second presentation of an identity token");
+        refusal = "This sign-in token has already been used";
+        return std::nullopt;
+    }
+
+    return claims;
+}
+
 // ── Account linking ───────────────────────────────────────────────────────
 //
 // POST /_matrix/client/v3/bsfchat/account/link_identity
@@ -1152,8 +1214,8 @@ void AuthHandler::handle_whoami(const httplib::Request& req, httplib::Response& 
 // THE SECURITY PROPERTY, stated once: this endpoint requires the caller to be
 // authenticated as BOTH sides at the same moment. The bearer token proves
 // control of the account that will survive; the id_token in the body, verified
-// against the provider's published keys and this server's own client_id,
-// proves control of the identity being attached. There is no flow in which
+// against the provider's published keys and audienced to THIS server's own
+// public URL, proves control of the identity being attached. There is no flow in which
 // merely ASSERTING an identity — a subject string, an email, a display name —
 // attaches anything, which is the attack this shape exists to make
 // unrepresentable: if it were enough to name an identity, the first person to
@@ -1234,14 +1296,23 @@ void AuthHandler::handle_link_identity(const httplib::Request& req, httplib::Res
     }
 
     // Half two: control of the identity. Verified with the SAME call the login
-    // path makes — same keys, same issuer, same audience — so an id_token that
-    // could not sign anybody in cannot link anything either.
-    const std::string expected_audience =
-        config_.identity ? config_.identity->client_id : std::string();
-    auto claims = oidc_auth_->validate_token(body["token"].get<std::string>(), expected_audience);
+    // path makes — same keys, same issuer, same audience, same single use —
+    // so an id_token that could not sign anybody in cannot link anything
+    // either.
+    //
+    // The audience is what makes this half mean anything. Until identity
+    // audit 2026-09 (C1) it was the desktop client id, shared by every
+    // server: a hostile server that received a user's token at sign-in could
+    // post it here beside a bearer for its OWN account on this server, and
+    // this endpoint would link the victim's identity to the attacker's
+    // account and revoke the victim's sessions — permanently, links being
+    // insert-only. Production blocked the route in nginx on 2026-09-22 until
+    // this shipped. A token is now accepted only if it names this server.
+    std::string refusal;
+    auto claims = verify_identity_token(body["token"].get<std::string>(), refusal);
     if (!claims) {
         record_failure(client, {});
-        send_error(res, 403, MatrixError::forbidden("Invalid identity token"));
+        send_error(res, 403, MatrixError::forbidden(refusal));
         return;
     }
 

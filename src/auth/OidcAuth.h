@@ -36,8 +36,11 @@ public:
     OidcAuth& operator=(const OidcAuth&) = delete;
 
     // Validate an identity token. Returns its claims if valid.
-    // `expected_audience` is the relying party's client_id; when non-empty a
-    // token minted for a different OAuth client is rejected.
+    // `expected_audience` is this server's canonical public URL (see
+    // expected_identity_audience()); when non-empty a token audienced to
+    // anybody else is rejected. Callers that accept a token as a credential
+    // must never pass it empty — AuthHandler::verify_identity_token refuses
+    // outright instead.
     std::optional<JwtClaims> validate_token(const std::string& id_token,
                                              const std::string& expected_audience = std::string());
 
@@ -56,6 +59,27 @@ public:
 
     // True once any refresh has succeeded. Used only for logging.
     bool has_keys() const;
+
+    // Records one presentation of an identity token, keyed on (issuer,
+    // subject, nonce). Returns true the first time and false for every later
+    // presentation until `expires_at` (the token's own `exp`, plus the
+    // verifier's leeway) has passed.
+    //
+    // Why: an id_token is a bearer credential that is presented once, seconds
+    // after it is minted. Audience binding (C1) already confines it to this
+    // server; this confines it to one USE here, so a copy picked up on the way
+    // — a proxy log, a crash dump, a debugging session — is worth nothing once
+    // the real sign-in has happened. The client generates a fresh nonce per
+    // authorization and the identity provider echoes it, so a nonce names one
+    // token.
+    //
+    // In memory, deliberately: tokens live five minutes, so a restart forgets
+    // at most five minutes of history, and a table would be one more thing to
+    // migrate and prune. Bounded; when full of live entries it refuses (fails
+    // closed) — filling it takes that many freshly minted tokens for THIS
+    // server, which only the identity provider can produce.
+    bool first_presentation(const std::string& issuer, const std::string& subject,
+                            const std::string& nonce, int64_t expires_at);
 
 private:
     // PEM for `kid`; falls back to the sole published key when the token names
@@ -94,6 +118,11 @@ private:
     int64_t on_demand_backoff_ = kMinBackoffSeconds;
     static constexpr int64_t kMinBackoffSeconds = 2;
     static constexpr int64_t kMaxBackoffSeconds = 300;
+
+    // first_presentation() state: key -> expiry (unix seconds).
+    std::mutex seen_mutex_;
+    std::map<std::string, int64_t> seen_tokens_;
+    static constexpr size_t kMaxSeenTokens = 100000;
 
     // Background startup retry.
     std::thread refresher_;

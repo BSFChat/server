@@ -43,6 +43,40 @@ claim being recorded: one person, two logins.
 After a link, `m.login.token` for that identity resolves to the linked account
 before any `oidc_*` id is derived. Unlinked identities behave exactly as before.
 
+### What "the id_token proves control of the identity" requires
+
+That argument holds only if an id_token that verifies here is one its owner
+obtained **to sign in here**. When this endpoint first shipped it was not.
+Every id_token carried `aud=bsfchat-desktop` (the desktop client's id), and
+every chat server checked for exactly that value, so a token handed to *any*
+server verified at every other one (identity audit 2026-09, finding C1). A
+hostile server receives each of its users' id_tokens at sign-in. It could post
+one here beside a bearer token for its **own** account on this server, and this
+endpoint would link the victim's identity to the attacker's account and revoke
+the victim's sessions. Links are insert-only, so that was a permanent takeover.
+Production blocked the route in nginx on 2026-09-22 (zero identities had been
+linked) until the fix shipped.
+
+The fix binds each token to one server:
+
+* The desktop client names the server it is signing in to as an RFC 8707
+  `resource`: the base URL it will post the token to, never anything a server
+  advertised. A hostile server can therefore only ever cause a token for
+  itself to exist.
+* The identity provider validates it (one absolute https URL, or http on
+  loopback), shows it on the consent page, and puts it — alone — in the
+  token's `aud`, with the client in `azp`.
+* This server accepts a token only when `aud` is its own public URL
+  (`server.public_url`, default `https://<server.name>`, compared in the
+  canonical form `bsfchat::canonical_audience_url` produces), `azp` is
+  `identity.client_id`, and the token carries a nonce it has not seen before.
+  Sign-in and linking share that one check (`AuthHandler::verify_identity_token`),
+  so a token that could not sign anybody in cannot link anything either, and a
+  token that has been used for one cannot be used for the other.
+
+A token from a client that predates the fix carries the old audience and is
+refused, with a message telling the person to update their app.
+
 `GET /_matrix/client/v3/bsfchat/account/linked_identities` returns the caller's
 own links — issuer and date only. The subject never leaves the database, and
 there is no way to ask about another account: "which identity-provider account
@@ -104,6 +138,11 @@ The owner, **signed in as `@josh` with a password**, obtains an id_token from
 BSFChat ID for the identity behind `@oidc_a5cdbefe-…` (the one displaying
 "josh"), and POSTs it to `/account/link_identity`. From then on, signing in
 with BSFChat ID lands in `@josh`, with admin.
+
+The id_token must be one minted **for this server**: requested with
+`resource=https://chat.bsfchat.com` (and a `nonce`), used within its five-minute
+lifetime, and not already used to sign in — a token is accepted once. A token
+obtained without `resource`, or the one a sign-in has just consumed, is refused.
 
 There is no client UI for this yet (see *Deferred* below), so today this is one
 `curl` by the owner with their own two credentials — not an operator action, and

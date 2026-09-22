@@ -3,6 +3,7 @@
 #include "core/RateLimiter.h"
 #include "http/ClientAddress.h"
 
+#include <bsfchat/JwtUtils.h>
 #include <httplib.h>
 
 #include <atomic>
@@ -85,6 +86,19 @@ private:
     // intact. Either may be empty, meaning "not applicable". See the comment on
     // redact_ip_key in the .cpp for what goes wrong when they are treated alike.
     void record_failure(const std::string& ip_key, const std::string& id_key);
+
+    // The one place an identity token is accepted as a credential — sign-in
+    // (m.login.token) and link_identity both call it, so a token that could
+    // not sign anybody in cannot link anything either.
+    //
+    // Accepts the token only when ALL of: the provider's signature and issuer
+    // verify; `aud` is THIS server's own public URL (C1 — never the client
+    // id, which every server used to share); `azp` is identity.client_id when
+    // that is set; it carries a nonce; and this is the first presentation of
+    // that nonce here. On refusal, writes nothing and sets `refusal` to the
+    // message for the M_FORBIDDEN body.
+    std::optional<JwtClaims> verify_identity_token(const std::string& token,
+                                                   std::string& refusal);
 
     SqliteStore& store_;
     SyncEngine& sync_engine_;

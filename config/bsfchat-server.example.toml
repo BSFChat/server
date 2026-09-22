@@ -1,5 +1,13 @@
 [server]
 name = "localhost"
+# The URL clients use to reach this server. BSFChat ID sign-in tokens are
+# accepted only when they are audienced to exactly this URL — it is what the
+# desktop client names when it signs in here — so it must match the address
+# users connect to (after any .well-known redirect). Unset means
+# "https://<name>", which is right for the shipped deployment. A wrong value
+# refuses every BSFChat ID sign-in (password sign-in is unaffected); the
+# server logs the URL it expects at startup. For local development:
+# public_url = "http://localhost:8448"
 bind_address = "0.0.0.0"
 port = 8448
 # SIZING THE WORKER POOL. Read this before lowering either number.
@@ -702,8 +710,9 @@ key_file = ""
 provider_url = "http://localhost:8480"
 required = false
 allow_local_accounts = true
-# Expected `aud` claim on identity tokens — the client_id this chat server is
-# registered under with the identity provider. Without it, an ID token minted
-# for ANY other OAuth client of the same provider would be accepted as a chat
-# login. Defaults to the id the shipped desktop client uses.
+# The OAuth client a sign-in token must have been issued to (its `azp`
+# claim). Defaults to the shipped desktop client; empty turns the check off.
+# This is NOT the audience any more: that is server.public_url. When it was,
+# every server checked for the same value, so a token handed to one server
+# signed its holder in at all of them (identity audit 2026-09, C1).
 client_id = "bsfchat-desktop"

@@ -22,10 +22,19 @@ struct IdentityConfig {
     std::string provider_url;
     bool required = false;
     bool allow_local_accounts = true;
-    // Expected `aud` claim on identity tokens. Without an audience check, an
-    // ID token minted for ANY other OAuth client registered with the same
-    // identity provider is accepted as a chat login. Defaults to the id the
-    // shipped desktop client registers under.
+    // The OAuth client an identity token must have been issued to — checked
+    // against the token's `azp` claim. Empty skips that check.
+    //
+    // This USED to be the expected `aud`, and that was identity audit
+    // 2026-09 finding C1: every server checked for the same value, so an
+    // id_token handed to one server (a hostile one included) signed its
+    // holder in at every other server trusting the provider, and through
+    // link_identity could attach the victim's identity to the attacker's
+    // account for good. The audience is now this server's own public URL —
+    // see Config::public_url and expected_identity_audience() — and the
+    // client id moved to `azp`, where OIDC puts it once `aud` names somebody
+    // else. Keeping the check stops a token some other registered relying
+    // party obtained for this server from signing anybody in here.
     std::string client_id = "bsfchat-desktop";
 };
 
@@ -154,6 +163,14 @@ struct VoiceConfig {
 // give out. See Config::validate for why that is a misconfiguration rather than
 // a mode, and VoiceHandler::handle_turn_server for the branch it selects.
 bool turn_credentials_are_shared(const VoiceConfig& voice);
+
+struct Config;
+// The `aud` an identity token must carry to sign in here: public_url, or
+// "https://<server_name>" when that is unset, canonicalised with the same
+// function the client and the identity provider use. Empty when neither is a
+// usable URL — and an empty audience means NO identity token is accepted,
+// never that the audience goes unchecked.
+std::string expected_identity_audience(const Config& cfg);
 
 struct PushConfig {
     bool enabled = true;
@@ -400,6 +417,15 @@ struct AuthLimitsConfig {
 struct Config {
     // Server
     std::string server_name = "localhost";
+    // The URL clients use to reach this server, e.g. "https://chat.example".
+    // Identity tokens are accepted only when their `aud` is exactly this URL
+    // (in canonical form): it is what the desktop client names as the
+    // `resource` when it signs in here, so it must match the address users
+    // actually type or are sent to by .well-known. Empty means
+    // "https://<server_name>", which is right for the shipped deployment.
+    // A wrong value fails CLOSED — every identity sign-in is refused, password
+    // sign-in is unaffected — and the server says so at startup.
+    std::string public_url;
     std::string bind_address = "0.0.0.0";
     int port = 8448;
     // Base size of the HTTP worker pool. cpp-httplib dispatches one pool task

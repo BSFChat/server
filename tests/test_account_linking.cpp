@@ -46,6 +46,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -99,7 +101,10 @@ protected:
         id.provider_url = issuer();
         id.required = false;
         id.allow_local_accounts = true;  // the mixed deployment: both flows live
-        id.client_id = "bsfchat-server";
+        // The shipped default: the desktop client. It is now checked against
+        // `azp`; the audience is this server's own URL, which with no
+        // server.public_url is "https://" + server_name = "https://test".
+        id.client_id = "bsfchat-desktop";
         config.identity = id;
 
         sync_engine = std::make_unique<SyncEngine>(*store, config);
@@ -115,20 +120,44 @@ protected:
 
     std::string issuer() const { return "http://127.0.0.1:" + std::to_string(port); }
 
+    // What the identity provider now mints for a desktop client signing in
+    // to THIS server: aud = our URL, azp = the client, a fresh nonce.
     std::string id_token_for(const std::string& subject,
                              const std::optional<std::string>& name = std::nullopt,
                              bool sign_with_rogue_key = false) {
+        JwtClaims claims = claims_for(subject);
+        claims.name = name;
+        return jwt_sign(claims, sign_with_rogue_key ? rogue_pem : private_pem, "test-key-1");
+    }
+
+    JwtClaims claims_for(const std::string& subject) {
+        static int nonce_counter = 0;
         const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         JwtClaims claims;
         claims.sub = subject;
         claims.iss = issuer();
-        claims.aud = "bsfchat-server";
+        claims.aud = kOwnUrl;
+        claims.azp = "bsfchat-desktop";
+        claims.nonce = "nonce-" + std::to_string(++nonce_counter);
         claims.iat = now;
-        claims.exp = now + 600;
-        claims.name = name;
-        return jwt_sign(claims, sign_with_rogue_key ? rogue_pem : private_pem, "test-key-1");
+        claims.exp = now + 300;
+        return claims;
     }
+
+    std::string sign(const JwtClaims& claims) {
+        return jwt_sign(claims, private_pem, "test-key-1");
+    }
+
+    httplib::Response login_with_token(const std::string& id_token, AuthHandler* via = nullptr) {
+        httplib::Request req;
+        req.body = json{{"type", "m.login.token"}, {"token", id_token}}.dump();
+        httplib::Response res;
+        (via ? via : handler.get())->handle_login(req, res);
+        return res;
+    }
+
+    static constexpr const char* kOwnUrl = "https://test";
 
     httplib::Response login_with_identity(const std::string& subject,
                                           const std::optional<std::string>& name = std::nullopt) {
@@ -538,4 +567,163 @@ TEST_F(AccountLinkTest, LinkingIsRefusedWhenTheServerHasNoIdentityProvider) {
     httplib::Response res;
     no_idp.handle_link_identity(req, res);
     EXPECT_EQ(status_of(res), 400) << res.body;
+}
+
+// ── The token is bound to THIS server (identity audit 2026-09, C1) ───────
+//
+// Everything above holds only if "an id_token that verifies here" means "an
+// id_token its owner obtained to sign in HERE". Until C1 was fixed it did
+// not: every token carried aud=bsfchat-desktop, every server checked for
+// exactly that, so a hostile server — which receives each of its users'
+// tokens at sign-in — could replay one here as that user, or post it to
+// link_identity beside a bearer for its OWN account here and take the
+// victim's sign-in route over for good. Production blocked link_identity in
+// nginx on 2026-09-22 until this shipped; these are what let that block go.
+
+TEST_F(AccountLinkTest, C1_TheLegacyClientIdAudienceSignsNobodyIn) {
+    // Exactly what the identity provider minted for every sign-in anywhere
+    // before the fix — and still mints for an old client that names no
+    // server. It is the replayable one, so it is refused, with a message
+    // that tells the person on an old client what to do.
+    //
+    // Both shapes: as the provider minted it before the fix (no azp), and as
+    // it mints it now for a client that names no server (azp = the client) —
+    // the second is what an upgraded provider hands a hostile server whose
+    // users are on old clients, and the azp check alone would not stop it.
+    for (bool with_azp : {false, true}) {
+        auto claims = claims_for("a5cdbefe");
+        claims.aud = "bsfchat-desktop";
+        if (!with_azp) claims.azp.reset();
+        auto res = login_with_token(sign(claims));
+        EXPECT_EQ(status_of(res), 403) << "azp=" << with_azp << ": " << res.body;
+        EXPECT_NE(res.body.find("out of date"), std::string::npos) << res.body;
+    }
+    EXPECT_FALSE(store->user_exists("@oidc_a5cdbefe:test"));
+}
+
+TEST_F(AccountLinkTest, C1_ATokenMintedForAnotherServerSignsNobodyIn) {
+    auto claims = claims_for("a5cdbefe");
+    claims.aud = "https://evil-chat.example";
+    auto res = login_with_token(sign(claims));
+    EXPECT_EQ(status_of(res), 403) << res.body;
+    EXPECT_EQ(res.body.find("out of date"), std::string::npos)
+        << "a token for another server is not an old-client problem: " << res.body;
+    EXPECT_FALSE(store->user_exists("@oidc_a5cdbefe:test"));
+}
+
+TEST_F(AccountLinkTest, C1_AReplayedTokenCannotHijackAnIdentityThroughLinkIdentity) {
+    // Alice has signed in here with her identity before, so she has a live
+    // session on her own @oidc_ account. Made directly rather than through a
+    // sign-in, so this test depends on nothing but the link path.
+    const std::string alice = "@oidc_a5cdbefe:test";
+    ASSERT_TRUE(store->create_user(alice, ""));
+    const std::string alice_session = "alice-session";
+    store->store_access_token(alice_session, alice, "alice-device");
+
+    // Mallory runs evil-chat.example, which Alice also signed in to, and holds
+    // an ordinary account on this server.
+    create_local_account("mallory", "mallory-token");
+
+    // What Alice's sign-in to evil-chat handed Mallory, before and after the
+    // fix. Neither links anything.
+    auto legacy = claims_for("a5cdbefe");            // pre-fix provider
+    legacy.aud = "bsfchat-desktop";
+    legacy.azp.reset();
+    auto legacy_azp = claims_for("a5cdbefe");        // upgraded provider, old client
+    legacy_azp.aud = "bsfchat-desktop";
+    auto for_evil = claims_for("a5cdbefe");          // upgraded provider and client
+    for_evil.aud = "https://evil-chat.example";
+    for (const auto& stolen : {legacy, legacy_azp, for_evil}) {
+        auto res = link_token("mallory-token", sign(stolen));
+        EXPECT_EQ(status_of(res), 403) << "aud=" << stolen.aud << ": " << res.body;
+    }
+
+    EXPECT_TRUE(json::parse(linked_identities("mallory-token").body)["identities"].empty());
+    EXPECT_TRUE(store->get_user_by_token(alice_session).has_value())
+        << "the victim's sessions were revoked by a replayed token";
+    auto after = login_with_identity("a5cdbefe");
+    ASSERT_EQ(status_of(after), 200) << after.body;
+    EXPECT_EQ(logged_in_user(after), alice) << "the victim's identity now signs in somewhere else";
+}
+
+TEST_F(AccountLinkTest, AnIdentityTokenIsAcceptedOnce) {
+    // A copy of a token that has already been used — from a proxy log, a
+    // crash dump — is worth nothing, at either endpoint.
+    const auto token = id_token_for("a5cdbefe");
+    ASSERT_EQ(status_of(login_with_token(token)), 200);
+
+    auto again = login_with_token(token);
+    EXPECT_EQ(status_of(again), 403) << again.body;
+
+    create_local_account("mallory", "mallory-token");
+    EXPECT_EQ(status_of(link_token("mallory-token", token)), 403);
+    EXPECT_TRUE(json::parse(linked_identities("mallory-token").body)["identities"].empty());
+}
+
+TEST_F(AccountLinkTest, ATokenWithoutANonceIsRefused) {
+    auto claims = claims_for("a5cdbefe");
+    claims.nonce.reset();
+    EXPECT_EQ(status_of(login_with_token(sign(claims))), 403);
+    create_local_account("josh", "josh-token");
+    EXPECT_EQ(status_of(link_token("josh-token", sign(claims))), 403);
+}
+
+TEST_F(AccountLinkTest, ATokenIssuedToAnotherClientIsRefused) {
+    // Right server, but obtained by some other relying party registered with
+    // the provider — the user consented to THAT app, not to this sign-in.
+    auto claims = claims_for("a5cdbefe");
+    claims.azp = "some-other-app";
+    EXPECT_EQ(status_of(login_with_token(sign(claims))), 403);
+    claims.azp.reset();
+    claims.nonce = "fresh";
+    EXPECT_EQ(status_of(login_with_token(sign(claims))), 403);
+}
+
+// The audience comes from server.public_url, canonicalised, so the operator
+// can write it however they like and still match what the client sends.
+TEST_F(AccountLinkTest, ServerPublicUrlIsTheAudience) {
+    auto dir = std::filesystem::temp_directory_path() /
+               ("bsfchat_aud_" + std::to_string(reinterpret_cast<uintptr_t>(this)));
+    std::filesystem::create_directories(dir);
+    const auto path = (dir / "server.toml").string();
+    {
+        std::ofstream f(path);
+        f << "[server]\nname = \"test\"\npublic_url = \"HTTPS://Chat.Example:443/\"\n"
+          << "[identity]\nprovider_url = \"" << issuer() << "\"\n";
+    }
+    const Config loaded = Config::load(path);
+    std::filesystem::remove_all(dir);
+    AuthHandler at_chat(*store, *sync_engine, loaded, oidc.get());
+
+    auto claims = claims_for("a5cdbefe");
+    claims.aud = "https://chat.example";
+    auto ok = login_with_token(sign(claims), &at_chat);
+    EXPECT_EQ(status_of(ok), 200) << ok.body;
+
+    // server_name is no longer the audience once public_url says otherwise.
+    auto by_name = login_with_token(id_token_for("76ea6af7"), &at_chat);
+    EXPECT_EQ(status_of(by_name), 403) << by_name.body;
+}
+
+TEST_F(AccountLinkTest, AnUnusablePublicUrlRefusesEveryToken) {
+    // Fail closed. jwt_verify reads an empty audience as "do not check"; an
+    // audience that cannot be derived must never get there.
+    auto dir = std::filesystem::temp_directory_path() /
+               ("bsfchat_aud_bad_" + std::to_string(reinterpret_cast<uintptr_t>(this)));
+    std::filesystem::create_directories(dir);
+    const auto path = (dir / "server.toml").string();
+    {
+        std::ofstream f(path);
+        f << "[server]\nname = \"test\"\npublic_url = \"chat.example\"\n"
+          << "[identity]\nprovider_url = \"" << issuer() << "\"\n";
+    }
+    const Config loaded = Config::load(path);
+    std::filesystem::remove_all(dir);
+    AuthHandler misconfigured(*store, *sync_engine, loaded, oidc.get());
+
+    for (const std::string aud : {"chat.example", "https://test", "bsfchat-desktop", ""}) {
+        auto claims = claims_for("a5cdbefe");
+        claims.aud = aud;
+        EXPECT_EQ(status_of(login_with_token(sign(claims), &misconfigured)), 403) << "aud=" << aud;
+    }
 }
