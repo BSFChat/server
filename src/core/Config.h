@@ -292,6 +292,30 @@ struct SendLimitsConfig {
     // number of accounts however long they run — and this bounds the burst.
     int room_create_limit = 30;
 
+    // Content reports (POST /rooms/{id}/report/{event}, /users/{id}/report).
+    //
+    // The smallest number in this block, deliberately. Every other limit here
+    // protects the SERVER from a loop; this one protects the MODERATION QUEUE
+    // from one, and the queue is read by a person. Ten a minute is far more
+    // than anyone reports by hand and still low enough that a script cannot
+    // bury a real report under a thousand fabricated ones between two glances
+    // at the log.
+    //
+    // It bounds the burst and nothing else — the same honest reading the other
+    // limits here get. An attacker with patience can still file reports slowly,
+    // and the answer to that is the ban list, not a smaller number.
+    int report_limit = 10;
+
+    // Account-data writes (PUT /user/{userId}/account_data/{type}), which is
+    // where a client's block list is stored.
+    //
+    // The most generous, because the write is the cheapest here: one upserted
+    // row, no event, no fan-out, no sync wake. It is not zero, though, because
+    // the account-data TYPE is caller-chosen — each new type is a new row, so a
+    // loop grows a table rather than rewriting one value. A client that blocks
+    // somebody sends one of these; a client syncing settings sends a handful.
+    int account_data_limit = 60;
+
     int window_seconds = 60;
 
     // ── How big one write may be, as opposed to how many ──────────────────

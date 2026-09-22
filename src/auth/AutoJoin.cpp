@@ -53,6 +53,18 @@ void join_user_to_room(SqliteStore& store, SyncEngine& sync_engine,
     // next channel anybody made — and the moderator had no way to know.
     if (store.is_server_banned(user_id)) return;
 
+    // A deactivated account is force-joined to nothing, for the same reason and
+    // in the same place (schema v29). deactivate_user sets every membership row
+    // to 'leave' rather than deleting it precisely so find_membership() above
+    // reports a decision and this funnel leaves it alone — but that only covers
+    // channels that existed when the account was deactivated. A channel created
+    // afterwards has no row for it at all, which reads as "never considered",
+    // and backfill_auto_join runs at every boot. Without this, deleting your
+    // account and waiting for somebody to make a channel would put you back in
+    // it, with a fresh m.room.member event announcing a departed account's
+    // arrival to everyone in the room.
+    if (store.get_user_deactivated_at(user_id)) return;
+
     // Bots are never auto-joined to anything.
     //
     // Placed HERE for the same reason the ban check above is: this is the single

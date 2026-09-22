@@ -7,6 +7,7 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "core/Version.h"
+#include "http/JsonIo.h"
 #include "http/Middleware.h"
 #include "identity/Localpart.h"
 #include "store/SqliteStore.h"
@@ -34,6 +35,11 @@ namespace {
 // becomes "=hh". Literal '_' is escaped so it can't collide with the
 // uppercase form. Blindly concatenating the raw subject is what produced the
 // "@@josh:" double-@ user ids.
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 std::string sanitize_localpart(const std::string& input) {
     static const char* kHex = "0123456789abcdef";
     std::string out;
@@ -532,6 +538,32 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
             get_logger()->info("Refused identity login for banned user {}", user_id);
             res.status = 403;
             res.set_content(MatrixError::forbidden("You are banned from this server")
+                                .to_json().dump(), "application/json");
+            return;
+        }
+
+        // And the same gate for a deactivated account, in the same place and for
+        // the same reason: after the identity token has been validated, and
+        // BEFORE create_user, so the request that should be refused cannot
+        // quietly resurrect the account by recreating it.
+        //
+        // The password path needs no equivalent — get_password_hash filters on
+        // `deactivated_at IS NULL`, so it never returns a usable hash — but
+        // this path does not go through a password at all. Without it, deleting
+        // your account and signing in again through the identity provider would
+        // put you straight back into a dead account with its rooms left and its
+        // profile blanked.
+        //
+        // The refusal deliberately does NOT say "this account was deactivated".
+        // It is answered to a caller holding a valid identity token for the
+        // subject, so it would tell them nothing they could not infer — but the
+        // same sentence for a banned account is what the ban gate above already
+        // decided not to distinguish, and two adjacent refusals that disagree
+        // about how much they say is how one of them drifts.
+        if (store_.get_user_deactivated_at(user_id)) {
+            get_logger()->info("Refused identity login for deactivated account {}", user_id);
+            res.status = 403;
+            res.set_content(MatrixError::forbidden("This account has been deactivated")
                                 .to_json().dump(), "application/json");
             return;
         }
@@ -1430,6 +1462,165 @@ void AuthHandler::handle_linked_identities(const httplib::Request& req, httplib:
     }
     res.status = 200;
     res.set_content(json{{"identities", out}}.dump(), "application/json");
+}
+
+void AuthHandler::handle_deactivate_account(const httplib::Request& req,
+                                            httplib::Response& res) {
+    // Limited on the same per-address budget as /login and /account/password,
+    // and charged first. This endpoint runs PBKDF2 for the re-authentication
+    // stage below, so without it an unauthenticated caller could spend the
+    // server's CPU here exactly as they could on /login — the hole the auth
+    // limiter was written to close, reopened by a new route.
+    const auto client = client_key(req);
+    if (over_attempt_limit("deactivate", client, res)) return;
+
+    const auto auth_header = req.get_header_value("Authorization");
+    auto token = extract_access_token(auth_header);
+    if (!token) {
+        return send_error(res, 401, auth_error(auth_header));
+    }
+    auto user_id = store_.get_user_by_token(*token);
+    if (!user_id) {
+        return send_error(res, 401, MatrixError::unknown_token());
+    }
+
+    // Bots are deactivated through DELETE /bsfchat/bots/{userId}, which is
+    // MANAGE_BOTS and leaves an audit record naming the human who did it. A bot
+    // reaching this route would be a non-human account turning itself off with
+    // nobody's name on the record — and, because a bot's token never expires,
+    // the only way its owner would find out is that the integration stopped.
+    if (store_.is_bot(*user_id)) {
+        return send_error(res, 403, MatrixError::forbidden(
+            "Bot accounts are deactivated by an administrator, not by themselves"));
+    }
+
+    json body = json::object();
+    if (!req.body.empty()) {
+        try {
+            body = parse_request_json(req.body);
+        } catch (...) {
+            return send_error(res, 400, MatrixError::bad_json());
+        }
+        if (!body.is_object()) {
+            return send_error(res, 400, MatrixError::bad_json());
+        }
+    }
+
+    // ── Re-authentication ────────────────────────────────────────────────
+    //
+    // Same rule as handle_password_change, and for a stronger version of the
+    // same reason: a valid access token proves "this client holds a token", not
+    // "the account owner is present". A token lifted from an unattended device
+    // could otherwise destroy the account it belongs to in one request, with no
+    // undo — this is the single most destructive thing an account can do to
+    // itself, and it is the one that most needs the owner to actually be there.
+    //
+    // An account with NO PASSWORD — OIDC-backed, created with an empty hash on
+    // the m.login.token path — is admitted on the bearer token alone, and that
+    // is a deliberate asymmetry rather than an oversight. There is nothing to
+    // re-authenticate against: this server holds no credential for such an
+    // account, so the m.login.password stage cannot be completed by its
+    // rightful owner either. The alternatives were to refuse those accounts a
+    // delete button (which is the thing App Store guideline 5.1.1(v) requires
+    // and would make identity-backed deployments non-compliant) or to invent an
+    // identity-token re-auth stage. The second is the right answer and is
+    // deliberately not attempted here: verify_identity_token already exists and
+    // could carry it, but the stage is a protocol addition that needs a client
+    // change to be usable, and shipping a half of it that no client sends would
+    // leave the refusal above as the only behaviour anyone ever saw.
+    auto stored = store_.get_password_hash(*user_id);
+    const bool has_password = stored && !stored->empty();
+
+    if (has_password) {
+        if (!body.contains("auth") || !body["auth"].is_object()) {
+            // The Matrix user-interactive auth handshake: a 401 carrying the
+            // flows, which the client answers by repeating the request with an
+            // `auth` object. Byte-identical in shape to the one
+            // handle_password_change emits, so a client that already implements
+            // that stage needs no new code.
+            res.status = 401;
+            res.set_content(json{
+                {"flows", json::array({json{{"stages", json::array({"m.login.password"})}}})},
+                {"params", json::object()},
+                {"completed", json::array()},
+                {"session", generate_device_id()},
+            }.dump(), "application/json");
+            return;
+        }
+
+        const auto& auth = body["auth"];
+        if (auth.value("type", "") != "m.login.password") {
+            return send_error(res, 400, MatrixError::unknown("Unsupported auth type"));
+        }
+        // A named identifier must be the authenticated account. A token must
+        // never be usable to re-authenticate as somebody else — the same guard
+        // handle_password_change carries, and here the consequence of missing
+        // it would be deleting an account you are not signed in as.
+        if (auth.contains("identifier") && auth["identifier"].is_object()) {
+            auto named = auth["identifier"].value("user", "");
+            if (!named.empty()) {
+                if (named[0] != '@') named = "@" + named + ":" + config_.server_name;
+                if (named != *user_id) {
+                    return send_error(res, 403, MatrixError::forbidden(
+                        "Authentication identifier does not match the access token"));
+                }
+            }
+        }
+
+        const auto user_key = user_failure_key(*user_id);
+        if (locked_out(client, user_key, res)) return;
+
+        if (!verify_password(auth.value("password", ""), *stored)) {
+            // Counted against the SAME failure trackers a wrong password at
+            // /login is counted against. A separate counter here would be a
+            // second, unlimited place to guess the same password from — the
+            // lockout has to be a property of the account and the address, not
+            // of the endpoint.
+            record_failure(client, user_key);
+            return send_error(res, 403, MatrixError::forbidden("Invalid password"));
+        }
+        failures_.clear(user_key);
+    }
+
+    // The room list is read BEFORE the account is deactivated, because
+    // deactivate_user sets every membership row to 'leave' — after it, there is
+    // nothing left to say goodbye in. Getting this order wrong leaves the
+    // account gone from the database and still sitting in every member list in
+    // every client on the server until they next do a full initial sync.
+    auto rooms = store_.get_joined_rooms(*user_id);
+
+    const bool newly_deactivated = store_.deactivate_user(*user_id, now_ms());
+
+    // The leave events. Emitted AFTER the rows are written so a client that
+    // acts on one and re-reads the membership finds it already gone, and with a
+    // bare insert_event because a leave carries no profile fields and so has no
+    // media to bind — the same shape handle_deactivate_bot uses.
+    //
+    // Unconditional, like the purges inside deactivate_user: `newly_deactivated`
+    // says who got here first, and it must not decide whether the account
+    // actually disappears from the rooms it was in. A repeat call finding rows
+    // to clean up still cleans them up.
+    for (const auto& room_id : rooms) {
+        store_.insert_event(generate_event_id(config_.server_name), room_id, *user_id,
+                            std::string(event_type::kRoomMember), *user_id,
+                            json{{"membership", membership::kLeave}}.dump(), now_ms());
+    }
+    if (!rooms.empty()) sync_engine_.notify_new_event();
+
+    if (newly_deactivated) {
+        // Exactly one record however many times the request is repeated — the
+        // idempotency `newly_deactivated` exists for.
+        audit_account_deactivation(store_, *user_id);
+        get_logger()->info("Account deactivated: {} (self-service); {} session(s) revoked, "
+                           "left {} room(s)", *user_id, "all", rooms.size());
+    }
+
+    // Matrix's response shape. `id_server_unbind_result` describes what happened
+    // to third-party identifiers (email, phone) bound at an identity server;
+    // this deployment has none and binds none, so "no-support" is the honest
+    // answer rather than a claim that nothing needed unbinding.
+    res.status = 200;
+    res.set_content(json{{"id_server_unbind_result", "no-support"}}.dump(), "application/json");
 }
 
 } // namespace bsfchat

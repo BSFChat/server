@@ -139,6 +139,23 @@ int PushService::evaluate_message(const MessageNotification& n, PermissionsEngin
             // not the payload carries any text.
             if (!perms.can(user_id, n.room_id, permission::kViewChannel)) return false;
 
+            // The ignore list (schema v29), and this is the delivery path where
+            // it matters most. /sync filters a blocked account's messages out
+            // of the timeline, so without this the reader gets a phone
+            // notification naming a person whose messages they have blocked,
+            // opens the app, and finds nothing there — the harassment arrives
+            // and the evidence does not.
+            //
+            // Above the mention test on purpose. A DIRECT mention by a blocked
+            // account is the exact case a block is bought for, and the level
+            // logic below would let it through at every setting except "none".
+            //
+            // Checked per candidate, like the VIEW_CHANNEL gate it sits under,
+            // and cached with it by the same notify_cache — one primary-key
+            // probe per recipient who has a pusher registered, on a path that
+            // has already done a permission evaluation for each of them.
+            if (store_.is_ignoring(user_id, n.sender)) return false;
+
             const bool is_mentioned_here = is_mentioned(user_id);
 
             // Default: everything in a DM (there is no such thing as an

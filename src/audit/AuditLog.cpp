@@ -283,6 +283,42 @@ void audit_bot_lifecycle(SqliteStore& store, const std::string& actor,
     store.append_audit_record(record);
 }
 
+void audit_content_report(SqliteStore& store, const std::string& reporter,
+                          const std::string& target_user, const std::string& room_id,
+                          const std::string& event_id, int score,
+                          const std::string& reason) {
+    SqliteStore::AuditRecord record;
+    record.actor = reporter;
+    record.action = audit_action::kContentReport;
+    record.target_user = target_user;
+    record.target_room = room_id;
+    // The event id goes in target_key, which is the generic "which thing within
+    // the target" slot the role and override records already use. Not a column
+    // of its own: the audit table is shared by every action and a per-action
+    // column would be NULL for all but one of them.
+    record.target_key = event_id;
+    record.reason = reason;
+    // `score` is Matrix's severity hint (-100..0) and belongs with the report
+    // rather than in the sentence, so a reader can sort by it without parsing
+    // prose. after_json, not before_json: nothing was superseded — this is a new
+    // statement, the same shape as a bot lifecycle record.
+    record.after_json = json{{"score", score}}.dump();
+    store.append_audit_record(record);
+}
+
+void audit_account_deactivation(SqliteStore& store, const std::string& user_id) {
+    SqliteStore::AuditRecord record;
+    record.actor = user_id;
+    record.action = audit_action::kAccountDeactivate;
+    // Both, even though they are the same string. An investigator filtering by
+    // this account asks one of two questions — what did they do, what was done
+    // to them — and a self-inflicted action is a true answer to both. Filling
+    // only `actor` would hide the departure from the "what happened to this
+    // account" query, which is the one somebody actually runs.
+    record.target_user = user_id;
+    store.append_audit_record(record);
+}
+
 void audit_account_link(SqliteStore& store, const std::string& actor,
                         const std::string& issuer,
                         const std::string& superseded_user_id) {

@@ -375,9 +375,33 @@ profile_limit = 10
 # wake per participant.
 room_create_limit = 30
 
+# Content reports (POST /rooms/{id}/report/{eventId}, POST /users/{id}/report)
+# per account per window.
+#
+# The smallest number here, and the only one whose purpose is not to protect the
+# server. Every other limit in this block bounds a loop that costs CPU, disk or
+# bandwidth; this one bounds a loop that costs an ADMINISTRATOR'S ATTENTION. A
+# script filing ten thousand reports does not spam any channel — it buries the
+# moderation queue and with it the real reports already sitting in it. Ten a
+# minute is far more than anyone reports by hand.
+#
+# It bounds the burst and nothing more. Someone patient can still file reports
+# slowly; the answer to that is the ban list, not a smaller number here.
+report_limit = 10
+
+# Account-data writes (PUT /user/{userId}/account_data/{type}) per account per
+# window. This is where a client stores its block list (m.ignored_user_list).
+#
+# The most generous, because the write is the cheapest in this block: one
+# upserted row, no event, no fan-out, no sync wake. Not unlimited, though,
+# because the account-data TYPE is chosen by the caller — each new type is a new
+# row, so a loop grows a table rather than overwriting one value. Blocking
+# somebody is one of these; a client syncing its settings is a handful.
+account_data_limit = 60
+
 # --- How big one write may be (as opposed to how many) -----------------------
 #
-# The five numbers above are rates: how OFTEN an account may do a thing. The
+# The seven numbers above are rates: how OFTEN an account may do a thing. The
 # two below are sizes: how BIG one of those things may be. Until these existed
 # there was no bound on a message at all, in this server or in the desktop
 # client, so any member could post a multi-megabyte body — stored, full-text

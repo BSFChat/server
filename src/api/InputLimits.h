@@ -54,6 +54,37 @@ inline constexpr std::size_t kMaxRoomNameBytes = 255;
 // even that fits in 4 KiB.
 inline constexpr std::size_t kMaxRoomTopicBytes = 4096;
 
+// One account-data document. Matrix puts no ceiling on this and the type is
+// caller-chosen, so without one an authenticated account owns an unbounded,
+// permanently-stored key/value space on somebody else's server — which is a
+// storage-exhaustion lever, not a feature. Generous: the largest document this
+// server defines is the ignore list, and a thousand user ids is about 40 KiB.
+inline constexpr std::size_t kMaxAccountDataBytes = 64 * 1024;
+
+// The `type` segment of an account-data path. It is a map key in a table this
+// account can create rows in at will, so it is bounded for the same reason the
+// document is.
+inline constexpr std::size_t kMaxAccountDataTypeBytes = 255;
+
+// How many accounts one user may ignore.
+//
+// A ceiling is needed because every entry is a row that the /sync scan's
+// NOT EXISTS probe has to be correct against and that the account keeps
+// forever. It is deliberately far above any real use: somebody who has blocked
+// a thousand people is not being protected by the thousand-and-first, and on a
+// self-hosted server of this shape they have blocked most of the members.
+inline constexpr std::size_t kMaxIgnoredUsers = 1000;
+
+// The copy of a reported event's content kept with the report.
+//
+// Bounded because the reporter does not choose it but the REPORTED party does:
+// without a ceiling, posting a 16 KiB message (limits::kMaxMessageBodyBytes)
+// and getting it reported by a hundred people would store 1.6 MiB. 4 KiB is
+// enough for a moderator to see what was said and is a quarter of the largest
+// message this server accepts, so the truncation is visible rather than
+// routine.
+inline constexpr std::size_t kMaxReportSnapshotBytes = 4096;
+
 } // namespace input_limits
 
 // nullopt when `value` fits in `max_bytes`; otherwise the error to send (with

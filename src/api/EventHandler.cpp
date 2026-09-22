@@ -904,8 +904,17 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
     std::optional<std::string> from;
     if (req.has_param("from")) from = req.get_param_value("from");
 
-    auto [events, next_pos] =
-        store_.get_room_events_paginated(room_id, limit, dir, from);
+    // No `viewer`, deliberately — this is the HISTORY path, and addressed call
+    // signalling is not pageable months later (store/CallSignalling.h).
+    //
+    // But the caller IS passed as the ignoring user, and the two are separate
+    // arguments precisely so that one can be absent while the other is present.
+    // An ignore that held on /sync and not on back-pagination would be undone
+    // by scrolling up: the blocked account's messages would reappear the moment
+    // the client asked for history, which is the first thing it does when a
+    // channel is opened.
+    auto [events, next_pos] = store_.get_room_events_paginated(
+        room_id, limit, dir, from, std::nullopt, *user_id);
 
     MessagesResponse msg_resp;
     msg_resp.chunk = std::move(events);

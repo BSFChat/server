@@ -123,6 +123,35 @@ void attach_invite(SqliteStore& store, const std::string& user_id, const std::st
     response.rooms.invite[room_id] = std::move(invited);
 }
 
+// Whether an invite into `room_id` was sent by somebody `user_id` ignores.
+//
+// A block has to cover invites or it does not cover the thing people are
+// actually blocking for: the whole point of a DM invite from a stranger is that
+// it arrives whether or not you want it, and a block that silenced their
+// messages but still delivered their invitations would leave the harassment
+// route open and the feature looking broken.
+//
+// SUPPRESSED AT DELIVERY, NOT REFUSED AT THE INVITE. The inviter's POST
+// succeeds and returns exactly what it returned before; the membership row is
+// written; the invite simply never appears in the ignoring user's /sync. That
+// asymmetry is the requirement, not a shortcut around one — a block whose
+// subject can detect it by watching their own invite fail is a block that tells
+// them they have been blocked and by whom, which is what makes a second account
+// worth registering. Nothing else about the room changes: if the invite is
+// later accepted by some other route, or the block is lifted, the row is still
+// there and the room appears.
+bool invite_is_from_ignored_user(SqliteStore& store, const std::string& user_id,
+                                 const std::string& room_id) {
+    auto inviter = store.get_invite_sender(room_id, user_id);
+    // No inviter found means no m.room.member invite event to read a sender
+    // from — a membership row written by some path that does not emit one. Fail
+    // OPEN (deliver the invite): a block is a filter over a known sender, and
+    // silently swallowing invites whose origin cannot be established would be a
+    // far stranger failure than showing one.
+    if (!inviter) return false;
+    return store.is_ignoring(user_id, *inviter);
+}
+
 // Every invite this user currently has pending, whether or not it arrived in
 // this delta — the same restatement m.direct gets, for the same reason.
 //
@@ -149,6 +178,13 @@ void attach_pending_invites(SqliteStore& store, const Config& config,
     if (invited.empty()) return;  // the common case: one indexed lookup, no rows
     PermissionsEngine perms(store, config);
     for (const auto& room_id : invited) {
+        // Ahead of the visibility gate below, and it does not matter which
+        // order these two run in — both end in `continue` and neither is
+        // observable — but a blocked inviter is the cheaper question (one
+        // primary-key probe against an almost always empty table) and asking it
+        // first keeps the permission engine off the path for the case that has
+        // already been decided.
+        if (invite_is_from_ignored_user(store, user_id, room_id)) continue;
         // The same gate every other room in the response passes. An invite into
         // a channel this user's roles cannot view would be an invitation to
         // accept and still see nothing, and it would surface a channel the
@@ -434,8 +470,15 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
         // it, this user sees their own signalling and no one else's; /messages
         // passes no viewer and so shows none of it to anybody. See
         // store/CallSignalling.h.
+        //
+        // `user_id` twice, for two unrelated rules that happen to take the same
+        // argument: as the VIEWER, which admits this account's own addressed
+        // call signalling (see store/CallSignalling.h), and as the IGNORING
+        // USER, which drops non-state events sent by anyone they have blocked.
+        // Both belong here rather than in a filter over the result — see
+        // SqliteStore::get_room_events_paginated.
         auto [timeline_events, next_pos] = store_.get_room_events_paginated(
-            room_id, limits::kDefaultTimelineLimit, "b", std::nullopt, user_id);
+            room_id, limits::kDefaultTimelineLimit, "b", std::nullopt, user_id, user_id);
         joined.timeline.events = std::move(timeline_events);
         std::reverse(joined.timeline.events.begin(), joined.timeline.events.end());
         // `limited` is true when more history exists beyond this batch; the
@@ -556,6 +599,20 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
             event.state_key.has_value() && *event.state_key == user_id;
         if (own_member_event &&
             membership_of(event.room_id) == std::string(membership::kInvite)) {
+            // The ignore filter in get_events_since exempts STATE events, and
+            // an invite IS one — this user's own m.room.member — so the scan
+            // hands it over however the invite arrived. That exemption is right
+            // (dropping member events empties the reader's member list) and it
+            // is why the block has to be applied here, on the sender of the
+            // invite rather than on the sender of the row.
+            //
+            // `event.sender` rather than a fresh get_invite_sender() lookup:
+            // this IS the invite event, so its sender is the inviter by
+            // definition, and a second read would only introduce a way for the
+            // delta path and the restatement path to disagree about the same
+            // invite. attach_pending_invites has no event in hand and so has to
+            // ask the store; both end up on the same answer.
+            if (store_.is_ignoring(user_id, event.sender)) continue;
             if (can_view(event.room_id)) invited_rooms.insert(event.room_id);
             continue;
         }

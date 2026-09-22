@@ -44,6 +44,7 @@ add_executable(bsfchat-server
     src/audit/AuditLog.cpp
     src/identity/Localpart.cpp
     src/identity/Nickname.cpp
+    src/api/AccountDataHandler.cpp
     src/api/AuditHandler.cpp
     src/api/AuthHandler.cpp
     src/api/BotHandler.cpp
@@ -60,6 +61,7 @@ add_executable(bsfchat-server
     src/api/ProfileHandler.cpp
     src/api/VoiceHandler.cpp
     src/api/PushHandler.cpp
+    src/api/ReportHandler.cpp
     src/api/SearchHandler.cpp
     src/push/PushService.cpp
     src/storage/LocalStorage.cpp

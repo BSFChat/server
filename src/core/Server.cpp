@@ -2,6 +2,7 @@
 #include "core/Logger.h"
 #include "auth/AutoJoin.h"
 #include "auth/RoleBootstrap.h"
+#include "api/AccountDataHandler.h"
 #include "api/AuditHandler.h"
 #include "api/AuthHandler.h"
 #include "api/BotHandler.h"
@@ -16,6 +17,7 @@
 #include "api/PresenceHandler.h"
 #include "api/VoiceHandler.h"
 #include "api/PushHandler.h"
+#include "api/ReportHandler.h"
 #include "api/SearchHandler.h"
 #include "push/PushService.h"
 #include "http/RequestGuard.h"
@@ -184,6 +186,13 @@ void Server::register_routes() {
             [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_linked_identities(req, res); });
     svr.Get(std::string(api_path::kWhoami),
             [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_whoami(req, res); });
+    // Self-service account deletion. App Store guideline 5.1.1(v) requires an
+    // in-app path to it for any app that creates accounts, and Google Play's
+    // UGC policy expects the same. Path literal rather than api_path:: for the
+    // reason the media-ticket route below gives — a constant would move this
+    // change into the protocol repo, which has to merge first.
+    svr.Post("/_matrix/client/v3/account/deactivate",
+             [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_deactivate_account(req, res); });
 
     // Room routes
     svr.Post(std::string(api_path::kCreateRoom),
@@ -335,6 +344,43 @@ void Server::register_routes() {
             [h = push_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_notify_level(req, res); });
     svr.Put(R"(/_matrix/client/v3/bsfchat/rooms/([^/]+)/notify_level)",
             [h = push_handler](const httplib::Request& req, httplib::Response& res) { h->handle_put_notify_level(req, res); });
+
+    // Account data, and the block list it carries. Spec paths, deliberately:
+    // Matrix stores a user's ignore list as the m.ignored_user_list account-data
+    // document, so a conventional client's block button looks for it exactly
+    // here. Reads and writes are restricted to the caller's OWN account inside
+    // the handler — there is no permission that unlocks somebody else's, and
+    // there must never be one: a block whose subject can read it is a block
+    // that names its author to the person it is protecting them from.
+    //
+    // Registered before the route patterns below for no ordering reason — the
+    // path is unambiguous — but kept next to the report routes because the two
+    // are the halves of one feature: block to stop it now, report to have it
+    // dealt with.
+    auto account_data_handler = std::make_shared<AccountDataHandler>(*store_, config_);
+
+    svr.Get(R"(/_matrix/client/v3/user/([^/]+)/account_data/([^/]+)$)",
+            [h = account_data_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_account_data(req, res); });
+    svr.Put(R"(/_matrix/client/v3/user/([^/]+)/account_data/([^/]+)$)",
+            [h = account_data_handler](const httplib::Request& req, httplib::Response& res) { h->handle_put_account_data(req, res); });
+
+    // Content and user reporting. The two POSTs are spec paths for the same
+    // reason the account-data pair are; the GET is bsfchat.* because Matrix has
+    // no read path for reports at all and this deployment's administrator has
+    // no out-of-band moderation tool to read them with.
+    //
+    // The GET is gated on MANAGE_SERVER at SERVER scope inside the handler, so
+    // a per-channel override cannot unlock the server-wide queue — the same
+    // boundary the audit-log route above depends on, argued in full in
+    // audit/AuditLog.h.
+    auto report_handler = std::make_shared<ReportHandler>(*store_, config_);
+
+    svr.Post(R"(/_matrix/client/v3/rooms/([^/]+)/report/([^/]+)$)",
+             [h = report_handler](const httplib::Request& req, httplib::Response& res) { h->handle_report_event(req, res); });
+    svr.Post(R"(/_matrix/client/v3/users/([^/]+)/report$)",
+             [h = report_handler](const httplib::Request& req, httplib::Response& res) { h->handle_report_user(req, res); });
+    svr.Get("/_matrix/client/v3/bsfchat/reports",
+            [h = report_handler](const httplib::Request& req, httplib::Response& res) { h->handle_list_reports(req, res); });
 
     // Search. Spec-shaped POST /search; permission filtering happens inside the
     // query rather than over its output (see SearchHandler).

@@ -154,6 +154,10 @@ Config Config::load(const std::string& path) {
                 sl.profile_limit = v->value_or(sl.profile_limit);
             if (auto v = limits_tbl->get("room_create_limit"))
                 sl.room_create_limit = v->value_or(sl.room_create_limit);
+            if (auto v = limits_tbl->get("report_limit"))
+                sl.report_limit = v->value_or(sl.report_limit);
+            if (auto v = limits_tbl->get("account_data_limit"))
+                sl.account_data_limit = v->value_or(sl.account_data_limit);
             if (auto v = limits_tbl->get("window_seconds"))
                 sl.window_seconds = v->value_or(sl.window_seconds);
             // Sizes, not rates. Read as int64 and clamped in validate(): toml++

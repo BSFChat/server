@@ -75,6 +75,27 @@ inline std::string role_mention_sentinel(const std::string& role_id) {
     return std::string(kRoleMentionPrefix) + role_id;
 }
 
+// Account-data types this server treats as more than an opaque blob.
+//
+// Here rather than in the protocol headers for the reason the media-ticket path
+// literal in Server.cpp is: adding a constant there moves this change into a
+// second repository that has to merge first. Fold it in the next time protocol
+// changes for another reason. The string itself is fixed by the Matrix spec,
+// which is what makes a local copy safe — it is not this server's to choose.
+namespace account_data_type {
+
+// The block list: {"ignored_users": {"@spammer:example": {}}}.
+//
+// Named here because SqliteStore has to recognise it — it is the one type whose
+// write also rewrites an index (see set_account_data). Everything else in
+// account_data is stored and returned untouched.
+inline constexpr const char* kIgnoredUserList = "m.ignored_user_list";
+
+// The key inside that document holding the map of ignored user ids.
+inline constexpr const char* kIgnoredUsersKey = "ignored_users";
+
+} // namespace account_data_type
+
 class SqliteStore {
 public:
     explicit SqliteStore(const std::string& db_path);
@@ -102,6 +123,10 @@ public:
     // every existing caller already treats nullopt as "this account cannot
     // authenticate that way" and refuses. "Bots have an empty password_hash" is
     // then a second, independent line of defence rather than the only one.
+    // The same clause-you-cannot-get-past argument covers `deactivated_at IS
+    // NULL` (schema v29): a deactivated account is handed nullopt here, and
+    // every existing caller already reads nullopt as "this account cannot
+    // authenticate that way".
     std::optional<std::string> get_password_hash(const std::string& user_id);
     // Replaces the stored hash (used to transparently upgrade a hash that was
     // generated with a weaker cost factor at the next successful login).
@@ -257,6 +282,45 @@ public:
     // AutoJoin's own funnel where it can be read next to its reasoning, not in a
     // filter here that every unrelated caller would silently inherit.
     std::vector<std::string> list_all_users();
+
+    // ── Account deactivation (schema v29) ───────────────────────────────────
+    //
+    // Apple App Store guideline 5.1.1(v) requires an app that creates accounts
+    // to let a person delete theirs from inside the app, and Matrix spells that
+    // as POST /_matrix/client/v3/account/deactivate.
+    //
+    // DEACTIVATION IS NOT ROW DELETION, and the distinction is the whole design.
+    // A user id appears on every message that account ever sent, in every
+    // membership row, in the audit log and in anyone else's DM history. Deleting
+    // the row would either break those references or mean rewriting other
+    // people's conversations, which is not the departing user's to rewrite —
+    // the same position Matrix, Element and every other server on the protocol
+    // take. What goes is the account's identity and its ability to act:
+    //
+    //   * every access and refresh token (it can no longer authenticate);
+    //   * its password hash (nothing can sign in as it again, and the hash is
+    //     the one piece of credential material the account leaves behind);
+    //   * display name, avatar and per-server nickname (its personal data);
+    //   * account data, including the ignore list, and push registrations;
+    //   * linked identity-provider identities, so the identity is free to sign
+    //     in as a fresh account rather than being permanently bound to a dead
+    //     one;
+    //   * membership of every room, left as an ordinary 'leave'.
+    //
+    // Returns false when the account was already deactivated, so the caller can
+    // write exactly one audit record however many times the button is pressed —
+    // the same idempotency shape as deactivate_bot, and taken from the UPDATE's
+    // own WHERE clause rather than from a read followed by a write.
+    //
+    // The caller emits the m.room.member leave events and wakes the syncs; this
+    // writes the rows. See AuthHandler::handle_deactivate_account.
+    bool deactivate_user(const std::string& user_id, int64_t when_ms);
+
+    // When the account was deactivated, or nullopt for a live one (and for an
+    // account that does not exist — callers here always have an authenticated
+    // user id, and "no such account" and "not deactivated" lead to the same
+    // refusal at every site that asks).
+    std::optional<int64_t> get_user_deactivated_at(const std::string& user_id);
 
     // ── Bot accounts ────────────────────────────────────────────────────────
     //
@@ -601,11 +665,26 @@ public:
     //
     // Unaddressed signalling, from a client too old to name a recipient, is
     // NULL in the column and returned on both paths exactly as before.
+    //
+    // `ignoring_user` applies that account's ignore list (schema v29): NON-STATE
+    // events sent by somebody it ignores are dropped from the page. Both
+    // /messages and the initial sync pass it; the history case passes it too,
+    // because an ignore that held on /sync and not on back-pagination would be
+    // undone by scrolling up.
+    //
+    // STATE EVENTS ARE NEVER DROPPED BY IT, whoever sent them, and that is not
+    // an oversight. A room's state is not the sender's content — it is the
+    // room's description of itself. Dropping the m.room.member event of a person
+    // you ignore takes them out of your member list; dropping an m.room.name
+    // they happened to set renames the channel to nothing in your client. Same
+    // rule Matrix's own ignore semantics take, and the same one the /sync scan
+    // applies in get_events_since.
     std::pair<std::vector<RoomEvent>, std::optional<int64_t>>
     get_room_events_paginated(const std::string& room_id, int limit,
                               const std::string& direction = "b",
                               const std::optional<std::string>& from = std::nullopt,
-                              const std::optional<std::string>& viewer = std::nullopt);
+                              const std::optional<std::string>& viewer = std::nullopt,
+                              const std::optional<std::string>& ignoring_user = std::nullopt);
 
     std::vector<RoomEvent> get_room_events(const std::string& room_id, int limit, const std::string& direction = "b",
                                             const std::optional<std::string>& from = std::nullopt);
@@ -634,6 +713,18 @@ public:
     // placement means nothing before the invite is accepted.
     std::vector<RoomEvent> get_invite_state(const std::string& room_id,
                                             const std::string& invitee);
+
+    // Who invited `invitee` into `room_id`: the sender of the most recent
+    // m.room.member event that put them in 'invite'. nullopt when there is no
+    // such event.
+    //
+    // The MOST RECENT one, not the first: an invite that was declined and
+    // re-sent by somebody else must answer with whoever sent the live one, or
+    // the ignore filter in SyncEngine would suppress an invite from a person
+    // the reader has not blocked because a different person's older invite is
+    // still in the table.
+    std::optional<std::string> get_invite_sender(const std::string& room_id,
+                                                 const std::string& invitee);
     std::optional<RoomEvent> get_state_event(const std::string& room_id, const std::string& event_type, const std::string& state_key);
     std::optional<RoomEvent> get_event_by_id(const std::string& event_id);
 
@@ -1256,6 +1347,86 @@ public:
     };
     static AuditQuery audit_page_query(const AuditFilter& filter, bool with_cursor);
     static AuditQuery audit_match_count_query(const AuditFilter& filter);
+
+    // ── Account data, and the ignore list it carries (schema v29) ─────────
+    //
+    // Matrix's per-account key/value store. Global only; see migrate_v29 for
+    // why the room-scoped variant is deliberately absent.
+
+    // The stored document for `type`, or nullopt when this account has never
+    // written one. Raw JSON text, exactly as it was PUT.
+    std::optional<std::string> get_account_data(const std::string& user_id,
+                                                const std::string& type);
+
+    // Replaces the document for `type`.
+    //
+    // When `type` is m.ignored_user_list this ALSO rewrites that account's rows
+    // in `ignored_users`, in the same transaction. The two are not two stores:
+    // account_data is the authority and ignored_users is an index over it, the
+    // same relationship insert_event maintains with the FTS5 search index and
+    // taken for the same reason — see migrate_v29.
+    //
+    // `ignored` is the projection the caller parsed out of `content_json`, and
+    // it is a parameter rather than something re-derived here so that the
+    // parsing rules (what a valid entry is, what the ceiling is, what a
+    // malformed one means) stay in the handler where they can be refused with a
+    // 400. This function is the atomicity, not the policy. It must be nullopt
+    // for every other type, and the store enforces the pairing: passing one
+    // without the other for the ignore list is a programming error that would
+    // leave the index disagreeing with the document.
+    void set_account_data(const std::string& user_id, const std::string& type,
+                          const std::string& content_json,
+                          const std::optional<std::vector<std::string>>& ignored,
+                          int64_t when_ms);
+
+    // Every account `user_id` currently ignores, ascending. Read from the index,
+    // so it is what the /sync and /messages filters will actually apply — a test
+    // that asserts on this asserts on the enforcement, not on a re-parse of the
+    // document.
+    std::vector<std::string> get_ignored_users(const std::string& user_id);
+
+    // Whether `ignorer` ignores `sender`. One primary-key probe.
+    bool is_ignoring(const std::string& ignorer, const std::string& sender);
+
+    // ── Content reports (schema v29) ──────────────────────────────────────
+    //
+    // Apple guideline 1.2 and Google Play's UGC policy both require a way to
+    // report content. Stored here AND appended to the audit log: the audit log
+    // answers "what has happened on this server, in order", this answers "what
+    // is outstanding about this account or this channel".
+
+    struct ContentReport {
+        int64_t id = 0;         // assigned by add_content_report; monotonic
+        int64_t created_at = 0; // ms; filled with "now" when left at 0
+        std::string reporter;
+        // The account the report is about. For an event report this is the
+        // event's sender, resolved by the handler rather than taken from the
+        // request — a reporter does not get to say whose record this lands on.
+        std::string target_user;
+        std::string room_id;   // empty for a user-level report
+        std::string event_id;  // empty for a user-level report
+        std::string event_sender;
+        // Bounded copy of the reported event's content at report time; see
+        // migrate_v29 for why the report does not just point at the event.
+        std::string event_snapshot;
+        // Matrix's severity hint: -100 (most offensive) to 0. Zero for a
+        // user-level report, which the spec gives no score.
+        int score = 0;
+        std::string reason;
+    };
+
+    int64_t add_content_report(const ContentReport& report);
+
+    struct ReportPage {
+        std::vector<ContentReport> reports;  // newest first
+        std::optional<int64_t> next_from;    // pass back as before_id
+        int64_t total = 0;                   // whole table
+    };
+
+    // Newest-first page of at most `limit` reports, restricted to ids strictly
+    // below `before_id` when one is given. Same cursor shape as the audit log,
+    // and stable for the same reason: ids are monotonic and never reused.
+    ReportPage list_content_reports(int limit, std::optional<int64_t> before_id = std::nullopt);
 
     // Profile
     void set_display_name(const std::string& user_id, const std::string& display_name);
