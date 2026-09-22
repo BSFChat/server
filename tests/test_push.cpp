@@ -530,6 +530,43 @@ TEST(PushEvaluation, PlainChannelMessageDoesNotPushByDefault) {
     EXPECT_EQ(f.store->count_queued_pushes(), 0);
 }
 
+// A block has to reach the push path, not only the timeline.
+//
+// This is the case where getting it wrong is worst: /sync filters the blocked
+// account's message out, so without this the reader's phone buzzes with that
+// person's name, they open the app, and there is nothing there — the harassment
+// arrives and the evidence does not.
+TEST(PushEvaluation, AMentionFromAnIgnoredUserDoesNotPush) {
+    PushFixture f;
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    f.register_pusher("bob", "bob-device");
+
+    // A DIRECT mention with the level at "all" — every setting that could let a
+    // message through, so the refusal cannot be coming from anywhere else.
+    f.set_level("bob", PushService::kLevelAll);
+    f.store->set_account_data(bob, std::string(account_data_type::kIgnoredUserList),
+                              json{{account_data_type::kIgnoredUsersKey,
+                                    {{alice, json::object()}}}}.dump(),
+                              std::vector<std::string>{alice}, 1000);
+
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"},
+                                      {"body", "@Bob look"},
+                                      {"m.mentions", {{"user_ids", json::array({bob})}}}},
+                            "t1")));
+    EXPECT_EQ(f.store->count_queued_pushes(), 0);
+
+    // And somebody bob has not blocked still gets through, so the test is not
+    // passing because pushes stopped working.
+    auto carol = f.add_user("carol");
+    (void)carol;
+    ASSERT_TRUE(IsOk(f.send("carol", {{"msgtype", "m.text"},
+                                      {"body", "@Bob over here"},
+                                      {"m.mentions", {{"user_ids", json::array({bob})}}}},
+                            "t2")));
+    EXPECT_EQ(f.store->count_queued_pushes(), 1);
+}
+
 TEST(PushEvaluation, EveryMessageInADmPushesByDefault) {
     PushFixture f;
     auto alice = f.add_user("alice", /*join=*/false);

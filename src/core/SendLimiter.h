@@ -66,6 +66,31 @@ public:
         // the first; see direct_room_shape_refusal there for why those come
         // first, and why this is charged below them.
         kRoomCreate,
+        // POST /rooms/{id}/report/{event} and POST /users/{id}/report.
+        //
+        // Its own bucket rather than a share of kSend, because the two failures
+        // are different. A send flood costs the server; a REPORT flood costs a
+        // human being — every report is a row an administrator has to read, and
+        // a script that files ten thousand of them does not spam the channel,
+        // it buries the moderation queue and with it the real reports already
+        // in it. That is also why the default is the lowest number here:
+        // reporting is something a person does deliberately, a handful of times
+        // at the very most, and anything faster is not a person.
+        //
+        // Keyed on the reporter like every other bucket, which is what makes it
+        // survive the thing a report-specific limit is actually for: an
+        // attacker cannot buy more budget by opening more connections, and
+        // cannot spend someone else's.
+        kReport,
+        // GET/PUT /user/{userId}/account_data/{type}.
+        //
+        // The cheapest write here — one upserted row, no fan-out, no sync wake
+        // — so the ceiling is the most generous. It exists because the type is
+        // CALLER-CHOSEN: each new type is a new row, so an unlimited loop is an
+        // unbounded table rather than a repeated overwrite, and
+        // input_limits::kMaxAccountDataBytes bounds each row without bounding
+        // how many there are.
+        kAccountData,
     };
 
     SendLimiter(const SendLimitsConfig& config, LimiterClock clock = limiter_steady_now_ms);
@@ -89,6 +114,8 @@ private:
     RateLimiter media_upload_;
     RateLimiter profile_;
     RateLimiter room_create_;
+    RateLimiter report_;
+    RateLimiter account_data_;
 };
 
 } // namespace bsfchat

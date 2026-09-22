@@ -158,6 +158,43 @@ constexpr const char* kChannelPermissionsSet = "channel.permissions.set";
 // operator deciding whether a database they are about to restore predates one.
 constexpr const char* kVoiceRekey = "voice.rekey";
 
+// A user reporting content or another account
+// (POST /rooms/{id}/report/{event}, POST /users/{id}/report).
+//
+// THE ODD ONE OUT IN THIS LIST, and worth saying so plainly: every other action
+// here is an exercise of AUTHORITY — a moderator did something to somebody, and
+// the record exists so it can be attributed. A report is the opposite. It is an
+// ordinary member with no permissions at all asking for attention, and it
+// changes nothing.
+//
+// It is recorded here anyway, and the reason is the question that gets asked
+// afterwards. "This account was banned in November — had anyone raised it
+// before?" is answered by the audit log or it is answered by nobody, and a ban
+// record with no reports before it and a ban record with fourteen are very
+// different documents. content_reports holds the queue, which is a working set
+// somebody triages; this holds the history, which is append-only and outlives
+// the room, the event and the account (migrate_v29).
+//
+// The consequence to be aware of: this is the one audit action an unprivileged
+// account can cause, so it is the one an abuser can use to write into a log
+// they cannot read. The report rate limit (SendLimiter::Bucket::kReport) is
+// what bounds that, and the reason it is the smallest limit in the block.
+constexpr const char* kContentReport = "content.report";
+
+// An account deactivating itself (POST /account/deactivate).
+//
+// Also self-inflicted rather than an act of authority, and recorded for a
+// related reason: it is the only way an account can disappear from every member
+// list on the server at once, and without a record an operator investigating
+// "where did this person go" has a user id, no memberships, and nothing that
+// says whether they left, were banned, or were removed by somebody.
+//
+// The record names only the account and the time. What was deleted is described
+// by SqliteStore::deactivate_user and is the same every time; what the account
+// SAID is not recorded, because deactivation takes no reason and inventing a
+// field for one would invite a client to collect it.
+constexpr const char* kAccountDeactivate = "account.deactivate";
+
 } // namespace audit_action
 
 // The action name for a membership transition, so the same ban is recorded under
@@ -243,6 +280,32 @@ void audit_voice_rekey(SqliteStore& store, const std::string& actor,
 void audit_account_link(SqliteStore& store, const std::string& actor,
                         const std::string& issuer,
                         const std::string& superseded_user_id);
+
+// Records one content report. `target_user` is the account the report is about —
+// the reported event's SENDER, resolved by the handler from the event itself and
+// never taken from the request body, so a reporter cannot file a report against
+// somebody who did not write the thing they are reporting.
+//
+// `room_id` and `event_id` are empty for a user-level report.
+//
+// THE REPORTED CONTENT IS NOT COPIED INTO THIS RECORD, and callers must not put
+// it in. The audit log has no delete path, deliberately, so a snapshot written
+// here would be a permanent, unredactable copy of the exact material somebody
+// asked to have dealt with — including the case where the right answer is that
+// it should not exist anywhere. The bounded snapshot lives on the
+// content_reports row instead, which is an ordinary table a future moderation
+// queue can resolve and clear. What goes here is that a report was made, by
+// whom, about whom, and why — the `reason`, which is the reporter's own words
+// and not the reported party's.
+void audit_content_report(SqliteStore& store, const std::string& reporter,
+                          const std::string& target_user, const std::string& room_id,
+                          const std::string& event_id, int score,
+                          const std::string& reason);
+
+// Records one self-service account deactivation. Actor and target are the same
+// account by construction — this endpoint deactivates the caller and nobody
+// else — and both are filled in, so a filter on either finds it.
+void audit_account_deactivation(SqliteStore& store, const std::string& user_id);
 
 // Records a change to server-scoped state (bsfchat.server.roles /
 // bsfchat.member.roles). Called from write_server_scoped_state, which is the one

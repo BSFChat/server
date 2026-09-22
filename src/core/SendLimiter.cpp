@@ -12,7 +12,10 @@ SendLimiter::SendLimiter(const SendLimitsConfig& config, LimiterClock clock)
                     clock)
     , profile_(config.profile_limit, std::chrono::seconds(config.window_seconds), clock)
     , room_create_(config.room_create_limit, std::chrono::seconds(config.window_seconds),
-                   clock) {}
+                   clock)
+    , report_(config.report_limit, std::chrono::seconds(config.window_seconds), clock)
+    , account_data_(config.account_data_limit, std::chrono::seconds(config.window_seconds),
+                    clock) {}
 
 int64_t SendLimiter::acquire(Bucket bucket, const std::string& identity) {
     if (!enabled_ || identity.empty()) return 0;
@@ -22,6 +25,8 @@ int64_t SendLimiter::acquire(Bucket bucket, const std::string& identity) {
         case Bucket::kMediaUpload: return media_upload_.acquire(identity);
         case Bucket::kProfile:     return profile_.acquire(identity);
         case Bucket::kRoomCreate:  return room_create_.acquire(identity);
+        case Bucket::kReport:      return report_.acquire(identity);
+        case Bucket::kAccountData: return account_data_.acquire(identity);
     }
     return 0;
 }
@@ -42,6 +47,10 @@ const char* SendLimiter::message_for(Bucket bucket) {
             // one a 429 belongs to without telling an attacker which of the two
             // budgets they are burning.
             return "Too many rooms created in a row. Try again shortly.";
+        case Bucket::kReport:
+            return "Too many reports in a row. Try again shortly.";
+        case Bucket::kAccountData:
+            return "Too many settings changes in a row. Try again shortly.";
     }
     return "Too many requests. Try again later.";
 }

@@ -1711,6 +1711,144 @@ void migrate_v28(sqlite3* db, bool /*fresh_database*/) {
         "them");
 }
 
+void migrate_v29(sqlite3* db, bool /*fresh_database*/) {
+    // User-generated-content safety: blocking, reporting, and account deletion.
+    //
+    // Three tables and one column, added together because they are one feature
+    // — a chat app has to let somebody stop hearing from a person, tell the
+    // operator why, and leave for good.
+
+    // ── Account data ──────────────────────────────────────────────────────
+    //
+    // Matrix's per-account key/value store: GET/PUT
+    // /_matrix/client/v3/user/{userId}/account_data/{type}. This server had
+    // none at all, which is why the ignore list below needed it.
+    //
+    // GLOBAL account data only. Matrix also defines a room-scoped variant
+    // (/user/{u}/rooms/{r}/account_data/{t}) and it is deliberately NOT here:
+    // on this server membership is not visibility (docs/membership-vs-
+    // visibility.md), so a room-scoped write needs a VIEW_CHANNEL gate and a
+    // decision about what happens to the rows when a channel is deleted. There
+    // is no consumer for it yet, and a half-considered one would be a second
+    // place for that gate to be got wrong. Add it with its first caller.
+    //
+    // No `ON DELETE CASCADE` and no trigger: the deactivation path deletes a
+    // user's rows explicitly, so the deletion is visible at the call site
+    // rather than happening somewhere a reader of that code cannot see.
+    exec(db, R"(
+        CREATE TABLE IF NOT EXISTS account_data (
+            user_id     TEXT NOT NULL REFERENCES users(user_id),
+            type        TEXT NOT NULL,
+            content     TEXT NOT NULL,
+            updated_at  INTEGER NOT NULL,
+            PRIMARY KEY (user_id, type)
+        )
+    )");
+
+    // ── The ignore list, as an index over account data ─────────────────────
+    //
+    // THIS TABLE IS NOT A SECOND AUTHORITY. The `m.ignored_user_list` row in
+    // account_data above is the one source of truth — it is what GET returns
+    // and what a client's PUT replaces — and these rows are a projection of it,
+    // rewritten inside the same transaction as the PUT that caused them
+    // (SqliteStore::set_account_data). Exactly the relationship insert_event
+    // already has with the FTS5 search index, and for the same reason: the
+    // authoritative form is a JSON document, and the form the enforcement
+    // queries need is a row per pair.
+    //
+    // It exists because the enforcement is a filter in SQL, on the /sync scan
+    // that every client runs continuously. `NOT EXISTS (SELECT 1 FROM
+    // ignored_users WHERE user_id = ? AND ignored_user_id = e.sender)` is a
+    // primary-key probe; the same question asked of a JSON blob is a parse per
+    // row. Putting the filter in SQL rather than in a loop above it is also the
+    // point argued at get_events_since for the call-signalling filter: a room
+    // the reader must not be shown must not be able to put rows on the wire
+    // because some caller further out forgot.
+    //
+    // Both halves of the primary key are user ids. There is no foreign key to
+    // users(user_id) on `ignored_user_id` ON PURPOSE: a user may ignore an
+    // account that is later deactivated and removed, and the ignore should not
+    // fail to write, nor vanish and start delivering content, because of it.
+    exec(db, R"(
+        CREATE TABLE IF NOT EXISTS ignored_users (
+            user_id         TEXT NOT NULL,
+            ignored_user_id TEXT NOT NULL,
+            created_at      INTEGER NOT NULL,
+            PRIMARY KEY (user_id, ignored_user_id)
+        )
+    )");
+
+    // ── Content reports ───────────────────────────────────────────────────
+    //
+    // POST /_matrix/client/v3/rooms/{roomId}/report/{eventId} and
+    // POST /_matrix/client/v3/users/{userId}/report. Read by server
+    // administrators; a report is also appended to the audit log, so the
+    // question "was anything ever reported about this account" is answerable
+    // from either side.
+    //
+    // NOTHING HERE REFERENCES rooms(room_id) OR events(event_id), which is the
+    // decision a later reader is most likely to want explained. A report is
+    // most often about content somebody is ABOUT TO DELETE — the reported
+    // message gets redacted, the channel gets deleted, the account gets
+    // deactivated — and a foreign key would either block that deletion or take
+    // the report with it. The same reasoning the audit log is stored outside
+    // room events for (audit/AuditLog.h).
+    //
+    // That is also why `event_sender` and `event_snapshot` are columns rather
+    // than something a reader joins back to the timeline for. By the time an
+    // administrator looks, the event may be redacted and its content gone, and
+    // a report that says only "event $abc in !xyz was reported" is a record
+    // with nothing in it. The snapshot is taken at report time and bounded
+    // (input_limits::kMaxReportSnapshotBytes) so one report cannot store an
+    // unbounded copy of anything.
+    //
+    // Unlike audit_log, this table is NOT append-only at the database level:
+    // there is no resolve/dismiss path today, but a moderation queue wants one
+    // and a trigger here would have to be dropped out of band to add it.
+    exec(db, R"(
+        CREATE TABLE IF NOT EXISTS content_reports (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at     INTEGER NOT NULL,
+            reporter       TEXT NOT NULL,
+            target_user    TEXT NOT NULL DEFAULT '',
+            room_id        TEXT NOT NULL DEFAULT '',
+            event_id       TEXT NOT NULL DEFAULT '',
+            event_sender   TEXT NOT NULL DEFAULT '',
+            event_snapshot TEXT NOT NULL DEFAULT '',
+            score          INTEGER NOT NULL DEFAULT 0,
+            reason         TEXT NOT NULL DEFAULT ''
+        )
+    )");
+
+    // "Everything reported about this account" and "everything this account
+    // reported" are the two questions a moderator asks; the id is already the
+    // newest-first cursor, so no index is needed for the unfiltered page.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_content_reports_target "
+             "ON content_reports(target_user)");
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_content_reports_reporter "
+             "ON content_reports(reporter)");
+
+    // ── Account deactivation ──────────────────────────────────────────────
+    //
+    // A TIMESTAMP, not a flag, for the same reason bots.deactivated_at is one:
+    // "when" is the question asked afterwards, and a boolean cannot answer it.
+    // NULL means live.
+    //
+    // The row is KEPT rather than deleted. A user id is on every message that
+    // account ever sent and in every membership row; deleting it would either
+    // break those references or require rewriting other people's conversation
+    // history, which is not the departing user's to rewrite. What deactivation
+    // removes is the account's identity and its ability to act — see
+    // SqliteStore::deactivate_user for the full list.
+    if (!column_exists(db, "users", "deactivated_at")) {
+        exec(db, "ALTER TABLE users ADD COLUMN deactivated_at INTEGER");
+    }
+
+    get_logger()->info(
+        "Schema v29: users can now ignore other accounts, report content, and deactivate "
+        "their own account");
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1743,6 +1881,7 @@ const std::vector<Step>& steps() {
         migrate_v26,
         migrate_v27,
         migrate_v28,
+        migrate_v29,
     };
     return kMigrations;
 }

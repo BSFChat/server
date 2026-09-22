@@ -44,6 +44,30 @@ public:
     // access/refresh pair, rotating both.
     void handle_refresh(const httplib::Request& req, httplib::Response& res);
 
+    // POST /_matrix/client/v3/account/deactivate — the account owner deleting
+    // their own account. Apple App Store guideline 5.1.1(v) requires this of
+    // any app that lets people create accounts, and Matrix spells it here.
+    //
+    // Requires the current password (a valid access token is not enough), by
+    // the same m.login.password user-interactive stage handle_password_change
+    // uses and for a stronger version of the same reason — this is the one
+    // irreversible thing an account can do to itself. An account that signs in
+    // through the identity provider and therefore has no password is admitted
+    // on the bearer token alone; see the definition for why, and for what would
+    // have to be built to close that gap properly.
+    //
+    // Deactivation is not row deletion. SqliteStore::deactivate_user has the
+    // full list of what goes and the argument for what stays; this handler adds
+    // the parts that are not database rows — an m.room.member leave in every
+    // room the account was in, a sync wake, and one audit record.
+    //
+    // It lives here rather than in a handler of its own because it needs this
+    // class's machinery: the client-address key, the attempt limiter, and the
+    // failure tracker that a wrong password at /login is counted against. A
+    // second copy of the password re-auth stage somewhere else is how the two
+    // would eventually disagree about what counts as a failure.
+    void handle_deactivate_account(const httplib::Request& req, httplib::Response& res);
+
     // POST /_matrix/client/v3/bsfchat/account/link_identity — attaches an
     // identity-provider identity to the CALLER's account, so that identity
     // signs in as this account from now on instead of minting a parallel

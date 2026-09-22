@@ -635,8 +635,16 @@ std::optional<std::string> SqliteStore::get_password_hash(const std::string& use
     // `kind = 'user'` is load-bearing, not a tidy-up. It is what makes "a bot can
     // never log in with a password" a property of the schema rather than a check
     // somebody has to remember to write. See the header for the full reasoning.
+    //
+    // `deactivated_at IS NULL` (schema v29) is there for exactly the same reason
+    // and buys the same thing: a deactivated account can never authenticate by
+    // password, whatever a future handler does. deactivate_user also blanks the
+    // hash, and the two are not redundant — the blanking is what removes the
+    // credential material, this is what keeps the door shut if some later path
+    // ever writes a hash back.
     auto stmt = prepare(db_,
-        "SELECT password_hash FROM users WHERE user_id = ? AND kind = 'user'");
+        "SELECT password_hash FROM users "
+        "WHERE user_id = ? AND kind = 'user' AND deactivated_at IS NULL");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         return reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
@@ -2092,7 +2100,8 @@ std::pair<std::vector<RoomEvent>, std::optional<int64_t>>
 SqliteStore::get_room_events_paginated(const std::string& room_id, int limit,
                                         const std::string& direction,
                                         const std::optional<std::string>& from,
-                                        const std::optional<std::string>& viewer) {
+                                        const std::optional<std::string>& viewer,
+                                        const std::optional<std::string>& ignoring_user) {
     std::lock_guard lock(mutex_);
 
     // Same query shape as get_room_events, but we also pull stream_position
@@ -2139,6 +2148,28 @@ SqliteStore::get_room_events_paginated(const std::string& room_id, int limit,
         sql += " AND e.signal_to IS NULL";
     }
 
+    // The ignore list (schema v29), applied to NON-STATE events only — see the
+    // header for why state is never dropped and what breaks if it is.
+    //
+    // A correlated NOT EXISTS against a primary key, not a join: the ignore
+    // list is empty for almost every caller, and an empty list must cost one
+    // index probe per row and nothing else. Expressed in the SQL rather than as
+    // a filter over the result for the reason the call-signalling clause above
+    // is: a row that must not reach this reader must not be able to reach a
+    // caller that forgot to re-apply the rule.
+    //
+    // It does NOT change the pagination token. `next_token` is derived from the
+    // last row actually returned, so a page that lost rows to this filter is a
+    // short page whose cursor still points at real history — never a hole. That
+    // is also why the probe row (limit + 1) is bound after the filter rather
+    // than compensating for it: over-fetching to refill a page would make the
+    // page size a leak of how much the ignored account has posted.
+    if (ignoring_user) {
+        sql += " AND (e.state_key IS NOT NULL OR NOT EXISTS ("
+               "     SELECT 1 FROM ignored_users iu "
+               "     WHERE iu.user_id = ?5 AND iu.ignored_user_id = e.sender))";
+    }
+
     if (from) {
         if (direction == "b") {
             sql += " AND e.stream_position < ?3 ORDER BY e.stream_position DESC";
@@ -2171,6 +2202,9 @@ SqliteStore::get_room_events_paginated(const std::string& room_id, int limit,
         sqlite3_bind_int64(stmt.get(), 3, parse_token(from));
     }
     sqlite3_bind_int(stmt.get(), 4, limit + 1);
+    if (ignoring_user) {
+        sqlite3_bind_text(stmt.get(), 5, ignoring_user->c_str(), -1, SQLITE_TRANSIENT);
+    }
 
     std::vector<RoomEvent> events;
     std::vector<int64_t> positions;
@@ -2937,6 +2971,26 @@ std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id,
         "         AND e.event_type = '" + std::string(event_type::kRoomMember) + "' "
         "         AND e.state_key = ?1)) "
         "AND (e.signal_to IS NULL OR e.signal_to = ?1 OR e.sender = ?1) "
+        // The ignore list (schema v29). Non-state events only: state is the
+        // room's description of itself, not its sender's content, so dropping
+        // it would empty this reader's member list and blank out names and
+        // topics set by anyone they have blocked. Matrix's own ignore
+        // semantics draw the line in the same place, and so does
+        // get_room_events_paginated, which is the /messages half of this rule.
+        //
+        // Here for the reason the addressee clause above it is here: this is
+        // the one scan every client runs continuously, and a row that must not
+        // reach this reader must not depend on a caller further out
+        // remembering to drop it.
+        //
+        // Filtered rows are NOT a hole in the sync token, by exactly the
+        // argument given for signal_to: excluding a row makes the scan return
+        // fewer than `limit`, SyncEngine then advances next_batch to the scan's
+        // own head, and the client's no-progress backoff never sees a poll that
+        // came back with an unmoved token.
+        "AND (e.state_key IS NOT NULL OR NOT EXISTS ("
+        "     SELECT 1 FROM ignored_users iu "
+        "     WHERE iu.user_id = ?1 AND iu.ignored_user_id = e.sender)) "
         "ORDER BY e.stream_position ASC "
         "LIMIT ?3");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -3072,11 +3126,21 @@ int SqliteStore::count_unread(const std::string& user_id, const std::string& roo
         "AND replaces IS NULL "
         "AND redacted_by IS NULL "
         "AND stream_position > COALESCE("
-        "  (SELECT last_read_pos FROM read_markers WHERE user_id = ? AND room_id = ?), 0)");
+        "  (SELECT last_read_pos FROM read_markers WHERE user_id = ? AND room_id = ?), 0) "
+        // The ignore list (schema v29). A badge is a claim that there is
+        // something in there for you to read, and an ignored account's message
+        // is precisely the thing this reader will never be shown — so counting
+        // it lights a channel up for content that /sync has already filtered
+        // out, and the badge can never be cleared by reading, because there is
+        // nothing to read. Same clause in all three count queries and in
+        // PushService, for the same reason.
+        "AND NOT EXISTS (SELECT 1 FROM ignored_users iu "
+        "                 WHERE iu.user_id = ? AND iu.ignored_user_id = events.sender)");
     sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 3, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 4, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 5, user_id.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         return sqlite3_column_int(stmt.get(), 0);
     }
@@ -3205,7 +3269,11 @@ int SqliteStore::count_unread_mentions(const std::string& user_id, const std::st
         "SELECT COUNT(*) FROM event_mentions "
         "WHERE room_id = ? AND user_id IN (" + placeholders(keys.size()) + ") AND sender != ? "
         "AND stream_position > COALESCE("
-        "  (SELECT last_read_pos FROM read_markers WHERE user_id = ? AND room_id = ?), 0)");
+        "  (SELECT last_read_pos FROM read_markers WHERE user_id = ? AND room_id = ?), 0) "
+        // See count_unread: a highlight from an account this reader has blocked
+        // is an interruption for a message they will never be shown.
+        "AND NOT EXISTS (SELECT 1 FROM ignored_users iu "
+        "                 WHERE iu.user_id = ? AND iu.ignored_user_id = event_mentions.sender)");
     int p = 1;
     sqlite3_bind_text(stmt.get(), p++, room_id.c_str(), -1, SQLITE_TRANSIENT);
     for (const auto& key : keys) {
@@ -3214,6 +3282,7 @@ int SqliteStore::count_unread_mentions(const std::string& user_id, const std::st
     sqlite3_bind_text(stmt.get(), p++, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), p++, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), p++, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), p++, user_id.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         return sqlite3_column_int(stmt.get(), 0);
     }
@@ -3250,11 +3319,19 @@ std::map<std::string, int> SqliteStore::get_unread_mention_counts(const std::str
         "AND m.stream_position > COALESCE("
         "  (SELECT last_read_pos FROM read_markers r "
         "   WHERE r.user_id = ? AND r.room_id = m.room_id), 0) "
+        // See count_unread. Unlike the VIEW_CHANNEL filter this function
+        // deliberately does not carry, this one costs no per-room query and no
+        // PermissionsEngine — it is a primary-key probe per row against a table
+        // that is empty for almost every reader — so the grouped-query property
+        // this function exists for is preserved.
+        "AND NOT EXISTS (SELECT 1 FROM ignored_users iu "
+        "                 WHERE iu.user_id = ? AND iu.ignored_user_id = m.sender) "
         "GROUP BY m.room_id");
     int p = 1;
     for (const auto& key : keys) {
         sqlite3_bind_text(stmt.get(), p++, key.c_str(), -1, SQLITE_TRANSIENT);
     }
+    sqlite3_bind_text(stmt.get(), p++, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), p++, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), p++, user_id.c_str(), -1, SQLITE_TRANSIENT);
 
@@ -4316,5 +4393,315 @@ bool SqliteStore::delete_media(const std::string& media_id) {
     sqlite3_step(stmt.get());
     return sqlite3_changes(db_) > 0;
 }
+
+// ── Account data, the ignore list, reports, and deactivation (schema v29) ──
+
+std::optional<std::string> SqliteStore::get_account_data(const std::string& user_id,
+                                                         const std::string& type) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT content FROM account_data WHERE user_id = ? AND type = ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, type.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    return std::string(column_text_or_empty(stmt.get(), 0));
+}
+
+void SqliteStore::set_account_data(const std::string& user_id, const std::string& type,
+                                   const std::string& content_json,
+                                   const std::optional<std::vector<std::string>>& ignored,
+                                   int64_t when_ms) {
+    // The pairing is a precondition, not a preference: the index and the
+    // document are written together or the enforcement stops matching what the
+    // user is shown their block list to be. A caller that supplies one without
+    // the other has a bug, and it is the kind that only shows up as "I blocked
+    // them and still see their messages".
+    const bool is_ignore_list = type == std::string(account_data_type::kIgnoredUserList);
+    if (is_ignore_list != ignored.has_value()) {
+        throw std::runtime_error(
+            "set_account_data: the projected ignore list must be supplied for '" +
+            std::string(account_data_type::kIgnoredUserList) + "' and for no other type");
+    }
+
+    std::lock_guard lock(mutex_);
+
+    // ONE TRANSACTION over the document and its index, for the reason
+    // insert_event takes one over the event row and the search index: the
+    // failure that matters is the one where the first write lands and the
+    // second throws. Here that would leave the account's stated block list and
+    // the list the /sync filter actually applies permanently out of step, with
+    // nothing to notice it.
+    exec("BEGIN IMMEDIATE");
+    try {
+        {
+            auto stmt = prepare(db_,
+                "INSERT INTO account_data (user_id, type, content, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(user_id, type) DO UPDATE SET "
+                "  content = excluded.content, updated_at = excluded.updated_at");
+            sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt.get(), 2, type.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt.get(), 3, content_json.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt.get(), 4, when_ms);
+            if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("Failed to write account data: ") +
+                                         sqlite3_errmsg(db_));
+            }
+        }
+
+        if (ignored) {
+            // Replace wholesale rather than diff. An ignore list PUT is a full
+            // replacement by Matrix convention — the client sends the list it
+            // wants, not a delta — so computing a diff here would be inventing
+            // a second semantics for the same request. It also means an UNBLOCK
+            // is just an absence, which is the one direction a diff is easy to
+            // get wrong.
+            {
+                auto del = prepare(db_, "DELETE FROM ignored_users WHERE user_id = ?");
+                sqlite3_bind_text(del.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(del.get()) != SQLITE_DONE) {
+                    throw std::runtime_error(std::string("Failed to clear ignore list: ") +
+                                             sqlite3_errmsg(db_));
+                }
+            }
+            auto ins = prepare(db_,
+                "INSERT OR IGNORE INTO ignored_users (user_id, ignored_user_id, created_at) "
+                "VALUES (?, ?, ?)");
+            for (const auto& target : *ignored) {
+                sqlite3_reset(ins.get());
+                sqlite3_bind_text(ins.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(ins.get(), 2, target.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(ins.get(), 3, when_ms);
+                if (sqlite3_step(ins.get()) != SQLITE_DONE) {
+                    throw std::runtime_error(std::string("Failed to write ignore list: ") +
+                                             sqlite3_errmsg(db_));
+                }
+            }
+        }
+
+        exec("COMMIT");
+    } catch (...) {
+        try {
+            exec("ROLLBACK");
+        } catch (...) {
+        }
+        throw;
+    }
+}
+
+std::vector<std::string> SqliteStore::get_ignored_users(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT ignored_user_id FROM ignored_users WHERE user_id = ? ORDER BY ignored_user_id");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    std::vector<std::string> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        out.emplace_back(column_text_or_empty(stmt.get(), 0));
+    }
+    return out;
+}
+
+bool SqliteStore::is_ignoring(const std::string& ignorer, const std::string& sender) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT 1 FROM ignored_users WHERE user_id = ? AND ignored_user_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, ignorer.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, sender.c_str(), -1, SQLITE_TRANSIENT);
+    return sqlite3_step(stmt.get()) == SQLITE_ROW;
+}
+
+std::optional<std::string> SqliteStore::get_invite_sender(const std::string& room_id,
+                                                          const std::string& invitee) {
+    std::lock_guard lock(mutex_);
+    // Ordered by stream_position DESC and limited to one: the LATEST invite,
+    // for the reason given in the header. No kEditJoin — a state event is not
+    // editable, and resolving an edit here would be asking a different question.
+    auto stmt = prepare(db_,
+        "SELECT sender FROM events "
+        "WHERE room_id = ? AND event_type = ? AND state_key = ? "
+        "  AND json_extract(content, '$.membership') = 'invite' "
+        "ORDER BY stream_position DESC LIMIT 1");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, std::string(event_type::kRoomMember).c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, invitee.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    return std::string(column_text_or_empty(stmt.get(), 0));
+}
+
+int64_t SqliteStore::add_content_report(const ContentReport& report) {
+    std::lock_guard lock(mutex_);
+    const int64_t created_at =
+        report.created_at != 0
+            ? report.created_at
+            : std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto stmt = prepare(db_,
+        "INSERT INTO content_reports (created_at, reporter, target_user, room_id, event_id, "
+        "                             event_sender, event_snapshot, score, reason) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    sqlite3_bind_int64(stmt.get(), 1, created_at);
+    sqlite3_bind_text(stmt.get(), 2, report.reporter.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, report.target_user.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 4, report.room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 5, report.event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 6, report.event_sender.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 7, report.event_snapshot.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt.get(), 8, report.score);
+    sqlite3_bind_text(stmt.get(), 9, report.reason.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        throw std::runtime_error(std::string("Failed to store content report: ") +
+                                 sqlite3_errmsg(db_));
+    }
+    return sqlite3_last_insert_rowid(db_);
+}
+
+SqliteStore::ReportPage SqliteStore::list_content_reports(int limit,
+                                                          std::optional<int64_t> before_id) {
+    std::lock_guard lock(mutex_);
+    ReportPage page;
+    if (limit <= 0) return page;
+
+    // Over-fetch by one to learn whether another page exists, the same probe-row
+    // trick get_room_events_paginated and list_audit_records use.
+    std::string sql =
+        "SELECT id, created_at, reporter, target_user, room_id, event_id, event_sender, "
+        "       event_snapshot, score, reason FROM content_reports ";
+    if (before_id) sql += "WHERE id < ? ";
+    sql += "ORDER BY id DESC LIMIT ?";
+
+    auto stmt = prepare(db_, sql);
+    int bind_index = 1;
+    if (before_id) sqlite3_bind_int64(stmt.get(), bind_index++, *before_id);
+    sqlite3_bind_int(stmt.get(), bind_index, limit + 1);
+
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        ContentReport r;
+        r.id = sqlite3_column_int64(stmt.get(), 0);
+        r.created_at = sqlite3_column_int64(stmt.get(), 1);
+        r.reporter = column_text_or_empty(stmt.get(), 2);
+        r.target_user = column_text_or_empty(stmt.get(), 3);
+        r.room_id = column_text_or_empty(stmt.get(), 4);
+        r.event_id = column_text_or_empty(stmt.get(), 5);
+        r.event_sender = column_text_or_empty(stmt.get(), 6);
+        r.event_snapshot = column_text_or_empty(stmt.get(), 7);
+        r.score = sqlite3_column_int(stmt.get(), 8);
+        r.reason = column_text_or_empty(stmt.get(), 9);
+        page.reports.push_back(std::move(r));
+    }
+
+    if (page.reports.size() > static_cast<size_t>(limit)) {
+        page.reports.pop_back();
+        // Exclusive cursor: the next page is everything strictly older than the
+        // last row returned, so no report is served twice or skipped.
+        page.next_from = page.reports.back().id;
+    }
+
+    auto count = prepare(db_, "SELECT COUNT(*) FROM content_reports");
+    if (sqlite3_step(count.get()) == SQLITE_ROW) {
+        page.total = sqlite3_column_int64(count.get(), 0);
+    }
+    return page;
+}
+
+bool SqliteStore::deactivate_user(const std::string& user_id, int64_t when_ms) {
+    std::lock_guard lock(mutex_);
+
+    exec("BEGIN IMMEDIATE");
+    try {
+        bool changed = false;
+        {
+            // The UPDATE's own WHERE clause is the idempotency test, not a read
+            // followed by a write — see deactivate_bot for the argument. The
+            // `kind = 'user'` guard keeps this off bot accounts: a bot is
+            // deactivated through DELETE /bsfchat/bots/{id}, which also leaves
+            // an audit record naming the human who did it, and letting a bot
+            // token reach this route would be a bot deactivating itself with
+            // nobody's name on it.
+            auto upd = prepare(db_,
+                "UPDATE users SET deactivated_at = ?, password_hash = '', "
+                "                 display_name = NULL, avatar_url = NULL, nickname = NULL "
+                "WHERE user_id = ? AND kind = 'user' AND deactivated_at IS NULL");
+            sqlite3_bind_int64(upd.get(), 1, when_ms);
+            sqlite3_bind_text(upd.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(upd.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("Failed to deactivate account: ") +
+                                         sqlite3_errmsg(db_));
+            }
+            changed = sqlite3_changes(db_) > 0;
+        }
+
+        // Everything below runs UNCONDITIONALLY, even for an account that was
+        // already deactivated. `changed` reports who got there first; it must
+        // not decide whether the credentials and the personal data actually go.
+        // A repeat call finding a live token — because an earlier attempt
+        // half-failed — must still kill it. Same reasoning as deactivate_bot:
+        // what has to be true after this returns is not the same thing as what
+        // has to be attributable.
+        //
+        // Tokens first, because it is the one that stops the account acting.
+        const char* const purges[] = {
+            "DELETE FROM access_tokens WHERE user_id = ?",
+            "DELETE FROM account_data WHERE user_id = ?",
+            // Both directions. The rows this account wrote are its data and go
+            // with it; the rows OTHER accounts wrote about it stay, because a
+            // block is the blocker's decision and is not undone by the blocked
+            // party leaving — an id can be re-registered.
+            "DELETE FROM ignored_users WHERE user_id = ?",
+            "DELETE FROM pushers WHERE user_id = ?",
+            "DELETE FROM push_queue WHERE user_id = ?",
+            "DELETE FROM room_notify_settings WHERE user_id = ?",
+            // The identity is freed to sign in as a fresh account. Leaving the
+            // link would bind that person's identity-provider identity to a
+            // dead account forever, which is the opposite of what deleting an
+            // account is for.
+            "DELETE FROM linked_identities WHERE user_id = ?",
+        };
+        for (const char* sql : purges) {
+            auto stmt = prepare(db_, sql);
+            sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("Failed to purge account data: ") +
+                                         sqlite3_errmsg(db_));
+            }
+        }
+
+        // Membership goes to 'leave' everywhere. NOT deleted: a deleted row
+        // reads as "never considered" to auto-join, which force-joins the
+        // account back into every public channel at the next boot — exactly the
+        // defect join_user_to_room's find_membership() check exists to prevent.
+        // A 'ban' row is left alone: deactivating must not lift a ban.
+        {
+            auto stmt = prepare(db_,
+                "UPDATE room_members SET membership = 'leave', "
+                "                        updated_at = strftime('%s','now') * 1000 "
+                "WHERE user_id = ? AND membership NOT IN ('leave', 'ban')");
+            sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("Failed to leave rooms: ") +
+                                         sqlite3_errmsg(db_));
+            }
+        }
+
+        exec("COMMIT");
+        return changed;
+    } catch (...) {
+        try {
+            exec("ROLLBACK");
+        } catch (...) {
+        }
+        throw;
+    }
+}
+
+std::optional<int64_t> SqliteStore::get_user_deactivated_at(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT deactivated_at FROM users WHERE user_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    if (sqlite3_column_type(stmt.get(), 0) == SQLITE_NULL) return std::nullopt;
+    return sqlite3_column_int64(stmt.get(), 0);
+}
+
 
 } // namespace bsfchat

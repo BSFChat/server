@@ -59,6 +59,8 @@ add_executable(server_tests
     # the tests added with the fixes.
     test_security_audit_2026_09.cpp
     test_security_fixes_2026_09.cpp
+    # Blocking, reporting and self-service account deletion (schema v29).
+    test_ugc_safety.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -122,7 +124,9 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/api/ProfileHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/PushHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/SearchHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/AccountDataHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/AuditHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/ReportHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/BotHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/RoleHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/PermissionsHandler.cpp

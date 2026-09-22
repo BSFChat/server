@@ -212,8 +212,11 @@ TEST(MigrationV11, PreExistingV8DatabaseUpgradesAndKeepsItsData) {
     // the LiveKit media-key generation, which until then lived in memory and
     // reverted on every restart; 27 -> 28 added the linked_identities table, so
     // one human's identity-provider login and their existing account are one
-    // account. A v8 database still upgrades all the way in one go.
-    EXPECT_EQ(kTargetSchemaVersion, 28);
+    // account; 28 -> 29 added account_data, its ignored_users projection, the
+    // content_reports table and users.deactivated_at, for blocking, reporting
+    // and self-service account deletion. A v8 database still upgrades all the
+    // way in one go.
+    EXPECT_EQ(kTargetSchemaVersion, 29);
     std::filesystem::remove(path);
 }
 
