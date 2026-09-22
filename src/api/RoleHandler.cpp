@@ -5,6 +5,7 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
+#include "http/JsonIo.h"
 #include "http/Router.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
@@ -41,7 +42,7 @@ void send_json(httplib::Response& res, const json& body, int status = 200) {
 }
 
 std::optional<json> parse_object_body(const httplib::Request& req, httplib::Response& res) {
-    auto parsed = json::parse(req.body.empty() ? "{}" : req.body, nullptr, false);
+    auto parsed = parse_request_json_or_discarded(req.body.empty() ? "{}" : req.body);
     if (parsed.is_discarded() || !parsed.is_object()) {
         send_error(res, 400, MatrixError::bad_json("Request body must be a JSON object"));
         return std::nullopt;

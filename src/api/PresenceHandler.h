@@ -65,6 +65,9 @@ public:
     // briefly-disconnected client isn't flapped offline.
     static constexpr std::chrono::seconds kExpiry{150};
 
+    // status_msg ceiling, in code points (never bytes; see the .cpp).
+    static constexpr std::size_t kMaxStatusMsgCodepoints = 80;
+
 private:
     // Caller must hold mutex_.
     bool is_expired_locked(const Entry& e,

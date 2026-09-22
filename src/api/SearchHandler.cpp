@@ -4,6 +4,7 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
+#include "http/JsonIo.h"
 #include "store/SqliteStore.h"
 
 #include <bsfchat/Constants.h>
@@ -84,7 +85,7 @@ void SearchHandler::handle_search(const httplib::Request& req, httplib::Response
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         return send_error(res, 400, MatrixError::bad_json());
     }
@@ -114,7 +115,7 @@ void SearchHandler::handle_search(const httplib::Request& req, httplib::Response
         json out;
         out["search_categories"][kRoomEvents] = {
             {"count", 0}, {"results", json::array()}, {"highlights", json::array()}};
-        res.set_content(out.dump(), "application/json");
+        res.set_content(dump_response_json(out), "application/json");
         return;
     }
 
@@ -224,7 +225,7 @@ void SearchHandler::handle_search(const httplib::Request& req, httplib::Response
                 {"highlights", terms},
                 {"next_batch", std::to_string(offset + limit)},
             };
-            res.set_content(out.dump(), "application/json");
+            res.set_content(dump_response_json(out), "application/json");
             return;
         }
     }
@@ -236,7 +237,7 @@ void SearchHandler::handle_search(const httplib::Request& req, httplib::Response
         // The terms the client should highlight in the rendered results.
         {"highlights", terms},
     };
-    res.set_content(out.dump(), "application/json");
+    res.set_content(dump_response_json(out), "application/json");
 }
 
 } // namespace bsfchat

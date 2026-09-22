@@ -531,6 +531,10 @@ void SqliteStore::initialize() {
     // After the migrations and outside any transaction — see the function.
     vacuum_freelist_once_locked(fresh_database);
 
+    // Sessions that lapsed while the server was down, or were abandoned long
+    // before this build existed (audit S3). See reap_expired_tokens_locked.
+    reap_expired_tokens_locked(audit_now_ms(), /*force=*/true);
+
     // Load the monotonic stream counter, never letting it go backwards past
     // what the events table already contains (covers a database last written
     // by a build that derived positions from MAX(stream_position) + 1).
@@ -762,6 +766,38 @@ void SqliteStore::store_access_token(const std::string& token, const std::string
     if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
         throw std::runtime_error(std::string("Failed to store access token: ") + sqlite3_errmsg(db_));
     }
+    reap_expired_tokens_locked(now, /*force=*/false);
+}
+
+void SqliteStore::reap_expired_tokens_locked(int64_t now, bool force) {
+    // Abandoned sessions are otherwise reaped only when their access token is
+    // presented, which is precisely what an abandoned session never does (audit
+    // S3). Redemption refuses an expired refresh token on its own, so this is
+    // not what makes the tokens dead — it is what makes their hashes stop
+    // sitting in the database indefinitely.
+    //
+    // Run at startup and then at most hourly, piggybacked on token issue (every
+    // login, registration and refresh) rather than on a thread of its own: the
+    // table is small, the statement is one indexed-or-scanned DELETE, and a
+    // server nobody logs in to has no new rows to be untidy about.
+    constexpr int64_t kSweepIntervalMs = 60LL * 60 * 1000;
+    if (!force && now - last_token_sweep_ms_ < kSweepIntervalMs) return;
+    last_token_sweep_ms_ = now;
+
+    // lifetime_ms > 0 keeps bot tokens (non-expiring by design) out of it.
+    // A row without a refresh secret dies at its access expiry; a row with one
+    // dies at its refresh deadline — the same arithmetic as
+    // refresh_deadline_ms, spelled in SQL.
+    auto del = prepare(db_,
+        "DELETE FROM access_tokens WHERE lifetime_ms > 0 AND ("
+        "  (refresh_hash IS NULL AND expires_at <= ?1) OR"
+        "  (expires_at + lifetime_ms <= ?1))");
+    sqlite3_bind_int64(del.get(), 1, now);
+    sqlite3_step(del.get());
+    const int reaped = sqlite3_changes(db_);
+    if (reaped > 0) {
+        get_logger()->info("Reaped {} expired session(s)", reaped);
+    }
 }
 
 std::optional<std::string> SqliteStore::get_user_by_token(const std::string& token) {
@@ -772,9 +808,11 @@ std::optional<std::string> SqliteStore::get_user_by_token(const std::string& tok
     int64_t expires_at = 0;
     int64_t lifetime_ms = kDefaultAccessTokenLifetimeMs;
     int64_t last_used_at = 0;  // NULL reads as 0 = "never", which is what we want
+    bool has_refresh = false;
     {
         auto stmt = prepare(db_,
-            "SELECT user_id, expires_at, lifetime_ms, COALESCE(last_used_at, 0) "
+            "SELECT user_id, expires_at, lifetime_ms, COALESCE(last_used_at, 0), "
+            "       refresh_hash IS NOT NULL "
             "FROM access_tokens WHERE token_hash = ?");
         sqlite3_bind_text(stmt.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
@@ -782,6 +820,7 @@ std::optional<std::string> SqliteStore::get_user_by_token(const std::string& tok
         expires_at = sqlite3_column_int64(stmt.get(), 1);
         lifetime_ms = sqlite3_column_int64(stmt.get(), 2);
         last_used_at = sqlite3_column_int64(stmt.get(), 3);
+        has_refresh = sqlite3_column_int(stmt.get(), 4) != 0;
     }
 
     const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -800,10 +839,18 @@ std::optional<std::string> SqliteStore::get_user_by_token(const std::string& tok
     // credential ends, and both are explicit operator actions.
     if (lifetime_ms > 0) {
         if (expires_at <= now) {
-            // Reap it rather than leaving a dead row to be re-checked forever.
-            auto del = prepare(db_, "DELETE FROM access_tokens WHERE token_hash = ?");
-            sqlite3_bind_text(del.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_step(del.get());
+            // Reap it rather than leaving a dead row to be re-checked forever —
+            // unless the row still carries a refresh token inside its refresh
+            // window (refresh_deadline_ms). Presenting a lapsed access token is
+            // exactly what a refreshing client does first, and deleting the row
+            // here used to take the refresh secret with it, so the refresh that
+            // should have followed the 401 always failed. The access token is
+            // refused either way.
+            if (!has_refresh || refresh_deadline_ms(expires_at, lifetime_ms) <= now) {
+                auto del = prepare(db_, "DELETE FROM access_tokens WHERE token_hash = ?");
+                sqlite3_bind_text(del.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_step(del.get());
+            }
             return std::nullopt;
         }
 
@@ -899,14 +946,40 @@ SqliteStore::consume_refresh_token(const std::string& refresh_token) {
     auto refresh_hash = hash_access_token(refresh_token);
 
     TokenSession session;
+    int64_t expires_at = 0;
+    int64_t lifetime_ms = 0;
     {
         auto stmt = prepare(db_,
-            "SELECT user_id, device_id, family_id FROM access_tokens WHERE refresh_hash = ?");
+            "SELECT user_id, device_id, family_id, expires_at, lifetime_ms "
+            "FROM access_tokens WHERE refresh_hash = ?");
         sqlite3_bind_text(stmt.get(), 1, refresh_hash.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
         session.user_id = column_text_or_empty(stmt.get(), 0);
         session.device_id = column_text_or_empty(stmt.get(), 1);
         session.family_id = column_text_or_empty(stmt.get(), 2);
+        expires_at = sqlite3_column_int64(stmt.get(), 3);
+        lifetime_ms = sqlite3_column_int64(stmt.get(), 4);
+    }
+
+    // The refresh token's own expiry (security-audit-2026-09 finding S3).
+    //
+    // This used to mint a fresh session from ANY row that still existed, and
+    // rows were reaped only when their ACCESS token was presented — which an
+    // abandoned session (uninstalled app, lost device, a token lifted from an
+    // old backup or log) never does. So a refresh token outlived its session
+    // forever and redeemed into a current one in a single request.
+    //
+    // A row past its refresh deadline is reaped and refused, and it is NOT
+    // recorded as spent: it was never redeemed, so presenting it again is not
+    // evidence of a copied chain and must not revoke anyone's live family.
+    // lifetime_ms == 0 rows (bot tokens) never carry a refresh secret, so the
+    // guard is only here in case one ever does: a non-expiring row has no
+    // deadline to pass.
+    if (lifetime_ms > 0 && refresh_deadline_ms(expires_at, lifetime_ms) <= audit_now_ms()) {
+        auto del = prepare(db_, "DELETE FROM access_tokens WHERE refresh_hash = ?");
+        sqlite3_bind_text(del.get(), 1, refresh_hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(del.get());
+        return std::nullopt;
     }
 
     // Remember that this secret has been spent, BEFORE the row that holds it
@@ -984,7 +1057,12 @@ void SqliteStore::prune_consumed_refresh_tokens_locked() {
     // (and re-recorded) long before this; anything older belongs to a chain
     // that has not been touched in a full token lifetime, which cannot be
     // revoked usefully because its sessions have expired anyway.
-    constexpr int64_t kRetentionMs = kDefaultAccessTokenLifetimeMs;
+    //
+    // Two lifetimes, not one: a refresh token stays redeemable for one further
+    // lifetime after its access token lapses (refresh_deadline_ms), so a family
+    // can sit idle that long and still rotate. A spent record pruned sooner
+    // would let a replay inside that window go undetected.
+    constexpr int64_t kRetentionMs = 2 * kDefaultAccessTokenLifetimeMs;
     auto del = prepare(db_, "DELETE FROM consumed_refresh_tokens WHERE consumed_at < ?");
     sqlite3_bind_int64(del.get(), 1, audit_now_ms() - kRetentionMs);
     sqlite3_step(del.get());

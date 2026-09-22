@@ -55,6 +55,10 @@ add_executable(server_tests
     test_dm_membership.cpp
     test_permission_audit_2026_09.cpp
     test_permission_containment.cpp
+    # docs/security-audit-2026-09.md: the audit's proof tests, unchanged, and
+    # the tests added with the fixes.
+    test_security_audit_2026_09.cpp
+    test_security_fixes_2026_09.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -84,7 +88,10 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/core/Config.cpp
     ${CMAKE_SOURCE_DIR}/src/core/RateLimiter.cpp
     ${CMAKE_SOURCE_DIR}/src/core/SendLimiter.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/Utf8.cpp
     ${CMAKE_SOURCE_DIR}/src/http/ClientAddress.cpp
+    ${CMAKE_SOURCE_DIR}/src/http/JsonIo.cpp
+    ${CMAKE_SOURCE_DIR}/src/http/RequestGuard.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/LocalAuth.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/MediaAccess.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/Permissions.cpp

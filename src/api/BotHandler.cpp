@@ -1,4 +1,5 @@
 #include "api/BotHandler.h"
+#include "api/InputLimits.h"
 
 #include "audit/AuditLog.h"
 #include "auth/Permissions.h"
@@ -7,6 +8,7 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
+#include "http/JsonIo.h"
 #include "http/Router.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
@@ -156,7 +158,7 @@ void BotHandler::handle_create_bot(const httplib::Request& req, httplib::Respons
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         return send_error(res, 400, MatrixError::bad_json());
     }
@@ -171,6 +173,13 @@ void BotHandler::handle_create_bot(const httplib::Request& req, httplib::Respons
             "A bot localpart must start with \"" + std::string(bot::kLocalpartPrefix) +
             "\", be at most " + std::to_string(limits::kMaxUsernameLength) +
             " characters, and contain only lowercase letters, digits, ., _, -"));
+    }
+    // The bot's display name rides in its m.room.member event in every channel
+    // it joins, exactly like a human's set through PUT /displayname, so it gets
+    // the same ceiling (audit S2, api/InputLimits.h).
+    if (auto err = oversize_field("display_name", display_name,
+                                  input_limits::kMaxDisplayNameBytes)) {
+        return send_error(res, 400, *err);
     }
     if (description.size() > limits::kMaxBotDescriptionLength) {
         return send_error(res, 400, MatrixError::invalid_param(

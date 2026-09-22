@@ -1,9 +1,11 @@
 #include "api/EventHandler.h"
+#include "api/InputLimits.h"
 #include "auth/MediaAccess.h"
 #include "auth/Permissions.h"
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
+#include "http/JsonIo.h"
 #include "http/RateLimitResponse.h"
 #include "http/Router.h"
 #include "push/PushService.h"
@@ -505,7 +507,7 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
 
     json content;
     try {
-        content = json::parse(req.body);
+        content = parse_request_json(req.body);
     } catch (...) {
         return send_error(res, 400, MatrixError::bad_json());
     }
@@ -917,7 +919,7 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
 
     json resp;
     to_json(resp, msg_resp);
-    res.set_content(resp.dump(), "application/json");
+    res.set_content(dump_response_json(resp), "application/json");
 }
 
 void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Response& res) {
@@ -959,7 +961,7 @@ void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Resp
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         return send_error(res, 400, MatrixError::bad_json());
     }
@@ -1064,7 +1066,7 @@ void EventHandler::handle_redact(const httplib::Request& req, httplib::Response&
 
     json body = json::object();
     if (!req.body.empty()) {
-        try { body = json::parse(req.body); } catch (...) {
+        try { body = parse_request_json(req.body); } catch (...) {
             return send_error(res, 400, MatrixError::bad_json());
         }
     }
@@ -1072,7 +1074,16 @@ void EventHandler::handle_redact(const httplib::Request& req, httplib::Response&
     json content = json::object();
     content["redacts"] = target_event_id;
     if (body.contains("reason") && body["reason"].is_string()) {
-        content["reason"] = body["reason"];
+        // Checked here, BEFORE redact_event() below strips the target: an
+        // oversize reason must be refused with nothing done, not after the
+        // message is already gone. The redaction event is delivered to every
+        // member and kept forever, and nothing bounded this but the 51 MiB
+        // transport cap (audit S2). See api/InputLimits.h.
+        const auto& reason = body["reason"].get_ref<const std::string&>();
+        if (auto err = oversize_field("reason", reason, input_limits::kMaxReasonBytes)) {
+            return send_error(res, 400, *err);
+        }
+        content["reason"] = reason;
     }
 
     // Actually strip the target's content. Previously redaction only appended

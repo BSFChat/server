@@ -658,18 +658,36 @@ TEST(ClientAddress, TrustedPeerYieldsTheRightmostUntrustedHop) {
     // The header split across two lines: the order of repeated header lines
     // is not recoverable from httplib (unordered_multimap), so "rightmost" is
     // unknowable and the resolver must refuse to guess rather than risk
-    // returning the value the client supplied itself.
+    // returning the value the client supplied itself. Refusing to guess means
+    // the proxy's own bucket (fail closed, security-audit-2026-09 S4), never
+    // either of the header values.
     auto req = request_from("127.0.0.1", "6.6.6.6");
     req.set_header("X-Forwarded-For", "203.0.113.9");
-    EXPECT_EQ(r.resolve(req), std::nullopt);
+    EXPECT_EQ(r.resolve(req), "127.0.0.1");
 }
 
-TEST(ClientAddress, UnknowableClientIsNulloptNotASharedBucket) {
+TEST(ClientAddress, NoClientFromTheProxyIsNulloptNotASharedBucket) {
+    // Shapes no client can produce through a proxy that appends: the request
+    // did not come from a client, or the proxy forwards nothing.
     ClientAddressResolver r({"127.0.0.0/8", "10.0.0.0/8"});
     EXPECT_EQ(r.resolve(request_from("127.0.0.1")), std::nullopt);              // no header
     EXPECT_EQ(r.resolve(request_from("127.0.0.1", "10.0.0.5")), std::nullopt);  // all trusted
-    EXPECT_EQ(r.resolve(request_from("127.0.0.1", "1.2.3.4, unknown")), std::nullopt);
     EXPECT_EQ(r.resolve(request_from("")), std::nullopt);
+}
+
+TEST(ClientAddress, MalformedChainFailsClosedToThePeer) {
+    // Was nullopt — "skip the per-address limits" — until security-audit-
+    // 2026-09 S4. An unparseable hop where the walk needs an address now
+    // resolves to the trusted peer's bucket, and nothing to its left (which a
+    // client wrote) is ever consulted.
+    ClientAddressResolver r({"127.0.0.0/8", "10.0.0.0/8"});
+    EXPECT_EQ(r.resolve(request_from("127.0.0.1", "1.2.3.4, unknown")), "127.0.0.1");
+    EXPECT_EQ(r.resolve(request_from("127.0.0.1", "not-an-address")), "127.0.0.1");
+    EXPECT_EQ(r.resolve(request_from("127.0.0.1", "203.0.113.9, _hidden, 10.0.0.2")),
+              "127.0.0.1");
+    // A well-formed chain is untouched: the unparseable junk is to the LEFT of
+    // the first untrusted hop, where the walk never reaches.
+    EXPECT_EQ(r.resolve(request_from("127.0.0.1", "unknown, 203.0.113.9")), "203.0.113.9");
 }
 
 TEST(ClientAddress, Ipv6CollapsesToSlash64) {

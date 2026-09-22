@@ -432,6 +432,15 @@ struct Config {
     // deadlocking at exactly the size an operator configured.
     int max_workers = 512;
 
+    // Browser origins allowed to read this API cross-origin, exactly as a
+    // browser sends them in `Origin` ("https://app.example.com"). Empty — the
+    // default — means no CORS headers at all, which is right for every client
+    // that exists today: the desktop client is Qt and the bots are plain HTTP
+    // clients, none of which enforce CORS. Add an origin when a browser client
+    // ships. "*" is refused by Config::validate: a wildcard is what this
+    // replaced (security-audit-2026-09 finding S8). See http/RequestGuard.h.
+    std::vector<std::string> cors_allowed_origins;
+
     // Database
     std::string database_path = "./data/bsfchat.db";
 

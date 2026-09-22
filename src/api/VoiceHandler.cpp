@@ -4,6 +4,7 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
+#include "http/JsonIo.h"
 #include "http/Router.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
@@ -329,7 +330,7 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
     std::string device_id;
     if (!req.body.empty()) {
         try {
-            auto body = json::parse(req.body);
+            auto body = parse_request_json(req.body);
             device_id = body.value("device_id", "");
         } catch (...) {}
     }
@@ -518,7 +519,7 @@ void VoiceHandler::handle_voice_leave(const httplib::Request& req, httplib::Resp
     bool has_claimed_joined_at = false;
     if (!req.body.empty()) {
         try {
-            auto body = json::parse(req.body);
+            auto body = parse_request_json(req.body);
             if (body.is_object()) {
                 if (body.contains("session_id") && body["session_id"].is_string()) {
                     claimed_session = body["session_id"].get<std::string>();
@@ -716,7 +717,7 @@ void VoiceHandler::handle_voice_state(const httplib::Request& req, httplib::Resp
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
@@ -1011,7 +1012,7 @@ void VoiceHandler::handle_livekit_token(const httplib::Request& req, httplib::Re
     std::string device_id;
     if (!req.body.empty()) {
         try {
-            auto body = json::parse(req.body);
+            auto body = parse_request_json(req.body);
             device_id = body.value("device_id", "");
         } catch (...) {}
     }

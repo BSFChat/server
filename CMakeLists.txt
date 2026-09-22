@@ -26,8 +26,11 @@ add_executable(bsfchat-server
     src/core/InstanceSecret.cpp
     src/core/RateLimiter.cpp
     src/core/SendLimiter.cpp
+    src/core/Utf8.cpp
     src/http/HttpServer.cpp
     src/http/ClientAddress.cpp
+    src/http/JsonIo.cpp
+    src/http/RequestGuard.cpp
     src/http/Router.cpp
     src/http/Middleware.cpp
     src/auth/AutoJoin.cpp

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <list>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -42,13 +43,23 @@ public:
     size_t size();
 
 private:
+    // Each key's timestamps plus its place in the recency list, so eviction at
+    // the size bound is O(1) and takes the least recently SEEN key — see
+    // kMaxTrackedKeys in the .cpp for why that replaced clearing the map.
+    struct Entry {
+        std::deque<int64_t> times;
+        std::list<std::string>::iterator lru;
+    };
+
     void prune_locked(int64_t now);
+    void erase_locked(std::unordered_map<std::string, Entry>::iterator it);
 
     int max_events_;
     int64_t window_ms_;
     LimiterClock clock_;
     std::mutex mutex_;
-    std::unordered_map<std::string, std::deque<int64_t>> events_;
+    std::unordered_map<std::string, Entry> events_;
+    std::list<std::string> lru_;  // front = most recently seen
     int64_t last_prune_ = 0;
 };
 
@@ -72,19 +83,31 @@ public:
     size_t size();
 
 private:
+    // Two recency lists, because the two kinds of entry are not equally
+    // disposable. A key that is merely COUNTING failures can be forgotten at
+    // the cost of a slightly later lockout; a key that is LOCKED is the
+    // protection itself, and forgetting it is the bypass (audit S5). Eviction
+    // therefore takes the stalest counting entry first and touches a locked
+    // one only when nothing else is left.
     struct Entry {
         int failures = 0;
         int64_t locked_until = 0;
         int64_t last_failure = 0;
+        bool in_locked = false;
+        std::list<std::string>::iterator pos;
     };
 
     void prune_locked(int64_t now);
+    void erase_locked(std::unordered_map<std::string, Entry>::iterator it);
+    void evict_one_locked();
 
     int max_failures_;
     int64_t lockout_ms_;
     LimiterClock clock_;
     std::mutex mutex_;
     std::unordered_map<std::string, Entry> entries_;
+    std::list<std::string> counting_;  // front = most recent failure
+    std::list<std::string> locked_;    // front = most recently locked
     int64_t last_prune_ = 0;
 };
 
