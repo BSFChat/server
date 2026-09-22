@@ -109,15 +109,25 @@ public:
 
     // The client's address in canonical form, with IPv6 collapsed to its /64
     // (a single subscriber routinely controls a whole /64, so per-address
-    // limits would be no limit at all) — or nullopt when the client cannot be
-    // told apart from other clients:
+    // limits would be no limit at all).
     //
-    //   * the peer is a trusted proxy but sent no usable X-Forwarded-For, or
-    //     every hop in it is itself a trusted proxy;
-    //   * the peer address is missing or unparseable.
+    // When the peer is a trusted proxy and its X-Forwarded-For is MALFORMED —
+    // an unparseable hop ("unknown", an RFC 7239 obfuscated id) where the walk
+    // needs an address, or the header split over several lines — this returns
+    // the PEER, so those requests share the proxy's one bucket. Fail-closed on
+    // purpose (security-audit-2026-09 S4); it used to be nullopt, which
+    // callers read as "skip per-address limits", so one malformed hop switched
+    // the limits off.
     //
-    // Callers must treat nullopt as "skip per-address limits", never as a
-    // shared bucket.
+    // nullopt — callers skip per-address limits — is left for the cases no
+    // client can produce through a correctly configured proxy:
+    //
+    //   * the peer is a trusted proxy but sent no X-Forwarded-For, or every
+    //     hop in it is itself a trusted proxy (see the .cpp for why that is
+    //     not a shared bucket);
+    //   * the peer address is missing or unparseable (httplib fills
+    //     remote_addr numerically for every TCP connection, so only an
+    //     in-process caller sees this).
     [[nodiscard]] std::optional<std::string> resolve(const httplib::Request& req) const;
 
     // True when the request looks like it came through a reverse proxy that is

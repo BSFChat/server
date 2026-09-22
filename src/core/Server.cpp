@@ -18,6 +18,7 @@
 #include "api/PushHandler.h"
 #include "api/SearchHandler.h"
 #include "push/PushService.h"
+#include "http/RequestGuard.h"
 #include "http/Router.h"
 #include "storage/LocalStorage.h"
 #include "storage/MediaReaper.h"
@@ -88,20 +89,57 @@ Server::~Server() {
 void Server::register_routes() {
     auto& svr = http_server_->server();
 
-    // Set CORS headers for all responses
-    svr.set_pre_routing_handler([](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    // CORS: only for origins the operator has named in
+    // server.cors_allowed_origins, and never a wildcard. It used to be
+    // `Access-Control-Allow-Origin: *` on every response, which nothing needed
+    // and which let any web page read this API on a signed-in browser user's
+    // behalf. See apply_cors_headers in http/RequestGuard.h (audit S8).
+    svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
+        apply_cors_headers(req, res, config_.cors_allowed_origins);
         return httplib::Server::HandlerResponse::Unhandled;
     });
 
-    // Handle CORS preflight
+    // CORS preflight. Answered for any path so a browser gets a clean "no"
+    // (no Allow-Origin header) rather than a 404, and a clean "yes" for an
+    // allowlisted origin; the headers themselves come from the pre-routing
+    // handler above, which has already run.
     svr.Options(R"(.*)", [](const httplib::Request&, httplib::Response& res) {
-        res.set_header("Access-Control-Allow-Origin", "*");
-        res.set_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-        res.set_header("Access-Control-Allow-Headers", "Authorization, Content-Type");
         res.set_content("", "text/plain");
+    });
+
+    // Runs after a route matches and BEFORE its body is read: refuses
+    // compressed, chunked and oversized JSON bodies so they are never
+    // buffered, inflated or parsed. See http/RequestGuard.h (audit S6/S2).
+    svr.set_pre_request_handler([this](const httplib::Request& req, httplib::Response& res) {
+        if (auto refusal = refuse_before_body(req, config_)) {
+            res.status = refusal->status;
+            res.set_content(refusal->error.to_json().dump(), "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
+
+    // An exception that escapes a handler used to become a bare, unlogged 500
+    // — which is how the presence/sync failure of audit S1 stayed invisible:
+    // every co-member's /sync failed and nothing said why. Now it is logged
+    // (route pattern, not the raw path, and the message made log-safe) and the
+    // client gets the standard JSON error shape. It still fails that request;
+    // the fixes for S1 are what keep one account's data from failing everyone
+    // else's.
+    svr.set_exception_handler([](const httplib::Request& req, httplib::Response& res,
+                                 std::exception_ptr ep) {
+        std::string what = "non-standard exception";
+        try {
+            if (ep) std::rethrow_exception(ep);
+        } catch (const std::exception& e) {
+            what = e.what();
+        } catch (...) {
+        }
+        get_logger()->error("Unhandled exception in {} {}: {}", req.method,
+                            log_safe(req.matched_route.empty() ? req.path : req.matched_route, 200),
+                            log_safe(what, 300));
+        res.status = 500;
+        res.set_content(MatrixError::unknown().to_json().dump(), "application/json");
     });
 
     auto auth_handler = std::make_shared<AuthHandler>(*store_, *sync_engine_, config_, oidc_auth_.get());

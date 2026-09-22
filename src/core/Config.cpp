@@ -54,6 +54,17 @@ Config Config::load(const std::string& path) {
             if (auto v = server->get("port")) cfg.port = v->value_or(cfg.port);
             if (auto v = server->get("workers")) cfg.workers = v->value_or(cfg.workers);
             if (auto v = server->get("max_workers")) cfg.max_workers = v->value_or(cfg.max_workers);
+            // Single string or array, like voice.turn_uri.
+            if (auto v = server->get("cors_allowed_origins")) {
+                cfg.cors_allowed_origins.clear();
+                if (auto arr = v->as_array()) {
+                    for (const auto& el : *arr) {
+                        if (auto o = el.value<std::string>()) cfg.cors_allowed_origins.push_back(*o);
+                    }
+                } else if (auto o = v->value<std::string>()) {
+                    cfg.cors_allowed_origins.push_back(*o);
+                }
+            }
         }
 
         // [database]
@@ -284,6 +295,25 @@ bool turn_credentials_are_shared(const VoiceConfig& voice) {
 
 void Config::validate(Config& cfg) {
     auto log = get_logger();
+
+    // A wildcard is exactly the default this list replaced (audit S8): it lets
+    // every web page on the internet read the API on a signed-in browser
+    // user's behalf. Dropped rather than fatal, so a config written for the
+    // old behaviour still starts; the named origins beside it keep working.
+    {
+        auto& origins = cfg.cors_allowed_origins;
+        const auto before = origins.size();
+        origins.erase(std::remove_if(origins.begin(), origins.end(),
+                                     [](const std::string& o) {
+                                         return o.empty() || o == "*" || o == "null";
+                                     }),
+                      origins.end());
+        if (origins.size() != before) {
+            log->warn("server.cors_allowed_origins: ignored {} entr{} (\"*\", \"null\" or empty). "
+                      "List each browser origin by name, e.g. \"https://app.example.com\".",
+                      before - origins.size(), before - origins.size() == 1 ? "y" : "ies");
+        }
+    }
 
     if (cfg.voice.enabled) {
         const bool has_relay = !cfg.voice.turn_uris.empty();

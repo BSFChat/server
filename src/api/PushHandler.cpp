@@ -4,6 +4,7 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
+#include "http/JsonIo.h"
 #include "http/Router.h"
 #include "push/PushService.h"
 #include "store/SqliteStore.h"
@@ -458,7 +459,7 @@ void PushHandler::handle_set_pusher(const httplib::Request& req, httplib::Respon
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         return send_error(res, 400, MatrixError::bad_json());
     }
@@ -623,7 +624,7 @@ void PushHandler::handle_put_notify_level(const httplib::Request& req, httplib::
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         return send_error(res, 400, MatrixError::bad_json());
     }

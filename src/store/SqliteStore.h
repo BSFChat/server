@@ -39,6 +39,21 @@ inline constexpr int64_t kDefaultAccessTokenLifetimeMs = 90LL * 24 * 60 * 60 * 1
 // hundreds of requests a second costs one write, not hundreds.
 inline constexpr int64_t kBotLastSeenIntervalMs = 60LL * 1000;
 
+// When a session's refresh token stops being redeemable: one further lifetime
+// after its access token lapses (180 days idle at the default 90-day lifetime).
+//
+// Longer than the access token, because refreshing a lapsed access token is
+// what a refresh token is for — but FINITE, which it was not before
+// security-audit-2026-09 finding S3: redemption never read the expiry at all,
+// so a refresh token lifted from an abandoned device worked forever. Derived
+// from the row's own expires_at and lifetime_ms rather than stored, so it
+// needed no schema change and every existing row got a deadline the moment
+// this shipped. Because expires_at slides while the session is used, so does
+// this: an active session never meets it.
+constexpr int64_t refresh_deadline_ms(int64_t expires_at, int64_t lifetime_ms) {
+    return expires_at + lifetime_ms;
+}
+
 // Sentinel "user id" a room-wide (`@room`) mention is stored under. Safe as a
 // sentinel because every real Matrix user id is "@localpart:server" and so
 // always contains a colon — no account can ever collide with it, which means a
@@ -207,7 +222,9 @@ public:
     // to and removes the row, so the caller can issue a fresh access/refresh
     // pair. Rotation-on-use means a stolen refresh token stops working as soon
     // as the legitimate client refreshes. Expiry of the ACCESS token does not
-    // block redemption — refreshing an expired access token is the whole point.
+    // block redemption — refreshing an expired access token is the whole point —
+    // but the refresh token's own deadline does (refresh_deadline_ms): past it
+    // the row is reaped and nothing is returned.
     std::optional<TokenSession> consume_refresh_token(const std::string& refresh_token);
     // Reuse detection, to be called when consume_refresh_token() returned
     // nothing: if this refresh token was one we have ALREADY redeemed, the
@@ -1343,6 +1360,11 @@ private:
     // Drops spent refresh-token records once no live session could still
     // belong to their family. Called with mutex_ already held.
     void prune_consumed_refresh_tokens_locked();
+    // Deletes sessions past their expiry (or, when they hold a refresh token,
+    // past refresh_deadline_ms). Throttled to hourly unless `force`. Called
+    // with mutex_ already held.
+    void reap_expired_tokens_locked(int64_t now, bool force);
+    int64_t last_token_sweep_ms_ = 0;
 
     void exec(const std::string& sql);
     // Strips group/other access from the database file and its -wal/-shm

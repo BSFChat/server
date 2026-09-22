@@ -199,9 +199,12 @@ std::optional<std::string> ClientAddressResolver::resolve(const httplib::Request
     // So more than one line means we do not know who this is. nginx and every
     // mainstream proxy fold the header into a single line, so this only bites
     // a proxy that was already behaving unusually.
+    //
+    // "We do not know who this is" now means the TRUSTED PEER's own bucket, not
+    // no bucket at all — see the fail-closed note below.
     std::vector<std::string> hops;
     const auto lines = req.get_header_value_count("X-Forwarded-For");
-    if (lines > 1) return std::nullopt;
+    if (lines > 1) return canonical(*peer);
     for (size_t i = 0; i < lines; ++i) {
         const auto line = req.get_header_value("X-Forwarded-For", "", i);
         size_t start = 0;
@@ -220,13 +223,41 @@ std::optional<std::string> ClientAddressResolver::resolve(const httplib::Request
     // hands the client the choice of its own rate-limit identity.
     for (auto it = hops.rbegin(); it != hops.rend(); ++it) {
         auto hop = parse_ip(*it);
-        // "unknown" or an obfuscated node id (RFC 7239): a trusted proxy is
-        // telling us it does not know. Neither do we.
-        if (!hop) return std::nullopt;
+        // "unknown" or an obfuscated node id (RFC 7239), or plain garbage: see
+        // below. Stop walking either way — everything to its left is
+        // client-supplied, so walking past it would be worse than both options.
+        if (!hop) return canonical(*peer);
         if (!is_trusted(*hop)) return canonical(*hop);
     }
+    // No header, or every hop is one of our own proxies: the request did not
+    // come from a client at all (a health check, a proxy-originated request) or
+    // the proxy is not configured to forward the client. Nothing a client can
+    // put on the wire gets here — nginx's appended $remote_addr is always the
+    // rightmost hop — so this stays "unknown, skip per-address limits" rather
+    // than one shared bucket, for the reason the test
+    // ProxyWithNoForwardedForIsNotOneGiantBucket records: a misconfigured proxy
+    // must not let one attacker's ten wrong passwords lock the whole server out
+    // of /login.
     return std::nullopt;
 }
+
+// On the two returns of canonical(*peer) above — a split header and an
+// unparseable hop — resolution fails CLOSED (security-audit-2026-09 finding S4).
+// Both used to return nullopt, which AuthHandler reads as "skip per-address
+// limits", so one malformed value in the position this walk reaches switched
+// off the login/register/refresh attempt limits and the PBKDF2-cost brake for
+// that request. On the shipped nginx that position is always nginx's own
+// appended address, so it was latent — but it was one proxy misconfiguration
+// (a hop that appends "unknown", a second proxy that adds a header line rather
+// than appending) away from live, and unlike the no-header case above it is a
+// shape a CLIENT can try to produce.
+//
+// The peer is a trusted proxy, so such requests share that proxy's single
+// bucket: a known-imperfect identity that still bounds the work, where nullopt
+// removed the bound. The shared bucket holds only requests that arrived with a
+// malformed chain, so an attacker filling it locks out nobody whose proxy
+// forwards properly; well-formed headers take the return inside the loop
+// exactly as before.
 
 bool ClientAddressResolver::looks_like_untrusted_proxy(const httplib::Request& req) const {
     if (!req.has_header("X-Forwarded-For")) return false;

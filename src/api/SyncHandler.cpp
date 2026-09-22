@@ -4,6 +4,7 @@
 #include "auth/Permissions.h"
 #include "auth/RoomVisibility.h"
 #include "core/Config.h"
+#include "http/JsonIo.h"
 #include "http/Middleware.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
@@ -47,6 +48,17 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
             timeout = limits::kDefaultSyncTimeoutMs;
         }
         timeout = std::clamp(timeout, 0, limits::kMaxSyncTimeoutMs);
+    }
+
+    // Only an incremental sync with a timeout can park; an initial sync and a
+    // timeout=0 poll return at once and need no slot. Over the per-account cap
+    // the poll is answered immediately instead of parked — see
+    // sync/ParkedSyncGate.h for why that and not a 429. The slot lives until
+    // this function returns, i.e. for exactly as long as the worker is held.
+    ParkedSyncGate::Slot parked_slot;
+    if (!since.empty() && timeout > 0) {
+        parked_slot = parked_.try_park(*user_id);
+        if (!parked_slot) timeout = 0;
     }
 
     auto response = sync_engine_.handle_sync(*user_id, since, timeout);
@@ -198,9 +210,17 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
         if (!pe.events.empty()) response.presence = std::move(pe);
     }
 
+    // Lenient serialisation. This response is assembled from OTHER accounts'
+    // data — their presence, their messages, their state — and the strict
+    // dump() throws on any invalid UTF-8 anywhere in it; the throw escaped as a
+    // 500, so one bad string from one account made /sync fail for everyone
+    // who shared a room with it (audit S1). The server no longer manufactures
+    // such strings (PresenceHandler, core/Utf8.h), and this makes sure no
+    // single field can ever again take the whole poll down with it: a bad byte
+    // becomes U+FFFD in one field of one event.
     json resp;
     to_json(resp, response);
-    res.set_content(resp.dump(), "application/json");
+    res.set_content(dump_response_json(resp), "application/json");
 }
 
 } // namespace bsfchat

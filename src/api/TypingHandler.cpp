@@ -4,6 +4,7 @@
 
 #include "auth/Permissions.h"
 #include "http/Middleware.h"
+#include "http/JsonIo.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
 #include "core/Config.h"
@@ -78,7 +79,7 @@ void TypingHandler::handle_typing(const httplib::Request& req, httplib::Response
     // Parse request body
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");

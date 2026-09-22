@@ -8,6 +8,7 @@
 #include "core/InstanceSecret.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
+#include "http/JsonIo.h"
 #include "http/RateLimitResponse.h"
 #include "storage/MediaStorage.h"
 #include "store/SqliteStore.h"
@@ -401,7 +402,7 @@ void MediaHandler::handle_ticket(const httplib::Request& req, httplib::Response&
 
     std::string mxc_uri;
     try {
-        auto body = nlohmann::json::parse(req.body);
+        auto body = parse_request_json(req.body);
         if (!body.is_object() || !body.contains("mxc_uri") || !body["mxc_uri"].is_string()) {
             throw std::runtime_error("mxc_uri must be a string");
         }

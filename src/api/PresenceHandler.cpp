@@ -1,7 +1,9 @@
 #include "api/PresenceHandler.h"
 
 #include "core/Config.h"
+#include "core/Utf8.h"
 #include "http/Middleware.h"
+#include "http/JsonIo.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
 
@@ -43,11 +45,24 @@ void PresenceHandler::handle_put_presence(const httplib::Request& req,
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(),
                         "application/json");
+        return;
+    }
+
+    // value() below throws type_error on a non-object body or a non-string
+    // field, which escaped as a bare 500. A malformed body is a 400.
+    if (!body.is_object() ||
+        (body.contains("presence") && !body["presence"].is_string()) ||
+        (body.contains("status_msg") && !body["status_msg"].is_null() &&
+         !body["status_msg"].is_string())) {
+        res.status = 400;
+        res.set_content(MatrixError::bad_json(
+            "presence and status_msg must be strings").to_json().dump(),
+            "application/json");
         return;
     }
 
@@ -63,11 +78,25 @@ void PresenceHandler::handle_put_presence(const httplib::Request& req,
             "application/json");
         return;
     }
-    std::string status_msg = body.value("status_msg", "");
+    std::string status_msg;
+    if (body.contains("status_msg") && body["status_msg"].is_string()) {
+        status_msg = body["status_msg"].get<std::string>();
+    }
 
-    // Cap status length to keep clients honest. 80 chars matches
-    // Discord's status field.
-    if (status_msg.size() > 80) status_msg.resize(80);
+    // Cap status length to keep clients honest. 80 chars matches Discord's
+    // status field (and the client's StatusPicker maximumLength).
+    //
+    // CHARACTERS, on a code-point boundary. This used to be
+    // `status_msg.resize(80)` — a byte count — and that was security-audit
+    // 2026-09 finding S1, the one rated High: 79 ASCII bytes and a two-byte
+    // character put the cut between the character's two bytes, the stored
+    // string ended in a lone UTF-8 lead byte, and SyncHandler's strict dump()
+    // threw on it while serialising the presence of EVERY co-member. One
+    // unprivileged PUT made /sync answer 500 to everyone sharing a room with
+    // the sender, for as long as the entry lived, renewable by re-PUTting.
+    // See core/Utf8.h; SyncHandler now also serialises leniently, so a bad
+    // string from anywhere else cannot do this again either.
+    status_msg = truncate_utf8(status_msg, kMaxStatusMsgCodepoints);
 
     auto now = std::chrono::steady_clock::now();
     {

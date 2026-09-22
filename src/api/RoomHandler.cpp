@@ -1,4 +1,5 @@
 #include "api/RoomHandler.h"
+#include "api/InputLimits.h"
 #include "auth/MediaAccess.h"
 #include "audit/AuditLog.h"
 #include "auth/AutoJoin.h"
@@ -8,6 +9,7 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
+#include "http/JsonIo.h"
 #include "http/RateLimitResponse.h"
 #include "http/Router.h"
 #include "identity/Nickname.h"
@@ -520,6 +522,22 @@ MembershipIntent classify_transition(MembershipAction declared, const std::strin
     return {};
 }
 
+// The optional free-text `reason` on kick / ban / unban. Bounded because it is
+// written into the membership event the whole room receives and into the audit
+// log, and until audit S2 nothing but the 51 MiB transport cap limited it.
+//
+// Also typed: `body.value("reason", "")` threw nlohmann's type_error on a
+// non-string reason, which escaped the handler as a bare 500. A wrong type is
+// the caller's mistake and gets the caller's 400.
+std::optional<MatrixError> read_reason(const json& body, std::string& out) {
+    out.clear();
+    const auto it = body.find("reason");
+    if (it == body.end() || it->is_null()) return std::nullopt;
+    if (!it->is_string()) return MatrixError::bad_json("reason must be a string");
+    out = it->get<std::string>();
+    return oversize_field("reason", out, input_limits::kMaxReasonBytes);
+}
+
 } // namespace
 
 RoomHandler::RoomHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config)
@@ -772,7 +790,7 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
 
     json body;
     try {
-        body = json::parse(req.body.empty() ? "{}" : req.body);
+        body = parse_request_json(req.body.empty() ? "{}" : req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
@@ -781,6 +799,24 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
 
     CreateRoomRequest room_req;
     from_json(body, room_req);
+
+    // Name and topic become m.room.name / m.room.topic state events that every
+    // member downloads on every initial sync. Bounded here like the same
+    // events written through PUT /state (see handle_set_state); audit S2.
+    {
+        std::optional<MatrixError> err;
+        if (room_req.name) {
+            err = oversize_field("name", *room_req.name, input_limits::kMaxRoomNameBytes);
+        }
+        if (!err && room_req.topic) {
+            err = oversize_field("topic", *room_req.topic, input_limits::kMaxRoomTopicBytes);
+        }
+        if (err) {
+            res.status = 400;
+            res.set_content(err->to_json().dump(), "application/json");
+            return;
+        }
+    }
 
     // Direct messages are a per-user capability, not channel management: any
     // authenticated user may open a DM. Everything else — channels and
@@ -1407,7 +1443,7 @@ void RoomHandler::handle_room_state(const httplib::Request& req, httplib::Respon
         to_json(j, ev);
         resp.push_back(j);
     }
-    res.set_content(resp.dump(), "application/json");
+    res.set_content(dump_response_json(resp), "application/json");
 }
 
 void RoomHandler::handle_room_state_event(const httplib::Request& req, httplib::Response& res) {
@@ -1444,7 +1480,7 @@ void RoomHandler::handle_room_state_event(const httplib::Request& req, httplib::
         return;
     }
 
-    res.set_content(event->content.data.dump(), "application/json");
+    res.set_content(dump_response_json(event->content.data), "application/json");
 }
 
 void RoomHandler::handle_room_members(const httplib::Request& req, httplib::Response& res) {
@@ -1493,7 +1529,7 @@ void RoomHandler::handle_room_members(const httplib::Request& req, httplib::Resp
             {"room_id", room_id},
         });
     }
-    res.set_content(json{{"chunk", chunk}}.dump(), "application/json");
+    res.set_content(dump_response_json(json{{"chunk", chunk}}), "application/json");
 }
 
 void RoomHandler::handle_kick(const httplib::Request& req, httplib::Response& res) {
@@ -1520,7 +1556,7 @@ void RoomHandler::handle_kick(const httplib::Request& req, httplib::Response& re
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
@@ -1534,7 +1570,12 @@ void RoomHandler::handle_kick(const httplib::Request& req, httplib::Response& re
     }
 
     auto target_user = body["user_id"].get<std::string>();
-    auto reason = body.value("reason", "");
+    std::string reason;
+    if (auto err = read_reason(body, reason)) {
+        res.status = 400;
+        res.set_content(err->to_json().dump(), "application/json");
+        return;
+    }
 
     // Permission scope, rank, the membership row, the event and the audit record
     // all live in apply_membership_moderation — see its declaration for why this
@@ -1579,7 +1620,7 @@ void RoomHandler::handle_ban(const httplib::Request& req, httplib::Response& res
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
@@ -1593,7 +1634,12 @@ void RoomHandler::handle_ban(const httplib::Request& req, httplib::Response& res
     }
 
     auto target_user = body["user_id"].get<std::string>();
-    auto reason = body.value("reason", "");
+    std::string reason;
+    if (auto err = read_reason(body, reason)) {
+        res.status = 400;
+        res.set_content(err->to_json().dump(), "application/json");
+        return;
+    }
 
     // A ban is SERVER-WIDE, and this endpoint is where it is placed.
     //
@@ -1657,7 +1703,7 @@ void RoomHandler::handle_unban(const httplib::Request& req, httplib::Response& r
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
@@ -1671,7 +1717,12 @@ void RoomHandler::handle_unban(const httplib::Request& req, httplib::Response& r
     }
 
     auto target_user = body["user_id"].get<std::string>();
-    auto reason = body.value("reason", "");
+    std::string reason;
+    if (auto err = read_reason(body, reason)) {
+        res.status = 400;
+        res.set_content(err->to_json().dump(), "application/json");
+        return;
+    }
 
     // Interoperates with the server-wide ban by BEING the server-wide unban: it
     // clears the ban-list row and restores every room where the projection had set
@@ -1859,7 +1910,7 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
@@ -2330,13 +2381,59 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     const bool is_server_scoped = gate.home == Home::kServerState;
     const std::string perm_scope = gate.scope == Scope::kServer ? kServerScope : room_id;
 
+    // A state event is an event: the same ceiling /send applies, for the same
+    // reason (every member downloads it, and state is re-sent on every initial
+    // sync, which makes an oversize state event worse than an oversize
+    // message). RequestGuard already refuses a larger body before it is read;
+    // this is the handler saying so for itself, so the rule survives being
+    // called without that guard in front of it. Audit S2.
+    if (req.body.size() > config_.send_limits.max_event_bytes) {
+        res.status = 413;
+        res.set_content(
+            MatrixError::too_large("State event content is " + std::to_string(req.body.size()) +
+                                   " bytes; the limit is " +
+                                   std::to_string(config_.send_limits.max_event_bytes))
+                .to_json()
+                .dump(),
+            "application/json");
+        return;
+    }
+
     json content;
     try {
-        content = json::parse(req.body);
+        content = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
         return;
+    }
+
+    // The two state events whose one field is a user-facing string get the
+    // same per-field ceilings createRoom applies, so the limit does not depend
+    // on which route wrote the event. A member event's `reason` (kick/ban via
+    // PUT state rather than the /kick and /ban endpoints) is bounded like the
+    // endpoints' own.
+    {
+        std::optional<MatrixError> err;
+        const auto string_field = [&](const char* key, std::size_t max) {
+            if (err || !content.is_object()) return;
+            const auto it = content.find(key);
+            if (it != content.end() && it->is_string()) {
+                err = oversize_field(key, it->get_ref<const std::string&>(), max);
+            }
+        };
+        if (evt_type == event_type::kRoomName) {
+            string_field("name", input_limits::kMaxRoomNameBytes);
+        } else if (evt_type == event_type::kRoomTopic) {
+            string_field("topic", input_limits::kMaxRoomTopicBytes);
+        } else if (evt_type == event_type::kRoomMember) {
+            string_field("reason", input_limits::kMaxReasonBytes);
+        }
+        if (err) {
+            res.status = 400;
+            res.set_content(err->to_json().dump(), "application/json");
+            return;
+        }
     }
 
     // Self-membership: a joined member may update their own m.room.member
@@ -2666,7 +2763,7 @@ void RoomHandler::handle_move_channel(const httplib::Request& req, httplib::Resp
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
@@ -2756,7 +2853,7 @@ void RoomHandler::handle_set_order(const httplib::Request& req, httplib::Respons
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");

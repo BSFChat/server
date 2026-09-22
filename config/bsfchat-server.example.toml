@@ -42,6 +42,12 @@ workers = 64
 # after a restart — leaves a backlog that growth alone will not clear.
 max_workers = 512
 
+# Browser origins allowed to call this API cross-origin. Leave empty (the
+# default) unless you run a BROWSER client: the desktop app and bots are not
+# browsers and need no CORS. "*" is refused — it would let any web page read
+# the API on behalf of a signed-in browser user.
+# cors_allowed_origins = ["https://app.yourdomain.com"]
+
 [database]
 # This file is NOT encrypted. It holds every message body in plaintext, a
 # second full copy of each body in the search index, queued push payloads and

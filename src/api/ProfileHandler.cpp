@@ -1,10 +1,12 @@
 #include "api/ProfileHandler.h"
+#include "api/InputLimits.h"
 #include "auth/MediaAccess.h"
 #include "audit/AuditLog.h"
 #include "auth/Permissions.h"
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
+#include "http/JsonIo.h"
 #include "http/RateLimitResponse.h"
 #include "http/Router.h"
 #include "identity/Nickname.h"
@@ -118,7 +120,7 @@ void ProfileHandler::handle_get_profile(const httplib::Request& req, httplib::Re
     // shown to everyone who sees the account.
     if (store_.is_bot(user_id)) resp[std::string(bot::kProfileKey)] = true;
 
-    res.set_content(resp.dump(), "application/json");
+    res.set_content(dump_response_json(resp), "application/json");
 }
 
 void ProfileHandler::handle_get_displayname(const httplib::Request& req, httplib::Response& res) {
@@ -150,7 +152,7 @@ void ProfileHandler::handle_get_displayname(const httplib::Request& req, httplib
     auto display_name = store_.get_display_name(user_id);
     if (display_name) resp["displayname"] = *display_name;
 
-    res.set_content(resp.dump(), "application/json");
+    res.set_content(dump_response_json(resp), "application/json");
 }
 
 void ProfileHandler::handle_put_displayname(const httplib::Request& req, httplib::Response& res) {
@@ -180,7 +182,7 @@ void ProfileHandler::handle_put_displayname(const httplib::Request& req, httplib
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
@@ -193,12 +195,24 @@ void ProfileHandler::handle_put_displayname(const httplib::Request& req, httplib
         return;
     }
 
+    // Size before rate: a refused oversize name must not spend budget either.
+    // The name is re-emitted as an m.room.member event into every joined
+    // channel (broadcastMemberUpdate), so it is bounded like one field of an
+    // event rather than like a request body. See api/InputLimits.h (audit S2).
+    const auto displayname = body["displayname"].get<std::string>();
+    if (auto err = oversize_field("displayname", displayname,
+                                  input_limits::kMaxDisplayNameBytes)) {
+        res.status = 400;
+        res.set_content(err->to_json().dump(), "application/json");
+        return;
+    }
+
     // Charged here, after the request has been validated and immediately before
     // the fan-out it is protecting. Charging earlier would spend budget on
     // malformed requests that were never going to emit anything.
     if (profile_flood(*user_id, res)) return;
 
-    store_.set_display_name(*user_id, body["displayname"].get<std::string>());
+    store_.set_display_name(*user_id, displayname);
     broadcastMemberUpdate(*user_id);
 
     get_logger()->info("User {} updated display name", *user_id);
@@ -234,7 +248,7 @@ void ProfileHandler::handle_get_avatar_url(const httplib::Request& req, httplib:
     auto avatar_url = store_.get_avatar_url(user_id);
     if (avatar_url) resp["avatar_url"] = *avatar_url;
 
-    res.set_content(resp.dump(), "application/json");
+    res.set_content(dump_response_json(resp), "application/json");
 }
 
 void ProfileHandler::handle_put_avatar_url(const httplib::Request& req, httplib::Response& res) {
@@ -264,7 +278,7 @@ void ProfileHandler::handle_put_avatar_url(const httplib::Request& req, httplib:
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
@@ -277,9 +291,14 @@ void ProfileHandler::handle_put_avatar_url(const httplib::Request& req, httplib:
         return;
     }
 
-    if (profile_flood(*user_id, res)) return;
-
     const auto avatar_url = body["avatar_url"].get<std::string>();
+    if (auto err = oversize_field("avatar_url", avatar_url, input_limits::kMaxAvatarUrlBytes)) {
+        res.status = 400;
+        res.set_content(err->to_json().dump(), "application/json");
+        return;
+    }
+
+    if (profile_flood(*user_id, res)) return;
 
     // The avatar has to be an object THIS account uploaded. Audit F5's worst
     // variant, and the reason the test is "uploaded" and not "can read":
@@ -367,7 +386,7 @@ void ProfileHandler::handle_get_nickname(const httplib::Request& req, httplib::R
     // spelled as an empty object.
     json resp = json::object();
     if (auto nick = store_.get_nickname(user_id)) resp["nickname"] = *nick;
-    res.set_content(resp.dump(), "application/json");
+    res.set_content(dump_response_json(resp), "application/json");
 }
 
 void ProfileHandler::handle_put_nickname(const httplib::Request& req, httplib::Response& res) {
@@ -432,7 +451,7 @@ void ProfileHandler::handle_put_nickname(const httplib::Request& req, httplib::R
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
