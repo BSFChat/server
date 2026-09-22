@@ -128,7 +128,7 @@ MUTATIONS = [
         [(AUTH,
           [("    if (!claims) {\n"
             "        record_failure(client, {});\n"
-            "        send_error(res, 403, MatrixError::forbidden(\"Invalid identity token\"));\n"
+            "        send_error(res, 403, MatrixError::forbidden(refusal));\n"
             "        return;\n"
             "    }",
             "    if (!claims) {\n"
@@ -175,6 +175,40 @@ MUTATIONS = [
             '    nlohmann::json after = {{"issuer", issuer}, {"subject", "a5cdbefe"}};')])],
         "AccountLinkTest.TheProviderSubjectIsNotRecordedAsAClaimOfItsOwn"
         ":AccountLinkTest.LinkingIsAuditedWithExactlyTheIssuerAndTheSupersededAccount",
+    ),
+    # ── C1: the token is bound to THIS server (identity audit 2026-09) ──
+    Mutation(
+        "C1a: the audience is the shared client id again (the code before the C1 fix)",
+        [(AUTH, [("    const std::string audience = expected_identity_audience(config_);\n",
+                  "    const std::string audience = config_.identity->client_id;\n")])],
+        "AccountLinkTest.C1_TheLegacyClientIdAudienceSignsNobodyIn:"
+        "AccountLinkTest.C1_AReplayedTokenCannotHijackAnIdentityThroughLinkIdentity",
+    ),
+    Mutation(
+        "C1b: an underivable audience falls through to jwt_verify's unchecked mode",
+        [(AUTH, [("    if (audience.empty()) {\n"
+                  "        log->error(\"Refused an identity token: this server has no usable public URL \"\n",
+                  "    if (false) {\n"
+                  "        log->error(\"Refused an identity token: this server has no usable public URL \"\n")])],
+        "AccountLinkTest.AnUnusablePublicUrlRefusesEveryToken",
+    ),
+    Mutation(
+        "C1c: a token is accepted however many times it is presented",
+        [(AUTH, [("    if (!oidc_auth_->first_presentation(claims->iss, claims->sub, *claims->nonce,\n",
+                  "    if (false && !oidc_auth_->first_presentation(claims->iss, claims->sub, *claims->nonce,\n")])],
+        "AccountLinkTest.AnIdentityTokenIsAcceptedOnce",
+    ),
+    Mutation(
+        "C1d: azp is not checked, so another relying party's token signs in here",
+        [(AUTH, [("    if (!client_id.empty() && claims->azp.value_or(std::string()) != client_id) {\n",
+                  "    if (false) {\n")])],
+        "AccountLinkTest.ATokenIssuedToAnotherClientIsRefused",
+    ),
+    Mutation(
+        "C1e: a token without a nonce is accepted",
+        [(AUTH, [("    if (!claims->nonce || claims->nonce->empty()) {\n",
+                  "    if (!claims->nonce) claims->nonce = std::string(\"\");\n    if (false) {\n")])],
+        "AccountLinkTest.ATokenWithoutANonceIsRefused",
     ),
 ]
 

@@ -70,6 +70,30 @@ bool OidcAuth::has_keys() const {
     return !keys_by_kid_.empty();
 }
 
+bool OidcAuth::first_presentation(const std::string& issuer, const std::string& subject,
+                                  const std::string& nonce, int64_t expires_at) {
+    const int64_t now = now_seconds();
+    // Length-prefixed, so no choice of subject or nonce can make two
+    // different triples spell the same key.
+    std::string key = std::to_string(issuer.size()) + ':' + issuer +
+                      std::to_string(subject.size()) + ':' + subject + nonce;
+
+    std::lock_guard lock(seen_mutex_);
+    if (seen_tokens_.size() >= kMaxSeenTokens) {
+        std::erase_if(seen_tokens_, [now](const auto& entry) { return entry.second < now; });
+        if (seen_tokens_.size() >= kMaxSeenTokens) return false;
+    }
+    auto [it, inserted] = seen_tokens_.emplace(std::move(key), expires_at);
+    if (inserted) return true;
+    if (it->second < now) {
+        // A stale record: the token it was made for has expired, so this is
+        // not that token being replayed (an expired token never verifies).
+        it->second = expires_at;
+        return true;
+    }
+    return false;
+}
+
 void OidcAuth::start_background_refresh() {
     if (refresher_.joinable()) return;
     refresher_ = std::thread([this] { background_refresh_loop(); });

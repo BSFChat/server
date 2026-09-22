@@ -399,9 +399,15 @@ protected:
         bsfchat::JwtClaims claims;
         claims.sub = subject;
         claims.iss = issuer();
-        claims.aud = "bsfchat-server";
+        // Audienced to this server's own URL ("https://" + server_name, as no
+        // public_url is set), issued to the configured client, with a nonce —
+        // which the server now requires, and accepts once.
+        static int nonce_counter = 0;
+        claims.aud = "https://test";
+        claims.azp = "bsfchat-server";
+        claims.nonce = "nonce-" + std::to_string(++nonce_counter);
         claims.iat = now;
-        claims.exp = now + 600;
+        claims.exp = now + 300;
         return bsfchat::jwt_sign(claims, private_pem, "test-key-1");
     }
 
