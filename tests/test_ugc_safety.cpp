@@ -280,7 +280,7 @@ TEST(UgcBlocking, IgnoreListRoundTripsThroughAccountData) {
     f.add_user("spammer");
     f.add_user("other");
 
-    AccountDataHandler handler(*f.store, f.config);
+    AccountDataHandler handler(*f.store, *f.sync, f.config);
 
     // Nothing written yet: 404, which is what lets a client tell "no block
     // list" from "an empty block list" and decide whether to upload its own.
@@ -317,7 +317,7 @@ TEST(UgcBlocking, UnblockingIsAFullReplacementAndClearsTheProjection) {
     auto alice = f.add_user("alice");
     f.add_user("spammer");
 
-    AccountDataHandler handler(*f.store, f.config);
+    AccountDataHandler handler(*f.store, *f.sync, f.config);
     ASSERT_TRUE(IsOk(call(handler, &AccountDataHandler::handle_put_account_data,
                           account_data_path(alice, account_data_type::kIgnoredUserList),
                           "token-alice", ignore_document({"@spammer:test"}))));
@@ -337,7 +337,7 @@ TEST(UgcBlocking, ArbitraryAccountDataTypesAreStoredVerbatim) {
     f.seed_roles();
     auto alice = f.add_user("alice");
 
-    AccountDataHandler handler(*f.store, f.config);
+    AccountDataHandler handler(*f.store, *f.sync, f.config);
     const std::string doc = R"({"theme":"dark","nested":{"a":[1,2,3]}})";
     ASSERT_TRUE(IsOk(call(handler, &AccountDataHandler::handle_put_account_data,
                           account_data_path(alice, "com.example.prefs"), "token-alice", doc)));
@@ -360,7 +360,7 @@ TEST(UgcBlocking, NobodyCanReadOrWriteAnotherAccountsAccountData) {
     // An ADMINISTRATOR, to pin that there is no permission which unlocks this.
     f.add_user("root", {std::string(permission::role_id::kAdmin)});
 
-    AccountDataHandler handler(*f.store, f.config);
+    AccountDataHandler handler(*f.store, *f.sync, f.config);
     ASSERT_TRUE(IsOk(call(handler, &AccountDataHandler::handle_put_account_data,
                           account_data_path(alice, account_data_type::kIgnoredUserList),
                           "token-alice", ignore_document({"@spammer:test"}))));
@@ -397,7 +397,7 @@ TEST(UgcBlocking, MalformedIgnoreListsAreRefusedRatherThanStoredUnenforced) {
     f.seed_roles();
     auto alice = f.add_user("alice");
 
-    AccountDataHandler handler(*f.store, f.config);
+    AccountDataHandler handler(*f.store, *f.sync, f.config);
     const auto path = account_data_path(alice, account_data_type::kIgnoredUserList);
 
     struct Case {
@@ -434,7 +434,7 @@ TEST(UgcBlocking, TheIgnoreListHasACeiling) {
         many.push_back("@u" + std::to_string(i) + ":test");
     }
 
-    AccountDataHandler handler(*f.store, f.config);
+    AccountDataHandler handler(*f.store, *f.sync, f.config);
     auto res = call(handler, &AccountDataHandler::handle_put_account_data,
                     account_data_path(alice, account_data_type::kIgnoredUserList),
                     "token-alice", ignore_document(many));
@@ -465,7 +465,7 @@ TEST(UgcBlocking, IgnoredUsersEventsAreFilteredFromSyncAndMessages) {
     EXPECT_EQ(sync_bodies(*f.sync, alice, room).size(), 3u);
     EXPECT_EQ(messages_bodies(events, room, "token-alice").size(), 3u);
 
-    AccountDataHandler account_data(*f.store, f.config);
+    AccountDataHandler account_data(*f.store, *f.sync, f.config);
     ASSERT_TRUE(IsOk(call(account_data, &AccountDataHandler::handle_put_account_data,
                           account_data_path(alice, account_data_type::kIgnoredUserList),
                           "token-alice", ignore_document({spammer}))));
@@ -503,7 +503,7 @@ TEST(UgcBlocking, StateEventsFromAnIgnoredUserAreStillDelivered) {
     auto room = f.add_channel(alice, "general");
     f.join(room, spammer);
 
-    AccountDataHandler account_data(*f.store, f.config);
+    AccountDataHandler account_data(*f.store, *f.sync, f.config);
     ASSERT_TRUE(IsOk(call(account_data, &AccountDataHandler::handle_put_account_data,
                           account_data_path(alice, account_data_type::kIgnoredUserList),
                           "token-alice", ignore_document({spammer}))));
@@ -552,7 +552,7 @@ TEST(UgcBlocking, UnreadAndHighlightCountsSkipIgnoredSenders) {
     EXPECT_EQ(f.store->count_unread_mentions(alice, room), 2);
     EXPECT_EQ(f.store->get_unread_mention_counts(alice)[room], 2);
 
-    AccountDataHandler account_data(*f.store, f.config);
+    AccountDataHandler account_data(*f.store, *f.sync, f.config);
     ASSERT_TRUE(IsOk(call(account_data, &AccountDataHandler::handle_put_account_data,
                           account_data_path(alice, account_data_type::kIgnoredUserList),
                           "token-alice", ignore_document({spammer}))));
@@ -590,7 +590,7 @@ TEST(UgcBlocking, TheBlockedPartyCannotTellTheyHaveBeenBlocked) {
     const auto before_sync = sync_bodies(*f.sync, spammer, room);
     const auto before_messages = messages_bodies(events, room, "token-spammer");
 
-    AccountDataHandler account_data(*f.store, f.config);
+    AccountDataHandler account_data(*f.store, *f.sync, f.config);
     ASSERT_TRUE(IsOk(call(account_data, &AccountDataHandler::handle_put_account_data,
                           account_data_path(alice, account_data_type::kIgnoredUserList),
                           "token-alice", ignore_document({spammer}))));
@@ -621,7 +621,7 @@ TEST(UgcBlocking, InvitesFromAnIgnoredUserAreNotDelivered) {
     auto spammer = f.add_user("spammer");
     auto carol = f.add_user("carol");
 
-    AccountDataHandler account_data(*f.store, f.config);
+    AccountDataHandler account_data(*f.store, *f.sync, f.config);
     ASSERT_TRUE(IsOk(call(account_data, &AccountDataHandler::handle_put_account_data,
                           account_data_path(alice, account_data_type::kIgnoredUserList),
                           "token-alice", ignore_document({spammer}))));
@@ -883,7 +883,7 @@ TEST(UgcDeactivation, DeactivationRevokesTokensErasesProfileAndLeavesEveryRoom) 
     f.store->set_display_name(alice, "Alice A");
     f.store->set_avatar_url(alice, "mxc://test/abc");
 
-    AccountDataHandler account_data(*f.store, f.config);
+    AccountDataHandler account_data(*f.store, *f.sync, f.config);
     ASSERT_TRUE(IsOk(call(account_data, &AccountDataHandler::handle_put_account_data,
                           account_data_path(alice, account_data_type::kIgnoredUserList),
                           "token-alice", ignore_document({bob}))));

@@ -9,6 +9,7 @@
 #include <bsfchat/Constants.h>
 #include <bsfchat/Permissions.h>
 
+#include <optional>
 #include <set>
 #include <unordered_map>
 
@@ -194,6 +195,51 @@ void attach_pending_invites(SqliteStore& store, const Config& config,
     }
 }
 
+// ── Account data ─────────────────────────────────────────────────────────
+//
+// The section that was missing: /sync carried no account data at all, so a
+// document written on one device — a block list, a read marker — reached the
+// account's other devices never. See docs/read-state.md.
+//
+// Stored content is text this server hands back as it was PUT, so it is parsed
+// here rather than trusted. A row that will not parse is SKIPPED, not thrown
+// on: the alternative is one malformed document taking out /sync for that
+// account entirely, on the endpoint a client cannot work without.
+std::optional<AccountDataEvent> account_data_event(const std::string& type,
+                                                   const std::string& content_json) {
+    auto content = nlohmann::json::parse(content_json, nullptr, /*allow_exceptions=*/false);
+    if (content.is_discarded() || !content.is_object()) {
+        get_logger()->warn("account data for type '{}' is not a JSON object; not delivered",
+                           type);
+        return std::nullopt;
+    }
+    return AccountDataEvent{type, std::move(content)};
+}
+
+// `m.fully_read` for one room: the Matrix room account-data document naming
+// how far its owner has read.
+//
+// The marker is STORED as a stream position, which is meaningless to a client
+// — it is this server's internal ordering. What goes on the wire is the event
+// that position points at: its id, which is the spec's field, and its
+// origin_server_ts, which is what this client's unread dot compares against
+// (client/src/core/ReadState.h). Resolving it here costs one indexed lookup
+// per CHANGED marker, which is the reason the section is a delta.
+//
+// nullopt when the position resolves to no surviving event — an empty room, or
+// a marker below everything left after a purge. There is nothing truthful to
+// say then, and saying "read up to timestamp 0" would be a marker that moves
+// the client's own backwards.
+std::optional<AccountDataEvent> fully_read_event(SqliteStore& store,
+                                                 const SqliteStore::ReadMarker& marker) {
+    auto marked = store.resolve_read_marker(marker.room_id, marker.last_read_pos);
+    if (!marked) return std::nullopt;
+    return AccountDataEvent{
+        std::string(event_type::kFullyRead),
+        nlohmann::json{{std::string(fully_read::kEventId), marked->event_id},
+                       {std::string(fully_read::kOriginServerTs), marked->origin_server_ts}}};
+}
+
 } // namespace
 
 SyncEngine::SyncEngine(SqliteStore& store, const Config& config)
@@ -322,8 +368,20 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
     //
     // This deliberately reads the response BUILT BY build_incremental_sync,
     // never one that deliver() has touched — see attach_pending_invites.
+    //
+    // Global account data counts too, and has to: a block list written on
+    // another device belongs to no room, so it puts nothing in rooms.join, and
+    // a response carrying only that would otherwise be judged empty, discarded
+    // by the wait, and the change held back until the poll timed out. Room
+    // account data needs no clause of its own — a read marker is attached to
+    // its room, so the room is in rooms.join by the time this is asked.
+    //
+    // It cannot spin: the delta is bounded above by the same position
+    // next_batch is built from, so the very token this response hands back
+    // puts those documents below the next poll's range.
     auto has_payload = [](const SyncResponse& r) {
-        return !r.rooms.join.empty() || !r.rooms.invite.empty();
+        return !r.rooms.join.empty() || !r.rooms.invite.empty() ||
+               !r.account_data.empty();
     };
 
     // Opaque on the way out, opaque or legacy-numeric on the way in — see
@@ -520,6 +578,31 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
         joined.highlight_count = it == mentions.end() ? 0 : it->second;
     }
 
+    // Account data, complete rather than a delta: this caller has no token, so
+    // there is nothing to take a delta against, and everything they have is
+    // new to them.
+    for (auto& doc : store_.get_all_account_data(user_id)) {
+        if (auto event = account_data_event(doc.type, doc.content_json)) {
+            response.account_data.push_back(std::move(*event));
+        }
+    }
+    // Read markers, for the rooms this response actually contains — which is
+    // the visibility gate, already applied above. A marker for a room that is
+    // absent from rooms.join is DROPPED rather than attached: the account may
+    // have read a channel it can no longer view, and hanging its room id off
+    // the response would say the channel exists to somebody the rest of this
+    // function has just decided must not be told. `stubbed` is excluded for
+    // the same reason it is excluded from the counts: a category stub is a
+    // name and an ordering, and a read position inside it is contents.
+    for (const auto& marker : store_.get_read_markers(user_id)) {
+        auto it = response.rooms.join.find(marker.room_id);
+        if (it == response.rooms.join.end()) continue;
+        if (stubbed.count(marker.room_id)) continue;
+        if (auto event = fully_read_event(store_, marker)) {
+            it->second.account_data.push_back(std::move(*event));
+        }
+    }
+
     attach_direct_rooms(store_, user_id, response);
     // A fresh client learns its pending invites here; an established one is
     // told again on every delivered incremental response (see deliver()).
@@ -686,6 +769,39 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
     // The DM set only changes when this user lands in a direct room, so that is
     // the only incremental sync that needs to restate it.
     if (joined_direct_room) attach_direct_rooms(store_, user_id, response);
+
+    // ── Account data, as a delta ─────────────────────────────────────────
+    //
+    // Bounded by `delivered_max`, the same position next_batch is built from,
+    // and not by the head: a document written after this scan sits above the
+    // token this response hands back, so it is picked up by the next poll —
+    // which its own wake has already scheduled — instead of being delivered
+    // under a token that does not cover it. That is the identical rule the
+    // event scan follows two screens up, and for the identical reason.
+    //
+    // AHEAD of the counts pass below, deliberately. A read marker set on
+    // another device puts its room into rooms.join with nothing else in it,
+    // and that room's unread count is the number the other device's badge is
+    // wrong about. Attaching after the counts would deliver the marker and
+    // leave the count stale for another poll.
+    for (auto& doc : store_.get_account_data_changed(user_id, since_pos, delivered_max)) {
+        if (auto event = account_data_event(doc.type, doc.content_json)) {
+            response.account_data.push_back(std::move(*event));
+        }
+    }
+    for (const auto& marker : store_.get_read_markers_changed(user_id, since_pos, delivered_max)) {
+        // kFull, not `!= kNone`. The listing exemption that lets a category
+        // appear in the sidebar is not permission to see what happens inside
+        // one, and a read position is inside one. A marker for a room this
+        // account can no longer view is dropped entirely — it is their own
+        // row, but delivering it would name a room the visibility rules have
+        // stopped naming, which is how a "per-user" section becomes a channel
+        // oracle. See docs/membership-vs-visibility.md.
+        if (view_of(marker.room_id) != RoomView::kFull) continue;
+        if (auto event = fully_read_event(store_, marker)) {
+            response.rooms.join[marker.room_id].account_data.push_back(std::move(*event));
+        }
+    }
 
     auto mentions = store_.get_unread_mention_counts(user_id);
     for (auto& [room_id, joined] : response.rooms.join) {

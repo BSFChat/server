@@ -15,6 +15,7 @@ add_executable(server_tests
     test_rooms.cpp
     test_sync.cpp
     test_sync_latency.cpp
+    test_read_state_sync.cpp
     test_sync_token.cpp
     test_sync_invites.cpp
     test_call_privacy.cpp

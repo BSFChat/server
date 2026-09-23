@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -52,6 +53,16 @@ int scalar_int(sqlite3* db, const std::string& sql) {
     auto stmt = prepare(db, sql);
     int out = 0;
     if (sqlite3_step(stmt.get()) == SQLITE_ROW) out = sqlite3_column_int(stmt.get(), 0);
+    return out;
+}
+
+// int64 rather than scalar_int's int, for the one caller that reads a stream
+// position: those are 64-bit everywhere else and truncating one here would
+// hand out a position the events table already uses.
+int64_t scalar_int64(sqlite3* db, const std::string& sql) {
+    auto stmt = prepare(db, sql);
+    int64_t out = 0;
+    if (sqlite3_step(stmt.get()) == SQLITE_ROW) out = sqlite3_column_int64(stmt.get(), 0);
     return out;
 }
 
@@ -1849,6 +1860,89 @@ void migrate_v29(sqlite3* db, bool /*fresh_database*/) {
         "their own account");
 }
 
+void migrate_v30(sqlite3* db, bool /*fresh_database*/) {
+    // Read state that crosses devices: an `account_data` section in /sync, and
+    // the read marker inside it.
+    //
+    // Both tables already held the VALUE a second device needs. What neither
+    // held is WHEN it was written, in the one clock /sync can compare a client's
+    // token against — so an incremental sync had no way to ask "what has
+    // changed for this account since position N", and the only answer available
+    // was to restate everything on every poll or to send nothing at all. It
+    // sent nothing at all: reading a channel on a phone left the dot lit on the
+    // desktop forever, and a block made on one device never reached the other.
+    //
+    // ONE CLOCK, NOT A SECOND ONE. `updated_pos` is claimed from the same
+    // server_meta.next_stream_position counter that every event row is numbered
+    // from (SqliteStore::claim_stream_position_locked), so an account-data write
+    // is ordered against messages and against other account-data writes by the
+    // number the client's sync token already carries. A second stream position
+    // would have meant a new token format, a migration for every token in the
+    // field, and two orderings to keep consistent for a kind of write that is
+    // rare and small. See docs/read-state.md.
+    if (!column_exists(db, "account_data", "updated_pos")) {
+        exec(db, "ALTER TABLE account_data ADD COLUMN updated_pos INTEGER NOT NULL DEFAULT 0");
+    }
+    if (!column_exists(db, "read_markers", "updated_pos")) {
+        exec(db, "ALTER TABLE read_markers ADD COLUMN updated_pos INTEGER NOT NULL DEFAULT 0");
+    }
+
+    // The delta query is "this account's rows above the client's token", so it
+    // is the user id that leads both indexes. account_data is already keyed
+    // (user_id, type) and its primary key serves; read_markers is keyed
+    // (user_id, room_id) and likewise. The position is the second column so the
+    // range is a scan of one account's rows, not of the table.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_account_data_user_pos "
+             "ON account_data(user_id, updated_pos)");
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_read_markers_user_pos "
+             "ON read_markers(user_id, updated_pos)");
+
+    // ── Why the backfill claims a position instead of leaving zeros ───────
+    //
+    // A DEFAULT of 0 would put every pre-existing row below every client's
+    // token, so nothing already in these tables would ever be delivered
+    // incrementally. The account that has been blocking people for months, and
+    // every read marker every device has ever set, would stay invisible to the
+    // other device until the next WRITE to that row. For a read marker that
+    // heals itself the first time somebody opens a channel; for the block list
+    // it could be months, and "my blocks are not on my phone" is the same
+    // complaint this migration exists to end.
+    //
+    // So every existing row is stamped with ONE freshly claimed position, above
+    // the head every client's token can currently name and below everything
+    // written afterwards. Each established client is therefore told its stored
+    // account data exactly once, on its first poll after the upgrade, and never
+    // again.
+    //
+    // The counter is read here the way SqliteStore::initialize() reads it a
+    // moment later — max of the persisted value and the events table — because
+    // this runs before that load, and a backfill position at or below an
+    // existing event's position would be a number two different rows claim.
+    int64_t next_pos = 0;
+    {
+        const int64_t from_meta = scalar_int64(
+            db, "SELECT COALESCE((SELECT CAST(value AS INTEGER) FROM server_meta "
+                "WHERE key = 'next_stream_position'), 0)");
+        const int64_t from_events =
+            scalar_int64(db, "SELECT COALESCE(MAX(stream_position), 0) + 1 FROM events");
+        next_pos = std::max<int64_t>({1, from_meta, from_events});
+    }
+    const int64_t backfill_pos = next_pos;
+    exec(db, "UPDATE account_data SET updated_pos = " + std::to_string(backfill_pos) +
+                 " WHERE updated_pos = 0");
+    exec(db, "UPDATE read_markers SET updated_pos = " + std::to_string(backfill_pos) +
+                 " WHERE updated_pos = 0");
+    exec(db, "INSERT INTO server_meta (key, value) VALUES ('next_stream_position', '" +
+                 std::to_string(backfill_pos + 1) +
+                 "') ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+
+    get_logger()->info(
+        "Schema v30: account data and read markers are now numbered on the event stream, so "
+        "/sync can deliver them to a second device; existing rows are stamped at position {} "
+        "and reach each client once",
+        backfill_pos);
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1882,6 +1976,7 @@ const std::vector<Step>& steps() {
         migrate_v27,
         migrate_v28,
         migrate_v29,
+        migrate_v30,
     };
     return kMigrations;
 }

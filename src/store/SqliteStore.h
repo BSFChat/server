@@ -1062,8 +1062,63 @@ public:
 
     // Read markers
     // Upserts (user_id, room_id) marker. Only moves forward (monotonic).
-    void set_read_marker(const std::string& user_id, const std::string& room_id, int64_t stream_pos);
+    //
+    // Returns whether it MOVED. A marker that did not move is not a change, so
+    // there is nothing for a second device to be told and nothing to wake a
+    // parked /sync for — and, since a write that moves the marker claims a
+    // stream position (schema v30) so that /sync can deliver it, a no-op write
+    // must not claim one either. The client posts a marker on every batch of
+    // messages in the open room, so the no-op is the common case.
+    bool set_read_marker(const std::string& user_id, const std::string& room_id, int64_t stream_pos);
     int64_t get_read_marker(const std::string& user_id, const std::string& room_id);
+
+    // ── Cross-device read state (schema v30) ─────────────────────────────
+    //
+    // One user's read markers, for /sync to publish as `m.fully_read` room
+    // account data. `since_pos` and `until_pos` bound the range by the position
+    // of the WRITE (read_markers.updated_pos), never by the marker's own value:
+    // the question is "what has this account changed since its sync token",
+    // and the marker value is the answer, not the clock.
+    //
+    // Half-open at the bottom and closed at the top — (since_pos, until_pos] —
+    // to match exactly what the caller's next_batch will name. A row above
+    // `until_pos` is left for the next poll rather than delivered under a token
+    // that does not cover it.
+    //
+    // NO VISIBILITY FILTER HERE. These rows are the caller's own, but a room
+    // they may no longer view can still have one, and naming it would tell them
+    // the room exists. The gate is in SyncEngine, where room_view() lives; this
+    // returns what is stored.
+    struct ReadMarker {
+        std::string room_id;
+        int64_t last_read_pos = 0;
+    };
+    std::vector<ReadMarker> get_read_markers_changed(const std::string& user_id,
+                                                     int64_t since_pos, int64_t until_pos);
+    // Every read marker this account has, for an initial sync. Same caveat: no
+    // visibility filter, and the caller applies one.
+    std::vector<ReadMarker> get_read_markers(const std::string& user_id);
+
+    // What a read marker POINTS AT: the newest event in the room at or below
+    // `last_read_pos`. The marker is stored as a stream position, and the two
+    // things a client can use are the event id (the Matrix spec's field) and
+    // its origin_server_ts (what this client's unread dot is arithmetic on) —
+    // both of which live on that row.
+    //
+    // Resolves against ANY event type, not only messages. The position comes
+    // from get_room_max_stream_position(), so it is whatever was newest when
+    // the room was read; a state event's timestamp is the same server clock as
+    // a message's, and picking the newest MESSAGE at or below the marker
+    // instead would report the room as read up to an older moment than it was.
+    //
+    // nullopt for a marker in an empty room, or one pointing below every
+    // surviving event (every event before it redacted away and purged).
+    struct MarkedEvent {
+        std::string event_id;
+        int64_t origin_server_ts = 0;
+    };
+    std::optional<MarkedEvent> resolve_read_marker(const std::string& room_id,
+                                                   int64_t last_read_pos);
     // Counts messages in the room past the user's marker that somebody else
     // sent. Excludes m.replace replacements (editing a message used to bump
     // everyone else's badge as if it were a new message) and redacted events (a
@@ -1378,6 +1433,24 @@ public:
                           const std::string& content_json,
                           const std::optional<std::vector<std::string>>& ignored,
                           int64_t when_ms);
+
+    // One account's documents that were written above `since_pos` and at or
+    // below `until_pos` — the account-data delta for a /sync whose token names
+    // `since_pos`. Raw JSON text, as stored. See get_read_markers_changed for
+    // why the range is half-open at the bottom.
+    //
+    // Every type is returned, including ones this server never interprets: an
+    // account-data store whose contents only propagate if the server
+    // understands them is not a store, it is a list of features.
+    struct AccountDataDocument {
+        std::string type;
+        std::string content_json;
+    };
+    std::vector<AccountDataDocument> get_account_data_changed(const std::string& user_id,
+                                                              int64_t since_pos,
+                                                              int64_t until_pos);
+    // Every document this account has, for an initial sync.
+    std::vector<AccountDataDocument> get_all_account_data(const std::string& user_id);
 
     // Every account `user_id` currently ignores, ascending. Read from the index,
     // so it is what the /sync and /messages filters will actually apply — a test
