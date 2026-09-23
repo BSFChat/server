@@ -798,6 +798,12 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
         // stopped naming, which is how a "per-user" section becomes a channel
         // oracle. See docs/membership-vs-visibility.md.
         if (view_of(marker.room_id) != RoomView::kFull) continue;
+        // And a member, which the initial-sync path gets for free by walking
+        // get_joined_rooms(). A marker is only writable by a member — the
+        // handler checks — but a membership can END after one is written, and
+        // a room this account has left must not reappear in its sidebar
+        // because a row about it moved.
+        if (membership_of(marker.room_id) != std::string(membership::kJoin)) continue;
         if (auto event = fully_read_event(store_, marker)) {
             response.rooms.join[marker.room_id].account_data.push_back(std::move(*event));
         }

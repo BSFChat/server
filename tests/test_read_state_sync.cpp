@@ -541,6 +541,26 @@ TEST(ReadMarkerSync, AMarkerForARoomTheReaderCannotViewIsNotDelivered) {
            "marker";
 }
 
+// A membership that ended after the marker was written. The marker is only
+// writable by a member, but a kick or a DM leave happens afterwards, and a
+// room this account is no longer in must not reappear in its sidebar because
+// a row about it moved.
+TEST(ReadMarkerSync, AMarkerForARoomTheReaderHasLeftIsNotDelivered) {
+    Fixture f("left");
+    auto alice = f.add_user("alice");
+    auto bob = f.add_user("bob");
+    auto room = f.add_channel(bob, "general");
+    f.join(room, alice);
+    f.say(room, bob, "hello");
+
+    ASSERT_TRUE(f.store->set_read_marker(alice, room,
+                                         f.store->get_room_max_stream_position(room)));
+    f.store->set_membership(room, alice, std::string(membership::kLeave));
+
+    auto incremental = f.sync->handle_sync(alice, "s1", 0);
+    EXPECT_EQ(incremental.rooms.join.count(room), 0u);
+}
+
 // The sidebar stub a category gets is a name and a sort order. A read position
 // is contents, so it does not ride along with the exemption.
 TEST(ReadMarkerSync, ACategoryStubCarriesNoMarker) {
