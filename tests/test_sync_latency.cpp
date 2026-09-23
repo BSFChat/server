@@ -409,4 +409,188 @@ TEST_F(SyncLatencyTest, AnEphemeralWakeDoesNotHandBackATokenPastAnUnscannedEvent
               "alice's own message");
 }
 
+// ---------------------------------------------------------------------------
+// The shape production is actually in, rather than one poller and one send.
+//
+// A real account has several parked polls at once — a desktop, a phone, and
+// (until the client was fixed) a duplicate connection per desktop, because
+// three of ServerManager's four add paths appended a second ServerConnection
+// for a homeserver already in the roster. A client log from chat.bsfchat.com
+// on 2026-09-23 shows two /sync chains on one token for hours, and across
+// that log 25.5% of the polls that CARRIED timeline events returned at the
+// 30-second deadline rather than being woken:
+//
+//     responses that carried timeline events: 2038
+//       returned in under 1s                  53.2%
+//       returned mid-poll (1-29s)             21.2%
+//       returned AT the deadline (~30s)       25.5%   <-- not woken
+//
+// A poll answered at its deadline WITH events in it did not get its wake; it
+// found them in the post-deadline scan. These tests hold the line on the two
+// things that can produce that shape and are testable here — every parked
+// poll being woken, not just one, and repeated rounds not degrading — so a
+// regression in SyncEngine is ruled in or out before anyone goes looking at
+// deployment config again.
+// ---------------------------------------------------------------------------
+
+// Every parked poll wakes, not merely the first one the condvar happens to
+// reach. notify_all() is what makes this true; a notify_one() "optimisation"
+// for the thundering herd would leave all but one client waiting out the
+// full timeout, which is precisely the observed symptom.
+TEST_F(SyncLatencyTest, EveryParkedPollForAnAccountIsWokenByOneSend) {
+    // Four of Bob's devices, which is what a desktop with a duplicated
+    // connection plus a phone plus a spare looks like to the server.
+    constexpr int kPollers = 4;
+    const std::string since = sync->handle_sync("@bob:test", "", 0).next_batch;
+
+    std::atomic<clk::time_point> sent_at{clk::time_point{}};
+    std::vector<int64_t> waited(kPollers, -1);
+    std::vector<SyncResponse> got(kPollers);
+    std::vector<std::thread> pollers;
+
+    for (int i = 0; i < kPollers; ++i) {
+        pollers.emplace_back([&, i] {
+            got[i] = sync->handle_sync("@bob:test", since, 30000);
+            waited[i] = ms_since(sent_at.load());
+        });
+    }
+
+    // All of them into the wait before anything is sent.
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+    sent_at = clk::now();
+    insert_message("one send, four listeners");
+    sync->notify_new_event();
+
+    for (auto& t : pollers) t.join();
+
+    for (int i = 0; i < kPollers; ++i) {
+        ASSERT_EQ(got[i].rooms.join.count(room_id), 1u)
+            << "poller " << i << " came back without the message";
+        ASSERT_EQ(got[i].rooms.join[room_id].timeline.events.size(), 1u);
+        EXPECT_LT(waited[i], kMaxDeliveryMs)
+            << "poller " << i << " took " << waited[i]
+            << "ms; it rode out its timeout instead of being woken";
+    }
+}
+
+// Ten sends in a row, each to a freshly parked poll, all under budget. A
+// single wake proves the mechanism exists; this proves it keeps working —
+// current_position_ is monotonic and never rewound, checked_pos advances
+// every round, and nothing accumulates that makes round N slower than
+// round 1.
+TEST_F(SyncLatencyTest, RepeatedSendsKeepWakingTheirPolls) {
+    constexpr int kRounds = 10;
+    std::string since = sync->handle_sync("@bob:test", "", 0).next_batch;
+
+    for (int round = 0; round < kRounds; ++round) {
+        std::atomic<clk::time_point> sent_at{clk::time_point{}};
+        int64_t waited = -1;
+        SyncResponse got;
+
+        std::thread bob([&] {
+            got = sync->handle_sync("@bob:test", since, 30000);
+            waited = ms_since(sent_at.load());
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+
+        sent_at = clk::now();
+        insert_message("round " + std::to_string(round));
+        sync->notify_new_event();
+        bob.join();
+
+        ASSERT_EQ(got.rooms.join.count(room_id), 1u) << "round " << round;
+        EXPECT_LT(waited, kMaxDeliveryMs)
+            << "round " << round << " took " << waited << "ms";
+        since = got.next_batch;
+    }
+}
+
+// A send into a room the poller cannot see must NOT end their poll, and must
+// also not cost them the next event that IS theirs. The re-park path
+// (checked_pos advancing to what the re-scan covered) is what makes both
+// true; getting it wrong in either direction shows up as latency.
+TEST_F(SyncLatencyTest, AnInvisibleEventReparksWithoutLosingTheNextRealOne) {
+    // A room Bob is not in at all.
+    const std::string other = generate_room_id("test");
+    store->create_room(other, "@alice:test");
+    store->set_membership(other, "@alice:test", "join");
+
+    const std::string since = sync->handle_sync("@bob:test", "", 0).next_batch;
+
+    std::atomic<clk::time_point> sent_at{clk::time_point{}};
+    int64_t waited = -1;
+    SyncResponse got;
+
+    std::thread bob([&] {
+        got = sync->handle_sync("@bob:test", since, 30000);
+        waited = ms_since(sent_at.load());
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    // Three events Bob cannot see. Each wakes him; each must send him back
+    // to sleep rather than returning an empty reply (which the desktop
+    // client answers with an escalating no-progress backoff, walking its
+    // poll interval out to a minute).
+    for (int i = 0; i < 3; ++i) {
+        store->insert_event(generate_event_id("test"), other, "@alice:test",
+                            "m.room.message", std::nullopt,
+                            json{{"msgtype", "m.text"},
+                                 {"body", "not for bob"}}.dump(), 2000);
+        sync->notify_new_event();
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    }
+
+    sent_at = clk::now();
+    insert_message("for bob");
+    sync->notify_new_event();
+    bob.join();
+
+    ASSERT_EQ(got.rooms.join.count(room_id), 1u)
+        << "the poll never came back with Bob's message";
+    ASSERT_EQ(got.rooms.join[room_id].timeline.events.size(), 1u);
+    EXPECT_EQ(got.rooms.join[room_id].timeline.events[0].content.data["body"],
+              "for bob");
+    EXPECT_LT(waited, kMaxDeliveryMs)
+        << "after re-parking three times the poll took " << waited
+        << "ms to see an event it could read";
+}
+
+// Marking a room read changes unread and highlight counts but writes no
+// event row, so the stream head does not move. It was announced with
+// notify_new_event(), whose predicate is "has the head passed what I have
+// examined" — which is false, so the wake did nothing at all and the other
+// device kept its badge lit until its poll timed out.
+//
+// The assertion is on the mechanism rather than on the counts: a read marker
+// must move the EPHEMERAL epoch, which is what "something changed that is
+// not a timeline event" means here and what typing and presence already use.
+TEST_F(SyncLatencyTest, AReadMarkerWakesAParkedPoll) {
+    insert_message("something to be unread about");
+    sync->notify_new_event();
+    const std::string since = sync->handle_sync("@bob:test", "", 0).next_batch;
+
+    std::atomic<clk::time_point> marked_at{clk::time_point{}};
+    int64_t waited = -1;
+
+    std::thread bob([&] {
+        sync->handle_sync("@bob:test", since, 30000);
+        waited = ms_since(marked_at.load());
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    marked_at = clk::now();
+    store->set_read_marker("@bob:test", room_id,
+                           store->get_room_max_stream_position(room_id));
+    // What EventHandler::handle_read_marker now calls. With
+    // notify_new_event() here instead, this test hangs for the full 30s.
+    sync->notify_ephemeral();
+    bob.join();
+
+    EXPECT_LT(waited, kMaxDeliveryMs)
+        << "a read marker took " << waited
+        << "ms to reach a parked poll; notify_new_event() cannot wake one "
+           "because a read marker does not move the stream head";
+}
+
 } // namespace

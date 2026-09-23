@@ -357,6 +357,16 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
             }
             if (!signalled) break; // deadline passed with nothing for us
 
+            // Sampled BEFORE the re-scan, for the livelock fallback at the
+            // bottom of this loop. Sampling it after would be the same
+            // mistake this whole block was rewritten to remove: an event
+            // that commits while the re-scan runs would raise the head, the
+            // fallback would mark that head as examined, and the poll would
+            // sleep out its deadline holding an event it never looked at.
+            // Taken here, the value can only describe rows that already
+            // existed when the scan started.
+            const int64_t head_before_rescan = current_position_.load();
+
             response = build_incremental_sync(user_id, since_pos, &covered_pos);
             // Real events, or an ephemeral change the caller injects typing and
             // presence from — either is worth returning immediately.
@@ -373,9 +383,17 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
             // The re-scan covered no new ground. That means it was cut short by
             // its limit on rows this user cannot read, so re-scanning returns
             // the same rows forever and covered_pos will never move. Park
-            // against the current head rather than spinning until the deadline;
-            // next_batch carries the client past those rows on its next poll.
-            checked_pos = std::max(checked_pos, current_position_.load());
+            // against the head AS IT WAS WHEN THIS PASS BEGAN rather than
+            // spinning until the deadline; next_batch carries the client past
+            // those rows on its next poll.
+            //
+            // `head_before_rescan`, never a fresh load. Re-reading the head
+            // here would let an event that committed DURING the re-scan be
+            // written off as examined — the exact defect that
+            // EventDuringTheInitialScanWakesThePollAtOnce and
+            // AnEphemeralWakeDoesNotHandBackATokenPastAnUnscannedEvent exist
+            // for, surviving in the one branch neither of them reaches.
+            checked_pos = std::max(checked_pos, head_before_rescan);
         }
 
         response = build_incremental_sync(user_id, since_pos, &covered_pos);
