@@ -101,6 +101,55 @@ MUTATIONS = [
   "    auto ctx = authorize_bot_admin(req, res, user_id, \"read a bot's access\");\n    if (!ctx) return;\n    const auto& actor = ctx->actor;",
   "    auto authed = authenticate(store_, req.get_header_value(\"Authorization\"));\n    if (!authed) return send_error(res, 401, auth_error(req.get_header_value(\"Authorization\")));\n    auto bot_rec = store_.get_bot(user_id);\n    if (!bot_rec) return send_error(res, 404, MatrixError::not_found(\"No such bot\"));\n    std::optional<BotAdminContext> ctx = BotAdminContext{.actor = *authed, .bot = *bot_rec};\n    const auto& actor = ctx->actor;",
   "BotAccess.IsGatedOnManageBotsAtServerScope:BotAccess.RefusesForABotThatOutranksTheCaller", 180),
+
+ # ── and the discoverability half ────────────────────────────────────────
+ #
+ # Scoping was right and still produced a silent dead end, because nothing
+ # between "bot created" and "403 about a channel" said so. These five put the
+ # silence back, one statement at a time. A mutation here does not break
+ # security — it breaks an operator's afternoon, which is the failure that
+ # actually happened.
+
+ # The whole classification collapses back to the old sentence.
+ ("the refusal blames the channel again",
+  "src/api/ChannelAccessRefusal.h",
+  "    if (!is_unscoped_bot(store, user_id)) {",
+  "    if (true) {",
+  "BotFirstRun.TheRefusalNamesTheBotsRolesAndNotTheChannel", 180),
+
+ # The predicate loses its first half, so an ordinary member with an empty
+ # assignment document — who still holds @everyone implicitly — is told they
+ # have no roles. The wrong explanation is worse than the vague one.
+ ("unscoped means 'no roles' for humans too",
+  "src/api/ChannelAccessRefusal.h",
+  "    if (permission::inherits_everyone_role(user_id)) return false;\n    return store.get_member_role_ids(user_id).empty();",
+  "    return store.get_member_role_ids(user_id).empty();",
+  "BotFirstRun.AHumanDeniedInAChannelStillGetsTheChannelRefusal", 180),
+
+ # Creation goes back to reporting a token and nothing about scope.
+ ("creation stops declaring the empty scope",
+  "src/api/BotHandler.cpp",
+  "        {\"role_ids\", std::move(role_ids)},\n        {std::string(bot::kWarningKey),",
+  "        {\"role_ids_unused\", std::move(role_ids)},\n        {\"unused\",",
+  "BotFirstRun.CreationSaysTheBotHoldsNothing", 180),
+
+ # The join goes back to a bare 200, which is the response that made the dead
+ # end look like a working setup.
+ ("the join stops warning",
+  "src/api/RoomHandler.cpp",
+  "    if (warning) joined[std::string(bot::kWarningKey)] = *warning;",
+  "    if (false) joined[std::string(bot::kWarningKey)] = *warning;",
+  "BotFirstRun.TheJoinWarnsThatItGrantedNothing", 180),
+
+ # The access summary answers "some bit is set" instead of "can it get in".
+ # SEND_MESSAGES without VIEW_CHANNEL is access to nothing, so this reports a
+ # scoped-out bot as reachable — the exact wrong answer to the only question
+ # the field exists for.
+ ("access summary counts any permission bit",
+  "src/api/BotHandler.cpp",
+  "        if (permission::has(permission::flags_from_hex(c.value(\"permissions\", \"0x0\")),\n                            permission::kViewChannel)) {",
+  "        if (permission::flags_from_hex(c.value(\"permissions\", \"0x0\")) != 0) {",
+  "BotAccess.SaysInOneFieldWhetherTheBotCanSeeAnythingAtAll", 180),
 ]
 
 def run(cmd, timeout=None):

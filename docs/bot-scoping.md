@@ -175,6 +175,11 @@ permission on this server. It gains nothing by it: every read, write, voice and
 media path asks `PermissionsEngine`, so the join produces a membership row and
 an empty `/sync`.
 
+**That shape was a silent dead end and is now a loud one.** See §10: the design
+is unchanged, but nothing between "bot created" and "403 about a channel" used
+to state it, so the first operator to run the obvious sequence lost an hour to
+it. The join still succeeds and must.
+
 Grant it a channel:
 
 ```http
@@ -353,6 +358,7 @@ GET /_matrix/client/v3/bsfchat/bots/{userId}/access
   "deactivated": false,
   "role_ids": ["moderation"],
   "server_permissions": "0x0080",
+  "can_view_any_listed_channel": true,
   "channels": [
     {"room_id": "!cat:…", "name": "Team", "type": "category",
      "joined": false, "permissions": "0x0"},
@@ -369,6 +375,7 @@ GET /_matrix/client/v3/bsfchat/bots/{userId}/access
 | --- | --- |
 | `role_ids` | The assignment as stored — the editable document. Does not include `@everyone` unless it was granted explicitly, which for a bot is now meaningful. |
 | `server_permissions` | What that amounts to at server scope, `ADMINISTRATOR` already short-circuited into `kAllFlags`. Render "this bot is an administrator" from this, not from the role list. |
+| `can_view_any_listed_channel` | The headline. True when the bot holds `VIEW_CHANNEL` in at least one channel below. `false` is "this bot has been minted and never granted anything", which is the state the tab has to make impossible to miss — everything else on the page is a detail of it. Computed over the listed channels, so it inherits the caller-visibility caveat. |
 | `channels[].permissions` | The bot's **effective** mask in that channel, from `PermissionsEngine`. The number to render the row from. |
 | `channels[].override` | Present **only** when a `user:<bot>` override exists. Absent is a third state, distinct from `allow=0 deny=0`, and is where "revoke this grant" should land. |
 | `channels[].joined` | The **bot's** membership, not the caller's. A bot must be in a channel to post in it, so a tab that has just granted `VIEW_CHANNEL` still has to say it is not in there yet. |
@@ -503,9 +510,97 @@ bot. Two assertions in `tests/test_bots.cpp` moved with the behaviour and say so
 in place.
 
 `tests/e2e/mutate_botscope.py` puts the old behaviour back one guard at a time —
-eleven mutations, including **both** directions of the `@everyone` rule, since
+sixteen mutations, including **both** directions of the `@everyone` rule, since
 "the bot has no permissions" passes just as well on a server where the
-permission system is broken for everybody. 11/11 detected.
+permission system is broken for everybody. 16/16 detected.
+
+§8 of `tests/test_bot_scoping.cpp` was added later and tests the SEQUENCE rather
+than the rule: create, token, join, post, through the real handlers, which
+nothing covered. See §10. Its controls are the two directions of the wrong
+explanation — a human denied in one channel, and a scoped bot denied in one
+channel, must both keep the channel-shaped refusal. `tests/e2e/e2e_bots.sh` runs
+the same sequence against the real binary, including the join warning and the
+refusal's classification.
 
 Expectations are derived from protocol constants throughout, never from what
 `auth/Permissions.cpp` computes.
+
+---
+
+## 10. The dead end this left behind (2026-09-24)
+
+Scoping was right. The onboarding was not, and the two are easy to confuse, so
+this section is the record of the difference.
+
+### What happened
+
+An operator ran the obvious sequence against `test.bsfchat.com`, current `main`:
+
+| # | Request | Answer |
+| --- | --- | --- |
+| 1 | `POST /bsfchat/bots` | `201` — bot created |
+| 2 | `POST /bsfchat/bots/{id}/token` | `200` — token issued |
+| 3 | `POST /rooms/{room}/join` as the bot | `200` — **joined** |
+| 4 | `PUT /rooms/{room}/send/m.room.message/{txn}` | `403 M_FORBIDDEN "No access to this channel"` |
+
+Every step reported success until the last one, and the last one named the
+**channel**. The channel was fine. The cause was `bsfchat.member.roles` being
+`{"role_ids": []}` — §3, working exactly as designed.
+
+### What was NOT the fix
+
+Giving a new bot `@everyone` at creation. That is the behaviour §2.4 removed and
+§5.1 explains cannot be un-removed selectively: a role only ever ADDS, so a bot
+that inherits `@everyone` cannot be scoped down afterwards without a deny
+override on every channel, re-applied by hand to every channel created later.
+The whole feature is that the floor is below the ceiling. Nor was it the docs:
+`docs/bots.md` §8 already said "Do not read a successful join as access", in
+those words, before any of this.
+
+What was missing was that **the server never said it at the moment it mattered**.
+Four requests reported success and meant three, and the one refusal pointed at
+the wrong noun.
+
+### What changed
+
+Nothing in the permission model. Four statements, on paths that already existed:
+
+* **`POST /bots` declares the scope it just wrote** — `role_ids` (read back out
+  of the assignment, not hardcoded) and a `bsfchat.warning` sentence. §1 of
+  `docs/bots.md`.
+* **The join warns on its own 200.** `bsfchat.warning` again, and the server log
+  line changes with it, because "User X joined room Y" was the other thing that
+  read as success. The join is not refused — §4 depends on it succeeding.
+* **The refusal names the account.** `no_channel_access()` in
+  `src/api/ChannelAccessRefusal.h` builds the body for all eight handlers that
+  answer "you are in this room and may not see it", and where the cause is a bot
+  holding nothing it says so and carries `BSFCHAT.BOT_NOT_SCOPED`. The ordinary
+  case keeps its sentence and gains `BSFCHAT.NO_VIEW_CHANNEL`.
+* **The access report answers the question in one field** —
+  `can_view_any_listed_channel`. It could always be derived from the body; now
+  it does not have to be.
+
+The predicate is `!inherits_everyone_role(id) && assignment is empty`, and the
+conjunction is load-bearing: a **human** with an empty assignment document still
+holds `@everyone` implicitly (§3), so "this account has no roles" would be a
+false explanation and would send them to the wrong page. `test_bot_scoping.cpp`
+§8 pins both directions.
+
+### What is still open, and it is a client change
+
+`GET /bots/{id}/access` is not called by anything. The Bots pane in Server
+Settings (`client/qml/components/BotManagerPane.qml`) creates, lists, rotates and
+deactivates, and says nothing about access — so the tab §7 was written for is
+still not built, and an operator standing in front of the pane that made the bot
+has no indication that it needs a grant or where to perform one. A grant is
+reachable today only indirectly: add the bot to a channel, then assign it a role
+from the member-list context menu. The finest-grained grant the server
+supports — a `user:<mxid>` channel override — has no UI at all, although
+`MatrixClient::setChannelOverride` already accepts the key.
+
+Also client-side: `bsfchat.errcode` is parsed nowhere
+(`client/src/net/MatrixFailure.h` drops every field but `errcode`, `error` and
+`retry_after_ms`), and the QML toasts that render a failed state write replace
+the server's sentence with "you don't have permission" on any 403. Until that
+changes, the prose is the only part of this that reaches a person through the
+client, which is why the prose carries the explanation and not only the code.

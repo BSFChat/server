@@ -289,10 +289,34 @@ void BotHandler::handle_create_bot(const httplib::Request& req, httplib::Respons
     // `token` appears in this response and nowhere else, ever. Only its hash was
     // stored, so a later read of the database — or of the audit log — cannot
     // recover it, and an operator who loses it rotates rather than looking it up.
+    //
+    // `role_ids` AND A WARNING, because the block above just decided the most
+    // surprising thing about this account and said so nowhere. A bot arrives
+    // able to authenticate and to join, and able to do nothing else; an
+    // operator who does not already know that reads three 200s and a join, and
+    // meets the fact for the first time as a 403 about a channel. Saying it
+    // here is the earliest point at which it can be said.
+    //
+    // `role_ids` is spelt and shaped exactly as GET /bots/{id}/access spells
+    // it — the editable assignment document, empty today and empty for the
+    // foreseeable future — so a tab can render the new bot from this response
+    // without a second call and without a second vocabulary. It is not
+    // hardcoded to `[]`: it is read back out of what was actually written, so
+    // if that ever stops being empty this response stops claiming it is.
+    json role_ids = json::array();
+    for (const auto& id : store_.get_member_role_ids(user_id)) role_ids.push_back(id);
     res.set_content(json{
         {"user_id", user_id},
         {"display_name", record.display_name},
         {"token", token},
+        {"role_ids", std::move(role_ids)},
+        {std::string(bot::kWarningKey),
+         "This bot holds no roles and no channel grant: it can authenticate and join "
+         "channels, but cannot see or post in any of them until an operator grants it "
+         "access. Grant a role with PUT bsfchat.member.roles, or one channel with PUT "
+         "bsfchat.channel.permissions/user:" + user_id + " — both need MANAGE_ROLES. "
+         "GET " + std::string(api_path::kBots) + "/" + user_id + "/access reports where "
+         "it may go."},
     }.dump(), "application/json");
 }
 
@@ -475,6 +499,33 @@ void BotHandler::handle_get_bot_access(const httplib::Request& req, httplib::Res
     json role_ids = json::array();
     for (const auto& id : perms.roles_of(user_id)) role_ids.push_back(id);
 
+    // THE HEADLINE, computed rather than left for the reader to compute.
+    //
+    // Everything needed to answer "can this bot do anything at all?" was
+    // already in the body — role_ids, server_permissions, and a mask per
+    // channel — and answering it meant scanning the channel array and reading
+    // hex. That is a fine job for a tab and a bad one for the operator with
+    // curl who is, by the time they call this, already confused. So the
+    // endpoint says it.
+    //
+    // VIEW_CHANNEL rather than "any bit", because VIEW_CHANNEL is the
+    // prerequisite for everything in a channel (auth/Permissions.h): a bot
+    // holding SEND_MESSAGES and not VIEW_CHANNEL can do nothing with it.
+    //
+    // OVER THE CHANNELS LISTED, which is the caller's own visible directory
+    // and not the server's. For a caller who cannot see every channel this is
+    // therefore "nothing I can see it in", not "nothing anywhere" — the same
+    // caveat the `channels` array itself carries, and the reason this is named
+    // for the list rather than for the bot.
+    bool any_listed_channel = false;
+    for (const auto& c : channels) {
+        if (permission::has(permission::flags_from_hex(c.value("permissions", "0x0")),
+                            permission::kViewChannel)) {
+            any_listed_channel = true;
+            break;
+        }
+    }
+
     res.set_content(json{
         {"user_id", user_id},
         // Repeated from the bot list so a tab rendering this page does not have
@@ -487,6 +538,10 @@ void BotHandler::handle_get_bot_access(const httplib::Request& req, httplib::Res
         // role did it.
         {"role_ids", std::move(role_ids)},
         {"server_permissions", permission::flags_to_hex(perms.compute(user_id, kServerScope))},
+        // True when the bot holds VIEW_CHANNEL in at least one of the channels
+        // below. False is the state this whole change exists to make legible:
+        // a bot that has been minted and never granted anything.
+        {"can_view_any_listed_channel", any_listed_channel},
         {"channels", std::move(channels)},
     }.dump(), "application/json");
 }

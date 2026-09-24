@@ -1,5 +1,6 @@
 #include "api/RoomHandler.h"
 #include "api/InputLimits.h"
+#include "api/ChannelAccessRefusal.h"
 #include "auth/MediaAccess.h"
 #include "audit/AuditLog.h"
 #include "auth/AutoJoin.h"
@@ -1183,8 +1184,32 @@ void RoomHandler::handle_join(const httplib::Request& req, httplib::Response& re
     emit_state_event(room_id, *user_id, std::string(event_type::kRoomMember), *user_id,
                      join_content);
 
-    res.set_content(json{{"room_id", room_id}}.dump(), "application/json");
-    get_logger()->info("User {} joined room {}", *user_id, room_id);
+    // A 200 that says what it does NOT mean.
+    //
+    // This is the step the bug was hiding behind: a bot with no roles joins a
+    // public channel and this endpoint answers 200, correctly — membership is
+    // not a permission on this server and bot scoping relies on that
+    // (docs/bot-scoping.md §4). The next request it makes is a 403. Nothing
+    // between the two said so, and the 403 named the channel, so the operator
+    // went looking at the channel.
+    //
+    // An extra advisory key on the success body rather than a refusal, because
+    // the join is not the mistake. Absent for everybody else, so an ordinary
+    // join answers exactly the object it always did.
+    json joined{{"room_id", room_id}};
+    auto warning = unscoped_bot_warning(store_, *user_id);
+    if (warning) joined[std::string(bot::kWarningKey)] = *warning;
+    res.set_content(joined.dump(), "application/json");
+
+    // The server log gets the same correction the response does, because the
+    // log is the other place an operator looks and "User X joined room Y" is
+    // the line that made the dead end look like a working setup.
+    if (warning) {
+        get_logger()->info("Bot {} joined room {} holding no roles — it cannot read or post "
+                           "there, or anywhere, until it is granted access", *user_id, room_id);
+    } else {
+        get_logger()->info("User {} joined room {}", *user_id, room_id);
+    }
 }
 
 void RoomHandler::handle_delete_room(const httplib::Request& req, httplib::Response& res) {
@@ -1432,7 +1457,7 @@ void RoomHandler::handle_room_state(const httplib::Request& req, httplib::Respon
     auto& room_id = match.params["roomId"];
     if (!can_read_room(store_, config_, *user_id, room_id)) {
         res.status = 403;
-        res.set_content(MatrixError::forbidden("No access to this channel").to_json().dump(), "application/json");
+        res.set_content(no_channel_access(store_, *user_id).to_json().dump(), "application/json");
         return;
     }
 
@@ -1469,7 +1494,7 @@ void RoomHandler::handle_room_state_event(const httplib::Request& req, httplib::
     auto& room_id = match.params["roomId"];
     if (!can_read_room(store_, config_, *user_id, room_id)) {
         res.status = 403;
-        res.set_content(MatrixError::forbidden("No access to this channel").to_json().dump(), "application/json");
+        res.set_content(no_channel_access(store_, *user_id).to_json().dump(), "application/json");
         return;
     }
 
@@ -1501,7 +1526,7 @@ void RoomHandler::handle_room_members(const httplib::Request& req, httplib::Resp
     auto& room_id = match.params["roomId"];
     if (!can_read_room(store_, config_, *user_id, room_id)) {
         res.status = 403;
-        res.set_content(MatrixError::forbidden("No access to this channel").to_json().dump(), "application/json");
+        res.set_content(no_channel_access(store_, *user_id).to_json().dump(), "application/json");
         return;
     }
 
@@ -2444,7 +2469,7 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     if (evt_type == std::string(event_type::kRoomMember) && state_key == *user_id) {
         if (!perms.can(*user_id, room_id, permission::kViewChannel)) {
             res.status = 403;
-            res.set_content(MatrixError::forbidden("No access to this channel").to_json().dump(),
+            res.set_content(no_channel_access(store_, *user_id).to_json().dump(),
                             "application/json");
             return;
         }
@@ -2545,8 +2570,8 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         // short-circuit every flag, as everywhere.)
         if (!perms.can(*user_id, room_id, permission::kViewChannel)) {
             res.status = 403;
-            res.set_content(MatrixError::forbidden(
-                "No access to this channel").to_json().dump(), "application/json");
+            res.set_content(no_channel_access(store_, *user_id).to_json().dump(),
+                            "application/json");
             return;
         }
 

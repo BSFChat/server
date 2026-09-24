@@ -1,5 +1,6 @@
 #include "api/EventHandler.h"
 #include "api/InputLimits.h"
+#include "api/ChannelAccessRefusal.h"
 #include "auth/MediaAccess.h"
 #include "auth/Permissions.h"
 #include "core/Config.h"
@@ -457,7 +458,7 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
 
     // VIEW_CHANNEL is a prerequisite for anything happening in the room.
     if (!permission::has(user_perms, permission::kViewChannel)) {
-        return send_error(res, 403, MatrixError::forbidden("No access to this channel"));
+        return send_error(res, 403, no_channel_access(store_, *user_id));
     }
 
     // Then the per-type gate. Refusing an unrecognised type is the point: the
@@ -883,7 +884,7 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
 
     PermissionsEngine perms(store_, config_);
     if (!perms.can(*user_id, room_id, permission::kViewChannel)) {
-        return send_error(res, 403, MatrixError::forbidden("No access to this channel"));
+        return send_error(res, 403, no_channel_access(store_, *user_id));
     }
 
     // Parse query params
@@ -1088,7 +1089,7 @@ void EventHandler::handle_redact(const httplib::Request& req, httplib::Response&
     PermissionsEngine perms(store_, config_);
     auto user_perms = perms.compute(*user_id, room_id);
     if (!permission::has(user_perms, permission::kViewChannel)) {
-        return send_error(res, 403, MatrixError::forbidden("No access to this channel"));
+        return send_error(res, 403, no_channel_access(store_, *user_id));
     }
 
     // Self-redact always allowed; redacting others requires MANAGE_MESSAGES.
