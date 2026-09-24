@@ -357,7 +357,7 @@ void Server::register_routes() {
     // path is unambiguous — but kept next to the report routes because the two
     // are the halves of one feature: block to stop it now, report to have it
     // dealt with.
-    auto account_data_handler = std::make_shared<AccountDataHandler>(*store_, config_);
+    auto account_data_handler = std::make_shared<AccountDataHandler>(*store_, *sync_engine_, config_);
 
     svr.Get(R"(/_matrix/client/v3/user/([^/]+)/account_data/([^/]+)$)",
             [h = account_data_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_account_data(req, res); });

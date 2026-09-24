@@ -984,7 +984,16 @@ void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Resp
         pos = store_.get_room_max_stream_position(room_id);
     }
 
-    store_.set_read_marker(*user_id, room_id, pos);
+    // Nothing moved: the marker is already at or past `pos`. The client posts
+    // one for every batch of messages that arrives in the open room, so this is
+    // the ordinary case, and there is nothing to tell anybody about. Answering
+    // 200 either way is deliberate — a read marker is idempotent, and the
+    // client has no use for the distinction.
+    if (!store_.set_read_marker(*user_id, room_id, pos)) {
+        res.set_content("{}", "application/json");
+        return;
+    }
+
     // notify_ephemeral, NOT notify_new_event.
     //
     // A read marker writes no event row, so the stream head does not move —
@@ -998,6 +1007,12 @@ void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Resp
     //
     // The ephemeral counter is the mechanism for "something changed that is
     // not a timeline event" — it is what typing and presence already use.
+    //
+    // Since schema v30 the write also claims a stream position, so the wake is
+    // no longer all that a second device has: the marker travels in that
+    // poll's `m.fully_read` room account data, and a device that missed the
+    // wake still finds it against its own token on the next poll. The wake is
+    // when, not whether — see docs/read-state.md.
     sync_engine_.notify_ephemeral();
 
     res.set_content("{}", "application/json");

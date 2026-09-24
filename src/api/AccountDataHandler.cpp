@@ -7,6 +7,7 @@
 #include "http/RateLimitResponse.h"
 #include "http/Router.h"
 #include "store/SqliteStore.h"
+#include "sync/SyncEngine.h"
 
 #include <bsfchat/ErrorCodes.h>
 #include <bsfchat/Identifiers.h>
@@ -115,9 +116,10 @@ IgnoreList parse_ignore_list(const json& content, const std::string& self) {
 
 } // namespace
 
-AccountDataHandler::AccountDataHandler(SqliteStore& store, const Config& config,
-                                       LimiterClock clock)
-    : store_(store), config_(config), limits_(config.send_limits, std::move(clock)) {}
+AccountDataHandler::AccountDataHandler(SqliteStore& store, SyncEngine& sync_engine,
+                                       const Config& config, LimiterClock clock)
+    : store_(store), sync_engine_(sync_engine), config_(config),
+      limits_(config.send_limits, std::move(clock)) {}
 
 void AccountDataHandler::handle_get_account_data(const httplib::Request& req,
                                                  httplib::Response& res) {
@@ -228,26 +230,31 @@ void AccountDataHandler::handle_put_account_data(const httplib::Request& req,
         ignored = std::move(parsed.users);
     }
 
-    // The document and its index go down together; see set_account_data.
+    // The document and its index go down together; see set_account_data. The
+    // write also claims a stream position, which is what /sync compares a
+    // client's token against to find it (schema v30).
     store_.set_account_data(*user_id, type, content, ignored, now_ms());
 
-    // NO SYNC WAKE, and no account-data section in /sync.
+    // notify_ephemeral, NOT notify_new_event.
     //
-    // Matrix delivers account data through /sync, and this server does not —
-    // the client that reads its block list reads it from this endpoint, which
-    // is where it just wrote it. Waking every parked poll on the server for a
-    // change only one account can see, which that account already knows about
-    // because it is the one that made it, would be cost with nothing on the
-    // other side.
+    // This used to be nothing at all, and the comment here said so: /sync had
+    // no account_data section, so the only reader was this endpoint and the
+    // account that wrote the document already knew. It has one now, and the
+    // device that did NOT write the document is exactly who is waiting.
     //
-    // The enforcement does not wait for a sync either: the filter is a SQL
-    // clause evaluated on the next scan, so the very next poll — including one
-    // already parked, when it re-scans — is already filtered. Blocking takes
-    // effect at the moment of the PUT, not at the moment of a delivery.
+    // The ephemeral counter is this server's "something changed that is not a
+    // timeline event" — typing and presence use it, and so does the read
+    // marker (EventHandler::handle_read_marker). An account-data write does
+    // claim a stream position, so notify_new_event() would also wake a parked
+    // poll; using it here would mean two mechanisms for one kind of change,
+    // and the one a reader of the wait loop would then have to check twice.
     //
-    // A /sync account_data section is the thing to add when a second device
-    // needs to learn about the first one's change without asking. That is a
-    // real gap and it is stated here rather than left to be discovered.
+    // The wake is when, not whether. A client that misses it — parked poll
+    // already returning, process asleep on a phone — still gets the document
+    // on its next poll, because the delta is keyed on the stored position and
+    // not on having been listening at the right moment.
+    sync_engine_.notify_ephemeral();
+
     res.set_content("{}", "application/json");
 }
 

@@ -3083,18 +3083,100 @@ int64_t SqliteStore::get_room_max_stream_position(const std::string& room_id) {
 
 // Read markers
 
-void SqliteStore::set_read_marker(const std::string& user_id, const std::string& room_id, int64_t stream_pos) {
+bool SqliteStore::set_read_marker(const std::string& user_id, const std::string& room_id, int64_t stream_pos) {
     std::lock_guard lock(mutex_);
+
+    // Read first, then decide. The upsert below still resolves its conflict
+    // with MAX — a concurrent writer must not be able to drag the marker back
+    // between these two statements — but the read is what answers "did this
+    // change anything", and a write that changes nothing does not happen at
+    // all: it claims no stream position and wakes nobody. The client posts a
+    // marker for every batch of messages in the open room, so "the marker is
+    // already there" is the ordinary case, not the exception.
+    {
+        auto existing = prepare(db_,
+            "SELECT last_read_pos FROM read_markers WHERE user_id = ? AND room_id = ?");
+        sqlite3_bind_text(existing.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(existing.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(existing.get()) == SQLITE_ROW &&
+            sqlite3_column_int64(existing.get(), 0) >= stream_pos) {
+            return false;
+        }
+    }
+
+    // The position of the WRITE, on the same stream as every event row, which
+    // is what lets /sync deliver this marker to the account's other devices
+    // with the token they already hold (schema v30, docs/read-state.md).
+    const int64_t updated_pos = claim_stream_position_locked();
+
     // Upsert, but only move forward. ON CONFLICT uses MAX(existing, new).
+    //
+    // `updated_pos` moves with it, and only with it: a losing write leaves both
+    // columns alone, so the delivered position always describes the value that
+    // is actually stored.
     auto stmt = prepare(db_,
-        "INSERT INTO read_markers (user_id, room_id, last_read_pos) VALUES (?, ?, ?) "
-        "ON CONFLICT(user_id, room_id) DO UPDATE SET last_read_pos = "
-        "CASE WHEN excluded.last_read_pos > read_markers.last_read_pos "
-        "THEN excluded.last_read_pos ELSE read_markers.last_read_pos END");
+        "INSERT INTO read_markers (user_id, room_id, last_read_pos, updated_pos) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(user_id, room_id) DO UPDATE SET "
+        "  last_read_pos = CASE WHEN excluded.last_read_pos > read_markers.last_read_pos "
+        "                       THEN excluded.last_read_pos ELSE read_markers.last_read_pos END, "
+        "  updated_pos   = CASE WHEN excluded.last_read_pos > read_markers.last_read_pos "
+        "                       THEN excluded.updated_pos ELSE read_markers.updated_pos END");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt.get(), 3, stream_pos);
+    sqlite3_bind_int64(stmt.get(), 4, updated_pos);
     sqlite3_step(stmt.get());
+    return sqlite3_changes(db_) > 0;
+}
+
+std::vector<SqliteStore::ReadMarker> SqliteStore::get_read_markers_changed(
+    const std::string& user_id, int64_t since_pos, int64_t until_pos) {
+    std::lock_guard lock(mutex_);
+    std::vector<ReadMarker> out;
+    if (until_pos <= since_pos) return out;
+    auto stmt = prepare(db_,
+        "SELECT room_id, last_read_pos FROM read_markers "
+        "WHERE user_id = ? AND updated_pos > ? AND updated_pos <= ? "
+        "ORDER BY updated_pos ASC");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 2, since_pos);
+    sqlite3_bind_int64(stmt.get(), 3, until_pos);
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        out.push_back({std::string(column_text_or_empty(stmt.get(), 0)),
+                       sqlite3_column_int64(stmt.get(), 1)});
+    }
+    return out;
+}
+
+std::vector<SqliteStore::ReadMarker> SqliteStore::get_read_markers(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    std::vector<ReadMarker> out;
+    auto stmt = prepare(db_,
+        "SELECT room_id, last_read_pos FROM read_markers WHERE user_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        out.push_back({std::string(column_text_or_empty(stmt.get(), 0)),
+                       sqlite3_column_int64(stmt.get(), 1)});
+    }
+    return out;
+}
+
+std::optional<SqliteStore::MarkedEvent> SqliteStore::resolve_read_marker(
+    const std::string& room_id, int64_t last_read_pos) {
+    std::lock_guard lock(mutex_);
+    if (last_read_pos <= 0) return std::nullopt;
+    // idx_events_room_stream covers this exactly: one room, descending by
+    // position, first row.
+    auto stmt = prepare(db_,
+        "SELECT event_id, origin_server_ts FROM events "
+        "WHERE room_id = ? AND stream_position <= ? "
+        "ORDER BY stream_position DESC LIMIT 1");
+    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 2, last_read_pos);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    return MarkedEvent{std::string(column_text_or_empty(stmt.get(), 0)),
+                       sqlite3_column_int64(stmt.get(), 1)};
 }
 
 int64_t SqliteStore::get_read_marker(const std::string& user_id, const std::string& room_id) {
@@ -4406,6 +4488,38 @@ std::optional<std::string> SqliteStore::get_account_data(const std::string& user
     return std::string(column_text_or_empty(stmt.get(), 0));
 }
 
+std::vector<SqliteStore::AccountDataDocument> SqliteStore::get_account_data_changed(
+    const std::string& user_id, int64_t since_pos, int64_t until_pos) {
+    std::lock_guard lock(mutex_);
+    std::vector<AccountDataDocument> out;
+    if (until_pos <= since_pos) return out;
+    auto stmt = prepare(db_,
+        "SELECT type, content FROM account_data "
+        "WHERE user_id = ? AND updated_pos > ? AND updated_pos <= ? "
+        "ORDER BY updated_pos ASC");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 2, since_pos);
+    sqlite3_bind_int64(stmt.get(), 3, until_pos);
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        out.push_back({std::string(column_text_or_empty(stmt.get(), 0)),
+                       std::string(column_text_or_empty(stmt.get(), 1))});
+    }
+    return out;
+}
+
+std::vector<SqliteStore::AccountDataDocument> SqliteStore::get_all_account_data(
+    const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    std::vector<AccountDataDocument> out;
+    auto stmt = prepare(db_, "SELECT type, content FROM account_data WHERE user_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        out.push_back({std::string(column_text_or_empty(stmt.get(), 0)),
+                       std::string(column_text_or_empty(stmt.get(), 1))});
+    }
+    return out;
+}
+
 void SqliteStore::set_account_data(const std::string& user_id, const std::string& type,
                                    const std::string& content_json,
                                    const std::optional<std::vector<std::string>>& ignored,
@@ -4433,15 +4547,25 @@ void SqliteStore::set_account_data(const std::string& user_id, const std::string
     exec("BEGIN IMMEDIATE");
     try {
         {
+            // `updated_pos`, on the same stream as every event row, is what
+            // lets /sync hand this document to the account's other devices
+            // against the token they already hold (schema v30). It is claimed
+            // for every PUT, including one that stores identical content: a
+            // PUT is a write, the client that made it expects the others to
+            // see it, and comparing documents to decide would make delivery
+            // depend on whitespace.
+            const int64_t updated_pos = claim_stream_position_locked();
             auto stmt = prepare(db_,
-                "INSERT INTO account_data (user_id, type, content, updated_at) "
-                "VALUES (?, ?, ?, ?) "
+                "INSERT INTO account_data (user_id, type, content, updated_at, updated_pos) "
+                "VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(user_id, type) DO UPDATE SET "
-                "  content = excluded.content, updated_at = excluded.updated_at");
+                "  content = excluded.content, updated_at = excluded.updated_at, "
+                "  updated_pos = excluded.updated_pos");
             sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(stmt.get(), 2, type.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(stmt.get(), 3, content_json.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_int64(stmt.get(), 4, when_ms);
+            sqlite3_bind_int64(stmt.get(), 5, updated_pos);
             if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
                 throw std::runtime_error(std::string("Failed to write account data: ") +
                                          sqlite3_errmsg(db_));

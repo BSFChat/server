@@ -7,6 +7,7 @@
 namespace bsfchat {
 
 class SqliteStore;
+class SyncEngine;
 struct Config;
 
 // Matrix per-account key/value storage, and the block list it carries.
@@ -37,6 +38,15 @@ struct Config;
 // block is what stops the harassment — exactly which account to come back at
 // from a second one. Every refusal on this endpoint is that rule.
 //
+// ── It reaches the account's other devices now ────────────────────────────
+//
+// When this endpoint was added, /sync carried no account data, so a block made
+// on a phone never reached the desktop and the header said so. It does now: a
+// write claims a stream position and every one of the account's /sync polls
+// picks it up against the token it already holds (see
+// server/docs/read-state.md). The PUT wakes them rather than letting them time
+// out first.
+//
 // ── Global account data only ──────────────────────────────────────────────
 //
 // Matrix also defines room-scoped account data
@@ -50,7 +60,7 @@ struct Config;
 // implement.
 class AccountDataHandler {
 public:
-    AccountDataHandler(SqliteStore& store, const Config& config,
+    AccountDataHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config,
                        LimiterClock clock = limiter_steady_now_ms);
 
     // 200 with the stored document, or 404 M_NOT_FOUND when this account has
@@ -72,6 +82,10 @@ public:
 
 private:
     SqliteStore& store_;
+    // A successful PUT wakes parked /sync polls: since schema v30 the account's
+    // OTHER devices learn about the write from /sync, and the whole value of
+    // that is not waiting out a poll timeout for it.
+    SyncEngine& sync_engine_;
     const Config& config_;
     SendLimiter limits_;
 };
