@@ -94,6 +94,13 @@ Config Config::load(const std::string& path) {
                     v->value_or(static_cast<int64_t>(cfg.media_ticket_ttl_seconds)));
         }
 
+        // [first_run]
+        if (auto first_run = tbl["first_run"].as_table()) {
+            if (auto v = first_run->get("create_default_channels"))
+                cfg.create_default_channels =
+                    v->value_or(cfg.create_default_channels);
+        }
+
         // [auth]
         if (auto auth = tbl["auth"].as_table()) {
             if (auto v = auth->get("registration_enabled")) cfg.registration_enabled = v->value_or(cfg.registration_enabled);

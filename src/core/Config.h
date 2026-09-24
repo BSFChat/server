@@ -564,6 +564,15 @@ struct Config {
     // Storage
     StorageConfig storage;
 
+    // First run. What a deployment that has never held a room creates for
+    // itself at startup: a #general text channel and a General Voice channel,
+    // so the first person to sign in lands somewhere instead of in an empty
+    // shell they cannot add to. See core/FirstRun.h for the guards that keep
+    // this away from an established server — turning this off does NOT make an
+    // existing deployment safer, because the guards already do, and it does not
+    // remove channels a previous boot created.
+    bool create_default_channels = true;
+
     // Auth
     bool registration_enabled = true;
     // PBKDF2-HMAC-SHA256 work factor, as a power of two: iterations = 2^cost.

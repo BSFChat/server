@@ -1622,6 +1622,16 @@ std::vector<SqliteStore::RoomDirectoryRow> SqliteStore::list_room_directory_rows
     return rows;
 }
 
+bool SqliteStore::has_any_room() {
+    std::lock_guard lock(mutex_);
+    // EXISTS rather than COUNT(*): the answer is a boolean and SQLite can stop
+    // at the first row. No predicate at all — see the header for why the
+    // absence of one is the whole meaning of this query.
+    auto stmt = prepare(db_, "SELECT EXISTS(SELECT 1 FROM rooms)");
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return false;
+    return sqlite3_column_int(stmt.get(), 0) != 0;
+}
+
 std::vector<std::string> SqliteStore::list_public_rooms() {
     std::lock_guard lock(mutex_);
     // Return rooms where the latest m.room.join_rules state event has join_rule == "public"

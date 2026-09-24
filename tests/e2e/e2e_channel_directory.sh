@@ -69,6 +69,16 @@ workers = 4
 [database]
 path = "${WORK}/e2e.db"
 
+# This script builds a precise channel topology — a category, a granted
+# channel, a joined-but-ungranted channel and a private one — and then asserts
+# on the exact set each principal is shown. The first-run channels a new
+# deployment creates for itself are correct everywhere else, but here they are
+# two rooms the fixture did not put there and did not grant the bot, so the
+# directory comparisons would be measuring them instead of the scope rule. The
+# behaviour itself is covered by tests/test_first_run.cpp.
+[first_run]
+create_default_channels = false
+
 [media]
 path = "${WORK}/media/"
 max_upload_size_mb = 5

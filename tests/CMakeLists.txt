@@ -62,6 +62,8 @@ add_executable(server_tests
     test_security_fixes_2026_09.cpp
     # Blocking, reporting and self-service account deletion (schema v29).
     test_ugc_safety.cpp
+    # What a brand-new deployment creates for its first user (core/FirstRun.h).
+    test_first_run.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -136,6 +138,7 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/identity/Nickname.cpp
     ${CMAKE_SOURCE_DIR}/src/push/PushService.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/AutoJoin.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/FirstRun.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/OidcAuth.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/RoleBootstrap.cpp
     # The offline recovery CLI. Compiled in because the whole point of the
