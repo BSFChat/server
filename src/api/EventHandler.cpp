@@ -985,7 +985,20 @@ void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Resp
     }
 
     store_.set_read_marker(*user_id, room_id, pos);
-    sync_engine_.notify_new_event();
+    // notify_ephemeral, NOT notify_new_event.
+    //
+    // A read marker writes no event row, so the stream head does not move —
+    // and notify_new_event's predicate is "has the head passed what I have
+    // already examined". Waking every parked poll with a head that has not
+    // changed satisfies nobody's predicate, so the call was a pure no-op:
+    // the unread and highlight counts this changes did not reach a parked
+    // client until some unrelated event happened along, or until its poll
+    // timed out 30 seconds later. Reading a channel on one device left the
+    // badge lit on the other for exactly that long.
+    //
+    // The ephemeral counter is the mechanism for "something changed that is
+    // not a timeline event" — it is what typing and presence already use.
+    sync_engine_.notify_ephemeral();
 
     res.set_content("{}", "application/json");
 }
