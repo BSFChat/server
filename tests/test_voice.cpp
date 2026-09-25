@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 #include <fstream>
+#include <set>
 
 #include <bsfchat/Constants.h>
 #include <bsfchat/Identifiers.h>
@@ -2370,4 +2371,162 @@ TEST_F(LiveKitTokenTest, LeavingAChannelYouCannotSeeIsAConstantAnswerAndNoSideEf
 
     EXPECT_FALSE(is_active(room, alice));
     EXPECT_TRUE(is_active(room, mod)) << "leave touched a row that was not the caller's";
+}
+
+// ── Voice roster DELIVERY (2026-09-25) ───────────────────────────────────────
+//
+// Context: the channel drawer badged a voice channel `1`, listing only the
+// remote user, while the in-call header said "2 in call" in the same minute.
+// The two surfaces are transports of the same m.call.member fact — the header
+// polls GET /voice/members (RESOLVED state), the drawer folds /sync (a DELTA).
+// The suspicion was that the local user's m.call.member never reached sync at
+// all, which would mean remote clients could not see them in the channel
+// either. These tests exist to answer that, because it was answered by reading
+// code and not by anything that fails when it stops being true.
+//
+// The fold under test is client/src/util/VoiceRoster.h::applyCallMember,
+// transcribed here rather than linked: the client is a separate CMake project
+// with a Qt dependency, and the rule is four lines. The rule is last-write-wins
+// keyed on state_key — active=true inserts or updates, active=false REMOVES —
+// applied to the state block first and then the timeline, which is the order
+// ServerConnection::processSyncResponse walks them in.
+namespace {
+
+struct FoldedRoster {
+    std::set<std::string> present;
+
+    void apply(const std::vector<RoomEvent>& events) {
+        for (const auto& ev : events) {
+            if (ev.type != std::string(event_type::kCallMember) || !ev.state_key) continue;
+            if (ev.content.data.value("active", false)) present.insert(*ev.state_key);
+            else present.erase(*ev.state_key);
+        }
+    }
+    // One /sync response, folded exactly as the client folds it.
+    void apply(const SyncResponse& resp, const std::string& room_id) {
+        auto it = resp.rooms.join.find(room_id);
+        if (it == resp.rooms.join.end()) return;
+        apply(it->second.state.events);
+        apply(it->second.timeline.events);
+    }
+    bool has(const std::string& user_id) const { return present.count(user_id) > 0; }
+};
+
+} // namespace
+
+TEST_F(VoiceHandlerTest, RemoteClientSeesAVoiceJoinerInEverySyncPath) {
+    // The question that matters: can other people see you in a voice channel.
+    // Every path a remote client can learn the roster through, in one test, so
+    // that a regression in any one of them is named rather than inferred.
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    store->set_membership(room_id, "@bob:test", "join");
+
+    auto bob = sync_engine->handle_sync("@bob:test", "", 0);
+    FoldedRoster roster;
+    roster.apply(bob, room_id);
+    ASSERT_FALSE(roster.has("@alice:test")) << "nobody is in the call yet";
+
+    // (1) A first join, delivered incrementally.
+    real_join(room_id, "alice-token");
+    auto d1 = sync_engine->handle_sync("@bob:test", bob.next_batch, 0);
+    roster.apply(d1, room_id);
+    EXPECT_TRUE(roster.has("@alice:test"))
+        << "a remote client's incremental sync did not carry alice's join";
+
+    // (2) A rejoin over a still-active row, which emits the V-M6 retraction
+    // and the new active row as two separate events. Delivered together, the
+    // fold must end on active — the retraction must not be the last word.
+    real_join(room_id, "alice-token");
+    auto d2 = sync_engine->handle_sync("@bob:test", d1.next_batch, 0);
+    roster.apply(d2, room_id);
+    EXPECT_TRUE(roster.has("@alice:test"))
+        << "the retraction half of a rejoin was folded after the active half; "
+           "the pair reached the client out of stream order";
+
+    // (3) A cold client with no token at all. The state block is resolved
+    // (MAX(stream_position) per state_key), so the pair collapses to the join
+    // — but the timeline REPLAYS both, after the state block, so an ordering
+    // fault here would still erase her.
+    FoldedRoster cold;
+    cold.apply(sync_engine->handle_sync("@bob:test", "", 0), room_id);
+    EXPECT_TRUE(cold.has("@alice:test"))
+        << "a cold initial sync did not show alice in the voice channel";
+
+    // (4) And the joiner's own client, which is the surface the defect was
+    // reported on. Nothing about /sync distinguishes the sender of an event
+    // from anyone else, and this pins that.
+    FoldedRoster self;
+    self.apply(sync_engine->handle_sync("@alice:test", "", 0), room_id);
+    EXPECT_TRUE(self.has("@alice:test"))
+        << "the joiner's OWN sync omitted her m.call.member — the drawer's "
+           "missing-self defect would be a delivery bug after all";
+}
+
+TEST_F(VoiceHandlerTest, BusyVoiceChannelStillDeliversMembersOutsideTheTimelineWindow) {
+    // kDefaultTimelineLimit is 20. Measured in production (2026-09-23), a voice
+    // channel's newest 2000 events held 791 m.call.member: the server writes one
+    // on every join, leave and reap sweep, so the newest 20 of such a channel can
+    // be nothing BUT other people's churn. A member who joined before that window
+    // is then carried only by the resolved state block, and this pins that the
+    // state block is what makes an initial sync correct — not the timeline.
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    store->set_membership(room_id, "@bob:test", "join");
+
+    real_join(room_id, "alice-token");
+    for (int i = 0; i < 20; ++i) {   // 40 events, well past the 20-event window
+        real_join(room_id, "bob-token");
+        real_leave(room_id, "bob-token");
+    }
+
+    auto cold = sync_engine->handle_sync("@bob:test", "", 0);
+    const auto& jr = cold.rooms.join[room_id];
+    ASSERT_EQ(jr.timeline.events.size(), size_t(limits::kDefaultTimelineLimit))
+        << "the timeline window is not full; this test is no longer exercising truncation";
+
+    FoldedRoster only_timeline;
+    only_timeline.apply(jr.timeline.events);
+    ASSERT_FALSE(only_timeline.has("@alice:test"))
+        << "alice is inside the timeline window, so this test proves nothing";
+
+    FoldedRoster roster;
+    roster.apply(cold, room_id);
+    EXPECT_TRUE(roster.has("@alice:test"))
+        << "alice is in the call but fell out of a busy channel's initial sync";
+}
+
+TEST_F(VoiceHandlerTest, RejoinDoesNotWakeClientsIntoTheRetractionAlone) {
+    // The defect this closes. handle_voice_join's V-M6 path writes two rows —
+    // active=false then active=true — and emit_state_event used to notify after
+    // EACH. A poll parked on the first notify scanned in the window between the
+    // two writes and came back with a batch saying alice had LEFT the channel;
+    // every client in the room folded that and dropped her from the roster for
+    // a round trip, while the poll-fed in-call header went on counting her.
+    //
+    // A parked long poll rather than the post-scan hook: the hook fires inside
+    // build_incremental_sync, which is one step too late to model "which write
+    // woke this poll", and the wake is precisely what changed.
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    store->set_membership(room_id, "@bob:test", "join");
+    real_join(room_id, "alice-token");
+
+    const std::string since = sync_engine->handle_sync("@bob:test", "", 0).next_batch;
+
+    SyncResponse woke_with;
+    std::thread bob([&] { woke_with = sync_engine->handle_sync("@bob:test", since, 30000); });
+    // Long enough for the poll to be demonstrably parked, matching the pattern
+    // in test_sync_latency.cpp.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    real_join(room_id, "alice-token");   // reset + active, back to back
+    bob.join();
+
+    FoldedRoster roster;
+    roster.apply(woke_with, room_id);
+    EXPECT_TRUE(roster.has("@alice:test"))
+        << "a poll woken by the rejoin came back with the retraction and not the "
+           "active row: every client in the room now believes alice left the "
+           "voice channel until the next batch";
 }

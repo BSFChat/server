@@ -70,17 +70,50 @@ std::string generate_session_id() {
     return out;
 }
 
+// `wake` is false for an event this handler is about to supersede on the very
+// next line — see the V-M6 retraction in handle_voice_join. The event is still
+// written, and still reaches every client; what is withheld is only the
+// CONDITION-VARIABLE WAKE that would make a parked /sync scan the store in the
+// window between the two writes.
+//
+// Why that matters: notify_new_event() wakes every parked poll on the server,
+// and a woken poll takes the store mutex and scans immediately. The rejoin path
+// writes two m.call.member rows back to back — active=false, then active=true —
+// and insert_event releases the store mutex between them. A poll woken by the
+// FIRST row therefore scans while only the retraction is committed, and its
+// batch says the rejoining user has LEFT the voice channel. Every client in the
+// room folds that (client/src/util/VoiceRoster.h is last-write-wins: active
+// false REMOVES the row) and drops the user from the channel roster until the
+// next batch arrives a round trip later — p50 117 ms, p90 679 ms on the mobile
+// client. Meanwhile the in-call header, which is fed by GET /voice/members and
+// so reads RESOLVED state rather than the delta, still counts them. That is
+// exactly the disagreement photographed on 2026-09-25: the drawer badged 1
+// while the header said "2 in call".
+//
+// This does NOT make the pair atomic, and it is not trying to. A poll woken by
+// some unrelated event can still land in the same window. What it removes is
+// the guarantee: before this, the retraction ITSELF woke every client into the
+// half-written state, so the flicker was the expected path rather than a
+// coincidence. Closing it properly would mean writing both rows in one store
+// transaction, which insert_event (BEGIN IMMEDIATE per call) cannot nest today.
+//
+// Suppressing the wake is safe because the superseding write always follows
+// within the same critical section and calls notify_new_event() itself, and
+// that notify publishes a stream head covering BOTH rows. If the second write
+// throws, the retraction sits undelivered only until the next event or the
+// caller's long-poll timeout — a bounded delay on a path that has already
+// failed, and strictly better than reliably telling the room a live user left.
 void emit_state_event(SqliteStore& store, SyncEngine& sync_engine, const std::string& server_name,
                       const std::string& room_id, const std::string& sender,
                       const std::string& event_type, const std::string& state_key,
-                      const json& content) {
+                      const json& content, bool wake = true) {
     auto event_id = generate_event_id(server_name);
     // Bare insert_event: every caller of this helper emits m.call.member, whose
     // content is booleans the handler copied field by field out of the request
     // plus a server-generated session id. No string the caller chose reaches
     // it, so there is no media here to bind and no principal question to ask.
     store.insert_event(event_id, room_id, sender, event_type, state_key, content.dump(), now_ms());
-    sync_engine.notify_new_event();
+    if (wake) sync_engine.notify_new_event();
 }
 
 } // namespace
@@ -382,8 +415,13 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
             json reset_json;
             to_json(reset_json, reset);
             reset_json["session_id"] = existing->content.data.value("session_id", std::string{});
+            // wake=false: the active row two statements below supersedes this
+            // one, and its notify covers both. Waking clients HERE is what made
+            // them fold a lone active=false and paint the rejoining user as
+            // having left the channel for a round trip. See emit_state_event.
             emit_state_event(store_, sync_engine_, config_.server_name,
-                             room_id, *user_id, std::string(event_type::kCallMember), *user_id, reset_json);
+                             room_id, *user_id, std::string(event_type::kCallMember), *user_id, reset_json,
+                             /*wake=*/false);
             get_logger()->info("User {} rejoined voice in room {} over a still-active session; "
                                "emitted a reset first", *user_id, room_id);
         }
