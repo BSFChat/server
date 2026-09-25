@@ -440,6 +440,17 @@ public:
     // Public, non-category, non-direct rooms — i.e. rooms every user on the
     // instance is expected to be a member of.
     std::vector<std::string> list_public_rooms();
+    // Does this server hold ANY room — channel, category, DM, or a channel
+    // everyone has since left?
+    //
+    // The deliberately widest of the room predicates on this class, and the
+    // width is the point: bootstrap_default_channels (core/FirstRun.h) uses it
+    // to answer "has this deployment ever been used?", and every narrower
+    // question would answer a different one. A server whose only room is a
+    // category has had an admin arranging a sidebar; one whose only room is a
+    // DM has had two people talking in it. Neither is a new server, and
+    // neither should have channels invented underneath it.
+    bool has_any_room();
     // Non-category, non-direct rooms.
     std::vector<std::string> list_all_non_category_rooms();
     // Non-category, non-direct rooms that carry no bsfchat.room.type state

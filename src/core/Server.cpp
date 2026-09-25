@@ -1,4 +1,5 @@
 #include "core/Server.h"
+#include "core/FirstRun.h"
 #include "core/Logger.h"
 #include "auth/AutoJoin.h"
 #include "auth/RoleBootstrap.h"
@@ -526,6 +527,15 @@ void Server::start() {
     if (config_.identity) {
         log->info("Identity provider: {}", config_.identity->provider_url);
     }
+
+    // A deployment that has never held a room gets its first two channels here.
+    // ORDERED FIRST of the three, and both orderings matter: the backfill below
+    // then joins every existing account to what was just created (which is what
+    // carries an already-deployed-but-still-empty server across this upgrade),
+    // and bootstrap_roles afterwards finds a room to mirror the role document
+    // into — without which the first admin's client never learns it is one. See
+    // core/FirstRun.h.
+    bootstrap_default_channels(*store_, *sync_engine_, config_);
 
     // Retroactively ensure all existing users are members of all public rooms.
     // Idempotent — skips users already joined.

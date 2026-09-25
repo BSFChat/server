@@ -145,6 +145,30 @@ reaper_interval_minutes = 60
 #     ranges into one request will see 416 here where it saw 206 there.
 #   * Zero-length uploads are refused with 400.
 
+# What a server that has never held a room builds for itself the first time it
+# starts: a #general text channel and a General Voice channel.
+#
+# Without them a new deployment came up completely empty, and the first person
+# to sign in could not fix that from the app. Server-side they really are an
+# admin — the first account registered is given the Admin role — but the client
+# learns its permissions from role state events, and those can only be
+# delivered inside a room. No rooms meant the client never heard that it was
+# allowed to create one, so every "add channel" control stayed hidden.
+#
+# THIS IS NOT A MIGRATION AND CANNOT TOUCH A SERVER THAT IS ALREADY IN USE. The
+# channels are created only when the `rooms` table is completely empty — no
+# channels, no categories, no direct messages, nothing anyone has left — and
+# the decision is recorded in the database the first time this build starts, so
+# a server that already had rooms is marked as such and will never create them
+# later, even if every channel is deleted afterwards.
+#
+# Setting this to false on an existing deployment therefore changes nothing. It
+# is for an operator who provisions channels some other way and wants a new
+# server to come up bare. Channels a previous boot already created stay; delete
+# them in the app.
+[first_run]
+create_default_channels = true
+
 [auth]
 registration_enabled = true
 # PBKDF2-HMAC-SHA256 work factor as a power of two: iterations = 2^cost.
