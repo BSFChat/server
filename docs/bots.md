@@ -64,12 +64,21 @@ Content-Type: application/json
 ```json
 201 {"user_id": "@bot_weather:chat.example.com",
      "display_name": "Weather",
-     "token": "syt_...long-random-string..."}
+     "token": "syt_...long-random-string...",
+     "role_ids": [],
+     "bsfchat.warning": "This bot holds no roles and no channel grant: it can authenticate and join channels, but cannot see or post in any of them until an operator grants it access. ..."}
 ```
 
 The new bot holds **no permissions anywhere** until somebody grants it some —
 see §8. That is not a Matrix behaviour and it is the thing most likely to
-surprise you on first run.
+surprise you on first run, so the response says so twice: `role_ids` is the
+assignment document as written (empty, and spelt the way
+`GET /bots/{id}/access` spells it), and `bsfchat.warning` is the same fact as a
+sentence to show a person.
+
+`bsfchat.warning` is **advisory prose, not a value to branch on** — do not
+match on it. A tool that wants to act on the condition should read
+`can_view_any_listed_channel` from the access report instead.
 
 **The token is shown once** — it appears in this response and nowhere else,
 ever. Only its hash is stored, so it cannot be recovered from the database or
@@ -909,6 +918,30 @@ Note what does **not** change: `POST /rooms/{roomId}/join` still succeeds on a
 public channel, because membership is not a permission on this server. It gains
 the bot nothing. Do not read a successful join as access.
 
+The server now says this rather than leaving you to know it. An unscoped bot's
+join answers 200 with the room id **and** an advisory:
+
+```json
+200 {"room_id": "!gen:chat.example.com",
+     "bsfchat.warning": "Joined, but this bot holds no roles and no channel grant, so it cannot see or post in this channel — or any other. ..."}
+```
+
+and the refusal that follows names the account rather than the channel:
+
+```json
+403 {"errcode": "M_FORBIDDEN",
+     "bsfchat.errcode": "BSFCHAT.BOT_NOT_SCOPED",
+     "error": "No access to this channel: this bot holds no roles and no channel grant, so it has no access to any channel on this server. ..."}
+```
+
+Both keys are absent for every account that has been granted something, and for
+every human, so an ordinary join and an ordinary refusal are byte-identical to
+what they always were. The ordinary refusal — a member who is denied in *this*
+channel — keeps the sentence it has always had and carries
+`bsfchat.errcode: "BSFCHAT.NO_VIEW_CHANNEL"`. The two codes are the difference
+between "look at this channel's overrides" and "this bot has never been granted
+anything"; they are never both sent.
+
 If you are the operator and you want the old behaviour for a particular bot,
 that is one grant and it is worth saying explicitly:
 
@@ -961,6 +994,7 @@ GET /_matrix/client/v3/bsfchat/bots/@bot_weather:chat.example.com/access
      "deactivated": false,
      "role_ids": [],
      "server_permissions": "0x0",
+     "can_view_any_listed_channel": true,
      "channels": [
        {"room_id": "!rel:chat.example.com", "name": "releases", "type": "text",
         "joined": true, "permissions": "0x4003",
@@ -969,6 +1003,13 @@ GET /_matrix/client/v3/bsfchat/bots/@bot_weather:chat.example.com/access
         "joined": false, "permissions": "0x0"}
      ]}
 ```
+
+`can_view_any_listed_channel` is the headline: true when the bot holds
+`VIEW_CHANNEL` in at least one of the channels below. `false` is the answer to
+"why is this bot silent?" — it has been minted and never granted anything. It is
+`VIEW_CHANNEL` rather than "any bit set" because `VIEW_CHANNEL` is the
+prerequisite for everything in a channel, and it is computed over the channels
+**you** can see, hence the name.
 
 `MANAGE_BOTS` at server scope, plus the same rank rule rotation gets. `override`
 appears only where one exists — an absent key means nothing is written for this
@@ -1269,6 +1310,13 @@ Honest list, as of this writing:
 - **A category's overrides do not reach its channels.** Permissions are
   evaluated per room with no parent lookup, so "deny this bot the whole Team
   category" has to be written on each channel in it.
+- **The desktop client's Bots pane cannot grant a bot anything.** Server
+  Settings -> Bots creates, lists, rotates and deactivates, and stops there; it
+  does not call `/bots/{id}/access` and offers no way to write a grant. From the
+  UI the only route is indirect — add the bot to a channel, then assign it a role
+  from the member list — and the `user:<mxid>` channel override, which is the
+  grant this guide recommends, has no UI at all. Operators are writing these two
+  `PUT`s by hand for now. `docs/bot-scoping.md` §10 tracks it.
 
 Closed since earlier drafts of this guide, noted because you may have read
 around them: there is now a **channel directory** (§3.0), so a bot no longer has

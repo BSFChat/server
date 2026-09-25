@@ -22,6 +22,11 @@
 //   7. GET /bsfchat/bots/{id}/access answers "where can this bot go" from
 //      PermissionsEngine, gated like every other bot-administration endpoint
 //      and filtered by what the CALLER may be told about.
+//   8. THE OPERATOR'S ACTUAL FIRST RUN — create, token, join, post — end to
+//      end through the handlers, which nothing covered before. The rule in 1
+//      was tested against PermissionsEngine; this is the same rule as the
+//      four HTTP responses an operator sees, and every one of them says what
+//      it is doing.
 //
 // Expectations are derived from protocol constants (kEveryoneDefault,
 // kAllFlags, kViewChannel...), never from what auth/Permissions.cpp computes.
@@ -29,7 +34,9 @@
 #include <gtest/gtest.h>
 
 #include "api/BotHandler.h"
+#include "api/EventHandler.h"
 #include "api/RoleHandler.h"
+#include "api/RoomHandler.h"
 #include "auth/LocalAuth.h"
 #include "auth/Permissions.h"
 #include "auth/RoleBootstrap.h"
@@ -144,6 +151,8 @@ struct Fixture {
     std::unique_ptr<SyncEngine> sync;
     std::unique_ptr<BotHandler> bots;
     std::unique_ptr<RoleHandler> roles;
+    std::unique_ptr<RoomHandler> rooms;
+    std::unique_ptr<EventHandler> events;
 
     explicit Fixture(const std::string& name) {
         db_path = temp_db_path(name);
@@ -156,9 +165,13 @@ struct Fixture {
         sync = std::make_unique<SyncEngine>(*store, config);
         bots = std::make_unique<BotHandler>(*store, *sync, config);
         roles = std::make_unique<RoleHandler>(*store, *sync, config);
+        rooms = std::make_unique<RoomHandler>(*store, *sync, config);
+        events = std::make_unique<EventHandler>(*store, *sync, config);
     }
 
     ~Fixture() {
+        events.reset();
+        rooms.reset();
         roles.reset();
         bots.reset();
         sync.reset();
@@ -626,4 +639,274 @@ TEST(BotAccess, IsNotAnExistenceOracleForNonBotAccounts) {
                         access_path("@bot_nope:test"), "token-alice");
     EXPECT_EQ(person.status, 404);
     EXPECT_EQ(person.body, missing.body);
+}
+
+// ── 8. The operator's first run, end to end ─────────────────────────────────
+//
+// Everything above tests the RULE. This tests the SEQUENCE, because the rule
+// was right and the sequence was still a dead end: create the bot, mint the
+// token, join a public channel, post — and the first three answer 2xx and the
+// fourth answers "No access to this channel", which is a sentence about the
+// channel and the channel is fine.
+//
+// Nothing covered this. test_bots.cpp drives creation and the admin endpoints;
+// the tests above drive PermissionsEngine. Between them sat the four requests
+// an operator actually makes, and they passed individually.
+//
+// The join genuinely succeeds and must go on succeeding — membership is not a
+// permission here and bot scoping depends on that (docs/bot-scoping.md §4). So
+// what is asserted is not that the sequence works, it is that every step of it
+// SAYS WHAT IT IS DOING: the 201 declares the empty scope, the join warns that
+// it granted nothing, and the 403 names the bot's roles instead of the channel.
+
+namespace {
+
+std::string send_path(const std::string& room_id, const std::string& txn) {
+    return "/_matrix/client/v3/rooms/" + room_id + "/send/m.room.message/" + txn;
+}
+
+std::string join_path(const std::string& room_id) {
+    return "/_matrix/client/v3/rooms/" + room_id + "/join";
+}
+
+std::string text_message(const std::string& body) {
+    return json{{"msgtype", "m.text"}, {"body", body}}.dump();
+}
+
+} // namespace
+
+TEST(BotFirstRun, ANewBotJoinsAPublicChannelAndCannotPostInIt) {
+    // The reproduction, exactly as it was reported: four requests, and the
+    // fourth is the first one that mentions the problem.
+    Fixture fx("first-run-repro");
+    fx.seed_roles();
+    auto admin = fx.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto general = fx.add_channel(admin, "general");
+
+    auto created = call(*fx.bots, &BotHandler::handle_create_bot, kBotsPath, "token-alice",
+                        json{{"localpart", "bot_deploy"}}.dump());
+    ASSERT_TRUE(HasStatus(created, 201));
+    auto body = json::parse(created.body);
+    const std::string bot = body.at("user_id");
+    const std::string bot_token = body.at("token");
+
+    // The join succeeds, and it is supposed to.
+    auto joined = call(*fx.rooms, &RoomHandler::handle_join, join_path(general), bot_token);
+    ASSERT_TRUE(IsOk(joined));
+    EXPECT_EQ(json::parse(joined.body).value("room_id", ""), general);
+    EXPECT_TRUE(fx.store->is_room_member(general, bot));
+
+    // And the post does not. This is the pair that made it confusing, and it
+    // is pinned as a pair so that neither half can be "fixed" alone: a change
+    // that starts refusing the join, or one that starts allowing the send,
+    // fails here.
+    auto sent = call(*fx.events, &EventHandler::handle_send_event, send_path(general, "t1"),
+                     bot_token, text_message("hello"));
+    EXPECT_TRUE(HasStatus(sent, 403));
+}
+
+TEST(BotFirstRun, TheRefusalNamesTheBotsRolesAndNotTheChannel) {
+    // The actual bug. "No access to this channel" sends an operator to look at
+    // the channel's overrides, where there is nothing to find — the cause is an
+    // empty bsfchat.member.roles on the account.
+    Fixture fx("first-run-refusal");
+    fx.seed_roles();
+    auto admin = fx.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto general = fx.add_channel(admin, "general");
+    auto [bot, bot_token] = fx.make_bot("token-alice", "bot_deploy");
+    ASSERT_TRUE(IsOk(call(*fx.rooms, &RoomHandler::handle_join, join_path(general), bot_token)));
+
+    auto sent = call(*fx.events, &EventHandler::handle_send_event, send_path(general, "t1"),
+                     bot_token, text_message("hello"));
+    ASSERT_TRUE(HasStatus(sent, 403));
+    auto err = json::parse(sent.body);
+
+    // The sentence still STARTS with what it always said, because a client is
+    // matching substrings of it (ErrorCodes.h, standing rule 1). Asserted as a
+    // prefix, not as a contains, so a reworded opening is a failure here rather
+    // than a silently dead branch in the client.
+    const std::string sentence = err.at("error");
+    EXPECT_EQ(sentence.rfind("No access to this channel", 0), 0u) << sentence;
+    // ...and then explains itself. Checked as the words an operator would
+    // search for, not as the whole string, which nobody should have to match.
+    EXPECT_NE(sentence.find("no roles"), std::string::npos) << sentence;
+    EXPECT_NE(sentence.find("/access"), std::string::npos) << sentence;
+
+    // The machine-readable half. Written out by hand: the client compares this
+    // against a literal of its own in another repository, so an assertion
+    // through the constant would pass against any typo. Same reasoning as
+    // protocol/tests/test_error_codes.cpp.
+    EXPECT_EQ(err.at("errcode"), "M_FORBIDDEN");
+    EXPECT_EQ(err.at("bsfchat.errcode"), "BSFCHAT.BOT_NOT_SCOPED");
+}
+
+TEST(BotFirstRun, AHumanDeniedInAChannelStillGetsTheChannelRefusal) {
+    // The control, and the half that would hurt. The test above passes just as
+    // well on a server that has started blaming the account for every refusal,
+    // which would send an operator looking at roles when the cause really is a
+    // deny override in one channel.
+    Fixture fx("first-run-human-control");
+    fx.seed_roles();
+    auto admin = fx.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto secret = fx.add_channel(admin, "leadership");
+    fx.set_override(secret, std::string("role:") + permission::role_id::kEveryone, 0,
+                    permission::kViewChannel);
+    auto bob = fx.add_user("bob");
+    fx.store->set_membership(secret, bob, std::string(membership::kJoin));
+
+    auto sent = call(*fx.events, &EventHandler::handle_send_event, send_path(secret, "t1"),
+                     "token-bob", text_message("hello"));
+    ASSERT_TRUE(HasStatus(sent, 403));
+    auto err = json::parse(sent.body);
+    EXPECT_EQ(err.at("error"), "No access to this channel");
+    EXPECT_EQ(err.at("bsfchat.errcode"), "BSFCHAT.NO_VIEW_CHANNEL");
+
+    // And a human whose assignment document is EMPTY is still a human: they
+    // hold @everyone implicitly, so "this account has no roles" would be a
+    // false explanation and would send the reader to the wrong page. This is
+    // the reason the predicate is the conjunction and not the role list alone.
+    fx.assign(bob, {});
+    auto again = call(*fx.events, &EventHandler::handle_send_event, send_path(secret, "t2"),
+                      "token-bob", text_message("hello"));
+    ASSERT_TRUE(HasStatus(again, 403));
+    EXPECT_EQ(json::parse(again.body).at("bsfchat.errcode"), "BSFCHAT.NO_VIEW_CHANNEL");
+}
+
+TEST(BotFirstRun, AScopedBotRefusedInOneChannelGetsTheChannelRefusal) {
+    // The other direction of the same control: once a bot has been granted
+    // something, a refusal somewhere else IS a channel fact again, and telling
+    // it the account holds nothing would be wrong.
+    Fixture fx("first-run-scoped-bot");
+    fx.seed_roles();
+    auto admin = fx.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto general = fx.add_channel(admin, "general");
+    auto [bot, bot_token] = fx.make_bot("token-alice", "bot_deploy");
+    fx.assign(bot, {std::string(permission::role_id::kEveryone)});
+    fx.set_override(general, std::string("role:") + permission::role_id::kEveryone, 0,
+                    permission::kViewChannel);
+    ASSERT_TRUE(IsOk(call(*fx.rooms, &RoomHandler::handle_join, join_path(general), bot_token)));
+
+    auto sent = call(*fx.events, &EventHandler::handle_send_event, send_path(general, "t1"),
+                     bot_token, text_message("hello"));
+    ASSERT_TRUE(HasStatus(sent, 403));
+    EXPECT_EQ(json::parse(sent.body).at("error"), "No access to this channel");
+    EXPECT_EQ(json::parse(sent.body).at("bsfchat.errcode"), "BSFCHAT.NO_VIEW_CHANNEL");
+}
+
+TEST(BotFirstRun, CreationSaysTheBotHoldsNothing) {
+    // The earliest point the fact can be stated. An operator reading only this
+    // response now knows what they have.
+    Fixture fx("first-run-create-body");
+    fx.seed_roles();
+    fx.add_user("alice", {std::string(permission::role_id::kAdmin)});
+
+    auto res = call(*fx.bots, &BotHandler::handle_create_bot, kBotsPath, "token-alice",
+                    json{{"localpart", "bot_deploy"}}.dump());
+    ASSERT_TRUE(HasStatus(res, 201));
+    auto body = json::parse(res.body);
+
+    // Everything that was in this body before is still in it, unchanged. The
+    // token especially: this is the only response that ever carries it.
+    EXPECT_EQ(body.value("user_id", ""), "@bot_deploy:test");
+    EXPECT_EQ(body.value("display_name", ""), "bot_deploy");
+    EXPECT_FALSE(body.value("token", "").empty());
+
+    // The assignment, spelt as GET /bots/{id}/access spells it.
+    ASSERT_TRUE(body.contains("role_ids"));
+    EXPECT_TRUE(body.at("role_ids").is_array());
+    EXPECT_TRUE(body.at("role_ids").empty());
+
+    // And a sentence, because the field above is only legible to somebody who
+    // already knows the rule. Hand-written key: a client in another repository
+    // reads it.
+    ASSERT_TRUE(body.contains("bsfchat.warning"));
+    const std::string warning = body.at("bsfchat.warning");
+    EXPECT_NE(warning.find("no roles"), std::string::npos) << warning;
+    EXPECT_NE(warning.find("/access"), std::string::npos) << warning;
+}
+
+TEST(BotFirstRun, TheJoinWarnsThatItGrantedNothing) {
+    // The step the operator misreads. It still answers 200 and still answers
+    // room_id, because the join is correct; it now also says what it did not do.
+    Fixture fx("first-run-join-warning");
+    fx.seed_roles();
+    auto admin = fx.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto general = fx.add_channel(admin, "general");
+    auto [bot, bot_token] = fx.make_bot("token-alice", "bot_deploy");
+
+    auto res = call(*fx.rooms, &RoomHandler::handle_join, join_path(general), bot_token);
+    ASSERT_TRUE(IsOk(res));
+    auto body = json::parse(res.body);
+    EXPECT_EQ(body.value("room_id", ""), general);
+    ASSERT_TRUE(body.contains("bsfchat.warning"));
+    EXPECT_NE(body.at("bsfchat.warning").get<std::string>().find("cannot see or post"),
+              std::string::npos);
+
+    // A HUMAN's join is byte-identical to what it always was. An advisory key
+    // that appeared on every join would be noise, and noise is ignored.
+    auto bob = fx.add_user("bob");
+    auto human = call(*fx.rooms, &RoomHandler::handle_join, join_path(general), "token-bob");
+    ASSERT_TRUE(IsOk(human));
+    const std::string plain_general = json{{"room_id", general}}.dump();
+    EXPECT_EQ(human.body, plain_general);
+
+    // And so is a granted bot's, which is what makes the key mean something.
+    fx.assign(bot, {std::string(permission::role_id::kEveryone)});
+    auto other = fx.add_channel(admin, "releases");
+    auto scoped = call(*fx.rooms, &RoomHandler::handle_join, join_path(other), bot_token);
+    ASSERT_TRUE(IsOk(scoped));
+    const std::string plain_other = json{{"room_id", other}}.dump();
+    EXPECT_EQ(scoped.body, plain_other);
+}
+
+TEST(BotFirstRun, GrantingTheBotAChannelMakesTheSameSequenceWork) {
+    // The end of the story, and the assertion that the refusals above are
+    // about scope and not about bots being broken. One override, and the exact
+    // four requests from the reproduction succeed.
+    Fixture fx("first-run-granted");
+    fx.seed_roles();
+    auto admin = fx.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto general = fx.add_channel(admin, "general");
+    auto [bot, bot_token] = fx.make_bot("token-alice", "bot_deploy");
+
+    fx.set_override(general, "user:" + bot,
+                    permission::kViewChannel | permission::kSendMessages);
+
+    ASSERT_TRUE(IsOk(call(*fx.rooms, &RoomHandler::handle_join, join_path(general), bot_token)));
+    auto sent = call(*fx.events, &EventHandler::handle_send_event, send_path(general, "t1"),
+                     bot_token, text_message("hello"));
+    ASSERT_TRUE(IsOk(sent));
+    EXPECT_FALSE(json::parse(sent.body).value("event_id", "").empty());
+}
+
+TEST(BotAccess, SaysInOneFieldWhetherTheBotCanSeeAnythingAtAll) {
+    // The report already carried the answer, spread over a role list, a
+    // server-scope mask and one hex string per channel. An operator diagnosing
+    // a silent bot should not have to reduce that themselves.
+    Fixture fx("access-summary");
+    fx.seed_roles();
+    auto admin = fx.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto general = fx.add_channel(admin, "general");
+    auto [bot, _token] = fx.make_bot("token-alice", "bot_deploy");
+
+    auto before = call(*fx.bots, &BotHandler::handle_get_bot_access, access_path(bot),
+                       "token-alice");
+    ASSERT_TRUE(IsOk(before));
+    EXPECT_FALSE(json::parse(before.body).at("can_view_any_listed_channel"));
+
+    // SEND_MESSAGES without VIEW_CHANNEL is not access to anything — the flag
+    // is a prerequisite for everything in a channel — so the summary must not
+    // turn true on "some bit is set".
+    fx.set_override(general, "user:" + bot, permission::kSendMessages);
+    auto useless = call(*fx.bots, &BotHandler::handle_get_bot_access, access_path(bot),
+                        "token-alice");
+    ASSERT_TRUE(IsOk(useless));
+    EXPECT_FALSE(json::parse(useless.body).at("can_view_any_listed_channel"));
+
+    fx.set_override(general, "user:" + bot,
+                    permission::kViewChannel | permission::kSendMessages);
+    auto after = call(*fx.bots, &BotHandler::handle_get_bot_access, access_path(bot),
+                      "token-alice");
+    ASSERT_TRUE(IsOk(after));
+    EXPECT_TRUE(json::parse(after.body).at("can_view_any_listed_channel"));
 }

@@ -210,6 +210,20 @@ echo "     bot = $BOT_ID"
 check "bot id is in the bot_* namespace"        "@bot_e2e:e2e" "$BOT_ID"
 check "display_name echoed back"                "E2E Bot" "$BOT_NAME"
 
+# The creation body says what it just made: an account holding nothing. Before
+# this, the only 2xx in the whole onboarding sequence that could have mentioned
+# it did not, and the fact arrived as a 403 four requests later.
+if grep -q '"role_ids":\[\]' "$WORK/last-body.json"; then
+  note "  creation reports an empty role assignment"
+else
+  fail "  creation reports an empty role assignment" "body=$(cat "$WORK/last-body.json")"
+fi
+if grep -q 'bsfchat.warning' "$WORK/last-body.json"; then
+  note "  ...and says so in a sentence"
+else
+  fail "  ...and says so in a sentence" "body=$(cat "$WORK/last-body.json")"
+fi
+
 # A non-admin must not be able to mint accounts.
 T_BOB=$(register bob)
 [[ -n "$T_BOB" ]] || die "could not register a plain user"
@@ -321,6 +335,43 @@ fi
 check "bot cannot send before joining"          403 "$(req PUT "/rooms/${ROOM}/send/m.room.message/pre1" "$BOT_TOKEN" \
   '{"msgtype":"m.text","body":"should not appear"}')"
 
+# ── the reported dead end, in the order it was reported ──────────────────
+#
+# Join first, ungranted, which is what an operator does and what nothing used
+# to cover: the join succeeds (membership is not a permission here) and the
+# send that follows is refused. Both halves are asserted together so neither
+# can be "fixed" alone — a change that starts refusing this join, or one that
+# starts allowing this send, fails here.
+check "access report says the bot can reach nothing" 200 "$(req GET "/bsfchat/bots/${BOT_ID}/access" "$T_ADMIN")"
+if grep -q '"can_view_any_listed_channel":false' "$WORK/last-body.json"; then
+  note "  can_view_any_listed_channel is false before any grant"
+else
+  fail "  can_view_any_listed_channel is false before any grant" "body=$(cat "$WORK/last-body.json")"
+fi
+
+check "unscoped bot joins a public channel"     200 "$(req POST "/rooms/${ROOM}/join" "$BOT_TOKEN")"
+if grep -q 'bsfchat.warning' "$WORK/last-body.json"; then
+  note "  the join warns that it granted nothing"
+else
+  fail "  the join warns that it granted nothing" "body=$(cat "$WORK/last-body.json")"
+fi
+
+check "  ...and still cannot post"              403 "$(req PUT "/rooms/${ROOM}/send/m.room.message/unscoped1" "$BOT_TOKEN" \
+  '{"msgtype":"m.text","body":"should not appear"}')"
+# The refusal names the ACCOUNT, not the channel. The channel was never the
+# problem, and "No access to this channel" sent the first operator who hit this
+# to go and read the channel's overrides.
+if grep -q 'BSFCHAT.BOT_NOT_SCOPED' "$WORK/last-body.json"; then
+  note "  the refusal is classified BSFCHAT.BOT_NOT_SCOPED"
+else
+  fail "  the refusal is classified BSFCHAT.BOT_NOT_SCOPED" "body=$(cat "$WORK/last-body.json")"
+fi
+if grep -q 'no roles' "$WORK/last-body.json"; then
+  note "  ...and the sentence explains itself"
+else
+  fail "  ...and the sentence explains itself" "body=$(cat "$WORK/last-body.json")"
+fi
+
 # A bot starts with NO permissions anywhere — it does not inherit @everyone
 # (docs/bot-scoping.md). So it is scoped into this one channel the way an
 # operator would: a user-specific channel override, written by the admin, which
@@ -334,6 +385,15 @@ check "bot cannot send before joining"          403 "$(req PUT "/rooms/${ROOM}/s
 check "admin scopes the bot into the channel"   200 "$(req PUT \
   "/rooms/${ROOM}/state/bsfchat.channel.permissions/user:${BOT_ID}" "$T_ADMIN" \
   '{"allow":"0x440f","deny":"0x0"}')"
+
+# The operator-facing read of the same fact, which is the endpoint somebody
+# diagnosing a silent bot should have been pointed at. One field answers it.
+check "access report says the bot can now get in" 200 "$(req GET "/bsfchat/bots/${BOT_ID}/access" "$T_ADMIN")"
+if grep -q '"can_view_any_listed_channel":true' "$WORK/last-body.json"; then
+  note "  can_view_any_listed_channel is true once granted"
+else
+  fail "  can_view_any_listed_channel is true once granted" "body=$(cat "$WORK/last-body.json")"
+fi
 
 # ...and the grant is per-channel, not server-wide: the bot still cannot see
 # anything it was not given. Asserted against the directory, which filters by

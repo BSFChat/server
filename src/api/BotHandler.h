@@ -35,8 +35,16 @@ public:
     BotHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config);
 
     // POST /_matrix/client/v3/bsfchat/bots
-    // {localpart, display_name, description} -> 201 {user_id, display_name, token}
+    // {localpart, display_name, description}
+    //   -> 201 {user_id, display_name, token, role_ids, bsfchat.warning}
     // The token is shown HERE and never again; nothing stores the plaintext.
+    //
+    // `role_ids` and the warning are the scope this call just wrote, said out
+    // loud. They are not decoration: the account it creates holds nothing
+    // anywhere, that is the least Matrix-shaped thing about this server, and
+    // until they existed the first mention of it in the whole onboarding
+    // sequence was a 403 four requests later that named a channel. See
+    // docs/bot-scoping.md §10.
     void handle_create_bot(const httplib::Request& req, httplib::Response& res);
 
     // GET /_matrix/client/v3/bsfchat/bots -> {bots: [...]}
@@ -54,6 +62,7 @@ public:
 
     // GET /_matrix/client/v3/bsfchat/bots/{userId}/access
     //   -> 200 {user_id, deactivated, role_ids, server_permissions,
+    //           can_view_any_listed_channel,
     //           channels: [{room_id, name, type, category_id?, joined,
     //                       permissions, override?: {allow, deny}}]}
     //
@@ -82,6 +91,18 @@ public:
     // cannot grant a bot access to anything. Letting a bot into a channel needs
     // MANAGE_ROLES in that channel, which is the same authority it takes to let
     // a person in, and that is the intended answer rather than a gap.
+    //
+    // WHAT WAS A GAP was that nothing said so. The design above is unchanged;
+    // what changed is that creation, the join and the refusal now each state
+    // it at the moment it applies. docs/bot-scoping.md §10 is the record, and
+    // src/api/ChannelAccessRefusal.h is the refusal half.
+    //
+    // `can_view_any_listed_channel` is the reduction of that array that every
+    // reader was going to perform anyway: does this bot hold VIEW_CHANNEL
+    // anywhere the caller can see? It is one field because the audience for
+    // this endpoint is somebody whose bot has gone quiet, and making them scan
+    // hex masks to find out that the answer is "nowhere" is the same failure,
+    // one layer up, as the refusal that named the channel.
     //
     // GATED BY authorize_bot_admin, so it carries the rank rule too. Reading
     // where a credential may go is reconnaissance for rotating it, and rotation
