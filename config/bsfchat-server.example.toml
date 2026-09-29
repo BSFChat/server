@@ -663,14 +663,19 @@ allowed_gateway_prefixes = ["https://push.example.com/"]
 # hostname you do not control.
 # allow_internal_gateway = false
 
-# What a pusher that does not ask for a specific format gets.
+# How much of a message a push notification carries. Three levels, least
+# revealing first:
 #
-#   "event_id_only" (default) — the gateway is told that something happened in a
-#     room and is given the event id to fetch it with. No message body, no
-#     sender, no display name, no event type.
-#   "full" — the Matrix default: verbatim event content (body, formatted_body,
-#     attachment mxc:// and filename), the sender and their display name.
+#   "event_id_only" — the gateway is told that something happened in a room and
+#     is given the event id to fetch it with. No message body, no sender, no
+#     display name, no event type, no room name.
+#   "names" — adds the event type, the sender, their display name and the
+#     room's name (not for DMs, which have none): enough for "Alice in
+#     #general" on a lock screen. NEVER the message text.
+#   "full" — the Matrix default: adds the verbatim event content (body,
+#     formatted_body, attachment mxc:// and filename).
 #
+# default_payload is what a pusher that does not ask for a specific level gets.
 # event_id_only is the default because the party behind the gateway — Google,
 # Apple, or whoever runs sygnal — is exactly the party this product exists not
 # to trust, and because a pusher that omits `format` has consented to nothing.
@@ -678,13 +683,28 @@ allowed_gateway_prefixes = ["https://push.example.com/"]
 #
 # UPGRADING: deployments from before this setting existed behaved as "full". If
 # your users expect message text on the lock screen and you accept sending it to
-# your gateway, set "full" explicitly. A client that asks for
-# `format: "event_id_only"` always gets it, whatever this says.
+# your gateway, set "full" explicitly. A client that asks for less —
+# `format: "event_id_only"` or `"com.bsfchat.names"` — always gets it,
+# whatever this says.
 #
 # Even in event_id_only mode the gateway still learns the room id, the unread
 # count and whether the message was a mention or a DM (`prio`) — enough to build
 # a coarse social graph over time. There is no mode that discloses nothing.
 # default_payload = "event_id_only"
+
+# The most a client may ASK for, per device, with `data.format` on
+# /pushers/set: "event_id_only", "com.bsfchat.names" or "com.bsfchat.full".
+# A request above this is refused with M_INVALID_PARAM naming the ceiling,
+# rather than accepted and quietly served at less, so the client can grey the
+# option out instead of showing a setting that is not true. Lowering it also
+# applies to pushers registered before the change. Clients read the current
+# values from GET /_matrix/client/v3/bsfchat/push/payload.
+#
+# Unset, it is the more permissive of default_payload and "names": a user can
+# opt in to sender and room names on their own device, and message text still
+# needs an operator to allow it. Set "event_id_only" to keep every name off the
+# gateway too. A default_payload above this is lowered to it at startup.
+# max_payload = "names"
 
 # Delivery worker. The worker is woken immediately when a notification is
 # queued, so worker_poll_ms is only the ceiling on noticing a retry falling due.

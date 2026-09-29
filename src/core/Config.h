@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace bsfchat {
@@ -172,6 +173,40 @@ struct Config;
 // never that the audience goes unchecked.
 std::string expected_identity_audience(const Config& cfg);
 
+// How much of a message a push notification carries, least revealing first.
+// The order is the point: an operator sets a ceiling, a client may ask for
+// anything at or below it, and "at or below" has to mean something.
+//
+//   event_id_only — room id, event id, unread count, priority. Nothing about
+//                   who spoke or what they said.
+//   names         — adds the event type, the sender, the sender's display name
+//                   and the room's name: enough for "Alice in #general" on a
+//                   lock screen. NEVER the message content.
+//   full          — adds the verbatim event content: the Matrix default.
+namespace push_payload {
+inline constexpr std::string_view kEventIdOnly = "event_id_only";
+inline constexpr std::string_view kNames = "names";
+inline constexpr std::string_view kFull = "full";
+
+// What a client puts in `data.format` on /pushers/set to ask for each level.
+// The Matrix spec defines exactly one format value, "event_id_only", and says
+// omitting it means "full"; the other two are ours, so they are namespaced
+// rather than squatting on a bare word a later spec version might define
+// differently. Omission is NOT a request for "full" here — it means "whatever
+// the operator's push.default_payload is".
+inline constexpr std::string_view kFormatEventIdOnly = "event_id_only";
+inline constexpr std::string_view kFormatNames = "com.bsfchat.names";
+inline constexpr std::string_view kFormatFull = "com.bsfchat.full";
+
+// 0, 1, 2 for the levels above in order; -1 for anything else.
+int rank(std::string_view level);
+// The level a `data.format` value asks for, or empty for a value that names no
+// level (including the empty string, which is "no request").
+std::string_view level_for_format(std::string_view format);
+// The `data.format` value that asks for `level`.
+std::string_view format_for_level(std::string_view level);
+} // namespace push_payload
+
 struct PushConfig {
     bool enabled = true;
     // How long the delivery worker sleeps when the queue is empty. It is also
@@ -233,8 +268,25 @@ struct PushConfig {
     // gateway is exactly the party this product exists not to trust, and
     // because a pusher omitting `format` is saying nothing about consent. An
     // operator who runs their own gateway and wants rich notifications sets
-    // "full" deliberately.
+    // "full" deliberately. See push_payload above for the levels.
     std::string default_payload = "event_id_only";
+
+    // The most a client may ASK for with `data.format` on /pushers/set. A
+    // request above it is refused, not quietly downgraded — see
+    // PushHandler::handle_set_pusher. Also applied again at send time, so
+    // lowering it takes effect on pushers registered under a higher ceiling.
+    //
+    // Empty means "unset": the more permissive of default_payload and "names".
+    // That lets a user opt in to "Alice in #general" on their own device
+    // without the operator doing anything — the sender and room name go to the
+    // gateway only for pushers that asked, and message text never does — while
+    // a deployment that already chose default_payload = "full" keeps working
+    // instead of failing the "default must not exceed the ceiling" check.
+    // Config::validate resolves it to a concrete level, so after startup it is
+    // never empty; effective_max_payload() covers a config that skipped that.
+    std::string max_payload;
+
+    std::string_view effective_max_payload() const;
 };
 
 // Per-account limits on the endpoints that write to a room. Flat keys under

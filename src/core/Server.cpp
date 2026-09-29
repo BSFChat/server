@@ -345,6 +345,8 @@ void Server::register_routes() {
             [h = push_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_notify_level(req, res); });
     svr.Put(R"(/_matrix/client/v3/bsfchat/rooms/([^/]+)/notify_level)",
             [h = push_handler](const httplib::Request& req, httplib::Response& res) { h->handle_put_notify_level(req, res); });
+    svr.Get("/_matrix/client/v3/bsfchat/push/payload",
+            [h = push_handler](const httplib::Request& req, httplib::Response& res) { h->handle_get_push_payload(req, res); });
 
     // Account data, and the block list it carries. Spec paths, deliberately:
     // Matrix stores a user's ignore list as the m.ignored_user_list account-data

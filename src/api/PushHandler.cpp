@@ -512,10 +512,30 @@ void PushHandler::handle_set_pusher(const httplib::Request& req, httplib::Respon
                            log_safe(*user_id), log_safe(url), why);
         return send_error(res, 400, MatrixError::invalid_param(why));
     }
+    // `format` picks a payload level (see push_payload in core/Config.h).
+    // Omitted means the operator's default. Anything above the operator's
+    // ceiling is REFUSED rather than stored and quietly served at a lower
+    // level: a settings screen that says "show message text" while the server
+    // sends less would be telling the user something untrue, and a refusal is
+    // the only thing a client can turn into an honest greyed-out option. The
+    // ceiling is re-applied at send time too (PushService), for pushers stored
+    // before an operator lowered it.
     const std::string format = data.value("format", "");
-    if (!format.empty() && format != "event_id_only") {
-        return send_error(res, 400,
-            MatrixError::invalid_param("data.format must be omitted or \"event_id_only\""));
+    if (!format.empty()) {
+        const auto level = push_payload::level_for_format(format);
+        const auto ceiling = config_.push.effective_max_payload();
+        if (level.empty() || push_payload::rank(level) > push_payload::rank(ceiling)) {
+            std::string allowed;
+            for (auto candidate : {push_payload::kEventIdOnly, push_payload::kNames,
+                                   push_payload::kFull}) {
+                if (push_payload::rank(candidate) > push_payload::rank(ceiling)) break;
+                if (!allowed.empty()) allowed += ", ";
+                allowed += "\"" + std::string(push_payload::format_for_level(candidate)) + "\"";
+            }
+            return send_error(res, 400, MatrixError::invalid_param(
+                "data.format must be omitted or one of " + allowed + "; this server's "
+                "push.max_payload is \"" + std::string(ceiling) + "\""));
+        }
     }
 
     SqliteStore::Pusher pusher;
@@ -636,6 +656,32 @@ void PushHandler::handle_put_notify_level(const httplib::Request& req, httplib::
 
     store_.set_room_notify_level(*user_id, room_id, level);
     res.set_content("{}", "application/json");
+}
+
+void PushHandler::handle_get_push_payload(const httplib::Request& req,
+                                          httplib::Response& res) {
+    auto user_id = authenticate(store_, req.get_header_value("Authorization"));
+    if (!user_id) {
+        return send_error(res, 401, auth_error(req.get_header_value("Authorization")));
+    }
+    // What a notification-settings screen needs to render the payload choice
+    // honestly: which option is the default, and which ones this server will
+    // accept, as the exact strings to send back in `data.format`. The levels
+    // are listed by name as well so a client does not have to know the wire
+    // mapping to label them.
+    const auto ceiling = config_.push.effective_max_payload();
+    auto formats = json::array();
+    for (auto level : {push_payload::kEventIdOnly, push_payload::kNames, push_payload::kFull}) {
+        if (push_payload::rank(level) > push_payload::rank(ceiling)) break;
+        formats.push_back({{"level", std::string(level)},
+                           {"format", std::string(push_payload::format_for_level(level))}});
+    }
+    res.set_content(json{
+        {"enabled", config_.push.enabled},
+        {"default_payload", config_.push.default_payload},
+        {"max_payload", std::string(ceiling)},
+        {"allowed_formats", std::move(formats)},
+    }.dump(), "application/json");
 }
 
 } // namespace bsfchat

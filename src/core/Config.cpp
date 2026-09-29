@@ -255,6 +255,8 @@ Config Config::load(const std::string& path) {
                 cfg.push.allow_internal_gateway = v->value_or(cfg.push.allow_internal_gateway);
             if (auto v = push->get("default_payload"))
                 cfg.push.default_payload = v->value_or(cfg.push.default_payload);
+            if (auto v = push->get("max_payload"))
+                cfg.push.max_payload = v->value_or(cfg.push.max_payload);
             // Accepts a single string or an array, same as voice.turn_uri.
             if (auto v = push->get("allowed_gateway_prefixes")) {
                 if (auto arr = v->as_array()) {
@@ -287,6 +289,39 @@ Config Config::load(const std::string& path) {
 
     validate(cfg);
     return cfg;
+}
+
+namespace push_payload {
+
+int rank(std::string_view level) {
+    if (level == kEventIdOnly) return 0;
+    if (level == kNames) return 1;
+    if (level == kFull) return 2;
+    return -1;
+}
+
+std::string_view level_for_format(std::string_view format) {
+    if (format == kFormatEventIdOnly) return kEventIdOnly;
+    if (format == kFormatNames) return kNames;
+    if (format == kFormatFull) return kFull;
+    return {};
+}
+
+std::string_view format_for_level(std::string_view level) {
+    if (level == kNames) return kFormatNames;
+    if (level == kFull) return kFormatFull;
+    return kFormatEventIdOnly;
+}
+
+} // namespace push_payload
+
+std::string_view PushConfig::effective_max_payload() const {
+    if (push_payload::rank(max_payload) >= 0) return max_payload;
+    // Unset (or a value validate() would have replaced). An unknown
+    // default_payload ranks -1 and so loses to "names" here too.
+    return push_payload::rank(default_payload) > push_payload::rank(push_payload::kNames)
+               ? std::string_view(default_payload)
+               : push_payload::kNames;
 }
 
 std::string expected_identity_audience(const Config& cfg) {
@@ -715,11 +750,34 @@ void Config::validate(Config& cfg) {
         }
     }
 
-    if (cfg.push.default_payload != "event_id_only" && cfg.push.default_payload != "full") {
-        log->warn("push.default_payload = \"{}\" is not one of \"event_id_only\" or \"full\"; "
-                  "using \"event_id_only\".",
+    // Payload levels. Every correction below moves toward LESS disclosure: a
+    // typo in a privacy setting must not be what sends message text to a
+    // third party.
+    if (push_payload::rank(cfg.push.default_payload) < 0) {
+        log->warn("push.default_payload = \"{}\" is not one of \"event_id_only\", \"names\" "
+                  "or \"full\"; using \"event_id_only\".",
                   cfg.push.default_payload);
-        cfg.push.default_payload = "event_id_only";
+        cfg.push.default_payload = std::string(push_payload::kEventIdOnly);
+    }
+    if (!cfg.push.max_payload.empty() && push_payload::rank(cfg.push.max_payload) < 0) {
+        log->warn("push.max_payload = \"{}\" is not one of \"event_id_only\", \"names\" or "
+                  "\"full\"; using \"event_id_only\", so clients may not ask for more than "
+                  "the privacy mode.",
+                  cfg.push.max_payload);
+        cfg.push.max_payload = std::string(push_payload::kEventIdOnly);
+    }
+    // Only now, so an unset ceiling is derived from the corrected default.
+    cfg.push.max_payload = std::string(cfg.push.effective_max_payload());
+    if (push_payload::rank(cfg.push.default_payload) > push_payload::rank(cfg.push.max_payload)) {
+        // Lowering the default rather than raising the ceiling: the operator
+        // wrote the ceiling as a limit, and a limit that silently moved up
+        // would not be one. Not a startup failure, for the same reason an
+        // empty gateway allowlist is not — an upgrade must not brick a
+        // running deployment.
+        log->warn("push.default_payload = \"{}\" is above push.max_payload = \"{}\"; "
+                  "using \"{}\" as the default too.",
+                  cfg.push.default_payload, cfg.push.max_payload, cfg.push.max_payload);
+        cfg.push.default_payload = cfg.push.max_payload;
     }
 
     if (cfg.push.enabled && cfg.push.allowed_gateway_prefixes.empty()) {
@@ -752,8 +810,8 @@ void Config::validate(Config& cfg) {
             list += prefix;
         }
         log->info("Push enabled. Permitted push gateways: {}. Default payload: {}. "
-                  "Internal-address gateways: {}.",
-                  list, cfg.push.default_payload,
+                  "Most a client may request: {}. Internal-address gateways: {}.",
+                  list, cfg.push.default_payload, cfg.push.max_payload,
                   cfg.push.allow_internal_gateway ? "permitted" : "refused");
         // Same shape as the trusted_proxies check above, and for the same
         // reason: one line per offending entry turns a list into a wall. The
@@ -785,11 +843,15 @@ void Config::validate(Config& cfg) {
                       "response. Use https:// unless the gateway is on this host.",
                       cleartext);
         }
-        if (cfg.push.default_payload == "full") {
+        if (cfg.push.default_payload == push_payload::kFull) {
             log->warn("push.default_payload = \"full\": a pusher that does not ask for "
-                      "\"event_id_only\" will have verbatim message content, the sender and "
+                      "less will have verbatim message content, the sender and "
                       "their display name sent to the push gateway and stored in push_queue "
                       "in the clear until delivery.");
+        } else if (cfg.push.max_payload == push_payload::kFull) {
+            log->warn("push.max_payload = \"full\": a client that asks for it will have "
+                      "verbatim message content sent to the push gateway and stored in "
+                      "push_queue in the clear until delivery.");
         }
     }
 

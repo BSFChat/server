@@ -31,6 +31,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1290,6 +1291,309 @@ TEST(PushPayload, ExplicitEventIdOnlyBeatsAFullDefault) {
     auto payload = f.gateway.last_payload();
     const auto& n = payload["notification"];
     EXPECT_FALSE(n.contains("content")) << n.dump();
+}
+
+// ── Payload levels: event_id_only < names < full ──────────────────────────
+//
+// The middle level exists so a lock screen can say "Alice in #general" without
+// the gateway ever holding what Alice said. The tests below pin each level's
+// EXACT key set rather than spot-checking fields: a new field added to the
+// notification has to be placed in a level on purpose, not leak into all of
+// them by default.
+
+namespace {
+
+std::set<std::string> keys_of(const json& obj) {
+    std::set<std::string> out;
+    for (auto it = obj.begin(); it != obj.end(); ++it) out.insert(it.key());
+    return out;
+}
+
+const std::set<std::string> kEventIdOnlyKeys = {"event_id", "room_id", "prio", "counts",
+                                                "devices"};
+const std::set<std::string> kNamesKeys = {"event_id", "room_id", "prio", "counts", "devices",
+                                          "type", "sender", "sender_display_name", "room_name"};
+const std::set<std::string> kFullKeys = {"event_id", "room_id", "prio", "counts", "devices",
+                                         "type", "sender", "sender_display_name", "room_name",
+                                         "content"};
+
+// Registers a pusher for `localpart` with `format` (omitted when empty) and
+// hands back the whole response, for tests about refusals.
+httplib::Response set_pusher(PushFixture& f, const std::string& localpart,
+                             const std::string& format, const std::string& pushkey = "k") {
+    json data = {{"url", PushFixture::kGatewayUrl}};
+    if (!format.empty()) data["format"] = format;
+    auto req = make_request("/_matrix/client/v3/pushers/set", "token-" + localpart,
+                            json{{"pushkey", pushkey},
+                                 {"kind", "http"},
+                                 {"app_id", "com.bsfchat.app"},
+                                 {"data", data}}
+                                .dump());
+    httplib::Response res;
+    f.pushers->handle_set_pusher(req, res);
+    return res;
+}
+
+// A named channel, a sender with a display name, and bob listening to all of
+// it with the given format. Returns the notification bob's device received.
+json notification_for(PushFixture& f, const std::string& format,
+                      const std::string& body = "the secret words") {
+    f.add_user("alice");
+    f.add_user("bob");
+    f.store->set_display_name("@alice:test", "Alice");
+    f.store->insert_event("$name", PushFixture::kRoom, "@alice:test",
+                          std::string(event_type::kRoomName), "",
+                          json{{"name", "general"}}.dump(), 1);
+    f.register_pusher("bob", "bob-device", format);
+    f.set_level("bob", PushService::kLevelAll);
+    EXPECT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", body}}, "t1")));
+    f.push->drain_once();
+    return f.gateway.last_payload()["notification"];
+}
+
+} // namespace
+
+TEST(PushPayloadLevels, EventIdOnlyCarriesExactlyTheRoutingFields) {
+    PushFixture f;
+    auto n = notification_for(f, "event_id_only");
+    EXPECT_EQ(keys_of(n), kEventIdOnlyKeys) << n.dump();
+}
+
+// The headline: who and where, never what.
+TEST(PushPayloadLevels, NamesCarriesWhoAndWhereButNeverWhat) {
+    PushFixture f;
+    auto n = notification_for(f, "com.bsfchat.names");
+    EXPECT_EQ(keys_of(n), kNamesKeys) << n.dump();
+    EXPECT_EQ(n["type"], "m.room.message");
+    EXPECT_EQ(n["sender"], "@alice:test");
+    EXPECT_EQ(n["sender_display_name"], "Alice");
+    EXPECT_EQ(n["room_name"], "general");
+    EXPECT_FALSE(n.contains("content")) << n.dump();
+    // Not under any key, at any depth: the body must not be in the payload at
+    // all, which is also what push_queue holds in the clear until delivery.
+    EXPECT_EQ(n.dump().find("the secret words"), std::string::npos) << n.dump();
+}
+
+TEST(PushPayloadLevels, FullAddsTheContentAndTheRoomName) {
+    PushFixture f;
+    f.config.push.max_payload = "full";
+    auto n = notification_for(f, "com.bsfchat.full");
+    EXPECT_EQ(keys_of(n), kFullKeys) << n.dump();
+    EXPECT_EQ(n["content"]["body"], "the secret words");
+    EXPECT_EQ(n["room_name"], "general");
+}
+
+// The level a pusher that says nothing gets is the operator's default, at
+// every level — including the new one.
+TEST(PushPayloadLevels, OmittedFormatGetsTheOperatorDefault) {
+    PushFixture f;
+    f.config.push.default_payload = "names";
+    auto n = notification_for(f, "");
+    EXPECT_EQ(keys_of(n), kNamesKeys) << n.dump();
+}
+
+// A DM has no name of its own; the sender fields are its whole title.
+TEST(PushPayloadLevels, ADirectMessageCarriesNoRoomName) {
+    PushFixture f;
+    auto alice = f.add_user("alice", /*join=*/false);
+    auto bob = f.add_user("bob", /*join=*/false);
+    f.store->set_display_name(alice, "Alice");
+    f.store->create_room("!dm:test", alice, /*is_direct=*/true);
+    f.store->set_membership("!dm:test", alice, "join");
+    f.store->set_membership("!dm:test", bob, "join");
+    f.register_pusher("bob", "bob-device", "com.bsfchat.names");
+
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "hey"}}, "t1", "!dm:test")));
+    f.push->drain_once();
+    auto n = f.gateway.last_payload()["notification"];
+    EXPECT_FALSE(n.contains("room_name")) << n.dump();
+    EXPECT_FALSE(n.contains("content")) << n.dump();
+    EXPECT_EQ(n["sender_display_name"], "Alice");
+}
+
+// A room with no m.room.name gets no room_name key, not an empty one.
+TEST(PushPayloadLevels, AnUnnamedRoomOmitsRoomName) {
+    PushFixture f;
+    f.add_user("alice");
+    f.add_user("bob");
+    f.register_pusher("bob", "bob-device", "com.bsfchat.names");
+    f.set_level("bob", PushService::kLevelAll);
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "hi"}}, "t1")));
+    f.push->drain_once();
+    auto n = f.gateway.last_payload()["notification"];
+    EXPECT_FALSE(n.contains("room_name")) << n.dump();
+    EXPECT_EQ(n["sender"], "@alice:test");
+}
+
+// Asking for less always works, whatever the default is.
+TEST(PushPayloadLevels, ExplicitLowerLevelsBeatAPermissiveDefault) {
+    {
+        PushFixture f;
+        f.config.push.default_payload = "names";
+        auto n = notification_for(f, "event_id_only");
+        EXPECT_EQ(keys_of(n), kEventIdOnlyKeys) << n.dump();
+    }
+    {
+        PushFixture f;
+        f.config.push.default_payload = "full";
+        auto n = notification_for(f, "com.bsfchat.names");
+        EXPECT_EQ(keys_of(n), kNamesKeys) << n.dump();
+    }
+}
+
+// A request above the ceiling is refused, and the refusal says what the
+// ceiling is, so a client can show the user the truth instead of a setting
+// the server is silently not honouring.
+TEST(PushPayloadCeiling, RequestsAboveTheCeilingAreRefused) {
+    PushFixture f; // max_payload unset: derives to "names"
+    f.add_user("alice");
+
+    auto res = set_pusher(f, "alice", "com.bsfchat.full");
+    EXPECT_EQ(res.status, 400);
+    auto err = json::parse(res.body, nullptr, false);
+    EXPECT_EQ(err["errcode"], "M_INVALID_PARAM") << res.body;
+    const std::string message = err.value("error", "");
+    EXPECT_NE(message.find("max_payload is \"names\""), std::string::npos) << message;
+    EXPECT_NE(message.find("\"com.bsfchat.names\""), std::string::npos) << message;
+    EXPECT_EQ(message.find("com.bsfchat.full"), std::string::npos)
+        << "the refusal must not offer the level it just refused: " << message;
+    // The bare spec word is not ours to redefine, and is not accepted either.
+    EXPECT_EQ(set_pusher(f, "alice", "full").status, 400);
+    EXPECT_EQ(set_pusher(f, "alice", "names").status, 400);
+    EXPECT_EQ(set_pusher(f, "alice", "bogus").status, 400);
+    // A refused registration stores nothing.
+    EXPECT_TRUE(f.store->get_pushers("@alice:test").empty());
+
+    EXPECT_TRUE(IsOk(set_pusher(f, "alice", "")));
+    EXPECT_TRUE(IsOk(set_pusher(f, "alice", "event_id_only")));
+    EXPECT_TRUE(IsOk(set_pusher(f, "alice", "com.bsfchat.names")));
+
+    f.config.push.max_payload = "event_id_only";
+    EXPECT_EQ(set_pusher(f, "alice", "com.bsfchat.names").status, 400);
+    EXPECT_TRUE(IsOk(set_pusher(f, "alice", "event_id_only")));
+
+    f.config.push.max_payload = "full";
+    EXPECT_TRUE(IsOk(set_pusher(f, "alice", "com.bsfchat.full")));
+}
+
+// Lowering the ceiling takes effect on pushers that registered under a higher
+// one. Refusing at /pushers/set alone would leave every existing row at
+// whatever it asked for back then.
+TEST(PushPayloadCeiling, LoweringTheCeilingClampsExistingPushers) {
+    PushFixture f;
+    f.config.push.max_payload = "full";
+    f.add_user("alice");
+    f.add_user("bob");
+    f.register_pusher("bob", "bob-device", "com.bsfchat.full");
+    f.set_level("bob", PushService::kLevelAll);
+    f.config.push.max_payload = "names";
+
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "secret"}}, "t1")));
+    f.push->drain_once();
+    auto n = f.gateway.last_payload()["notification"];
+    EXPECT_FALSE(n.contains("content")) << n.dump();
+    EXPECT_EQ(n["sender"], "@alice:test");
+}
+
+// ── Payload config validation ─────────────────────────────────────────────
+
+TEST(PushPayloadConfig, UnsetCeilingIsTheMorePermissiveOfDefaultAndNames) {
+    Config cfg = Config::defaults();
+    allow_test_gateway(cfg);
+    Config::validate(cfg);
+    EXPECT_EQ(cfg.push.default_payload, "event_id_only");
+    EXPECT_EQ(cfg.push.max_payload, "names");
+
+    // A deployment that already chose "full" must keep starting, and keep
+    // serving it.
+    Config full = Config::defaults();
+    allow_test_gateway(full);
+    full.push.default_payload = "full";
+    Config::validate(full);
+    EXPECT_EQ(full.push.default_payload, "full");
+    EXPECT_EQ(full.push.max_payload, "full");
+}
+
+TEST(PushPayloadConfig, UnknownValuesFallBackToThePrivacyMode) {
+    auto ring = std::make_shared<spdlog::sinks::ringbuffer_sink_mt>(64);
+    get_logger()->sinks().push_back(ring);
+    struct Pop {
+        ~Pop() { get_logger()->sinks().pop_back(); }
+    } pop;
+
+    Config cfg = Config::defaults();
+    allow_test_gateway(cfg);
+    cfg.push.default_payload = "everything";
+    cfg.push.max_payload = "Full"; // case matters: not a level
+    Config::validate(cfg);
+    EXPECT_EQ(cfg.push.default_payload, "event_id_only");
+    EXPECT_EQ(cfg.push.max_payload, "event_id_only");
+
+    bool saw_default = false, saw_max = false;
+    for (const auto& line : ring->last_formatted()) {
+        if (line.find("push.default_payload = \"everything\"") != std::string::npos) saw_default = true;
+        if (line.find("push.max_payload = \"Full\"") != std::string::npos) saw_max = true;
+    }
+    EXPECT_TRUE(saw_default) << "an unknown default must be named in the log";
+    EXPECT_TRUE(saw_max) << "an unknown ceiling must be named in the log";
+}
+
+// The ceiling is the operator's limit; a default above it moves down to meet
+// it rather than dragging the limit up.
+TEST(PushPayloadConfig, ADefaultAboveTheCeilingIsLoweredToIt) {
+    Config cfg = Config::defaults();
+    allow_test_gateway(cfg);
+    cfg.push.default_payload = "full";
+    cfg.push.max_payload = "names";
+    Config::validate(cfg);
+    EXPECT_EQ(cfg.push.default_payload, "names");
+    EXPECT_EQ(cfg.push.max_payload, "names");
+}
+
+// ── Payload discovery ─────────────────────────────────────────────────────
+
+namespace {
+httplib::Response get_payload_info(PushFixture& f, const std::string& token) {
+    auto req = make_request("/_matrix/client/v3/bsfchat/push/payload", token);
+    httplib::Response res;
+    f.pushers->handle_get_push_payload(req, res);
+    return res;
+}
+} // namespace
+
+TEST(PushPayloadDiscovery, ReportsTheDefaultTheCeilingAndTheFormatsToSend) {
+    PushFixture f;
+    f.add_user("alice");
+
+    auto res = get_payload_info(f, "token-alice");
+    ASSERT_TRUE(IsOk(res));
+    auto body = json::parse(res.body);
+    EXPECT_EQ(body["enabled"], true);
+    EXPECT_EQ(body["default_payload"], "event_id_only");
+    EXPECT_EQ(body["max_payload"], "names");
+    EXPECT_EQ(body["allowed_formats"],
+              json::parse(R"([{"level":"event_id_only","format":"event_id_only"},
+                              {"level":"names","format":"com.bsfchat.names"}])"));
+
+    // Every format it advertises is one /pushers/set accepts.
+    for (const auto& entry : body["allowed_formats"]) {
+        EXPECT_TRUE(IsOk(set_pusher(f, "alice", entry["format"].get<std::string>())));
+    }
+
+    f.config.push.max_payload = "full";
+    body = json::parse(get_payload_info(f, "token-alice").body);
+    ASSERT_EQ(body["allowed_formats"].size(), 3u);
+    EXPECT_EQ(body["allowed_formats"][2]["format"], "com.bsfchat.full");
+
+    f.config.push.max_payload = "event_id_only";
+    body = json::parse(get_payload_info(f, "token-alice").body);
+    EXPECT_EQ(body["max_payload"], "event_id_only");
+    EXPECT_EQ(body["allowed_formats"].size(), 1u);
+}
+
+TEST(PushPayloadDiscovery, RequiresAuthentication) {
+    PushFixture f;
+    EXPECT_EQ(get_payload_info(f, "not-a-token").status, 401);
 }
 
 // ── Role mentions ─────────────────────────────────────────────────────────
