@@ -15,6 +15,7 @@ struct Config;
 //   GET  /_matrix/client/v3/pushers
 //   GET  /_matrix/client/v3/bsfchat/rooms/{roomId}/notify_level
 //   PUT  /_matrix/client/v3/bsfchat/rooms/{roomId}/notify_level
+//   GET  /_matrix/client/v3/bsfchat/push/payload
 //
 // The notify_level pair is deliberately in the bsfchat.* namespace rather than
 // pretending to be Matrix's /pushrules: it is a single enum per room, not the
@@ -28,6 +29,9 @@ public:
     void handle_get_pushers(const httplib::Request& req, httplib::Response& res);
     void handle_get_notify_level(const httplib::Request& req, httplib::Response& res);
     void handle_put_notify_level(const httplib::Request& req, httplib::Response& res);
+    // The operator's payload default and ceiling, and the `data.format`
+    // values /pushers/set will accept, so a client can grey out the rest.
+    void handle_get_push_payload(const httplib::Request& req, httplib::Response& res);
 
 private:
     SqliteStore& store_;

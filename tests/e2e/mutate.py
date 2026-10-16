@@ -117,8 +117,8 @@ MUTATIONS = [
 
  ("P4/B17 payload default back to full plaintext",
   "src/push/PushService.cpp",
-  "            pusher.format.empty() && config_.push.default_payload == \"full\";",
-  "            pusher.format.empty();",
+  "                                     ? std::string_view(config_.push.default_payload)",
+  "                                     ? push_payload::kFull",
   "PushPayload.DefaultsToEventIdOnly", 120),
 
  ("P4/A17 rejected gateway URL logged verbatim again",
@@ -135,9 +135,27 @@ MUTATIONS = [
 
  ("F2 event_id_only privacy mode ignored",
   "src/push/PushService.cpp",
-  "        const bool send_content =\n            pusher.format.empty() && config_.push.default_payload == \"full\";",
-  "        const bool send_content = true;",
+  "        const int rank = push_payload::rank(level);",
+  "        const int rank = push_payload::rank(push_payload::kFull);",
   "PushEvaluation.EventIdOnlyPushersDoNotLeakMessageContent", 120),
+
+ ("Push names level leaks the message content",
+  "src/push/PushService.cpp",
+  "        if (rank >= push_payload::rank(push_payload::kFull)) {",
+  "        if (rank >= push_payload::rank(push_payload::kNames)) {",
+  "PushPayloadLevels.NamesCarriesWhoAndWhereButNeverWhat", 120),
+
+ ("Push ceiling not re-applied at send time",
+  "src/push/PushService.cpp",
+  "        if (push_payload::rank(level) > push_payload::rank(ceiling)) level = ceiling;",
+  "",
+  "PushPayloadCeiling.LoweringTheCeilingClampsExistingPushers", 120),
+
+ ("Push ceiling not enforced at /pushers/set",
+  "src/api/PushHandler.cpp",
+  "        if (level.empty() || push_payload::rank(level) > push_payload::rank(ceiling)) {",
+  "        if (level.empty()) {",
+  "PushPayloadCeiling.RequestsAboveTheCeilingAreRefused", 120),
 
  ("F2 gateway URL validation removed (SSRF)",
   "src/api/PushHandler.cpp",

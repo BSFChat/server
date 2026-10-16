@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <set>
 
 namespace bsfchat {
@@ -181,6 +182,37 @@ int PushService::evaluate_message(const MessageNotification& n, PermissionsEngin
         return decision;
     };
 
+    // Looked up at most once per message, and only if some recipient's pusher
+    // is at a level that carries them.
+    std::optional<std::optional<std::string>> sender_display_name_cache;
+    auto sender_display_name = [&]() -> const std::optional<std::string>& {
+        if (!sender_display_name_cache) {
+            sender_display_name_cache = store_.get_display_name(n.sender);
+        }
+        return *sender_display_name_cache;
+    };
+    // A DM has no name of its own — it is titled by who is in it, and the
+    // client never reads m.room.name for one — so the sender fields are the
+    // whole of its title and there is nothing to add.
+    std::optional<std::optional<std::string>> room_name_cache;
+    auto room_name = [&]() -> const std::optional<std::string>& {
+        if (!room_name_cache) {
+            room_name_cache.emplace();
+            if (!is_dm) {
+                auto ev = store_.get_state_event(n.room_id,
+                                                 std::string(event_type::kRoomName), "");
+                if (ev) {
+                    const auto& c = ev->content.data;
+                    if (c.is_object() && c.contains("name") && c["name"].is_string() &&
+                        !c["name"].get_ref<const std::string&>().empty()) {
+                        *room_name_cache = c["name"].get<std::string>();
+                    }
+                }
+            }
+        }
+        return *room_name_cache;
+    };
+
     std::vector<SqliteStore::QueuedPush> queue;
     queue.reserve(candidates.size());
     for (const auto& pusher : candidates) {
@@ -211,7 +243,7 @@ int PushService::evaluate_message(const MessageNotification& n, PermissionsEngin
             {"counts", {{"unread", store_.count_unread(pusher.user_id, n.room_id)}}},
             {"devices", json::array({std::move(device)})},
         };
-        // What leaves this server, to a third party, by default.
+        // What leaves this server, to a third party.
         //
         // `event_id_only` is the spec's privacy mode: the gateway — and
         // whatever provider sits behind it — is told that something happened in
@@ -220,10 +252,14 @@ int PushService::evaluate_message(const MessageNotification& n, PermissionsEngin
         // no consent to shipping message bodies to a third party, and because
         // the payload is also stored in push_queue in the clear until delivery.
         // An operator who runs their own gateway and wants rich notifications
-        // sets push.default_payload = "full" deliberately.
+        // raises push.default_payload deliberately.
         //
-        // An explicit `format: event_id_only` always wins: a client asking for
-        // privacy outranks the deployment default.
+        // An explicit request replaces the default in either direction, so a
+        // client asking for privacy always outranks the deployment. It never
+        // gets more than push.max_payload — refused at /pushers/set, and
+        // clamped again here for a pusher stored before the operator lowered
+        // the ceiling. A stored format this build does not recognise is read
+        // as event_id_only, never as the default.
         //
         // `sender` and `type` are withheld in the privacy mode too. They used to
         // be sent unconditionally, which handed a gateway operator a per-message
@@ -233,15 +269,26 @@ int PushService::evaluate_message(const MessageNotification& n, PermissionsEngin
         // dropping them would break the feature rather than tighten it. They
         // still tell a gateway "this one was a mention or a DM" — there is no
         // mode here that discloses nothing at all.
-        const bool send_content =
-            pusher.format.empty() && config_.push.default_payload == "full";
-        if (send_content) {
+        std::string_view level = pusher.format.empty()
+                                     ? std::string_view(config_.push.default_payload)
+                                     : push_payload::level_for_format(pusher.format);
+        if (level.empty()) level = push_payload::kEventIdOnly;
+        const auto ceiling = config_.push.effective_max_payload();
+        if (push_payload::rank(level) > push_payload::rank(ceiling)) level = ceiling;
+        const int rank = push_payload::rank(level);
+
+        if (rank >= push_payload::rank(push_payload::kNames)) {
             notification["type"] = n.event_type;
             notification["sender"] = n.sender;
-            notification["content"] = n.content;
-            if (auto name = store_.get_display_name(n.sender)) {
+            if (const auto& name = sender_display_name()) {
                 notification["sender_display_name"] = *name;
             }
+            if (const auto& name = room_name()) notification["room_name"] = *name;
+        }
+        // The one line that separates "names" from "full". Nothing else in
+        // this function may copy from n.content.
+        if (rank >= push_payload::rank(push_payload::kFull)) {
+            notification["content"] = n.content;
         }
 
         SqliteStore::QueuedPush q;
