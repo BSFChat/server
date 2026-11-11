@@ -23,12 +23,38 @@ tombstone (id, type, sender, timestamp) and the content is gone.
 > After a redaction returns, no surface of the server still holds the text of
 > the redacted message or of any edit of it: not the `events` rows, not the FTS
 > index, not the bundled edit history, not the mention rows, and not the
-> undispatched push queue.
+> undispatched push queue. (Content reports keep their snapshot on purpose;
+> see the exception below.)
 
 "The message" is not a row. It is the original event plus every `m.replace` of
 it, transitively. That is the whole content of the invariant: a message that has
 been edited is several rows, and a redaction that strips one of them is not a
 redaction.
+
+### The one deliberate exception: content reports
+
+A **report keeps its snapshot of the reported message after that message is
+redacted.** This is decided, not overlooked. The usual outcome of a report is
+that the thing reported gets deleted; a report that then pointed at an empty
+tombstone would leave the moderation history unable to say what was removed or
+why. So `content_reports.event_snapshot` (the whole content object, capped at
+`input_limits::kMaxReportSnapshotBytes`) is history, and `redact_event` does
+not touch it.
+
+What bounds the exposure:
+
+- Reports are readable only with server-scope `MANAGE_SERVER`
+  (`GET /_matrix/client/v3/bsfchat/reports`). Nobody else, including the
+  reporter and the sender, can read a snapshot back.
+- Only reported messages are kept, and only as they were when reported.
+- The audit log records the report but **not** the reported content, because
+  the audit log has no delete path; the snapshot lives only in
+  `content_reports`.
+
+Pinned by `UgcReporting.TheReportedEventSurvivesItsOwnRedaction`. A change that
+makes redaction reach report snapshots reverses this decision and must say so.
+If a deployment needs reports to expire, that is a retention setting to add on
+`content_reports`, not a change to redaction.
 
 `SqliteStore::redact_event` is the single place this is enforced, in one
 transaction, and the enforcement is unconditional — re-redacting a message that
