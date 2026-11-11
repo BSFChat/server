@@ -1789,3 +1789,39 @@ TEST(IpInLogs, UntrustedProxyWarningNamesTheNetworkNotTheHost) {
     // And it must not have leaked the address the header claimed, either.
     EXPECT_EQ(warning.find("203.0.113.5"), std::string::npos) << warning;
 }
+
+// /refresh applies the same gates as /login. Ban and deactivation used to be
+// enforced here only by their token purge, which a refresh in flight could
+// straddle: consume_refresh_token and store_access_token lock separately, so a
+// purge landing between them left the newly minted pair alive and refreshable
+// forever. Each test below puts the store into exactly that post-race state —
+// flag set, a refresh token surviving — and was confirmed to fail before.
+TEST(RefreshGates, ABannedAccountCannotRefresh) {
+    AuthFixture f;
+    auto login = nlohmann::json::parse(f.login("alice", "correct-horse-7", true).body);
+    // The ban's flag is written; its purge "ran before this token existed".
+    f.store->set_server_ban("@alice:test", "@admin:test", "", 1);
+
+    auto r = f.call(&AuthHandler::handle_refresh, {{"refresh_token", login.at("refresh_token")}});
+    EXPECT_EQ(r.status, 403) << r.body;
+    EXPECT_FALSE(f.store->get_user_by_token(login.at("access_token")).has_value())
+        << "a refused refresh must also end the session it came from";
+}
+
+TEST(RefreshGates, ADeactivatedAccountCannotRefresh) {
+    AuthFixture f;
+    ASSERT_TRUE(f.store->deactivate_user("@alice:test", 1));
+    // The pair a refresh minted in the gap, after the purge.
+    f.store->store_access_token("late-access", "@alice:test", "DEV", 60000, "late-refresh");
+
+    auto r = f.call(&AuthHandler::handle_refresh, {{"refresh_token", "late-refresh"}});
+    EXPECT_EQ(r.status, 403) << r.body;
+    EXPECT_FALSE(f.store->get_user_by_token("late-access").has_value());
+}
+
+TEST(RefreshGates, AnOrdinaryRefreshStillWorks) {
+    AuthFixture f;
+    auto login = nlohmann::json::parse(f.login("alice", "correct-horse-7", true).body);
+    auto r = f.call(&AuthHandler::handle_refresh, {{"refresh_token", login.at("refresh_token")}});
+    EXPECT_EQ(r.status, 200) << r.body;
+}

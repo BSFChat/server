@@ -119,6 +119,10 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
         // Also add rooms where someone is typing but no timeline events occurred
         for (const auto& room_id : joined_rooms) {
             if (response.rooms.join.count(room_id)) continue; // already handled
+            // The same gate as the pass above. joined_rooms is the LISTING set,
+            // which keeps denied categories as stubs; without this, a room the
+            // first pass refused came straight back here with its typing list.
+            if (!perms->can(*user_id, room_id, permission::kViewChannel)) continue;
             auto typing_users = typing_handler_->get_typing_users(room_id);
             if (!typing_users.empty()) {
                 JoinedRoom joined;

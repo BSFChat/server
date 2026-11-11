@@ -1136,6 +1136,28 @@ void AuthHandler::handle_refresh(const httplib::Request& req, httplib::Response&
         return send_error(res, 401, MatrixError::unknown_token("Invalid refresh token"));
     }
 
+    // The same gates /login applies. Ban and deactivation were enforced here
+    // only by their token purge, and consume_refresh_token and
+    // store_access_token take the store lock separately: a purge landing
+    // between them (row consumed, new token not yet written) left the new pair
+    // alive, and nothing revisits it — authenticate() does not check bans, and
+    // refresh would rotate that session forever. So check before minting, and
+    // again AFTER storing: both actions set their flag before purging, so a
+    // purge that ran in the gap is always followed by a flag this second check
+    // sees, and the pair it missed is removed here instead.
+    const auto refused = [&]() -> bool {
+        if (!store_.is_server_banned(session->user_id) &&
+            !store_.get_user_deactivated_at(session->user_id)) {
+            return false;
+        }
+        store_.delete_all_tokens_for_user(session->user_id);
+        get_logger()->info("Refused refresh for banned or deactivated account {}",
+                           session->user_id);
+        send_error(res, 403, MatrixError::forbidden("This account can no longer sign in"));
+        return true;
+    };
+    if (refused()) return;
+
     auto access_token = generate_access_token();
     auto new_refresh = generate_access_token();
     // Carries the family forward. Passing nothing here would start a new
@@ -1144,6 +1166,7 @@ void AuthHandler::handle_refresh(const httplib::Request& req, httplib::Response&
     // revoking it would leave every earlier rotation alive.
     store_.store_access_token(access_token, session->user_id, session->device_id,
                               token_lifetime_ms(), new_refresh, session->family_id);
+    if (refused()) return;
 
     res.set_content(json{
         {"access_token", access_token},
