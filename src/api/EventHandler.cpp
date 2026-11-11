@@ -602,8 +602,20 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
     }
 
     if (evt_type == std::string(event_type::kRoomMessage)) {
-        const std::string msgtype = content.value("msgtype", "m.text");
-        const bool has_attachment = msgtype != std::string(msg_type::kText) && msgtype != std::string(msg_type::kEmote) && msgtype != std::string(msg_type::kNotice);
+        const auto is_attachment_type = [](const std::string& t) {
+            return t != msg_type::kText && t != msg_type::kEmote && t != msg_type::kNotice;
+        };
+        // An edit's m.new_content REPLACES the original's content on every read,
+        // so its msgtype is what the room will actually be served — gate on it
+        // too, or `m.text` + `m.new_content: {m.image}` walks past ATTACH_FILES.
+        // Same one-level-down rule as renderable_text().
+        bool has_attachment = is_attachment_type(content.value("msgtype", "m.text"));
+        if (auto nc = content.find("m.new_content"); nc != content.end() && nc->is_object()) {
+            const auto nt = nc->find("msgtype");
+            has_attachment = has_attachment ||
+                is_attachment_type(nt != nc->end() && nt->is_string() ? nt->get<std::string>()
+                                                                      : "m.text");
+        }
 
         if (has_attachment && !permission::has(user_perms, permission::kAttachFiles)) {
             return send_error(res, 403, MatrixError::forbidden("You don't have permission to attach files here"));
@@ -1096,6 +1108,18 @@ void EventHandler::handle_redact(const httplib::Request& req, httplib::Response&
     auto target = store_.get_event_by_id(target_event_id);
     if (!target || target->room_id != room_id) {
         return send_error(res, 404, MatrixError::not_found("Target event not found in this room"));
+    }
+    // Redaction is for messages. redact_event() strips content to '{}' and
+    // leaves the row in place, and for a state event that row is still the
+    // CURRENT state for its (type, state_key) — so redacting one is a state
+    // write that bypasses every check handle_set_state makes. A '{}' channel
+    // override reads as "no override", which let MANAGE_MESSAGES un-hide a
+    // private channel or lift a mute with no containment or rank check and no
+    // audit record; a '{}' room type or kick marker is the same hole in other
+    // clothes. State changes go through /state. See tests/test_state_redaction.cpp.
+    if (target->state_key.has_value()) {
+        return send_error(res, 403, MatrixError::forbidden(
+            "State events cannot be redacted; change room state through /state instead"));
     }
     const bool is_self = target->sender == *user_id;
     if (!is_self && !permission::has(user_perms, permission::kManageMessages)) {
