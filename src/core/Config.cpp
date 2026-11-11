@@ -277,7 +277,18 @@ Config Config::load(const std::string& path) {
             if (auto v = id->get("provider_url")) id_cfg.provider_url = v->value_or(std::string{});
             if (auto v = id->get("required")) id_cfg.required = v->value_or(false);
             if (auto v = id->get("allow_local_accounts")) id_cfg.allow_local_accounts = v->value_or(true);
-            if (auto v = id->get("client_id")) id_cfg.client_id = v->value_or(id_cfg.client_id);
+            // `client_ids` (array) wins; the older `client_id` (string) is a
+            // one-entry list. "" in either form turns the azp check off.
+            if (auto arr = id->get("client_ids"); arr && arr->is_array()) {
+                id_cfg.client_ids.clear();
+                for (const auto& el : *arr->as_array()) {
+                    if (auto s = el.value<std::string>(); s && !s->empty()) id_cfg.client_ids.push_back(*s);
+                }
+            } else if (auto v = id->get("client_id")) {
+                const std::string one = v->value_or(std::string{});
+                id_cfg.client_ids.clear();
+                if (!one.empty()) id_cfg.client_ids.push_back(one);
+            }
             if (!id_cfg.provider_url.empty()) {
                 cfg.identity = id_cfg;
             }
@@ -721,8 +732,8 @@ void Config::validate(Config& cfg) {
                           "ID sign-in will not work here.", audience);
             }
         }
-        if (cfg.identity->client_id.empty()) {
-            log->warn("identity.client_id is empty — identity tokens will be accepted whichever "
+        if (cfg.identity->client_ids.empty()) {
+            log->warn("identity.client_ids is empty — identity tokens will be accepted whichever "
                       "OAuth client they were issued to (the `azp` check is off).");
         }
     }

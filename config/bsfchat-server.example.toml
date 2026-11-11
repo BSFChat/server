@@ -784,9 +784,13 @@ key_file = ""
 provider_url = "http://localhost:8480"
 required = false
 allow_local_accounts = true
-# The OAuth client a sign-in token must have been issued to (its `azp`
+# The OAuth clients a sign-in token may have been issued to (its `azp`
 # claim). Defaults to the shipped desktop client; empty turns the check off.
 # This is NOT the audience any more: that is server.public_url. When it was,
 # every server checked for the same value, so a token handed to one server
 # signed its holder in at all of them (identity audit 2026-09, C1).
-client_id = "bsfchat-desktop"
+#
+# A list, because the BSFChat apps are two clients: desktop (loopback
+# redirect) and mobile (claimed https redirect). The older single
+# `client_id = "…"` still works, as a one-entry list. [] turns the check off.
+client_ids = ["bsfchat-desktop", "bsfchat-mobile"]

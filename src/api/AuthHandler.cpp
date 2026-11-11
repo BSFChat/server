@@ -1237,8 +1237,10 @@ std::optional<JwtClaims> AuthHandler::verify_identity_token(const std::string& t
     // Issued to the client we expect. A token some OTHER registered relying
     // party obtained for this server — with the user's consent to that
     // party, not to this app — does not sign anybody in here.
-    const std::string& client_id = config_.identity->client_id;
-    if (!client_id.empty() && claims->azp.value_or(std::string()) != client_id) {
+    const auto& client_ids = config_.identity->client_ids;
+    const std::string azp = claims->azp.value_or(std::string());
+    if (!client_ids.empty() &&
+        std::find(client_ids.begin(), client_ids.end(), azp) == client_ids.end()) {
         log->warn("Refused an identity token issued to another client");
         return std::nullopt;
     }

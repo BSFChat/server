@@ -104,7 +104,7 @@ protected:
         // The shipped default: the desktop client. It is now checked against
         // `azp`; the audience is this server's own URL, which with no
         // server.public_url is "https://" + server_name = "https://test".
-        id.client_id = "bsfchat-desktop";
+        id.client_ids = {"bsfchat-desktop"};
         config.identity = id;
 
         sync_engine = std::make_unique<SyncEngine>(*store, config);

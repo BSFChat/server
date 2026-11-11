@@ -36,7 +36,14 @@ struct IdentityConfig {
     // client id moved to `azp`, where OIDC puts it once `aud` names somebody
     // else. Keeping the check stops a token some other registered relying
     // party obtained for this server from signing anybody in here.
-    std::string client_id = "bsfchat-desktop";
+    //
+    // A LIST, because the first-party apps are two clients: desktop signs in
+    // as bsfchat-desktop (loopback redirect) and mobile as bsfchat-mobile
+    // (claimed https redirect; see identity/src/core/ClientRegistration.cpp
+    // for why mobile stopped sharing desktop's client). A token whose `azp`
+    // is any of these is accepted; an empty list skips the check. The old
+    // single `client_id = "…"` key still parses, as a one-entry list.
+    std::vector<std::string> client_ids = {"bsfchat-desktop", "bsfchat-mobile"};
 };
 
 struct StorageS3Config {

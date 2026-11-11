@@ -117,7 +117,7 @@ private:
     //
     // Accepts the token only when ALL of: the provider's signature and issuer
     // verify; `aud` is THIS server's own public URL (C1 — never the client
-    // id, which every server used to share); `azp` is identity.client_id when
+    // id, which every server used to share); `azp` is one of identity.client_ids when
     // that is set; it carries a nonce; and this is the first presentation of
     // that nonce here. On refusal, writes nothing and sets `refusal` to the
     // message for the M_FORBIDDEN body.
