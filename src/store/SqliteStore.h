@@ -1612,6 +1612,7 @@ public:
                                                int64_t created_before_ms, int limit);
 
 private:
+    void enqueue_pushes_locked(const std::vector<QueuedPush>& pushes);
     // Drops spent refresh-token records once no live session could still
     // belong to their family. Called with mutex_ already held.
     void prune_consumed_refresh_tokens_locked();

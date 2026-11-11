@@ -88,6 +88,11 @@ bool notify_level_refused(SqliteStore& store, const Config& config, const std::s
 // parser stress test.
 constexpr std::size_t kMaxGatewayUrlLen = 2048;
 
+// Per account: a person's phones, tablets and desktops, with room to spare.
+constexpr std::size_t kMaxPushersPerUser = 20;
+// The serialised `data` object minus url/format, which have their own limits.
+constexpr std::size_t kMaxPusherDataBytes = 4096;
+
 // An IPv4 address in any form inet_aton() accepts, which is what the resolver
 // behind httplib::Client will accept: 1 to 4 parts, each decimal, octal
 // (leading 0) or hex (leading 0x).
@@ -579,6 +584,30 @@ void PushHandler::handle_set_pusher(const httplib::Request& req, httplib::Respon
         rest.erase("url");
         rest.erase("format");
         pusher.data_json = rest.dump();
+    }
+    // `data` is copied into EVERY notification payload for this pusher, so its
+    // size is multiplied by every message the account is pushed for. A real
+    // gateway needs a handful of short fields; the 128 KB transport cap is not
+    // a sensible bound for something copied that often.
+    if (pusher.data_json.size() > kMaxPusherDataBytes) {
+        return send_error(res, 400, MatrixError::too_large("data is too large"));
+    }
+    // And the number of pushers is bounded per account, because each one costs
+    // an unread count, a payload build and a queue insert under the store lock
+    // on the SENDER's request, for every message. Unbounded, one account with
+    // ten thousand pushers made every message sent to it stall the server.
+    // Updating an existing (app_id, pushkey) never counts against the cap.
+    {
+        const auto existing = store_.get_pushers(*user_id);
+        const bool is_update = std::any_of(existing.begin(), existing.end(), [&](const auto& p) {
+            return p.app_id == app_id && p.pushkey == pushkey;
+        });
+        if (!is_update && existing.size() >= kMaxPushersPerUser) {
+            // M_INVALID_PARAM, not M_LIMIT_EXCEEDED: the latter means "rate
+            // limited, retry later" to a client, and waiting will not help.
+            return send_error(res, 400, MatrixError::invalid_param(
+                "Too many pushers on this account; remove one before adding another"));
+        }
     }
     if (auto token = extract_access_token(auth_header)) {
         if (auto session = store_.get_session_by_token(*token)) {

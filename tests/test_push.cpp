@@ -1799,3 +1799,54 @@ TEST(Pushers, TakingOverAPushkeyStillDropsThePreviousOwnersQueue) {
     EXPECT_EQ(f.store->count_queued_pushes(), 0)
         << "bob's message would be delivered to a device that is now carol's";
 }
+
+// ── Pusher volume ─────────────────────────────────────────────────────────────
+// Each pusher costs an unread count, a payload build and a queue insert on the
+// SENDER's request, for every message; `data` is copied into every payload.
+// Unbounded, one account registering thousands of pushers with ~128 KB of data
+// each made every message sent to it stall the whole server.
+
+namespace {
+httplib::Response add_pusher_with_data(PushFixture& f, const std::string& localpart,
+                             const std::string& pushkey, const json& extra_data = json::object()) {
+    json data = {{"url", PushFixture::kGatewayUrl}};
+    data.update(extra_data);
+    auto req = make_request("/_matrix/client/v3/pushers/set", "token-" + localpart,
+                            json{{"pushkey", pushkey}, {"kind", "http"},
+                                 {"app_id", "com.bsfchat.app"}, {"data", data}}
+                                .dump());
+    httplib::Response res;
+    f.pushers->handle_set_pusher(req, res);
+    return res;
+}
+} // namespace
+
+TEST(Pushers, PushersPerAccountAreCapped) {
+    PushFixture f;
+    f.add_user("alice");
+    int accepted = 0;
+    for (int i = 0; i < 200; ++i) {
+        if (IsOk(add_pusher_with_data(f, "alice", "dev-" + std::to_string(i)))) ++accepted;
+    }
+    EXPECT_LT(accepted, 200) << "no cap on pushers per account";
+    EXPECT_GE(accepted, 5) << "the cap must leave room for a person's real devices";
+    EXPECT_EQ(f.store->get_pushers("@alice:test").size(), static_cast<size_t>(accepted));
+
+    // Updating one you already have is never refused by the cap…
+    EXPECT_TRUE(IsOk(add_pusher_with_data(f, "alice", "dev-0")));
+    // …and removing one makes room again.
+    auto del = make_request("/_matrix/client/v3/pushers/set", "token-alice",
+                            json{{"pushkey", "dev-0"}, {"kind", nullptr},
+                                 {"app_id", "com.bsfchat.app"}}.dump());
+    httplib::Response dres;
+    f.pushers->handle_set_pusher(del, dres);
+    ASSERT_TRUE(IsOk(dres));
+    EXPECT_TRUE(IsOk(add_pusher_with_data(f, "alice", "replacement")));
+}
+
+TEST(Pushers, PusherDataIsBounded) {
+    PushFixture f;
+    f.add_user("alice");
+    EXPECT_EQ(add_pusher_with_data(f, "alice", "k", {{"blob", std::string(100000, 'x')}}).status, 400);
+    EXPECT_TRUE(IsOk(add_pusher_with_data(f, "alice", "k", {{"default_payload", "event_id_only"}})));
+}

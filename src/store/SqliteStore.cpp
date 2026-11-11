@@ -4004,6 +4004,20 @@ void SqliteStore::delete_queued_pushes_for_events_locked(const std::vector<std::
 void SqliteStore::enqueue_pushes(const std::vector<QueuedPush>& pushes) {
     if (pushes.empty()) return;
     std::lock_guard lock(mutex_);
+    // One transaction for the batch: in autocommit every row was its own
+    // fsync'd commit, taken on the sender's /send thread with the store lock
+    // held.
+    exec("BEGIN IMMEDIATE");
+    try {
+        enqueue_pushes_locked(pushes);
+        exec("COMMIT");
+    } catch (...) {
+        exec("ROLLBACK");
+        throw;
+    }
+}
+
+void SqliteStore::enqueue_pushes_locked(const std::vector<QueuedPush>& pushes) {
     auto stmt = prepare(db_,
         "INSERT INTO push_queue (user_id, app_id, pushkey, url, payload, event_id, next_attempt_at) "
         "VALUES (?, ?, ?, ?, ?, ?, 0)");
