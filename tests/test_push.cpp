@@ -1720,3 +1720,82 @@ TEST(PushRoleMentions, ANonMentionableRolePushesNobody) {
                             "t1")));
     EXPECT_EQ(f.store->count_queued_pushes(), 0);
 }
+
+// ── Gateway policy at delivery, and the pushkey takeover's reach ─────────────
+
+TEST(PushDelivery, APusherTheAllowlistNoLongerCoversIsDroppedNotDelivered) {
+    // Registered while allowed, then the operator narrowed the allowlist (or an
+    // older build stored it while the allowlist was default-open). It must stop
+    // receiving message data at once — not keep it until the device goes away.
+    PushFixture f;
+    f.add_user("alice");
+    f.add_user("bob");
+    f.register_pusher("bob", "bob-device");
+    f.set_level("bob", PushService::kLevelAll);
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "secret"}}, "t1")));
+    ASSERT_EQ(f.store->count_queued_pushes(), 1);
+
+    f.config.push.allowed_gateway_prefixes = {"https://other-gateway.example/"};
+    f.push->drain_once();
+
+    EXPECT_EQ(f.gateway.call_count(), 0u) << "delivered to a gateway the policy no longer allows";
+    EXPECT_EQ(f.store->count_queued_pushes(), 0);
+    EXPECT_TRUE(f.store->get_pushers("@bob:test").empty());
+}
+
+TEST(Pushers, DotSegmentsCannotEscapeTheAllowlistedPath) {
+    PushFixture f;
+    f.config.push.allowed_gateway_prefixes = {"https://gateway.example/_matrix/push/v1/notify"};
+    f.add_user("alice");
+    auto attempt = [&](const std::string& url) {
+        auto req = make_request("/_matrix/client/v3/pushers/set", "token-alice",
+                                json{{"kind", "http"},
+                                     {"pushkey", "k"},
+                                     {"app_id", "a"},
+                                     {"data", {{"url", url}}}}
+                                    .dump());
+        httplib::Response res;
+        f.pushers->handle_set_pusher(req, res);
+        return res;
+    };
+    const std::string base = "https://gateway.example/_matrix/push/v1/notify";
+    EXPECT_EQ(attempt(base + "/../../../admin/x").status, 400);
+    EXPECT_EQ(attempt(base + "/..").status, 400);
+    EXPECT_EQ(attempt(base + "/./x").status, 400);
+    EXPECT_EQ(attempt(base + "/..%2f..%2fadmin").status, 400);
+    EXPECT_EQ(attempt(base + "/%2E%2E/admin").status, 400);
+    // Control: the allowlisted endpoint and a path under it still register.
+    EXPECT_TRUE(IsOk(attempt(base)));
+    EXPECT_TRUE(IsOk(attempt(base + "/v2.beta")));
+}
+
+TEST(Pushers, ReRegisteringKeepsYourOwnQueuedPushes) {
+    // Clients re-register their pusher on every launch (append=false). That must
+    // not throw away the notifications already queued for that same device.
+    PushFixture f;
+    f.add_user("alice");
+    f.add_user("bob");
+    f.register_pusher("bob", "bob-device");
+    f.set_level("bob", PushService::kLevelAll);
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "hi"}}, "t1")));
+    ASSERT_EQ(f.store->count_queued_pushes(), 1);
+
+    f.register_pusher("bob", "bob-device");
+    EXPECT_EQ(f.store->count_queued_pushes(), 1);
+}
+
+TEST(Pushers, TakingOverAPushkeyStillDropsThePreviousOwnersQueue) {
+    // Control for the scoping above: the security property is unchanged.
+    PushFixture f;
+    f.add_user("alice");
+    f.add_user("bob");
+    f.add_user("carol");
+    f.register_pusher("bob", "shared-token");
+    f.set_level("bob", PushService::kLevelAll);
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "for bob"}}, "t1")));
+    ASSERT_EQ(f.store->count_queued_pushes(), 1);
+
+    f.register_pusher("carol", "shared-token");
+    EXPECT_EQ(f.store->count_queued_pushes(), 0)
+        << "bob's message would be delivered to a device that is now carol's";
+}

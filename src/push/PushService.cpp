@@ -1,4 +1,5 @@
 #include "push/PushService.h"
+#include "push/GatewayPolicy.h"
 
 #include "auth/Permissions.h"
 #include "core/Logger.h"
@@ -382,6 +383,21 @@ PushService::DrainResult PushService::drain_once() {
     if (batch.empty()) return result;
 
     for (const auto& item : batch) {
+        // The allowlist is re-checked at delivery, not only at /pushers/set. A
+        // pusher registered while the allowlist was default-open (audit-data
+        // finding 6), or before the operator removed a gateway or turned off
+        // allow_internal_gateway, is otherwise an egress feed that outlives the
+        // policy that should have ended it. Such a pusher is deleted with its
+        // row: re-registering under the current policy is the only way back.
+        if (std::string why; !gateway_url_allowed(item.url, config_.push, why)) {
+            get_logger()->warn("Push: dropping pusher for {} — gateway {} is no longer allowed ({})",
+                               log_safe(item.user_id), log_safe(item.url), why);
+            store_.delete_pusher(item.user_id, item.app_id, item.pushkey);
+            store_.delete_queued_push(item.id);
+            ++result.failed;
+            continue;
+        }
+
         auto response = transport_(item.url, item.payload);
 
         // The gateway is a third-party HTTP endpoint, so its response is

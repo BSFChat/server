@@ -1,4 +1,5 @@
 #include "api/PushHandler.h"
+#include "push/GatewayPolicy.h"
 
 #include "auth/Permissions.h"
 #include "core/Config.h"
@@ -350,6 +351,8 @@ bool path_is_within(const std::string& prefix_path, const std::string& url_path)
 }
 
 // Validates a client-supplied push gateway URL. See the block comment above.
+} // namespace
+
 bool gateway_url_allowed(const std::string& url, const PushConfig& cfg, std::string& why) {
     if (url.size() > kMaxGatewayUrlLen) {
         why = "data.url is too long";
@@ -375,6 +378,24 @@ bool gateway_url_allowed(const std::string& url, const PushConfig& cfg, std::str
     if (!parse_gateway_url(url, target)) {
         why = "data.url is not a well-formed absolute http(s) URL";
         return false;
+    }
+
+    // path_is_within() compares the path as written, and it is sent as written.
+    // A gateway or proxy that normalises "/notify/../../admin" or decodes
+    // "%2e%2e%2f" would route the POST outside the allowlisted prefix, so a
+    // dot-segment or an encoded separator is refused outright rather than
+    // normalised: no real notify endpoint needs one.
+    {
+        std::string lower = target.path;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const std::string segs = lower + "/";
+        if (segs.find("/./") != std::string::npos || segs.find("/../") != std::string::npos ||
+            lower.find('\\') != std::string::npos || lower.find("%2e") != std::string::npos ||
+            lower.find("%2f") != std::string::npos || lower.find("%5c") != std::string::npos) {
+            why = "data.url path must not contain dot-segments or encoded separators";
+            return false;
+        }
     }
 
     // Default CLOSED. An empty allowlist is not "any gateway" — it is "no
@@ -425,6 +446,8 @@ bool gateway_url_allowed(const std::string& url, const PushConfig& cfg, std::str
     }
     return true;
 }
+
+namespace {
 
 json pusher_to_json(const SqliteStore::Pusher& p) {
     auto data = json::parse(p.data_json, nullptr, false);
