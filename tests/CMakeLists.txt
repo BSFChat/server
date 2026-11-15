@@ -20,6 +20,8 @@ add_executable(server_tests
     test_sync_invites.cpp
     # rooms.leave (audit 2026-11-15, R-1).
     test_sync_leave.cpp
+    # POST /createRoom validates before it writes (audit 2026-11-15, R-4).
+    test_create_room_validation.cpp
     test_call_privacy.cpp
     test_permissions.cpp
     test_media.cpp
