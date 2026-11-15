@@ -73,6 +73,8 @@ add_executable(server_tests
     test_ugc_safety.cpp
     # What a brand-new deployment creates for its first user (core/FirstRun.h).
     test_first_run.cpp
+    # Server-side link previews: SSRF policy, OG parsing, cache (schema v33).
+    test_url_preview.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -104,6 +106,7 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/core/SendLimiter.cpp
     ${CMAKE_SOURCE_DIR}/src/core/Utf8.cpp
     ${CMAKE_SOURCE_DIR}/src/http/ClientAddress.cpp
+    ${CMAKE_SOURCE_DIR}/src/http/OutboundAddress.cpp
     ${CMAKE_SOURCE_DIR}/src/http/JsonIo.cpp
     ${CMAKE_SOURCE_DIR}/src/http/RequestGuard.cpp
     ${CMAKE_SOURCE_DIR}/src/auth/LocalAuth.cpp
@@ -133,6 +136,8 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/api/MediaHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/MediaPolicy.cpp
     ${CMAKE_SOURCE_DIR}/src/api/MediaTicket.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/UrlPreview.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/UrlPreviewHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/ProfileHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/PushHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/SearchHandler.cpp

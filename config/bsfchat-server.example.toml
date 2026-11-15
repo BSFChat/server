@@ -145,6 +145,39 @@ reaper_interval_minutes = 60
 #     ranges into one request will see 416 here where it saw 206 there.
 #   * Zero-length uploads are refused with 400.
 
+# ── Link previews (GET /_matrix/media/v3/preview_url) ───────────────────────
+#
+# The server fetches a linked page once and hands clients its title,
+# description and image, so a reader's client never contacts the linked site
+# itself (which used to disclose every reader's IP address to whoever posted
+# the link). See docs/url-previews.md.
+#
+# Every fetch is SSRF-guarded: http/https only, no credentials in the URL, the
+# name is resolved by the server and refused if ANY address it returns is
+# loopback, private, link-local (cloud metadata), CGNAT, multicast, reserved or
+# an IPv6 equivalent; the connection then goes to that checked address, so DNS
+# rebinding cannot swap it. At most 3 redirects, each re-checked.
+url_preview_enabled = true
+# Read caps, enforced while streaming. HTML past the cap is truncated (the
+# <head> is what matters); an image past its cap is dropped.
+url_preview_max_bytes = 1048576
+url_preview_image_max_bytes = 5242880
+# Total time for one fetch, including redirects (the page and its image are
+# separate fetches). Clamped to 1..30.
+url_preview_timeout_seconds = 8
+# Ports a previewed URL may use.
+url_preview_allowed_ports = [80, 443]
+# Extra ranges to refuse, on top of the built-in ones. A malformed entry stops
+# the server from starting rather than being silently ignored.
+# url_preview_ip_denylist = ["203.0.113.0/24", "2001:db8:1234::/48"]
+url_preview_ip_denylist = []
+# Default: "BSFChat-URL-Preview/<version> (+https://bsfchat.com)".
+# url_preview_user_agent = ""
+# Outbound fetches per account per minute (cache hits are free), and fetches in
+# flight across the whole server; past the latter requests get 429.
+url_preview_rate_per_minute = 30
+url_preview_max_concurrent = 8
+
 # What a server that has never held a room builds for itself the first time it
 # starts: a #general text channel and a General Voice channel.
 #

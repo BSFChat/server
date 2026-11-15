@@ -92,6 +92,35 @@ Config Config::load(const std::string& path) {
             if (auto v = media->get("ticket_ttl_seconds"))
                 cfg.media_ticket_ttl_seconds = static_cast<int>(
                     v->value_or(static_cast<int64_t>(cfg.media_ticket_ttl_seconds)));
+            if (auto v = media->get("url_preview_enabled"))
+                cfg.url_preview_enabled = v->value_or(cfg.url_preview_enabled);
+            if (auto v = media->get("url_preview_max_bytes"))
+                cfg.url_preview_max_bytes = v->value_or(cfg.url_preview_max_bytes);
+            if (auto v = media->get("url_preview_image_max_bytes"))
+                cfg.url_preview_image_max_bytes = v->value_or(cfg.url_preview_image_max_bytes);
+            if (auto v = media->get("url_preview_timeout_seconds"))
+                cfg.url_preview_timeout_seconds = static_cast<int>(
+                    v->value_or(static_cast<int64_t>(cfg.url_preview_timeout_seconds)));
+            if (auto v = media->get("url_preview_user_agent"))
+                cfg.url_preview_user_agent = v->value_or(cfg.url_preview_user_agent);
+            if (auto v = media->get("url_preview_rate_per_minute"))
+                cfg.url_preview_rate_per_minute = static_cast<int>(
+                    v->value_or(static_cast<int64_t>(cfg.url_preview_rate_per_minute)));
+            if (auto v = media->get("url_preview_max_concurrent"))
+                cfg.url_preview_max_concurrent = static_cast<int>(
+                    v->value_or(static_cast<int64_t>(cfg.url_preview_max_concurrent)));
+            if (auto arr = media->get_as<toml::array>("url_preview_ip_denylist")) {
+                cfg.url_preview_ip_denylist.clear();
+                for (const auto& el : *arr) {
+                    if (auto s = el.value<std::string>()) cfg.url_preview_ip_denylist.push_back(*s);
+                }
+            }
+            if (auto arr = media->get_as<toml::array>("url_preview_allowed_ports")) {
+                cfg.url_preview_allowed_ports.clear();
+                for (const auto& el : *arr) {
+                    if (auto p = el.value<int64_t>()) cfg.url_preview_allowed_ports.push_back(static_cast<int>(*p));
+                }
+            }
         }
 
         // [first_run]

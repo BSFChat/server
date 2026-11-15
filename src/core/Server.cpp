@@ -13,6 +13,7 @@
 #include "api/EventHandler.h"
 #include "api/SyncHandler.h"
 #include "api/MediaHandler.h"
+#include "api/UrlPreviewHandler.h"
 #include "api/ProfileHandler.h"
 #include "api/TypingHandler.h"
 #include "api/PresenceHandler.h"
@@ -325,6 +326,15 @@ void Server::register_routes() {
             [h = media_handler](const httplib::Request& req, httplib::Response& res) { h->handle_download(req, res); });
     svr.Get(R"(/_matrix/media/v3/download/([^/]+)/([^/]+))",
             [h = media_handler](const httplib::Request& req, httplib::Response& res) { h->handle_download(req, res); });
+
+    // Server-side link previews (docs/url-previews.md). The Matrix v3 path
+    // plus the authenticated-media alias.
+    auto preview_handler = std::make_shared<UrlPreviewHandler>(*store_, config_, media_storage_);
+    for (const char* path : {"/_matrix/media/v3/preview_url", "/_matrix/client/v1/media/preview_url"}) {
+        svr.Get(path, [h = preview_handler](const httplib::Request& req, httplib::Response& res) {
+            h->handle_preview(req, res);
+        });
+    }
 
     // Profile routes
     auto profile_handler = std::make_shared<ProfileHandler>(*store_, *sync_engine_, config_);
