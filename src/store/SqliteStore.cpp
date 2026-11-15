@@ -697,6 +697,20 @@ std::optional<std::string> SqliteStore::find_linked_user(const std::string& issu
     return std::nullopt;
 }
 
+bool SqliteStore::unlink_identity(const std::string& issuer, const std::string& subject,
+                                   const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "DELETE FROM linked_identities WHERE issuer = ? AND subject = ? AND user_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, issuer.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, subject.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        throw std::runtime_error(std::string("Failed to unlink identity: ") + sqlite3_errmsg(db_));
+    }
+    return sqlite3_changes(db_) > 0;
+}
+
 bool SqliteStore::link_identity(const std::string& issuer, const std::string& subject,
                                  const std::string& user_id, const std::string& linked_by,
                                  int64_t when_ms) {
@@ -961,6 +975,21 @@ SqliteStore::get_session_by_token(const std::string& token) {
     session.user_id = column_text_or_empty(stmt.get(), 0);
     session.device_id = column_text_or_empty(stmt.get(), 1);
     return session;
+}
+
+std::optional<int64_t> SqliteStore::get_unrotated_login_time(const std::string& token) {
+    if (token.empty()) return std::nullopt;
+    std::lock_guard lock(mutex_);
+    auto token_hash = hash_access_token(token);
+    // A spent refresh token in the family means this row came from /refresh.
+    // consumed_refresh_tokens is pruned only after two token lifetimes, far
+    // longer than any step-up window, so a recent rotation is never missed.
+    auto stmt = prepare(db_,
+        "SELECT t.created_at FROM access_tokens t WHERE t.token_hash = ? AND NOT EXISTS "
+        "(SELECT 1 FROM consumed_refresh_tokens c WHERE c.family_id = t.family_id)");
+    sqlite3_bind_text(stmt.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    return sqlite3_column_int64(stmt.get(), 0);
 }
 
 std::optional<SqliteStore::TokenSession>

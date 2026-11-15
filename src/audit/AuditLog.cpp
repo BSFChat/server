@@ -321,7 +321,8 @@ void audit_account_deactivation(SqliteStore& store, const std::string& user_id) 
 
 void audit_account_link(SqliteStore& store, const std::string& actor,
                         const std::string& issuer,
-                        const std::string& superseded_user_id) {
+                        const std::string& superseded_user_id,
+                        const std::string& step_up) {
     SqliteStore::AuditRecord record;
     record.actor = actor;
     record.action = audit_action::kAccountLink;
@@ -335,7 +336,20 @@ void audit_account_link(SqliteStore& store, const std::string& actor,
     // subject cannot be smuggled in. See audit_action::kAccountLink.
     nlohmann::json after = {{"issuer", issuer}};
     if (!superseded_user_id.empty()) after["superseded_user_id"] = superseded_user_id;
+    if (!step_up.empty()) after["step_up"] = step_up;
     record.after_json = after.dump();
+    store.append_audit_record(record);
+}
+
+void audit_account_unlink(SqliteStore& store, const std::string& actor,
+                          const std::string& issuer, int removed,
+                          const std::string& step_up) {
+    SqliteStore::AuditRecord record;
+    record.actor = actor;
+    record.action = audit_action::kAccountUnlink;
+    record.target_user = actor;
+    record.after_json =
+        nlohmann::json{{"issuer", issuer}, {"removed", removed}, {"step_up", step_up}}.dump();
     store.append_audit_record(record);
 }
 

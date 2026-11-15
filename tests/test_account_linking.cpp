@@ -194,9 +194,26 @@ protected:
         return res;
     }
 
-    httplib::Response link_token(const std::string& bearer, const std::string& id_token) {
-        return link(bearer, json{{"type", "m.login.token"}, {"token", id_token}}.dump());
+    // With the step-up a password account must now present (audit
+    // 2026-11-15 S-2). Password-less accounts ignore the field and pass on
+    // their fixture session being a fresh, never-refreshed sign-in.
+    httplib::Response link_token(const std::string& bearer, const std::string& id_token,
+                                 const std::string& password = kPassword) {
+        json body = {{"type", "m.login.token"}, {"token", id_token}};
+        if (!password.empty()) body["password"] = password;
+        return link(bearer, body.dump());
     }
+
+    httplib::Response unlink(const std::string& bearer, const json& body) {
+        httplib::Request req;
+        if (!bearer.empty()) req.set_header("Authorization", "Bearer " + bearer);
+        req.body = body.dump();
+        httplib::Response res;
+        handler->handle_unlink_identity(req, res);
+        return res;
+    }
+
+    static constexpr const char* kPassword = "tr0mbone-seven";
 
     httplib::Response linked_identities(const std::string& bearer) {
         httplib::Request req;
@@ -499,10 +516,11 @@ TEST_F(AccountLinkTest, LinkingIsAuditedWithExactlyTheIssuerAndTheSupersededAcco
     std::vector<std::string> keys;
     for (auto it = after.begin(); it != after.end(); ++it) keys.push_back(it.key());
     std::sort(keys.begin(), keys.end());
-    EXPECT_EQ(keys, (std::vector<std::string>{"issuer", "superseded_user_id"}))
+    EXPECT_EQ(keys, (std::vector<std::string>{"issuer", "step_up", "superseded_user_id"}))
         << record.after_json;
     EXPECT_EQ(after["issuer"], issuer());
     EXPECT_EQ(after["superseded_user_id"], "@oidc_a5cdbefe:test");
+    EXPECT_EQ(after["step_up"], "password");
 }
 
 TEST_F(AccountLinkTest, TheProviderSubjectIsNotRecordedAsAClaimOfItsOwn) {
@@ -726,4 +744,124 @@ TEST_F(AccountLinkTest, AnUnusablePublicUrlRefusesEveryToken) {
         claims.aud = aud;
         EXPECT_EQ(status_of(login_with_token(sign(claims), &misconfigured)), 403) << "aud=" << aud;
     }
+}
+
+// ── Step-up for linking and unlinking (audit 2026-11-15 S-2) ─────────────
+//
+// A bearer token proves a client holds a token, not that the owner is there.
+// Before this, a briefly stolen token linked the thief's identity for good —
+// surviving a password change and logout-all.
+
+TEST_F(AccountLinkTest, StepUp_APasswordAccountMustReenterItsPassword) {
+    const auto josh = create_local_account("josh", "josh-token");
+
+    auto missing = link_token("josh-token", id_token_for("a5cdbefe"), "");
+    EXPECT_EQ(status_of(missing), 401) << missing.body;
+    EXPECT_NE(missing.body.find("password"), std::string::npos) << missing.body;
+
+    auto wrong = link_token("josh-token", id_token_for("a5cdbefe"), "not-the-password");
+    EXPECT_EQ(status_of(wrong), 403) << wrong.body;
+    EXPECT_NE(wrong.body.find("Invalid password"), std::string::npos) << wrong.body;
+    EXPECT_TRUE(store->list_linked_identities(josh).empty());
+
+    // A password account gets no "recent sign-in" shortcut, however fresh.
+    ASSERT_EQ(status_of(link_token("josh-token", id_token_for("a5cdbefe"))), 200);
+    EXPECT_EQ(store->find_linked_user(issuer(), "a5cdbefe").value_or(""), josh);
+}
+
+TEST_F(AccountLinkTest, StepUp_APasswordlessAccountNeedsARecentUnrefreshedSignIn) {
+    // An OIDC-only account signed in moments ago: allowed.
+    ASSERT_EQ(status_of(login_with_identity("a5cdbefe")), 200);
+    const std::string alice = "@oidc_a5cdbefe:test";
+    store->store_access_token("alice-fresh", alice, "dev-a");
+    ASSERT_EQ(status_of(link_token("alice-fresh", id_token_for("second"), "")), 200);
+    EXPECT_EQ(store->find_linked_user(issuer(), "second").value_or(""), alice);
+
+    // The same account on a session that came from /refresh: created a
+    // moment ago, but not a sign-in, so it does not count.
+    store->store_access_token("alice-old", alice, "dev-b", 60'000, std::string("alice-refresh"));
+    auto session = store->consume_refresh_token("alice-refresh");
+    ASSERT_TRUE(session.has_value());
+    store->store_access_token("alice-rotated", alice, "dev-b", 60'000, std::nullopt,
+                              session->family_id);
+    ASSERT_FALSE(store->get_unrotated_login_time("alice-rotated").has_value());
+    auto refused = link_token("alice-rotated", id_token_for("third"), "");
+    EXPECT_EQ(status_of(refused), 401) << refused.body;
+    EXPECT_FALSE(store->find_linked_user(issuer(), "third").has_value());
+}
+
+TEST_F(AccountLinkTest, StepUp_APasswordlessAccountMayProveItselfWithItsOwnIdentity) {
+    const std::string alice = "@oidc_a5cdbefe:test";
+    ASSERT_TRUE(store->create_user(alice, ""));
+    store->store_access_token("alice-r", alice, "dev", 60'000, std::string("alice-refresh"));
+    auto session = store->consume_refresh_token("alice-refresh");
+    ASSERT_TRUE(session.has_value());
+    store->store_access_token("alice-rotated", alice, "dev", 60'000, std::nullopt,
+                              session->family_id);
+
+    // Somebody else's identity is no proof of being Alice.
+    json bad = {{"type", "m.login.token"}, {"token", id_token_for("second")},
+                {"auth", {{"type", "m.login.token"}, {"token", id_token_for("mallory")}}}};
+    auto refused = link("alice-rotated", bad.dump());
+    EXPECT_EQ(status_of(refused), 403) << refused.body;
+    EXPECT_FALSE(store->find_linked_user(issuer(), "second").has_value());
+
+    // Her own identity (she is its shadow account) is.
+    json good = {{"type", "m.login.token"}, {"token", id_token_for("second")},
+                 {"auth", {{"type", "m.login.token"}, {"token", id_token_for("a5cdbefe")}}}};
+    auto ok = link("alice-rotated", good.dump());
+    ASSERT_EQ(status_of(ok), 200) << ok.body;
+    EXPECT_EQ(store->find_linked_user(issuer(), "second").value_or(""), alice);
+
+    SqliteStore::AuditFilter filter;
+    filter.action = std::string(audit_action::kAccountLink);
+    auto page = store->list_audit_records(10, std::nullopt, filter);
+    ASSERT_EQ(page.records.size(), 1u);
+    EXPECT_EQ(json::parse(page.records.front().after_json)["step_up"], "identity_token");
+}
+
+TEST_F(AccountLinkTest, Unlink_RequiresStepUpAndIsAudited) {
+    const auto josh = create_local_account("josh", "josh-token");
+    ASSERT_EQ(status_of(link_token("josh-token", id_token_for("a5cdbefe"))), 200);
+
+    EXPECT_EQ(status_of(unlink("josh-token", {{"issuer", issuer()}})), 401);
+    EXPECT_EQ(status_of(unlink("josh-token", {{"issuer", issuer()}, {"password", "nope"}})), 403);
+    EXPECT_EQ(status_of(unlink("", {{"issuer", issuer()}, {"password", kPassword}})), 401);
+    EXPECT_EQ(status_of(unlink("josh-token", {{"issuer", "https://elsewhere"},
+                                              {"password", kPassword}})), 404);
+    ASSERT_EQ(store->find_linked_user(issuer(), "a5cdbefe").value_or(""), josh);
+
+    auto ok = unlink("josh-token", {{"issuer", issuer()}, {"password", kPassword}});
+    ASSERT_EQ(status_of(ok), 200) << ok.body;
+    EXPECT_EQ(json::parse(ok.body)["removed"], 1);
+    EXPECT_FALSE(store->find_linked_user(issuer(), "a5cdbefe").has_value());
+    // The identity signs in as it did before it was ever linked.
+    EXPECT_EQ(logged_in_user(login_with_identity("a5cdbefe")), "@oidc_a5cdbefe:test");
+
+    SqliteStore::AuditFilter filter;
+    filter.action = std::string(audit_action::kAccountUnlink);
+    auto page = store->list_audit_records(10, std::nullopt, filter);
+    ASSERT_EQ(page.records.size(), 1u);
+    const auto& record = page.records.front();
+    EXPECT_EQ(record.actor, josh);
+    EXPECT_EQ(record.target_user, josh);
+    EXPECT_EQ(record.after_json.find("a5cdbefe"), std::string::npos) << record.after_json;
+    auto after = json::parse(record.after_json);
+    EXPECT_EQ(after["issuer"], issuer());
+    EXPECT_EQ(after["removed"], 1);
+    EXPECT_EQ(after["step_up"], "password");
+}
+
+TEST_F(AccountLinkTest, Unlink_NeverStrandsAPasswordlessAccount) {
+    // A password-less account whose ONLY way in is a linked identity it is
+    // not the shadow of (it was linked to some other password-less account).
+    const std::string carol = "@carol:test";
+    ASSERT_TRUE(store->create_user(carol, ""));
+    store->store_access_token("carol-token", carol, "dev");
+    ASSERT_EQ(status_of(link_token("carol-token", id_token_for("c0ffee"), "")), 200);
+
+    auto res = unlink("carol-token", {{"issuer", issuer()}});
+    EXPECT_EQ(status_of(res), 403) << res.body;
+    EXPECT_NE(res.body.find("no way to sign in"), std::string::npos) << res.body;
+    EXPECT_EQ(store->find_linked_user(issuer(), "c0ffee").value_or(""), carol);
 }

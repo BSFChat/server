@@ -4,13 +4,20 @@
 #include "http/ClientAddress.h"
 
 #include <bsfchat/JwtUtils.h>
+#include <nlohmann/json.hpp>
 #include <httplib.h>
 
 #include <atomic>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace bsfchat {
+
+// Not in bsfchat/Constants.h (protocol repo) yet; beside kLinkIdentity there
+// when the protocol next moves.
+inline constexpr std::string_view kUnlinkIdentityPath =
+    "/_matrix/client/v3/bsfchat/account/unlink_identity";
 
 class SqliteStore;
 class OidcAuth;
@@ -82,8 +89,32 @@ public:
     // own links. Issuer and date only; the subject never leaves the database,
     // and there is no way to ask about another account.
     void handle_linked_identities(const httplib::Request& req, httplib::Response& res);
+    // POST /_matrix/client/v3/bsfchat/account/unlink_identity
+    //   {"issuer": "<iss>", "password": "..."}            (account with a password)
+    //   {"issuer": "<iss>", "auth": {"type": "m.login.token", "token": "<id_token>"}}
+    // Removes every identity from `issuer` linked to the caller's account.
+    // Same step-up as link_identity. Refused when it would leave a
+    // password-less account with no way to sign in.
+    void handle_unlink_identity(const httplib::Request& req, httplib::Response& res);
 
 private:
+    // Step-up for operations that change how an account signs in (audit
+    // 2026-11-15 S-2): a bearer token proves a client holds a token, not that
+    // the owner is present.
+    //   * account with a password: `password` in the body, verified like
+    //     /login and under the same failure lockout;
+    //   * password-less (OIDC-only) account: either the bearer token comes
+    //     from a sign-in within kStepUpWindowMs and has never been refreshed,
+    //     or `auth: {type: m.login.token, token}` carries a fresh id_token for
+    //     an identity that already signs in to this account.
+    // Returns the method used, for the audit record; on refusal writes the
+    // response and returns nullopt.
+    std::optional<std::string> require_step_up(const std::string& access_token,
+                                               const std::string& user_id,
+                                               const nlohmann::json& body,
+                                               const std::string& client,
+                                               httplib::Response& res);
+
     // Configured access-token lifetime, in milliseconds.
     [[nodiscard]] int64_t token_lifetime_ms() const;
 

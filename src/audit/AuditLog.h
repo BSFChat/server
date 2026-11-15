@@ -139,6 +139,9 @@ constexpr const char* kBotDeactivate = "bot.deactivate";
 // sent — and saying which account lost its sign-in route is the whole content
 // of the record. Omitting it would protect nothing and destroy the entry.
 constexpr const char* kAccountLink = "account.link";
+// The reverse: identities from one issuer detached from the actor's account
+// (POST /account/unlink_identity). Same payload rule — issuer, never subject.
+constexpr const char* kAccountUnlink = "account.unlink";
 
 constexpr const char* kChannelDelete = "channel.delete";
 constexpr const char* kCategoryDelete = "category.delete";
@@ -277,9 +280,19 @@ void audit_voice_rekey(SqliteStore& store, const std::string& actor,
 //
 // Takes the pieces rather than a pre-built JSON blob specifically so no call
 // site can pass the subject through by accident. See kAccountLink.
+//
+// `step_up` names how the owner re-proved presence ("password",
+// "recent_login" or "identity_token"; audit 2026-11-15 S-2).
 void audit_account_link(SqliteStore& store, const std::string& actor,
                         const std::string& issuer,
-                        const std::string& superseded_user_id);
+                        const std::string& superseded_user_id,
+                        const std::string& step_up = {});
+
+// Records an unlink: `removed` links from `issuer` taken off `actor`'s own
+// account, after the step-up named by `step_up`.
+void audit_account_unlink(SqliteStore& store, const std::string& actor,
+                          const std::string& issuer, int removed,
+                          const std::string& step_up);
 
 // Records one content report. `target_user` is the account the report is about —
 // the reported event's SENDER, resolved by the handler from the event itself and

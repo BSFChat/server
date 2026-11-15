@@ -217,6 +217,12 @@ public:
     // caller's own GET; never exposed for another user id.
     std::vector<LinkedIdentity> list_linked_identities(const std::string& user_id);
 
+    // Removes one link, only if it belongs to `user_id`. Returns whether a row
+    // was deleted. The owner's own act (POST /account/unlink_identity, with
+    // step-up); afterwards the identity signs in as it did before linking.
+    bool unlink_identity(const std::string& issuer, const std::string& subject,
+                         const std::string& user_id);
+
     // Access tokens
     //
     // Tokens are never stored in the clear — only hash_access_token() digests
@@ -294,6 +300,11 @@ public:
     // was registered from. Does NOT slide the expiry; callers have already
     // authenticated via get_user_by_token().
     std::optional<TokenSession> get_session_by_token(const std::string& token);
+    // When the sign-in behind this access token happened, or nullopt if the
+    // token is unknown or its family has ever been rotated by /refresh (then
+    // created_at is the last rotation, not a sign-in). Step-up for accounts
+    // with no password: "signed in within the last N minutes".
+    std::optional<int64_t> get_unrotated_login_time(const std::string& token);
     // Expiry timestamp (ms) of a live token, for `expires_in_ms` responses.
     std::optional<int64_t> get_token_expiry(const std::string& token);
 

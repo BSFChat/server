@@ -40,6 +40,9 @@ int64_t now_ms() {
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+// How recent a password-less account's sign-in must be to count as step-up.
+constexpr int64_t kStepUpWindowMs = 10 * 60 * 1000;
+
 std::string sanitize_localpart(const std::string& input) {
     static const char* kHex = "0123456789abcdef";
     std::string out;
@@ -1306,6 +1309,7 @@ std::optional<JwtClaims> AuthHandler::verify_identity_token(const std::string& t
 void AuthHandler::handle_link_identity(const httplib::Request& req, httplib::Response& res) {
     // Half one: who is asking. Before anything expensive, and before the body
     // is parsed at all.
+    const auto bearer = extract_access_token(req.get_header_value("Authorization"));
     auto actor = authenticate(store_, req.get_header_value("Authorization"));
     if (!actor) {
         res.status = 401;
@@ -1351,6 +1355,13 @@ void AuthHandler::handle_link_identity(const httplib::Request& req, httplib::Res
             "Expected {\"type\": \"m.login.token\", \"token\": \"<id_token>\"}"));
         return;
     }
+
+    // Step-up (audit 2026-11-15 S-2). Without it a briefly stolen bearer
+    // token became a permanent backdoor: the thief links THEIR identity, and
+    // it survives a password change and logout-all. Before the new id_token
+    // is verified, so a failed step-up does not burn its nonce.
+    const auto step_up = require_step_up(bearer.value_or(std::string()), *actor, body, client, res);
+    if (!step_up) return;
 
     // Half two: control of the identity. Verified with the SAME call the login
     // path makes — same keys, same issuer, same audience, same single use —
@@ -1444,7 +1455,7 @@ void AuthHandler::handle_link_identity(const httplib::Request& req, httplib::Res
     // takes the pieces and assembles the payload itself. See
     // audit_action::kAccountLink for why the superseded user id, which is
     // derived from the subject, is nonetheless the right thing to record.
-    audit_account_link(store_, *actor, claims->iss, superseded);
+    audit_account_link(store_, *actor, claims->iss, superseded, *step_up);
 
     json resp = {
         {"user_id", *actor},
@@ -1456,6 +1467,148 @@ void AuthHandler::handle_link_identity(const httplib::Request& req, httplib::Res
     if (!superseded.empty()) resp["superseded_user_id"] = superseded;
     res.status = 200;
     res.set_content(resp.dump(), "application/json");
+}
+
+std::optional<std::string> AuthHandler::require_step_up(const std::string& access_token,
+                                                        const std::string& user_id,
+                                                        const json& body,
+                                                        const std::string& client,
+                                                        httplib::Response& res) {
+    auto stored = store_.get_password_hash(user_id);
+    if (stored && !stored->empty()) {
+        const auto it = body.find("password");
+        if (it == body.end() || !it->is_string() || it->get_ref<const std::string&>().empty()) {
+            send_error(res, 401, MatrixError::forbidden(
+                "Confirm your current password: include it in the request as \"password\""));
+            return std::nullopt;
+        }
+        // The account's lockout, shared with /login and deactivation: a
+        // separate counter would be a second unlimited place to guess.
+        const auto user_key = user_failure_key(user_id);
+        if (locked_out(client, user_key, res)) return std::nullopt;
+        if (!verify_password(it->get_ref<const std::string&>(), *stored)) {
+            record_failure(client, user_key);
+            send_error(res, 403, MatrixError::forbidden("Invalid password"));
+            return std::nullopt;
+        }
+        failures_.clear(user_key);
+        return std::string("password");
+    }
+
+    // No password to re-enter. A sign-in from the last few minutes counts —
+    // only one that has never been refreshed, since /refresh mints a new row
+    // and a stolen refresh token must not be able to manufacture "recent".
+    if (auto login_at = store_.get_unrotated_login_time(access_token);
+        login_at && now_ms() - *login_at <= kStepUpWindowMs) {
+        return std::string("recent_login");
+    }
+
+    // Or a fresh id_token for an identity that already signs in HERE —
+    // linked to this account, or (unlinked) the identity this account is the
+    // shadow of. Verified like sign-in, so its nonce is spent.
+    if (const auto a = body.find("auth"); a != body.end() && a->is_object()) {
+        const auto type = a->find("type");
+        const auto tok = a->find("token");
+        if (type == a->end() || !type->is_string() || *type != "m.login.token" ||
+            tok == a->end() || !tok->is_string()) {
+            send_error(res, 400, MatrixError::bad_json(
+                "Expected auth: {\"type\": \"m.login.token\", \"token\": \"<id_token>\"}"));
+            return std::nullopt;
+        }
+        std::string refusal = "Identity sign-in is not configured on this server";
+        auto claims = oidc_auth_ ? verify_identity_token(tok->get<std::string>(), refusal)
+                                 : std::nullopt;
+        if (!claims) {
+            record_failure(client, {});
+            send_error(res, 403, MatrixError::forbidden(refusal));
+            return std::nullopt;
+        }
+        const auto linked = store_.find_linked_user(claims->iss, claims->sub);
+        const std::string signs_in_as =
+            linked ? *linked : shadow_user_id_for_subject(claims->sub, config_.server_name);
+        if (signs_in_as != user_id) {
+            send_error(res, 403, MatrixError::forbidden(
+                "That identity does not sign in to this account"));
+            return std::nullopt;
+        }
+        return std::string("identity_token");
+    }
+
+    send_error(res, 401, MatrixError::forbidden(
+        "Confirm it is you: sign in again (this needs a sign-in from the last 10 minutes), "
+        "or include auth: {\"type\": \"m.login.token\", \"token\": \"<id_token>\"} "
+        "for an identity that signs in to this account"));
+    return std::nullopt;
+}
+
+void AuthHandler::handle_unlink_identity(const httplib::Request& req, httplib::Response& res) {
+    const auto auth_header = req.get_header_value("Authorization");
+    const auto bearer = extract_access_token(auth_header);
+    if (!bearer) return send_error(res, 401, auth_error(auth_header));
+    auto actor = store_.get_user_by_token(*bearer);
+    if (!actor) return send_error(res, 401, MatrixError::unknown_token());
+
+    // Same budget as link_identity: this runs PBKDF2 or an id_token check.
+    const auto client = client_key(req);
+    if (over_attempt_limit("link_identity", client, res)) return;
+
+    if (store_.is_bot(*actor)) {
+        return send_error(res, 403, MatrixError::forbidden("Bot accounts have no linked identities"));
+    }
+
+    json body;
+    try {
+        body = parse_request_json(req.body);
+    } catch (...) {
+        return send_error(res, 400, MatrixError::bad_json());
+    }
+    if (!body.is_object() || !body.contains("issuer") || !body["issuer"].is_string() ||
+        body["issuer"].get_ref<const std::string&>().empty()) {
+        return send_error(res, 400, MatrixError::bad_json(
+            "Expected {\"issuer\": \"<issuer from linked_identities>\", ...}"));
+    }
+    const std::string issuer = body["issuer"].get<std::string>();
+
+    const auto step_up = require_step_up(*bearer, *actor, body, client, res);
+    if (!step_up) return;
+
+    // By issuer, because that is all GET linked_identities discloses: the
+    // subject never leaves the database, so the client cannot name one.
+    const auto links = store_.list_linked_identities(*actor);
+    std::vector<SqliteStore::LinkedIdentity> matching;
+    for (const auto& l : links) {
+        if (l.issuer == issuer) matching.push_back(l);
+    }
+    if (matching.empty()) {
+        return send_error(res, 404, MatrixError::not_found(
+            "No identity from that issuer is linked to this account"));
+    }
+
+    // Never strand an account. With no password, the only ways in are the
+    // remaining links and the identity this account is the shadow of (which
+    // resolves here again once unlinked).
+    auto stored = store_.get_password_hash(*actor);
+    if (!(stored && !stored->empty()) && matching.size() == links.size()) {
+        const bool shadow_of_removed = std::any_of(
+            matching.begin(), matching.end(), [&](const auto& l) {
+                return shadow_user_id_for_subject(l.subject, config_.server_name) == *actor;
+            });
+        if (!shadow_of_removed) {
+            return send_error(res, 403, MatrixError::forbidden(
+                "Unlinking this would leave the account with no way to sign in"));
+        }
+    }
+
+    int removed = 0;
+    for (const auto& l : matching) {
+        if (store_.unlink_identity(l.issuer, l.subject, *actor)) ++removed;
+    }
+    audit_account_unlink(store_, *actor, issuer, removed, *step_up);
+    get_logger()->info("{} unlinked {} identit{} from issuer {}", *actor, removed,
+                       removed == 1 ? "y" : "ies", log_safe(issuer));
+
+    res.status = 200;
+    res.set_content(json{{"issuer", issuer}, {"removed", removed}}.dump(), "application/json");
 }
 
 void AuthHandler::handle_linked_identities(const httplib::Request& req, httplib::Response& res) {

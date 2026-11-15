@@ -175,6 +175,9 @@ void Server::register_routes() {
     // mandatory. GET lists the caller's own links and nobody else's.
     svr.Post(std::string(api_path::kLinkIdentity),
              [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_link_identity(req, res); });
+    // Unlinking: the same step-up as linking (audit 2026-11-15 S-2).
+    svr.Post(std::string(kUnlinkIdentityPath),
+             [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_unlink_identity(req, res); });
     svr.Get(std::string(api_path::kLinkedIdentities),
             [h = auth_handler](const httplib::Request& req, httplib::Response& res) { h->handle_linked_identities(req, res); });
     svr.Get(std::string(api_path::kWhoami),
