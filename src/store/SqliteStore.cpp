@@ -232,6 +232,22 @@ SqliteStore::SqliteStore(const std::string& db_path) : db_path_(db_path) {
         throw std::runtime_error(std::string("Failed to open database: ") + sqlite3_errmsg(db_));
     }
     exec("PRAGMA journal_mode=WAL");
+    // synchronous=NORMAL, with WAL (audit 2026-11-15, R-7/8). The default,
+    // FULL, fsyncs the WAL on every commit, and a message costs three or more
+    // commits behind the store's one mutex. Under WAL, NORMAL fsyncs only at
+    // checkpoints and is still fully durable against an application crash or
+    // kill — the WAL is in the OS page cache either way — and the database can
+    // never be corrupted. What it gives up is the last few transactions before
+    // a POWER LOSS or kernel crash, which roll back on the next open. For a
+    // chat server that is the right trade. It is only safe because the mode
+    // really is WAL, so check rather than assume: an in-memory database
+    // reports "memory", and anything else keeps FULL.
+    {
+        auto mode = prepare(db_, "PRAGMA journal_mode");
+        std::string current;
+        if (sqlite3_step(mode.get()) == SQLITE_ROW) current = column_text_or_empty(mode.get(), 0);
+        if (current == "wal") exec("PRAGMA synchronous=NORMAL");
+    }
     exec("PRAGMA foreign_keys=ON");
     exec("PRAGMA busy_timeout=5000");
 
@@ -2181,9 +2197,24 @@ int64_t SqliteStore::insert_event(const std::string& event_id, const std::string
         const std::optional<std::string> signal_to =
             call_signal_addressee(event_type, content_json);
 
+        // The annotated event of a reaction (schema v32), derived here for the
+        // reason `replaces` is: no caller can forget it, and
+        // find_reaction_event() is an index probe on it.
+        std::optional<std::string> relates_to;
+        if (event_type == std::string(event_type::kReaction)) {
+            auto content = nlohmann::json::parse(content_json, nullptr, false);
+            if (!content.is_discarded() && content.is_object()) {
+                auto rel = content.find("m.relates_to");
+                if (rel != content.end() && rel->is_object()) {
+                    auto target = rel->value("event_id", "");
+                    if (!target.empty()) relates_to = std::move(target);
+                }
+            }
+        }
+
         auto stmt = prepare(db_,
-            "INSERT INTO events (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, stream_position, replaces, signal_to) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            "INSERT INTO events (event_id, room_id, sender, event_type, state_key, content, origin_server_ts, stream_position, replaces, signal_to, relates_to) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
         sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt.get(), 3, sender.c_str(), -1, SQLITE_TRANSIENT);
@@ -2205,6 +2236,11 @@ int64_t SqliteStore::insert_event(const std::string& event_id, const std::string
             sqlite3_bind_text(stmt.get(), 10, signal_to->c_str(), -1, SQLITE_TRANSIENT);
         } else {
             sqlite3_bind_null(stmt.get(), 10);
+        }
+        if (relates_to) {
+            sqlite3_bind_text(stmt.get(), 11, relates_to->c_str(), -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt.get(), 11);
         }
 
         if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
@@ -2535,15 +2571,23 @@ std::optional<std::string> SqliteStore::find_reaction_event(const std::string& r
     // path: an unquoted dot is a path separator, so '$.m.relates_to.event_id'
     // would look for a member "relates_to" of a member "m" and always miss.
     //
-    // Narrowed by (room_id, event_type, sender) before any JSON is touched, and
-    // reactions are a small slice of a room, so this is not the scan it looks
-    // like. redacted_by IS NULL is what keeps un-react/re-react working.
+    // Driven by idx_events_relates_to (schema v32): `relates_to` is the
+    // annotated event id, written at insert, so the candidate set is this
+    // sender's reactions to this one event — usually zero or one row — and
+    // json_extract only ever runs on those, never over the room (audit
+    // 2026-11-15, R-8). The event_id comparison stays as a belt over the
+    // column. redacted_by IS NULL is what keeps un-react/re-react working.
     auto stmt = prepare(db_,
+        // Unary + on room_id and event_type takes them out of index
+        // selection, so the planner cannot prefer the far less selective
+        // (room_id, event_type, ...) index on a database with no ANALYZE.
+        // Not INDEXED BY: that would turn a missing index into a hard error.
         "SELECT event_id FROM events "
-        " WHERE room_id = ? AND event_type = ? AND sender = ? AND redacted_by IS NULL "
+        " WHERE relates_to = ?4 AND sender = ?3 AND +room_id = ?1 AND +event_type = ?2 "
+        "   AND redacted_by IS NULL "
         "   AND json_valid(content) "
-        "   AND json_extract(content, '$.\"m.relates_to\".event_id') = ? "
-        "   AND IFNULL(json_extract(content, '$.\"m.relates_to\".key'), '') = ? "
+        "   AND json_extract(content, '$.\"m.relates_to\".event_id') = ?4 "
+        "   AND IFNULL(json_extract(content, '$.\"m.relates_to\".key'), '') = ?5 "
         " ORDER BY stream_position ASC LIMIT 1");
     sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, std::string(event_type::kReaction).c_str(), -1,
@@ -2566,20 +2610,21 @@ bool SqliteStore::is_event_redacted(const std::string& event_id) {
 void SqliteStore::reresolve_edit_locked(const std::string& room_id,
                                         const std::string& target_event_id) {
     // Find the newest surviving replacement of `target_event_id`. The candidate
-    // set is narrowed with a LIKE on the target's event id — event ids are
-    // random and unique, so this is highly selective — and then confirmed by
-    // parsing the relation in C++. Deliberately NOT json_extract(): the path
-    // would be `$."m.relates_to".rel_type`, and quoted JSON path labels are
-    // only supported by recent SQLite builds.
+    // set comes from `replaces` — the target id insert_event derives from the
+    // content's m.replace relation, backfilled by v9 — through the partial
+    // index idx_events_replaces (schema v32). This used to be
+    // `content LIKE '%<id>%'`, a scan of every message in the room under the
+    // store mutex on every edit and redaction (audit 2026-11-15, R-7). Each
+    // candidate is still confirmed by parsing the relation in C++.
     std::optional<std::string> winner;
     {
         auto sel = prepare(db_,
             "SELECT event_id, content FROM events "
-            "WHERE room_id = ? AND event_type = 'm.room.message' AND redacted_by IS NULL "
-            "  AND content LIKE '%' || ? || '%' "
+            "WHERE replaces = ? AND room_id = ? AND event_type = 'm.room.message' "
+            "  AND redacted_by IS NULL "
             "ORDER BY stream_position DESC");
-        sqlite3_bind_text(sel.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(sel.get(), 2, target_event_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(sel.get(), 1, target_event_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(sel.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
         while (sqlite3_step(sel.get()) == SQLITE_ROW) {
             auto content = nlohmann::json::parse(column_text_or_empty(sel.get(), 1), nullptr, false);
             if (content.is_discarded() || !content.is_object()) continue;

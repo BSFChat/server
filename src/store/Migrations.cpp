@@ -1989,6 +1989,67 @@ void migrate_v31(sqlite3* db, bool /*fresh_database*/) {
         "/sync can tell every device to drop it");
 }
 
+// If `content_json` is an m.reaction annotation, the id of the event it
+// annotates. Parsed in C++ for the same reason replacement_target() is.
+std::optional<std::string> annotation_target(const std::string& content_json) {
+    auto j = nlohmann::json::parse(content_json, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return std::nullopt;
+    auto it = j.find("m.relates_to");
+    if (it == j.end() || !it->is_object()) return std::nullopt;
+    auto target = it->value("event_id", "");
+    if (target.empty()) return std::nullopt;
+    return target;
+}
+
+void migrate_v32(sqlite3* db, bool /*fresh_database*/) {
+    // Indexes for the edit, redaction and reaction lookups (audit 2026-11-15,
+    // R-7/8). Each of these ran under the store's single mutex and scanned a
+    // whole room — or for `replaces`, the whole table — on every edit,
+    // redaction and reaction.
+    //
+    // `replaces` (v9) is NULL for every event that is not an edit, so the
+    // index is partial: it holds only the edits and costs nothing on an
+    // ordinary message insert. It serves edit_family_locked() (redaction) and
+    // reresolve_edit_locked(), which used `content LIKE '%<id>%'` instead.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_events_replaces ON events(replaces) "
+             "WHERE replaces IS NOT NULL");
+
+    // `relates_to`: the annotated event of an m.reaction, derived at insert
+    // exactly as `replaces` is (SqliteStore::insert_event), so the reaction
+    // dedupe in find_reaction_event() is an index probe instead of
+    // json_extract() over every reaction the sender made in the room. A
+    // column plus backfill rather than an expression index, because the
+    // expression would need the quoted JSON path `$."m.relates_to".event_id`,
+    // which older SQLite builds cannot parse (see replacement_target()).
+    if (!column_exists(db, "events", "relates_to")) {
+        exec(db, "ALTER TABLE events ADD COLUMN relates_to TEXT");
+    }
+    {
+        std::vector<std::pair<std::string, std::string>> rows;
+        auto sel = prepare(db,
+            "SELECT event_id, content FROM events "
+            "WHERE event_type = 'm.reaction' AND relates_to IS NULL");
+        while (sqlite3_step(sel.get()) == SQLITE_ROW) {
+            if (auto target = annotation_target(text_or_empty(sel.get(), 1))) {
+                rows.emplace_back(text_or_empty(sel.get(), 0), *target);
+            }
+        }
+        auto upd = prepare(db, "UPDATE events SET relates_to = ? WHERE event_id = ?");
+        for (const auto& [event_id, target] : rows) {
+            sqlite3_reset(upd.get());
+            sqlite3_bind_text(upd.get(), 1, target.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(upd.get(), 2, event_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(upd.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("failed to backfill relates_to: ") +
+                                         sqlite3_errmsg(db));
+            }
+        }
+        get_logger()->info("Schema v32: indexed {} existing reaction(s) by target", rows.size());
+    }
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_events_relates_to "
+             "ON events(relates_to, sender) WHERE relates_to IS NOT NULL");
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -2024,6 +2085,7 @@ const std::vector<Step>& steps() {
         migrate_v29,
         migrate_v30,
         migrate_v31,
+        migrate_v32,
     };
     return kMigrations;
 }
