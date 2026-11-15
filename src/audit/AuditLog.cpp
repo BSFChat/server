@@ -341,6 +341,18 @@ void audit_account_link(SqliteStore& store, const std::string& actor,
     store.append_audit_record(record);
 }
 
+void audit_bootstrap_admin(SqliteStore& store, const std::string& actor,
+                           const std::string& user_id) {
+    SqliteStore::AuditRecord record;
+    record.actor = actor;
+    record.action = audit_action::kRoleBootstrapAdmin;
+    record.target_user = user_id;
+    record.reason = "first run: no account held an administrator role";
+    record.after_json = nlohmann::json{
+        {"role_ids", nlohmann::json::array({std::string(permission::role_id::kAdmin)})}}.dump();
+    store.append_audit_record(record);
+}
+
 void audit_account_unlink(SqliteStore& store, const std::string& actor,
                           const std::string& issuer, int removed,
                           const std::string& step_up) {

@@ -105,6 +105,11 @@ constexpr const char* kRoleUpdate = "role.update";
 constexpr const char* kRoleDelete = "role.delete";
 // A change to which roles a user holds (bsfchat.member.roles).
 constexpr const char* kRoleAssign = "role.assign";
+// The one-time first-run grant of Admin to the server's first account, by
+// bootstrap_roles (audit 2026-11-15 S-6). Recorded in addition to the
+// role.assign the write itself produces, so "how did they get admin?" has an
+// answer that says "first run" rather than an unexplained @server grant.
+constexpr const char* kRoleBootstrapAdmin = "role.bootstrap_admin";
 
 // The bot lifecycle. All three are acts of authority over the server, performed
 // by a human holding MANAGE_BOTS, and all three create or destroy the ability of
@@ -290,6 +295,9 @@ void audit_account_link(SqliteStore& store, const std::string& actor,
 
 // Records an unlink: `removed` links from `issuer` taken off `actor`'s own
 // account, after the step-up named by `step_up`.
+void audit_bootstrap_admin(SqliteStore& store, const std::string& actor,
+                           const std::string& user_id);
+
 void audit_account_unlink(SqliteStore& store, const std::string& actor,
                           const std::string& issuer, int removed,
                           const std::string& step_up);

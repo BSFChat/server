@@ -12,6 +12,7 @@
 
 #include <nlohmann/json.hpp>
 #include <chrono>
+#include <set>
 
 namespace bsfchat {
 
@@ -319,15 +320,53 @@ void bootstrap_roles(SqliteStore& store, SyncEngine& sync_engine, const Config& 
     // no longer writes assignments for bots at all.
     backfill_bot_everyone(store, config, canonical);
 
-    // 2. Ensure every user has a member.roles event. First-registered user
-    // (oldest created_at) gets Admin; everyone else gets @everyone only.
+    // 2. Ensure every user has a member.roles event: @everyone only.
     auto users = store.list_users_with_created_at();
     if (users.empty()) {
         sync_engine.notify_new_event();
         return;
     }
 
-    const std::string& owner_id = users.front().first;
+    // 3. The first-run Admin grant (audit 2026-11-15 S-6). This used to hand
+    // Admin to the oldest account whenever ITS assignment was empty, on every
+    // register, first OIDC login and restart, silently — so co-admins could
+    // never demote a rogue owner. Now it happens at most once per server: only
+    // while the persisted marker is absent, only when no account holds an
+    // ADMINISTRATOR-bearing role, and only to an oldest account that has never
+    // been assigned anything (genuine first run). Once anybody holds admin the
+    // marker is set and this never runs again; a locked-out server is
+    // recovered with `bsfchat-server grant-admin`, deliberately and visibly.
+    static constexpr const char* kFirstAdminMarker = "bootstrap.first_admin";
+    std::string owner_id;
+    if (!store.get_meta(kFirstAdminMarker)) {
+        std::set<std::string> admin_roles;
+        for (const auto& r : store.get_server_roles()) {
+            if (permission::has(r.permissions, permission::kAdministrator)) admin_roles.insert(r.id);
+        }
+        bool admin_exists = false;
+        std::string oldest;
+        for (const auto& [user_id, _ts] : users) {
+            if (bot::is_bot_user_id(user_id)) continue;
+            if (oldest.empty() && !store.get_user_deactivated_at(user_id)) oldest = user_id;
+            for (const auto& id : store.get_member_role_ids(user_id)) {
+                if (admin_roles.count(id)) { admin_exists = true; break; }
+            }
+            if (admin_exists) break;
+        }
+        if (admin_exists) {
+            store.set_meta(kFirstAdminMarker, "existing");
+        } else if (!oldest.empty() && store.get_member_role_ids(oldest).empty()) {
+            owner_id = oldest;
+        } else if (!oldest.empty()) {
+            // Accounts exist, none is an admin, and the oldest has an
+            // assignment already: not a first run. Granting here is the
+            // silent re-grant this replaced, so leave it to the operator.
+            get_logger()->warn("bootstrap_roles: no account holds an administrator role; "
+                               "use `bsfchat-server grant-admin` to appoint one");
+            store.set_meta(kFirstAdminMarker, "none");
+        }
+    }
+
     int wrote = 0;
     for (const auto& [user_id, _ts] : users) {
         // A BOT IS NOT GIVEN @everyone HERE, and this is the line that makes
@@ -348,8 +387,14 @@ void bootstrap_roles(SqliteStore& store, SyncEngine& sync_engine, const Config& 
         write_member_roles(store, config, canonical, user_id, ids);
         ++wrote;
     }
+    if (!owner_id.empty()) {
+        audit_bootstrap_admin(store, server_actor(config), owner_id);
+        store.set_meta(kFirstAdminMarker, owner_id);
+        get_logger()->warn("bootstrap_roles: first run — granted Admin to the first account, {}",
+                           owner_id);
+    }
     if (wrote > 0) {
-        get_logger()->info("bootstrap_roles: assigned default roles to {} user(s); owner={}", wrote, owner_id);
+        get_logger()->info("bootstrap_roles: assigned default roles to {} user(s)", wrote);
     }
     sync_engine.notify_new_event();
 }

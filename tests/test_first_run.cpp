@@ -37,6 +37,7 @@
 
 #include <gtest/gtest.h>
 
+#include "audit/AuditLog.h"
 #include "auth/AutoJoin.h"
 #include "auth/RoleBootstrap.h"
 #include "core/Config.h"
@@ -46,6 +47,7 @@
 
 #include <bsfchat/Constants.h>
 #include <bsfchat/Identifiers.h>
+#include <bsfchat/MatrixTypes.h>
 #include <bsfchat/Permissions.h>
 
 #include <nlohmann/json.hpp>
@@ -311,4 +313,91 @@ TEST(FirstRun, AnAlreadyDeployedButEmptyServerJoinsItsExistingUserOnUpgrade) {
 
     auto joined = f.store->get_joined_rooms("@demo:test");
     EXPECT_EQ(joined.size(), 2u) << "the existing account was left outside the new channels";
+}
+
+// ── The first-run Admin grant happens once (audit 2026-11-15 S-6) ─────────
+//
+// bootstrap_roles used to grant Admin to the oldest account whenever that
+// account's assignment was empty — on every register, first OIDC login and
+// restart, with no record saying why. Co-admins could not demote a rogue
+// owner: emptying their roles was undone at the next boot.
+
+namespace {
+
+void set_roles(SqliteStore& store, const std::string& uid, const std::vector<std::string>& ids) {
+    MemberRolesContent c;
+    c.role_ids = ids;
+    json j;
+    to_json(j, c);
+    store.set_server_state(std::string(event_type::kMemberRoles), uid, "@server:test", j.dump());
+}
+
+bool holds_admin(SqliteStore& store, const std::string& uid) {
+    auto ids = store.get_member_role_ids(uid);
+    return std::find(ids.begin(), ids.end(), std::string(permission::role_id::kAdmin)) != ids.end();
+}
+
+size_t bootstrap_admin_records(SqliteStore& store) {
+    SqliteStore::AuditFilter filter;
+    filter.action = std::string(audit_action::kRoleBootstrapAdmin);
+    return store.list_audit_records(50, std::nullopt, filter).records.size();
+}
+
+} // namespace
+
+TEST(FirstAdmin, TheFirstAccountIsGrantedAdminOnceAndItIsAudited) {
+    Fixture f("first-admin");
+    f.store->create_user("@owner:test", "");
+    bootstrap_roles(*f.store, *f.sync, f.config);
+    EXPECT_TRUE(holds_admin(*f.store, "@owner:test"));
+    ASSERT_EQ(bootstrap_admin_records(*f.store), 1u);
+    SqliteStore::AuditFilter filter;
+    filter.action = std::string(audit_action::kRoleBootstrapAdmin);
+    auto rec = f.store->list_audit_records(5, std::nullopt, filter).records.front();
+    EXPECT_EQ(rec.target_user, "@owner:test");
+    EXPECT_EQ(rec.actor, "@server:test");
+
+    // A second account and a restart grant nothing more.
+    f.store->create_user("@bob:test", "");
+    bootstrap_roles(*f.store, *f.sync, f.config);
+    EXPECT_FALSE(holds_admin(*f.store, "@bob:test"));
+    EXPECT_EQ(bootstrap_admin_records(*f.store), 1u);
+}
+
+TEST(FirstAdmin, ADemotedOwnerIsNotReGrantedAdmin) {
+    Fixture f("demoted-owner");
+    f.store->create_user("@owner:test", "");
+    bootstrap_roles(*f.store, *f.sync, f.config);
+    f.store->create_user("@coadmin:test", "");
+    bootstrap_roles(*f.store, *f.sync, f.config);
+    set_roles(*f.store, "@coadmin:test",
+              {std::string(permission::role_id::kEveryone), std::string(permission::role_id::kAdmin)});
+
+    // The co-admin demotes the owner by emptying their assignment...
+    set_roles(*f.store, "@owner:test", {});
+    // ...and a new registration, then a restart, must not undo it.
+    f.store->create_user("@carol:test", "");
+    bootstrap_roles(*f.store, *f.sync, f.config);
+    bootstrap_roles(*f.store, *f.sync, f.config);
+
+    EXPECT_FALSE(holds_admin(*f.store, "@owner:test"));
+    EXPECT_EQ(bootstrap_admin_records(*f.store), 1u);
+    // The empty assignment is still given @everyone, as for anyone.
+    EXPECT_EQ(f.store->get_member_role_ids("@owner:test"),
+              std::vector<std::string>{std::string(permission::role_id::kEveryone)});
+}
+
+TEST(FirstAdmin, AnUpgradedServerWithAnAdminAlreadyGrantsNothing) {
+    // A server that predates the marker: someone other than the oldest
+    // account is the admin, and the oldest has an empty assignment.
+    Fixture g("upgrade-has-admin");
+    g.store->create_user("@old:test", "");
+    g.store->create_user("@admin:test", "");
+    set_roles(*g.store, "@old:test", {});
+    set_roles(*g.store, "@admin:test",
+              {std::string(permission::role_id::kEveryone), std::string(permission::role_id::kAdmin)});
+    bootstrap_roles(*g.store, *g.sync, g.config);
+    EXPECT_FALSE(holds_admin(*g.store, "@old:test"));
+    EXPECT_TRUE(holds_admin(*g.store, "@admin:test"));
+    EXPECT_EQ(bootstrap_admin_records(*g.store), 0u);
 }
