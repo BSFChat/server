@@ -1093,7 +1093,11 @@ void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Resp
     // poll's `m.fully_read` room account data, and a device that missed the
     // wake still finds it against its own token on the next poll. The wake is
     // when, not whether — see docs/read-state.md.
-    sync_engine_.notify_ephemeral();
+    //
+    // Scoped to this account (audit R-2): a marker changes only its owner's
+    // counts and m.fully_read. Broadcasting it returned every parked poll on
+    // the server once per reader per message.
+    sync_engine_.notify_ephemeral_for(*user_id);
 
     res.set_content("{}", "application/json");
 }

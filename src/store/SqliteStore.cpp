@@ -1883,6 +1883,19 @@ std::vector<std::pair<std::string, std::string>> SqliteStore::get_room_members(c
     return members;
 }
 
+std::vector<std::string> SqliteStore::get_co_members(const std::string& user_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT DISTINCT b.user_id FROM room_members a "
+        "JOIN room_members b ON b.room_id = a.room_id "
+        "WHERE a.user_id = ?1 AND a.membership = 'join' "
+        "AND b.membership = 'join' AND b.user_id <> ?1");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    std::vector<std::string> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) out.emplace_back(column_text_or_empty(stmt.get(), 0));
+    return out;
+}
+
 std::vector<std::pair<std::string, std::string>>
 SqliteStore::get_user_memberships(const std::string& user_id) {
     std::lock_guard lock(mutex_);

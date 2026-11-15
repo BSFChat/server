@@ -512,6 +512,11 @@ public:
     std::optional<std::string> find_membership(const std::string& room_id,
                                                const std::string& user_id);
     std::vector<std::pair<std::string, std::string>> get_room_members(const std::string& room_id);
+    // Every OTHER account joined to at least one room `user_id` is joined to,
+    // each once. Membership only — no visibility filter — so it is a superset
+    // of who may see this account's presence, which is what a wake audience
+    // needs (SyncEngine::notify_ephemeral_for). Not an access decision.
+    std::vector<std::string> get_co_members(const std::string& user_id);
     // Every (room_id, membership) row this user has, in any state. This is the
     // list a server-wide ban has to be projected across, and it is deliberately
     // NOT get_joined_rooms(): a ban must also reach rooms where the user is

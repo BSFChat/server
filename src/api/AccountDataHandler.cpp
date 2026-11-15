@@ -253,7 +253,10 @@ void AccountDataHandler::handle_put_account_data(const httplib::Request& req,
     // already returning, process asleep on a phone — still gets the document
     // on its next poll, because the delta is keyed on the stored position and
     // not on having been listening at the right moment.
-    sync_engine_.notify_ephemeral();
+    //
+    // Scoped to this account (audit R-2): account data is delivered to its
+    // owner and nobody else, so nobody else's poll has anything to return.
+    sync_engine_.notify_ephemeral_for(*user_id);
 
     res.set_content("{}", "application/json");
 }

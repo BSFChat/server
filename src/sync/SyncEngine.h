@@ -8,6 +8,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -64,7 +65,23 @@ public:
     // insert no event, so the stream position is unchanged and a waiter
     // blocked on it would never wake; the sync predicate watches a separate
     // counter that this bumps.
+    //
+    // BROADCAST: every parked poll on the server returns, and each one then
+    // runs a full pass. Prefer notify_ephemeral_for() whenever the change
+    // concerns a known set of accounts; this remains for a change whose
+    // audience cannot be named, and for tests.
     void notify_ephemeral();
+
+    // The same, scoped (audit 2026-11-15, R-2): only polls parked by one of
+    // `user_ids` return. The caller names everyone the change can be visible
+    // to — a SUPERSET is always safe, a missing account is a change that
+    // account waits a whole timeout for:
+    //   * read marker, account data: the writing account (its other devices);
+    //   * typing in a room: every joined member of that room;
+    //   * presence: every account sharing a joined room with the subject, and
+    //     the subject.
+    void notify_ephemeral_for(const std::vector<std::string>& user_ids);
+    void notify_ephemeral_for(const std::string& user_id);
 
     // Handle a /sync request. Blocks up to timeout_ms if no new events.
     //
@@ -132,6 +149,16 @@ private:
     // check and its block, costing that client up to a full poll timeout.
     std::atomic<int64_t> current_position_{0};
     std::atomic<uint64_t> ephemeral_seq_{0};
+    // Scoped ephemeral changes: the clock value of the latest change that
+    // concerns each account. Values come from `user_ephemeral_clock_`, which
+    // only ever increases, so a waiter compares its entry snapshot with `!=`
+    // and can never be fooled by a reset. Rows are never erased for the same
+    // reason; the map is bounded by the number of accounts. Both guarded by
+    // wait_mutex_ — the same rule as the two counters above.
+    std::unordered_map<std::string, uint64_t> user_ephemeral_seq_;
+    uint64_t user_ephemeral_clock_ = 0;
+    // Caller must hold wait_mutex_. 0 for an account never notified.
+    uint64_t user_ephemeral_seq_locked(const std::string& user_id) const;
     // Set once before any sync runs, by tests only.
     std::function<void()> post_scan_hook_for_test_;
 };

@@ -123,7 +123,17 @@ void TypingHandler::handle_typing(const httplib::Request& req, httplib::Response
     // ephemeral notifier: no event was inserted, so notify_new_event() would
     // re-read an unchanged stream position and the waiter's predicate would
     // stay false — typing stayed invisible until the 30s poll expired.
-    sync_engine_.notify_ephemeral();
+    //
+    // Scoped to the room's joined members (audit 2026-11-15, R-2). The
+    // indicator is injected only into rooms the reader is joined to and may
+    // view (SyncHandler), so the joined set is a superset of everyone who can
+    // see it; the broadcast this replaces returned every parked poll on the
+    // server for every keystroke burst in every channel.
+    std::vector<std::string> audience;
+    for (auto& [uid, state] : store_.get_room_members(room_id)) {
+        if (state == membership::kJoin) audience.push_back(std::move(uid));
+    }
+    sync_engine_.notify_ephemeral_for(audience);
 
     res.status = 200;
     res.set_content("{}", "application/json");

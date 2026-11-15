@@ -301,6 +301,32 @@ void SyncEngine::notify_ephemeral() {
     new_event_cv_.notify_all();
 }
 
+void SyncEngine::notify_ephemeral_for(const std::vector<std::string>& user_ids) {
+    if (user_ids.empty()) return;
+    {
+        // Under wait_mutex_ for the reason notify_new_event gives: a waiter
+        // evaluates its predicate under this lock, so a bump that slipped in
+        // between that evaluation and the wait would be lost.
+        std::lock_guard lock(wait_mutex_);
+        const uint64_t stamp = ++user_ephemeral_clock_;
+        for (const auto& uid : user_ids) user_ephemeral_seq_[uid] = stamp;
+    }
+    // Still notify_all: there is one condition variable, and every parked
+    // thread re-evaluates its predicate. That is a few comparisons per waiter;
+    // what the scoping removes is the full sync pass and the HTTP round trip
+    // each of them used to make after returning.
+    new_event_cv_.notify_all();
+}
+
+void SyncEngine::notify_ephemeral_for(const std::string& user_id) {
+    notify_ephemeral_for(std::vector<std::string>{user_id});
+}
+
+uint64_t SyncEngine::user_ephemeral_seq_locked(const std::string& user_id) const {
+    auto it = user_ephemeral_seq_.find(user_id);
+    return it == user_ephemeral_seq_.end() ? 0 : it->second;
+}
+
 void SyncEngine::set_post_scan_hook_for_test(std::function<void()> hook) {
     post_scan_hook_for_test_ = std::move(hook);
 }
@@ -426,10 +452,31 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
     // straight out of the handler; the parser is strict and total instead.
     const int64_t since_pos = parse_token(user_id, since_token);
 
-    // Snapshot the ephemeral counter BEFORE building, so typing/presence
+    // Snapshot the ephemeral counters BEFORE building, so typing/presence
     // changes that land while we're querying still count as "something
     // happened" and don't get swallowed by the wait.
-    const uint64_t edu_at_entry = ephemeral_seq_.load();
+    //
+    // Two of them: the broadcast counter, and this account's own scoped one
+    // (notify_ephemeral_for). Only a change in one of THESE wakes this poll —
+    // a read marker set by somebody else used to return every parked poll on
+    // the server (audit 2026-11-15, R-2). Both are read under wait_mutex_, so
+    // the pair is one consistent snapshot.
+    uint64_t edu_at_entry = 0;
+    uint64_t user_edu_at_entry = 0;
+    {
+        std::lock_guard lock(wait_mutex_);
+        edu_at_entry = ephemeral_seq_.load();
+        user_edu_at_entry = user_ephemeral_seq_locked(user_id);
+    }
+    // Caller must hold wait_mutex_.
+    auto edu_changed_locked = [&] {
+        return ephemeral_seq_.load() != edu_at_entry ||
+               user_ephemeral_seq_locked(user_id) != user_edu_at_entry;
+    };
+    auto edu_changed = [&] {
+        std::lock_guard lock(wait_mutex_);
+        return edu_changed_locked();
+    };
 
     // The position this scan covered — NOT the head as it stands now. An event
     // persisted while the scan was running has a position above this, so the
@@ -491,8 +538,7 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
             {
                 std::unique_lock lock(wait_mutex_);
                 signalled = new_event_cv_.wait_until(lock, deadline, [&] {
-                    return current_position_.load() > checked_pos ||
-                           ephemeral_seq_.load() != edu_at_entry;
+                    return current_position_.load() > checked_pos || edu_changed_locked();
                 });
             }
             if (!signalled) break; // deadline passed with nothing for us
@@ -513,7 +559,7 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
             // truncated re-scan is returned too, for the reason given above
             // the wait: the woken scan has filled a page of hidden rows.
             if (has_payload(response) || (truncated && covered_pos > since_pos) ||
-                ephemeral_seq_.load() != edu_at_entry) {
+                edu_changed()) {
                 return deliver(std::move(response));
             }
             // Woken for an event this user cannot see. Keep the poll parked,
