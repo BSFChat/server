@@ -8,11 +8,16 @@
 #include "storage/S3Storage.h"
 #include "store/SqliteStore.h"
 
+#include <bsfchat/Constants.h>
 #include <httplib.h>
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #endif
+#include <arpa/inet.h>   // the raw-socket upload admission tests
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>   // getpid(), for the per-process temp dirs below
 
 #include <algorithm>
@@ -1506,4 +1511,188 @@ TEST_F(MediaHeadTest, AnEmptyUploadIsRefusedAsAnInvalidParameterNotAsBadJson) {
 
     // And nothing was stored — a refused upload must not leave a media row behind.
     EXPECT_EQ(storage_->stat_calls, 0);
+}
+
+// ── Upload admission before the body (audit 2026-11-15 S-1) ──────────────
+//
+// handle_upload used to authenticate only after httplib had buffered the
+// whole body, so unauthenticated POSTs of max_upload_size_mb each were an
+// unauthenticated memory exhaustion. admit_upload now runs in the
+// pre-request handler, which httplib calls before read_content().
+
+namespace {
+
+class UploadAdmissionTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        dir_ = unique_temp_dir("bsfchat_upload_admission");
+        std::filesystem::create_directories(dir_);
+        storage_ = std::make_shared<LocalStorage>(dir_.string());
+        config_ = Config::defaults();
+        config_.server_name = "test";
+        config_.max_upload_size_mb = 10;
+        store_ = std::make_unique<SqliteStore>(":memory:");
+        store_->initialize();
+        store_->create_user("@alice:test", "x");
+        store_->store_access_token(token_, "@alice:test", "dev");
+        handler_ = std::make_shared<MediaHandler>(*store_, config_, storage_);
+    }
+
+    void TearDown() override {
+        if (listening_) {
+            svr_.stop();
+            if (thread_.joinable()) thread_.join();
+        }
+        std::filesystem::remove_all(dir_);
+    }
+
+    // The same wiring Server::register_routes installs for the upload route.
+    void listen() {
+        svr_.set_read_timeout(2);
+        svr_.set_pre_request_handler([h = handler_](const httplib::Request& rq,
+                                                   httplib::Response& rs) {
+            return h->admit_upload(rq, rs) ? httplib::Server::HandlerResponse::Unhandled
+                                           : httplib::Server::HandlerResponse::Handled;
+        });
+        svr_.Post(std::string(api_path::kMediaUpload),
+                  [h = handler_](const httplib::Request& rq, httplib::Response& rs) {
+                      h->handle_upload(rq, rs);
+                  });
+        port_ = svr_.bind_to_any_port("127.0.0.1");
+        ASSERT_GT(port_, 0);
+        thread_ = std::thread([this] { svr_.listen_after_bind(); });
+        svr_.wait_until_ready();
+        listening_ = true;
+    }
+
+    // Sends ONLY the request head — never a byte of the body it declares —
+    // and returns whatever the server answers within the timeout. A server
+    // that reads the body before deciding would sit waiting for it, and this
+    // returns empty.
+    std::string send_head_only(const std::string& extra_headers) {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) return {};
+        timeval tv{3, 0};
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(static_cast<uint16_t>(port_));
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        std::string out;
+        if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) {
+            const std::string head = "POST " + std::string(api_path::kMediaUpload) +
+                                     " HTTP/1.1\r\nHost: test\r\n"
+                                     "Content-Type: application/octet-stream\r\n" +
+                                     extra_headers + "\r\n";
+            ::send(fd, head.data(), head.size(), 0);
+            char buf[4096];
+            const auto n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n > 0) out.assign(buf, static_cast<size_t>(n));
+        }
+        ::close(fd);
+        return out;
+    }
+
+    httplib::Request upload_request(bool with_token, const std::string& length = "") {
+        httplib::Request req;
+        req.method = "POST";
+        req.path = std::string(api_path::kMediaUpload);
+        if (with_token) req.set_header("Authorization", "Bearer " + token_);
+        if (!length.empty()) req.set_header("Content-Length", length);
+        return req;
+    }
+
+    std::filesystem::path dir_;
+    std::shared_ptr<LocalStorage> storage_;
+    std::unique_ptr<SqliteStore> store_;
+    std::shared_ptr<MediaHandler> handler_;
+    Config config_;
+    httplib::Server svr_;
+    std::thread thread_;
+    bool listening_ = false;
+    int port_ = 0;
+    std::string token_ = "upload-token";
+};
+
+} // namespace
+
+TEST_F(UploadAdmissionTest, AnUnauthenticatedUploadIsRefusedBeforeItsBodyIsSent) {
+    listen();
+    // 9 MiB declared, nothing sent. The 401 must arrive anyway.
+    const auto resp = send_head_only("Content-Length: " + std::to_string(9 * 1024 * 1024) + "\r\n");
+    ASSERT_FALSE(resp.empty()) << "the server waited for the body before refusing";
+    EXPECT_EQ(resp.rfind("HTTP/1.1 401", 0), 0u) << resp;
+
+    const auto bad = send_head_only("Authorization: Bearer not-a-token\r\nContent-Length: 1000\r\n");
+    ASSERT_FALSE(bad.empty());
+    EXPECT_EQ(bad.rfind("HTTP/1.1 401", 0), 0u) << bad;
+    EXPECT_NE(bad.find("M_UNKNOWN_TOKEN"), std::string::npos) << bad;
+}
+
+TEST_F(UploadAdmissionTest, AnOversizedDeclaredLengthIsRefusedBeforeItsBodyIsSent) {
+    listen();
+    const auto resp = send_head_only("Authorization: Bearer " + token_ + "\r\nContent-Length: " +
+                                     std::to_string(10 * 1024 * 1024 + 1) + "\r\n");
+    ASSERT_FALSE(resp.empty()) << "the server waited for the body before refusing";
+    EXPECT_EQ(resp.rfind("HTTP/1.1 413", 0), 0u) << resp;
+    EXPECT_NE(resp.find("M_TOO_LARGE"), std::string::npos) << resp;
+}
+
+TEST_F(UploadAdmissionTest, AnAdmittedUploadStillStores) {
+    listen();
+    httplib::Client cli("127.0.0.1", port_);
+    cli.set_read_timeout(10);
+    httplib::Headers h{{"Authorization", "Bearer " + token_}};
+    auto res = cli.Post(std::string(api_path::kMediaUpload), h, std::string(1000, 'x'),
+                        "application/octet-stream");
+    ASSERT_TRUE(res);
+    EXPECT_EQ(res->status, 200) << res->body;
+    EXPECT_NE(res->body.find("mxc://test/"), std::string::npos) << res->body;
+}
+
+TEST_F(UploadAdmissionTest, AdmissionChecksAuthAndLengthWithoutABody) {
+    {
+        httplib::Response res;
+        EXPECT_FALSE(handler_->admit_upload(upload_request(false, "10"), res));
+        EXPECT_EQ(res.status, 401);
+        EXPECT_NE(res.body.find("M_MISSING_TOKEN"), std::string::npos) << res.body;
+    }
+    {
+        httplib::Response res;
+        EXPECT_FALSE(handler_->admit_upload(
+            upload_request(true, "99999999999999999999999999"), res));
+        EXPECT_EQ(res.status, 413);
+    }
+    {
+        httplib::Response res;
+        EXPECT_TRUE(handler_->admit_upload(upload_request(true, std::to_string(10 * 1024 * 1024)),
+                                           res))
+            << res.body;
+    }
+}
+
+TEST_F(UploadAdmissionTest, InFlightUploadsPerAccountAreCappedAndReleased) {
+    std::vector<std::unique_ptr<httplib::Response>> held;
+    for (int i = 0; i < MediaHandler::kMaxConcurrentUploadsPerAccount; ++i) {
+        held.push_back(std::make_unique<httplib::Response>());
+        ASSERT_TRUE(handler_->admit_upload(upload_request(true, "10"), *held.back()))
+            << held.back()->body;
+    }
+    httplib::Response over;
+    EXPECT_FALSE(handler_->admit_upload(upload_request(true, "10"), over));
+    EXPECT_EQ(over.status, 429);
+    EXPECT_NE(over.body.find("M_LIMIT_EXCEEDED"), std::string::npos) << over.body;
+
+    // Finishing one (httplib destroying its Response) frees its slot.
+    held.pop_back();
+    httplib::Response again;
+    EXPECT_TRUE(handler_->admit_upload(upload_request(true, "10"), again)) << again.body;
+
+    // Another account is unaffected by alice's uploads.
+    store_->create_user("@bob:test", "x");
+    store_->store_access_token("bob-token", "@bob:test", "dev");
+    auto req = upload_request(false, "10");
+    req.set_header("Authorization", "Bearer bob-token");
+    httplib::Response bob;
+    EXPECT_TRUE(handler_->admit_upload(req, bob)) << bob.body;
 }

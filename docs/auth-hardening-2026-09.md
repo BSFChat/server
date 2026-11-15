@@ -193,6 +193,11 @@ version:
   permission computation (the work worth refusing).
 * Upload bounds how *many* uploads an account makes. The size of any one is
   `[media] max_upload_size_mb`, enforced while streaming by `set_payload_max_length`.
+* Since audit 2026-11-15 S-1 the upload's token, declared `Content-Length`, rate bucket and a
+  per-account in-flight cap (`MediaHandler::kMaxConcurrentUploadsPerAccount`) are all checked in
+  httplib's pre-request handler, **before** the body is read (`MediaHandler::admit_upload`).
+  Previously the token was checked only after httplib had buffered the whole body, so
+  unauthenticated POSTs could hold `max_upload_size_mb` each in memory.
 
 `SendLimiter` takes the identity as a string and selects a bucket by enum, so the tighter
 per-bot bucket that `feat/bots` will want is one enum entry and one configured size, with no

@@ -5,6 +5,7 @@
 #include <bsfchat/MatrixTypes.h>
 #include <sqlite3.h>
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -26,6 +27,15 @@ namespace bsfchat {
 // that stops being used dies 90 days later. Admins can shorten it with
 // `auth.access_token_lifetime_days`.
 inline constexpr int64_t kDefaultAccessTokenLifetimeMs = 90LL * 24 * 60 * 60 * 1000;
+
+// How long a room_departures row (schema v31) is kept: the window within which
+// a client resuming from an old sync token is still told, through rooms.leave,
+// that a room it shows has gone. A client offline for longer than this misses
+// the leave and has to reconcile against GET /joined_rooms, which it does on
+// every reconnect anyway. Thirty days is far longer than any desktop or phone
+// session stays suspended, and short enough that the table never grows with
+// the history of the server.
+inline constexpr int64_t kRoomDepartureRetentionMs = 30LL * 24 * 60 * 60 * 1000;
 
 // How stale a bot token's `last_used_at` is allowed to get before a request
 // refreshes it.
@@ -99,6 +109,21 @@ inline constexpr const char* kIgnoredUsersKey = "ignored_users";
 class SqliteStore {
 public:
     explicit SqliteStore(const std::string& db_path);
+
+    // Changes whenever anything that decides which rooms an account may be
+    // shown might have changed: a membership row, a room's existence, any
+    // room STATE event (channel overrides and bsfchat.room.type are state),
+    // a redaction (which can strip an override), and any server_state write
+    // (role definitions and assignments). Bumped AFTER the write, so a reader
+    // that samples it, then computes, and finds it unchanged afterwards has
+    // computed from data no older than that sample.
+    //
+    // For caches of derived visibility only — /sync's restatement pass caches
+    // the caller's visible joined rooms against it (audit 2026-11-15, R-2).
+    // Deliberately coarse: a spurious bump costs one recomputation, a missed
+    // one is a privacy bug, so every new write path that can change any of
+    // the above must bump it too.
+    uint64_t visibility_generation() const { return visibility_generation_.load(); }
     ~SqliteStore();
 
     SqliteStore(const SqliteStore&) = delete;
@@ -503,6 +528,16 @@ public:
     std::optional<std::string> find_membership(const std::string& room_id,
                                                const std::string& user_id);
     std::vector<std::pair<std::string, std::string>> get_room_members(const std::string& room_id);
+    // Every OTHER account joined to at least one room `user_id` is joined to,
+    // each once. Membership only — no visibility filter — so it is a superset
+    // of who may see this account's presence, which is what a wake audience
+    // needs (SyncEngine::notify_ephemeral_for). Not an access decision.
+    std::vector<std::string> get_co_members(const std::string& user_id);
+    // Every account joined to at least one of `room_ids`, each once. One
+    // statement for the whole list rather than get_room_members() per room,
+    // which handed /sync's presence pass rooms x members rows to dedupe on
+    // every delivered poll (audit 2026-11-15, R-2).
+    std::vector<std::string> get_joined_members_of_rooms(const std::vector<std::string>& room_ids);
     // Every (room_id, membership) row this user has, in any state. This is the
     // list a server-wide ban has to be projected across, and it is deliberately
     // NOT get_joined_rooms(): a ban must also reach rooms where the user is
@@ -510,6 +545,38 @@ public:
     // It is also the query the CLIENT could not do — it looped over the rooms its
     // own sync had surfaced, which is why unsynced channels kept the user.
     std::vector<std::pair<std::string, std::string>> get_user_memberships(const std::string& user_id);
+
+    // ── Room departures (schema v31) ──────────────────────────────────────
+    //
+    // "This account should drop this room", numbered on the event stream so
+    // /sync can deliver it as rooms.leave (audit 2026-11-15, R-1). Written by
+    // the store itself, never by a handler, so no leave/kick/ban path can
+    // forget it:
+    //
+    //   * set_membership() records one whenever a membership goes from 'join'
+    //     to 'leave' or 'ban', and deletes the row when the user joins again;
+    //   * delete_room() records a 'deleted' one for every joined member before
+    //     the membership rows go.
+    //
+    // `reason` is one of the kDeparture* strings below. The store cannot tell
+    // a kick from a leave — both are set_membership(..., "leave") — so that
+    // distinction is made at delivery, from the sender of the member event.
+    struct RoomDeparture {
+        std::string room_id;
+        std::string reason;
+        int64_t stream_pos = 0;
+    };
+    static constexpr const char* kDepartureLeave = "leave";
+    static constexpr const char* kDepartureBan = "ban";
+    static constexpr const char* kDepartureDeleted = "deleted";
+    // `user_id`'s departures with since_pos < stream_pos <= up_to_pos, oldest
+    // first. One row per room at most.
+    std::vector<RoomDeparture> get_room_departures(const std::string& user_id,
+                                                   int64_t since_pos, int64_t up_to_pos);
+    // Deletes departure rows written before `older_than_ms` and returns how
+    // many went. Also run automatically, at most hourly, whenever a departure
+    // is recorded; public for tests and for an operator CLI.
+    int prune_room_departures(int64_t older_than_ms);
 
     // One phantom membership: a room_members row whose user_id names no account.
     struct OrphanMembership {
@@ -1630,6 +1697,12 @@ private:
     void vacuum_freelist_once_locked(bool fresh_database);
     // Claims the next stream position. Caller must hold mutex_.
     int64_t claim_stream_position_locked();
+    // Writes (replacing) the departure row for (user, room) at `stream_pos`,
+    // and prunes expired rows at most hourly. Caller must hold mutex_ and be
+    // inside a transaction.
+    void record_room_departure_locked(const std::string& user_id, const std::string& room_id,
+                                      const std::string& reason, int64_t stream_pos);
+    int64_t last_departure_prune_ms_ = 0;
     // Re-points `target_event_id` at the newest surviving (non-redacted)
     // replacement, clearing the pointer when none is left. Caller must hold
     // mutex_.
@@ -1681,6 +1754,13 @@ private:
     // Kept so the file mode can be re-applied after a VACUUM replaces the file.
     std::string db_path_;
     std::mutex mutex_;
+    std::atomic<uint64_t> visibility_generation_{0};
+    // Bumps visibility_generation_ when it goes out of scope, i.e. after the
+    // write it guards. Declare it AFTER the lock_guard, so it runs first.
+    struct VisibilityBump {
+        std::atomic<uint64_t>& generation;
+        ~VisibilityBump() { ++generation; }
+    };
     // Monotonic; never reused even after delete_room removes the newest rows.
     // Mirrored into server_meta so it survives a restart.
     int64_t next_stream_position_ = 1;

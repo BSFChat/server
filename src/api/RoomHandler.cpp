@@ -1,5 +1,6 @@
 #include "api/RoomHandler.h"
 #include "api/InputLimits.h"
+#include "api/PermissionInput.h"
 #include "api/ChannelAccessRefusal.h"
 #include "auth/MediaAccess.h"
 #include "audit/AuditLog.h"
@@ -26,6 +27,7 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
+#include <optional>
 
 namespace bsfchat {
 
@@ -145,6 +147,61 @@ const char* direct_room_shape_refusal(const CreateRoomRequest& req, const json& 
     if (body.value("voice", false)) {
         return "A direct message cannot be a voice channel";
     }
+    return nullptr;
+}
+
+// Every field POST /createRoom reads, type-checked BEFORE anything is written
+// (audit 2026-11-15, R-4).
+//
+// The handler used to create the room, emit its create/join/join-rules/name/
+// type events, and only then read `parent_id` and `sort_order` — with
+// `get<std::string>()` and `value("sort_order", 0)`, both of which throw on
+// the wrong JSON type. A body like {"parent_id": 5} or {"sort_order": "1"}
+// therefore answered 500 and left a committed, half-built public channel
+// behind, which backfill_auto_join then force-joined everybody into. A
+// well-typed parent_id naming no room did the same with a 400.
+//
+// So the shape is decided here, as a pure function of the body, and the one
+// check that needs the store (does the parent exist) runs in the handler
+// before create_room. Nothing in this function touches the store, so it can
+// sit above the permission checks without becoming an oracle.
+const char* create_room_body_refusal(const json& body) {
+    if (!body.is_object()) return "Request body must be a JSON object";
+    // `null_ok` only for the fields read through get_optional(), which treats
+    // null as absent. Everything else is read with json::value() or get(),
+    // and both throw on a null exactly as they do on any other wrong type.
+    auto wrong = [&](const char* key, auto&& ok, bool null_ok) {
+        auto it = body.find(key);
+        if (it == body.end()) return false;
+        if (it->is_null()) return !null_ok;
+        return !ok(*it);
+    };
+    auto is_string = [](const json& v) { return v.is_string(); };
+    auto is_bool = [](const json& v) { return v.is_boolean(); };
+    auto is_int = [](const json& v) { return v.is_number_integer(); };
+    for (const char* key : {"name", "topic", "room_alias_name", "preset"}) {
+        if (wrong(key, is_string, true)) return "A string field has the wrong type";
+    }
+    if (wrong("visibility", is_string, false)) return "visibility must be a string";
+    // parent_id is tested with body.contains() by the handler, so a null is a
+    // parent id too and is refused rather than skipped.
+    if (wrong("parent_id", is_string, false)) return "parent_id must be a room id string";
+    if (wrong("is_direct", is_bool, true)) return "is_direct must be a boolean";
+    for (const char* key : {"is_category", "voice"}) {
+        if (wrong(key, is_bool, false)) return "A boolean field has the wrong type";
+    }
+    if (wrong("sort_order", is_int, false)) return "sort_order must be an integer";
+    if (wrong("max_voice_participants", is_int, false)) {
+        return "max_voice_participants must be an integer";
+    }
+    auto is_id_list = [](const json& v) {
+        if (!v.is_array()) return false;
+        for (const auto& id : v) {
+            if (!id.is_string()) return false;
+        }
+        return true;
+    };
+    if (wrong("invite", is_id_list, false)) return "invite must be a list of user ids";
     return nullptr;
 }
 
@@ -798,8 +855,22 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
         return;
     }
 
+    if (const char* refusal = create_room_body_refusal(body)) {
+        res.status = 400;
+        res.set_content(MatrixError::invalid_param(refusal).to_json().dump(), "application/json");
+        return;
+    }
+
     CreateRoomRequest room_req;
-    from_json(body, room_req);
+    try {
+        from_json(body, room_req);
+    } catch (const std::exception&) {
+        // create_room_body_refusal has already checked every field from_json
+        // reads; this is the backstop should the protocol type grow one.
+        res.status = 400;
+        res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
+        return;
+    }
 
     // Name and topic become m.room.name / m.room.topic state events that every
     // member downloads on every initial sync. Bounded here like the same
@@ -915,6 +986,20 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
         }
     }
 
+    // The one body check that needs the store, and it has to come before the
+    // first write: see create_room_body_refusal. Below the permission checks
+    // and the budget, so a caller cannot use it to probe which room ids exist.
+    std::optional<std::string> parent_id;
+    if (body.contains("parent_id")) {
+        parent_id = body["parent_id"].get<std::string>();
+        if (!store_.room_exists(*parent_id)) {
+            res.status = 400;
+            res.set_content(MatrixError::bad_json("Parent room does not exist").to_json().dump(),
+                            "application/json");
+            return;
+        }
+    }
+
     auto room_id = generate_room_id(config_.server_name);
     store_.create_room(room_id, *user_id, is_direct);
 
@@ -994,16 +1079,11 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
     }
 
     // Emit bsfchat.room.category if parent_id is provided
-    if (body.contains("parent_id")) {
-        auto parent_id = body["parent_id"].get<std::string>();
-        if (!store_.room_exists(parent_id)) {
-            res.status = 400;
-            res.set_content(MatrixError::bad_json("Parent room does not exist").to_json().dump(), "application/json");
-            return;
-        }
+    if (parent_id) {
+        // Validated above, before the room existed.
         int order = body.value("sort_order", 0);
         emit_state_event(room_id, *user_id, std::string(event_type::kRoomCategory), "",
-                         json{{"parent_id", parent_id}, {"order", order}});
+                         json{{"parent_id", *parent_id}, {"order", order}});
     }
 
     // Default server roles are seeded once per server by RoleBootstrap —
@@ -1325,9 +1405,11 @@ void RoomHandler::handle_delete_room(const httplib::Request& req, httplib::Respo
     audit_room_deletion(store_, *user_id, room_id);
 
     store_.delete_room(room_id);
-    // Wake long-polls so clients notice and drop the room on their next
-    // sync (the server's VIEW_CHANNEL filter now trivially excludes it —
-    // they're no longer a joined member of anything by that id).
+    // delete_room recorded a 'deleted' departure for every joined member, at a
+    // freshly claimed stream position; publishing that head wakes their long
+    // polls, and each comes back with the room in rooms.leave (audit R-1).
+    // Before that row existed this wake delivered nothing: the room's events
+    // were gone, so no device that showed the channel was ever told to drop it.
     sync_engine_.notify_new_event();
 
     get_logger()->info("Room {} deleted by {}", room_id, *user_id);
@@ -2640,6 +2722,14 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
             }
             verdict = perms.may_assign_roles(*user_id, state_key, assignment.role_ids);
         } else {
+            // Shape first: protocol's from_json reads `permissions: -1` as all
+            // ones (audit 2026-11-15 P-1), and this content is stored as sent.
+            if (auto shape = permission_input::role_document_error(content)) {
+                res.status = 400;
+                res.set_content(MatrixError::bad_json(*shape).to_json().dump(),
+                                "application/json");
+                return;
+            }
             ServerRolesContent definitions;
             try {
                 from_json(content, definitions);
@@ -2713,6 +2803,16 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         // because the audit capture two lines up has already paid for that
         // read. `before` defaults to allow = 0, deny = 0, which is exactly
         // what "there is no override" means to compute().
+        //
+        // The proposed override's SHAPE is checked before from_json, which
+        // reads `allow: -1` as every permission and an unparseable string as
+        // none (audit 2026-11-15 P-1). The content is stored as sent, so every
+        // later reader would see the same all-ones value.
+        if (auto shape = permission_input::channel_override_error(content)) {
+            res.status = 400;
+            res.set_content(MatrixError::bad_json(*shape).to_json().dump(), "application/json");
+            return;
+        }
         ChannelPermissionOverride before;
         if (existing) from_json(existing->content.data, before);
         ChannelPermissionOverride proposed;

@@ -22,6 +22,8 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
+#include <optional>
 #include <regex>
 #include <string>
 #include <vector>
@@ -98,6 +100,75 @@ std::vector<RenderableField> renderable_text(const json& content) {
         take(*it, "formatted_body", "m.new_content.formatted_body", true);
     }
     return out;
+}
+
+// The SHAPE of an m.room.message or m.reaction content, checked before any
+// gate reads it (audit 2026-11-15 C-1).
+//
+// renderable_text() above skips a field that is not a string, which is right
+// for what IT does and meant the server stored `formatted_body: 123` as sent.
+// Clients read these fields as strings — the desktop client's value(key, "")
+// throws type_error on a number — and the event is cached and re-read on
+// every launch, so one crafted message crashed every member's client and kept
+// crashing it. A non-string msgtype or rel_type also threw out of this
+// handler's own value() calls, as a 500.
+//
+// The rule is narrow on purpose: a field that is PRESENT must have the type
+// every client expects. Absent fields, unknown keys and extra fields stay
+// legal, so nothing a well-behaved client sends is refused. Edits are covered
+// by the same rules applied to m.new_content.
+//
+// Returns the 400 M_BAD_JSON message, or nullopt when the content is well
+// formed.
+std::optional<std::string> message_content_error(const json& content) {
+    if (!content.is_object()) return "Event content must be a JSON object";
+
+    const auto string_field = [](const json& obj, const char* key,
+                                 const std::string& where) -> std::optional<std::string> {
+        auto it = obj.find(key);
+        if (it != obj.end() && !it->is_string()) return where + key + " must be a string";
+        return std::nullopt;
+    };
+
+    // Text and its framing, at the top level and inside an edit's replacement.
+    const auto text_fields = [&](const json& obj,
+                                 const std::string& where) -> std::optional<std::string> {
+        for (const char* key : {"body", "formatted_body", "format", "msgtype", "url"}) {
+            if (auto err = string_field(obj, key, where)) return err;
+        }
+        if (auto it = obj.find("info"); it != obj.end()) {
+            if (!it->is_object()) return where + "info must be an object";
+            for (const char* key : {"size", "w", "h", "duration"}) {
+                auto f = it->find(key);
+                if (f == it->end()) continue;
+                const bool ok = f->is_number_unsigned() ||
+                                (f->is_number_integer() && f->get<std::int64_t>() >= 0);
+                if (!ok) return where + "info." + key + " must be a non-negative integer";
+            }
+            if (auto err = string_field(*it, "mimetype", where + "info.")) return err;
+        }
+        return std::nullopt;
+    };
+
+    if (auto err = text_fields(content, "")) return err;
+    if (auto it = content.find("m.new_content"); it != content.end()) {
+        if (!it->is_object()) return "m.new_content must be an object";
+        if (auto err = text_fields(*it, "m.new_content.")) return err;
+    }
+
+    if (auto it = content.find("m.relates_to"); it != content.end()) {
+        if (!it->is_object()) return "m.relates_to must be an object";
+        for (const char* key : {"rel_type", "event_id", "key"}) {
+            if (auto err = string_field(*it, key, "m.relates_to.")) return err;
+        }
+        if (auto reply = it->find("m.in_reply_to"); reply != it->end()) {
+            if (!reply->is_object()) return "m.relates_to.m.in_reply_to must be an object";
+            if (auto err = string_field(*reply, "event_id", "m.relates_to.m.in_reply_to.")) {
+                return err;
+            }
+        }
+    }
+    return std::nullopt;
 }
 
 bool any_text(const std::vector<RenderableField>& fields, bool (*pred)(const std::string&)) {
@@ -511,6 +582,14 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
         content = parse_request_json(req.body);
     } catch (...) {
         return send_error(res, 400, MatrixError::bad_json());
+    }
+
+    // Shape before any gate reads a field. See message_content_error().
+    if (evt_type == std::string(event_type::kRoomMessage) ||
+        evt_type == std::string(event_type::kReaction)) {
+        if (auto err = message_content_error(content)) {
+            return send_error(res, 400, MatrixError::bad_json(*err));
+        }
     }
 
     // Set when this send is an m.replace edit, to the id of the event the
@@ -1014,7 +1093,11 @@ void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Resp
     // poll's `m.fully_read` room account data, and a device that missed the
     // wake still finds it against its own token on the next poll. The wake is
     // when, not whether — see docs/read-state.md.
-    sync_engine_.notify_ephemeral();
+    //
+    // Scoped to this account (audit R-2): a marker changes only its owner's
+    // counts and m.fully_read. Broadcasting it returned every parked poll on
+    // the server once per reader per message.
+    sync_engine_.notify_ephemeral_for(*user_id);
 
     res.set_content("{}", "application/json");
 }

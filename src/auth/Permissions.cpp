@@ -293,6 +293,10 @@ PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_assign_roles(
     }
 
     const auto& all = server_roles();
+    const auto& current = member_role_ids(target_id);
+    // What the actor themselves may do, at server scope — the same measure
+    // may_edit_role_definitions uses for the role document.
+    const permission::Flags actor_perms = compute(actor_id, std::string());
 
     // Nothing at or above your own rank may be granted...
     for (const auto& id : new_role_ids) {
@@ -302,11 +306,29 @@ PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_assign_roles(
         if (role->position >= actor_pos) {
             return {false, "You cannot assign a role ranked at or above your own"};
         }
+
+        // ...nor a role carrying a permission you do not hold yourself
+        // (audit 2026-11-15 S-3). Position alone was the whole gate here, so a
+        // MANAGE_ROLES holder at 10 could hand out a role at 9 that an
+        // administrator had given BAN_MEMBERS or ADMINISTRATOR — to anyone,
+        // themselves included. may_edit_role_definitions already stops them
+        // PUTTING such a bit on a role; this stops them HANDING OUT a role an
+        // administrator put it on. Scoped to roles the target does not already
+        // hold, so echoing an assignment back stays legal.
+        if (std::find(current.begin(), current.end(), id) != current.end()) continue;
+        if (permission::has(role->permissions, permission::kAdministrator)) {
+            return {false, "Only an administrator may assign a role with the Administrator "
+                           "permission"};
+        }
+        const permission::Flags lacking = role->permissions & ~actor_perms;
+        if (lacking != 0) {
+            return {false, "You cannot assign a role with a permission you do not hold yourself ("
+                               + permission::flags_to_hex(lacking) + ")"};
+        }
     }
 
     // ...nor taken away. Otherwise a moderator could strip the owner's admin
     // role, which is the same escalation wearing a different hat.
-    const auto& current = member_role_ids(target_id);
     for (const auto& id : current) {
         if (id == permission::role_id::kEveryone) continue;
         if (std::find(new_role_ids.begin(), new_role_ids.end(), id) != new_role_ids.end())
@@ -480,6 +502,20 @@ PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_edit_role_definition
         if ((added & ~actor_perms) != 0) {
             return {false, "You cannot grant a role a permission you do not hold yourself ("
                                + permission::flags_to_hex(added & ~actor_perms) + ")"};
+        }
+
+        // Making a role self-assignable hands it to every member, so it is a
+        // grant of the WHOLE role, not of the bits this edit adds (audit
+        // 2026-11-15 S-3). validate_role_document already caps an opt-in role
+        // at @everyone's permissions, which every member holds; this states
+        // the containment rule for the flip itself, so that it does not rest
+        // on that cap alone.
+        if (role.self_assignable && (!existing || !existing->self_assignable)) {
+            const permission::Flags lacking = role.permissions & ~actor_perms;
+            if (lacking != 0) {
+                return {false, "You cannot make a role self-assignable that has a permission you "
+                               "do not hold yourself (" + permission::flags_to_hex(lacking) + ")"};
+            }
         }
 
         // A role at or above your own rank may exist, but you may not touch

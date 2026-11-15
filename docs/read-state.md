@@ -104,14 +104,22 @@ PUT themselves.
 
 ## Waking
 
-A read marker and an account-data write both use `notify_ephemeral()`, the
-counter typing and presence already use, and not `notify_new_event()`.
+A read marker and an account-data write both use the ephemeral notifier, the
+mechanism typing and presence already use, and not `notify_new_event()`.
+
+Since audit 2026-11-15 (R-2) both use the SCOPED form,
+`notify_ephemeral_for(user_id)`: only the writing account's own parked polls
+return. The broadcast `notify_ephemeral()` returned every parked poll on the
+server, so with one read marker per reader per message a busy channel turned
+every long poll into a short poll. Typing is scoped to the room's joined
+members and presence to the subject's co-members; `notify_ephemeral()` remains
+for a change with no nameable audience.
 
 Since these writes now claim a stream position, `notify_new_event()` would in
 fact work — the head does move. It is not used because that would be two
 mechanisms for one kind of change, and a reader of the wait loop would have to
-check both. The rule stays as PR #4 left it: `notify_ephemeral()` is "something
-changed that is not a timeline event".
+check both. The rule stays as PR #4 left it: the ephemeral notifier is
+"something changed that is not a timeline event".
 
 The wake is *when*, not *whether*. A client that misses it — its poll was
 already returning, the phone was asleep — still finds the change on its next

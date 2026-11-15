@@ -1146,3 +1146,134 @@ TEST(MessageSize, ANegativeCeilingDoesNotWrapIntoNoLimit) {
     EXPECT_EQ(cfg.send_limits.max_message_bytes, limits::kMaxMessageBodyBytes)
         << "a nonsense value must fall back to the default, not to SIZE_MAX";
 }
+
+// ══ Audit 2026-11-15 C-1: message content of the wrong type ════════════════
+//
+// renderable_text() skipped non-string fields, so `formatted_body: 123` was
+// stored as sent and crashed every client that read it as a string — on every
+// launch, because the event is cached. A present field must now have the type
+// clients expect; absent and unknown fields stay legal.
+
+namespace {
+
+std::string reaction_path(const std::string& room, const std::string& txn) {
+    return "/_matrix/client/v3/rooms/" + room + "/send/m.reaction/" + txn;
+}
+
+httplib::Response send_raw(Fixture& f, const std::string& path, const json& content) {
+    EventHandler handler(*f.store, *f.sync, f.config);
+    httplib::Response res;
+    auto req = make_request(path, "token-alice", content.dump());
+    handler.handle_send_event(req, res);
+    return res;
+}
+
+} // namespace
+
+TEST(MessageShape, NonStringTextFieldsAreBadJson) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = f.add_room(alice);
+    auto target = f.post_message(room, alice, "original");
+
+    const json base = {{"msgtype", "m.text"}, {"body", "hi"}};
+    std::vector<std::pair<std::string, json>> bad;
+    for (const char* key : {"body", "formatted_body", "format", "msgtype"}) {
+        for (const json& v : {json(123), json::array(), json::object(), json(nullptr), json(true)}) {
+            json c = base;
+            c[key] = v;
+            bad.emplace_back(key, c);
+        }
+    }
+    {
+        json c = base;
+        c["m.new_content"] = {{"msgtype", "m.text"}, {"body", 5}};
+        c["m.relates_to"] = {{"rel_type", "m.replace"}, {"event_id", target}};
+        bad.emplace_back("m.new_content.body", c);
+        c["m.new_content"] = {{"msgtype", "m.text"}, {"body", "x"}, {"formatted_body", 7}};
+        bad.emplace_back("m.new_content.formatted_body", c);
+        c["m.new_content"] = "not an object";
+        bad.emplace_back("m.new_content", c);
+    }
+    {
+        json c = base;
+        c["m.relates_to"] = "nope";
+        bad.emplace_back("m.relates_to", c);
+        c["m.relates_to"] = {{"rel_type", 1}, {"event_id", target}};
+        bad.emplace_back("rel_type", c);
+        c["m.relates_to"] = {{"rel_type", "m.replace"}, {"event_id", 1}};
+        bad.emplace_back("event_id", c);
+        c["m.relates_to"] = {{"m.in_reply_to", {{"event_id", 42}}}};
+        bad.emplace_back("m.in_reply_to.event_id", c);
+        c["m.relates_to"] = {{"m.in_reply_to", "x"}};
+        bad.emplace_back("m.in_reply_to", c);
+    }
+    {
+        json c = {{"msgtype", "m.image"}, {"body", "a.png"}, {"url", "mxc://test/a"}};
+        c["info"] = "big";
+        bad.emplace_back("info", c);
+        for (const char* key : {"size", "w", "h", "duration"}) {
+            c["info"] = {{key, "12"}};
+            bad.emplace_back(key, c);
+            c["info"] = {{key, -1}};
+            bad.emplace_back(key, c);
+        }
+        c["info"] = {{"mimetype", 3}};
+        bad.emplace_back("mimetype", c);
+    }
+
+    int txn = 0;
+    for (const auto& [field, content] : bad) {
+        auto res = send_raw(f, send_path(room, "bad" + std::to_string(txn++)), content);
+        ASSERT_TRUE(HasStatus(res, 400)) << content.dump();
+        auto body = json::parse(res.body);
+        EXPECT_EQ(body.value("errcode", ""), "M_BAD_JSON") << res.body;
+        EXPECT_NE(body.value("error", "").find(field), std::string::npos)
+            << "refused for the wrong reason: " << res.body;
+    }
+
+    // The original is untouched by the refused edits, and nothing was stored.
+    auto stored = f.store->get_event_by_id(target);
+    ASSERT_TRUE(stored);
+    EXPECT_EQ(stored->content.data.value("body", ""), "original");
+}
+
+TEST(MessageShape, WellFormedMessagesStillSend) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = f.add_room(alice);
+    auto target = f.post_message(room, alice, "original");
+
+    EXPECT_TRUE(IsOk(send_raw(f, send_path(room, "ok1"),
+                              {{"msgtype", "m.text"},
+                               {"body", "hello"},
+                               {"format", "org.matrix.custom.html"},
+                               {"formatted_body", "<b>hello</b>"},
+                               {"com.example.extra", 5}})));
+    EXPECT_TRUE(IsOk(send_raw(f, send_path(room, "ok2"),
+                              {{"msgtype", "m.text"},
+                               {"body", "> quoted\n\nreply"},
+                               {"m.relates_to", {{"m.in_reply_to", {{"event_id", target}}}}}})));
+    EXPECT_TRUE(IsOk(send_raw(f, send_path(room, "ok3"), json::parse(edit_body(target)))));
+}
+
+TEST(MessageShape, ReactionContentIsCheckedToo) {
+    Fixture f;
+    auto alice = f.add_user("alice");
+    auto room = f.add_room(alice);
+    auto target = f.post_message(room, alice, "react to me");
+    int txn = 0;
+
+    for (const json& rel : {json("x"),
+                            json{{"rel_type", "m.annotation"}, {"event_id", target}, {"key", 1}},
+                            json{{"rel_type", "m.annotation"}, {"event_id", 1}, {"key", "+"}},
+                            json{{"rel_type", 2}, {"event_id", target}, {"key", "+"}}}) {
+        auto res = send_raw(f, reaction_path(room, "r" + std::to_string(txn++)),
+                            json{{"m.relates_to", rel}});
+        EXPECT_TRUE(HasStatus(res, 400)) << rel.dump() << " " << res.body;
+    }
+    EXPECT_TRUE(IsOk(send_raw(
+        f, reaction_path(room, "r-ok"),
+        json{{"m.relates_to",
+              {{"rel_type", "m.annotation"}, {"event_id", target}, {"key", "+1"}}}})));
+}

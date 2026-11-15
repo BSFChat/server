@@ -112,7 +112,17 @@ void PresenceHandler::handle_put_presence(const httplib::Request& req,
     // the new presence quickly. Ephemeral notifier — no event row is
     // written, so the stream position the normal notifier publishes is
     // unchanged and nothing would actually wake.
-    sync_engine_.notify_ephemeral();
+    //
+    // Scoped (audit R-2) to the accounts SyncHandler's presence pass could
+    // show this to: everyone sharing a joined room with the subject — a
+    // superset of the visible-room co-members it actually uses — plus the
+    // subject's own other devices. On a deployment where everyone is
+    // force-joined everywhere this is still nearly everyone; presence PUTs
+    // are user-initiated status changes, so that is a rare broadcast, not a
+    // hot one.
+    auto audience = store_.get_co_members(*user_id);
+    audience.push_back(*user_id);
+    sync_engine_.notify_ephemeral_for(audience);
 
     res.status = 200;
     res.set_content("{}", "application/json");

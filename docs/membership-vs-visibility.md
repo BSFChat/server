@@ -410,3 +410,22 @@ defence in depth rather than the only defence. Unaudited code fails closed.
 
 Steps 1–3 remove the disclosure and most of the bug class; step 4 is what
 actually closes it, and is a release of its own.
+
+## Addendum, 2026-11-15: telling clients to drop a room (audit R-1)
+
+`/sync` now has a `rooms.leave` section (see `docs/bots.md` §4 for the wire
+format), fed by the `room_departures` table (schema v31). It covers the cases
+membership CAN express — leave, kick, ban, and channel deletion, which is
+recorded for every joined member before the rows go.
+
+Loss of visibility is the case this model makes hard, for the reason the rest
+of this document gives: access is not membership, so nothing is written when
+it changes. The sync path reports `no_access` only when a channel-override
+event lands in a room the reader can no longer view **and** the reader holds a
+read marker there — evidence they had seen it — because naming the room to
+anybody else would be the disclosure `/joined_rooms` was fixed to stop. Role
+changes write no room event and are not reported at all. The client's
+reconciliation is `GET /joined_rooms`, which applies exactly the visibility
+rule `/sync` does (`visible_joined_rooms`: joined AND (VIEW_CHANNEL or a
+category)), so the two cannot disagree about which rooms exist.
+

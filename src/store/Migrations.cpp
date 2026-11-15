@@ -1943,6 +1943,113 @@ void migrate_v30(sqlite3* db, bool /*fresh_database*/) {
         backfill_pos);
 }
 
+void migrate_v31(sqlite3* db, bool /*fresh_database*/) {
+    // Room departures: the rows that let /sync say "drop this room"
+    // (audit 2026-11-15, R-1).
+    //
+    // An incremental /sync scans events in rooms the reader is CURRENTLY
+    // joined to. That is exactly the set a departure takes a room out of, so
+    // nothing about a room the reader has just left, been kicked or banned
+    // from, or that has been deleted outright, was ever on any stream they
+    // polled: delete_room wrote no event at all, and the reader's own leave
+    // or ban event sat in a room the scan no longer looks at. Other devices
+    // kept the channel in their sidebar indefinitely, and opening it was a 403.
+    //
+    // One row per (user, room), holding the LATEST departure. The position is
+    // claimed from the same stream counter events use (see v30 for why one
+    // clock), so a client's ordinary sync token says whether it has been told.
+    // A later departure from the same room replaces the row; re-joining
+    // deletes it. The table is therefore bounded by users x rooms and in
+    // practice by the departures of the last retention window, which
+    // SqliteStore prunes by `created_at` (kRoomDepartureRetentionMs).
+    //
+    // No foreign keys, on purpose: the whole point of a 'deleted' row is to
+    // outlive the room it names, and a deactivated account's rows do no harm.
+    //
+    // NOTHING IS BACKFILLED. Departures that happened before this build left
+    // no record to derive one from, so a client that is already showing a
+    // stale channel has to reconcile against GET /joined_rooms; this table
+    // fixes every departure from now on.
+    exec(db, R"(
+        CREATE TABLE IF NOT EXISTS room_departures (
+            user_id     TEXT NOT NULL,
+            room_id     TEXT NOT NULL,
+            reason      TEXT NOT NULL,
+            stream_pos  INTEGER NOT NULL,
+            created_at  INTEGER NOT NULL,
+            PRIMARY KEY (user_id, room_id)
+        )
+    )");
+    // The delta query is "this account's departures above the client's
+    // token", exactly the account_data shape in v30.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_room_departures_user_pos "
+             "ON room_departures(user_id, stream_pos)");
+    get_logger()->info(
+        "Schema v31: leaving, being removed from, or losing a deleted room is now recorded so "
+        "/sync can tell every device to drop it");
+}
+
+// If `content_json` is an m.reaction annotation, the id of the event it
+// annotates. Parsed in C++ for the same reason replacement_target() is.
+std::optional<std::string> annotation_target(const std::string& content_json) {
+    auto j = nlohmann::json::parse(content_json, nullptr, false);
+    if (j.is_discarded() || !j.is_object()) return std::nullopt;
+    auto it = j.find("m.relates_to");
+    if (it == j.end() || !it->is_object()) return std::nullopt;
+    auto target = it->value("event_id", "");
+    if (target.empty()) return std::nullopt;
+    return target;
+}
+
+void migrate_v32(sqlite3* db, bool /*fresh_database*/) {
+    // Indexes for the edit, redaction and reaction lookups (audit 2026-11-15,
+    // R-7/8). Each of these ran under the store's single mutex and scanned a
+    // whole room — or for `replaces`, the whole table — on every edit,
+    // redaction and reaction.
+    //
+    // `replaces` (v9) is NULL for every event that is not an edit, so the
+    // index is partial: it holds only the edits and costs nothing on an
+    // ordinary message insert. It serves edit_family_locked() (redaction) and
+    // reresolve_edit_locked(), which used `content LIKE '%<id>%'` instead.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_events_replaces ON events(replaces) "
+             "WHERE replaces IS NOT NULL");
+
+    // `relates_to`: the annotated event of an m.reaction, derived at insert
+    // exactly as `replaces` is (SqliteStore::insert_event), so the reaction
+    // dedupe in find_reaction_event() is an index probe instead of
+    // json_extract() over every reaction the sender made in the room. A
+    // column plus backfill rather than an expression index, because the
+    // expression would need the quoted JSON path `$."m.relates_to".event_id`,
+    // which older SQLite builds cannot parse (see replacement_target()).
+    if (!column_exists(db, "events", "relates_to")) {
+        exec(db, "ALTER TABLE events ADD COLUMN relates_to TEXT");
+    }
+    {
+        std::vector<std::pair<std::string, std::string>> rows;
+        auto sel = prepare(db,
+            "SELECT event_id, content FROM events "
+            "WHERE event_type = 'm.reaction' AND relates_to IS NULL");
+        while (sqlite3_step(sel.get()) == SQLITE_ROW) {
+            if (auto target = annotation_target(text_or_empty(sel.get(), 1))) {
+                rows.emplace_back(text_or_empty(sel.get(), 0), *target);
+            }
+        }
+        auto upd = prepare(db, "UPDATE events SET relates_to = ? WHERE event_id = ?");
+        for (const auto& [event_id, target] : rows) {
+            sqlite3_reset(upd.get());
+            sqlite3_bind_text(upd.get(), 1, target.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(upd.get(), 2, event_id.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(upd.get()) != SQLITE_DONE) {
+                throw std::runtime_error(std::string("failed to backfill relates_to: ") +
+                                         sqlite3_errmsg(db));
+            }
+        }
+        get_logger()->info("Schema v32: indexed {} existing reaction(s) by target", rows.size());
+    }
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_events_relates_to "
+             "ON events(relates_to, sender) WHERE relates_to IS NOT NULL");
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1977,6 +2084,8 @@ const std::vector<Step>& steps() {
         migrate_v28,
         migrate_v29,
         migrate_v30,
+        migrate_v31,
+        migrate_v32,
     };
     return kMigrations;
 }

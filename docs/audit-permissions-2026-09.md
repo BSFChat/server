@@ -144,8 +144,12 @@ rules:
 | Route | "cannot grant what you do not hold" | rank check |
 |---|---|---|
 | `bsfchat.server.roles` (and the `/roles` delta endpoints) | yes — `may_edit_role_definitions` | yes |
-| `bsfchat.member.roles` (and `/self_roles`) | yes — `may_assign_roles` / `may_self_assign_role` | yes |
+| `bsfchat.member.roles` (and `/self_roles`) | yes — `may_assign_roles` / `may_self_assign_role` ¹ | yes |
 | **`bsfchat.channel.permissions`** | **no** | **no** |
+
+¹ *Correction, audit 2026-11-15 S-3:* `may_assign_roles` in fact checked rank only; a lower role
+carrying a permission the actor lacked could still be assigned. It now also requires every added
+role's permissions to be a subset of the actor's (ADMINISTRATOR roles: administrators only).
 
 `PermissionsEngine.h` states the principle for the first two in as many words —
 "MANAGE_ROLES is the permission an owner hands to a trusted-but-not-admin
@@ -541,7 +545,8 @@ in position order, then the user override, with the `ADMINISTRATOR`
 short-circuit taken from the role base *before* overrides — which is what stops
 an `ALLOW ADMINISTRATOR` override being god mode. `highest_role_position` excludes
 self-assignable roles. `may_assign_roles` checks both directions (granting and
-removing at-or-above your rank). `may_edit_role_definitions` checks the
+removing at-or-above your rank) — and, since audit 2026-11-15 S-3, that an added role carries no
+permission the actor lacks. `may_edit_role_definitions` checks the
 *effective* position (`max(proposed, existing)`), which closes demotion-by-
 repositioning, scopes the "cannot grant what you do not hold" rule to what the
 edit adds, and refuses deletion of a role above you. `validate_role_document`

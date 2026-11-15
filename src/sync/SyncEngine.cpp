@@ -301,13 +301,61 @@ void SyncEngine::notify_ephemeral() {
     new_event_cv_.notify_all();
 }
 
+void SyncEngine::notify_ephemeral_for(const std::vector<std::string>& user_ids) {
+    if (user_ids.empty()) return;
+    {
+        // Under wait_mutex_ for the reason notify_new_event gives: a waiter
+        // evaluates its predicate under this lock, so a bump that slipped in
+        // between that evaluation and the wait would be lost.
+        std::lock_guard lock(wait_mutex_);
+        const uint64_t stamp = ++user_ephemeral_clock_;
+        for (const auto& uid : user_ids) user_ephemeral_seq_[uid] = stamp;
+    }
+    // Still notify_all: there is one condition variable, and every parked
+    // thread re-evaluates its predicate. That is a few comparisons per waiter;
+    // what the scoping removes is the full sync pass and the HTTP round trip
+    // each of them used to make after returning.
+    new_event_cv_.notify_all();
+}
+
+void SyncEngine::notify_ephemeral_for(const std::string& user_id) {
+    notify_ephemeral_for(std::vector<std::string>{user_id});
+}
+
+uint64_t SyncEngine::user_ephemeral_seq_locked(const std::string& user_id) const {
+    auto it = user_ephemeral_seq_.find(user_id);
+    return it == user_ephemeral_seq_.end() ? 0 : it->second;
+}
+
 void SyncEngine::set_post_scan_hook_for_test(std::function<void()> hook) {
     post_scan_hook_for_test_ = std::move(hook);
+}
+
+void attach_leave_section(nlohmann::json& response_json, const LeftRooms& leave) {
+    if (leave.empty()) return;
+    nlohmann::json section = nlohmann::json::object();
+    for (const auto& [room_id, left] : leave) {
+        nlohmann::json events = nlohmann::json::array();
+        for (const auto& event : left.timeline) {
+            nlohmann::json ev;
+            to_json(ev, event);
+            events.push_back(std::move(ev));
+        }
+        section[room_id] = {{"bsfchat.reason", left.reason},
+                            {"timeline", {{"events", std::move(events)}}}};
+    }
+    response_json["rooms"]["leave"] = std::move(section);
 }
 
 SyncResponse SyncEngine::handle_sync(const std::string& user_id,
                                       const std::string& since_token,
                                       int timeout_ms) {
+    return handle_sync_full(user_id, since_token, timeout_ms).response;
+}
+
+SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
+                                        const std::string& since_token,
+                                        int timeout_ms) {
     // A banned user sees nothing, whatever their membership rows say.
     //
     // The ban projection already sets every room_members row to "ban", so this is
@@ -318,13 +366,16 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
     // immediately rather than long-polling, so a banned client stops holding a
     // request thread open.
     if (store_.is_server_banned(user_id)) {
-        SyncResponse response;
-        response.next_batch = mint_token(user_id, store_.get_current_stream_position());
-        return response;
+        SyncResult banned;
+        banned.response.next_batch = mint_token(user_id, store_.get_current_stream_position());
+        return banned;
     }
 
     if (since_token.empty()) {
-        return build_initial_sync(user_id);
+        // An initial sync lists only the rooms the reader is in now, so it has
+        // nothing to say in rooms.leave: a client that starts from scratch
+        // simply never hears of a room it has left.
+        return SyncResult{build_initial_sync(user_id), {}};
     }
 
     // Every response this function DELIVERS restates m.direct; the ones it
@@ -356,9 +407,9 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
     // set on a delivered response is the complete one, and an invite that was
     // already outstanding when the client's token was minted is learned within
     // one poll instead of never.
-    auto deliver = [this, &user_id](SyncResponse&& r) {
-        if (!r.direct_rooms) attach_direct_rooms(store_, user_id, r);
-        attach_pending_invites(store_, config_, user_id, r);
+    auto deliver = [this, &user_id](SyncResult&& r) {
+        if (!r.response.direct_rooms) attach_direct_rooms(store_, user_id, r.response);
+        attach_pending_invites(store_, config_, user_id, r.response);
         return std::move(r);
     };
 
@@ -379,9 +430,15 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
     // It cannot spin: the delta is bounded above by the same position
     // next_batch is built from, so the very token this response hands back
     // puts those documents below the next poll's range.
-    auto has_payload = [](const SyncResponse& r) {
-        return !r.rooms.join.empty() || !r.rooms.invite.empty() ||
-               !r.account_data.empty();
+    //
+    // A departure (rooms.leave) counts for the same reason: it belongs to no
+    // room the reader is still in, so it puts nothing in rooms.join either,
+    // and a poll parked when a channel is deleted must return with it rather
+    // than sit out its timeout. It cannot spin by the same argument — the
+    // departure's position is at or below the next_batch handed back.
+    auto has_payload = [](const SyncResult& r) {
+        return !r.response.rooms.join.empty() || !r.response.rooms.invite.empty() ||
+               !r.response.account_data.empty() || !r.leave.empty();
     };
 
     // Opaque on the way out, opaque or legacy-numeric on the way in — see
@@ -395,17 +452,53 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
     // straight out of the handler; the parser is strict and total instead.
     const int64_t since_pos = parse_token(user_id, since_token);
 
-    // Snapshot the ephemeral counter BEFORE building, so typing/presence
+    // Snapshot the ephemeral counters BEFORE building, so typing/presence
     // changes that land while we're querying still count as "something
     // happened" and don't get swallowed by the wait.
-    const uint64_t edu_at_entry = ephemeral_seq_.load();
+    //
+    // Two of them: the broadcast counter, and this account's own scoped one
+    // (notify_ephemeral_for). Only a change in one of THESE wakes this poll —
+    // a read marker set by somebody else used to return every parked poll on
+    // the server (audit 2026-11-15, R-2). Both are read under wait_mutex_, so
+    // the pair is one consistent snapshot.
+    uint64_t edu_at_entry = 0;
+    uint64_t user_edu_at_entry = 0;
+    {
+        std::lock_guard lock(wait_mutex_);
+        edu_at_entry = ephemeral_seq_.load();
+        user_edu_at_entry = user_ephemeral_seq_locked(user_id);
+    }
+    // Caller must hold wait_mutex_.
+    auto edu_changed_locked = [&] {
+        return ephemeral_seq_.load() != edu_at_entry ||
+               user_ephemeral_seq_locked(user_id) != user_edu_at_entry;
+    };
+    auto edu_changed = [&] {
+        std::lock_guard lock(wait_mutex_);
+        return edu_changed_locked();
+    };
 
     // The position this scan covered — NOT the head as it stands now. An event
     // persisted while the scan was running has a position above this, so the
     // wait below still treats it as unseen and wakes on it at once.
     int64_t covered_pos = since_pos;
-    auto response = build_incremental_sync(user_id, since_pos, &covered_pos);
+    bool truncated = false;
+    auto response = build_incremental_sync(user_id, since_pos, &covered_pos, &truncated);
     if (has_payload(response)) {
+        return deliver(std::move(response));
+    }
+    // A full page of rows this user may not see (audit 2026-11-15, R-3): a
+    // thousand messages in channels they are denied, or an ignored sender's
+    // flood. The scan advanced — covered_pos is past every one of them — but
+    // found nothing to show, and parking here held the client at since_pos
+    // for a whole timeout per thousand hidden rows, DMs and all, because the
+    // re-scans inside the wait start from since_pos again and stop at the
+    // same limit. Return the advanced token now instead; the next poll scans
+    // the next page, and parks normally once a page comes back short.
+    //
+    // It cannot spin: next_batch is covered_pos, strictly above since_pos,
+    // and the rows below it are never scanned again.
+    if (truncated && covered_pos > since_pos) {
         return deliver(std::move(response));
     }
 
@@ -445,8 +538,7 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
             {
                 std::unique_lock lock(wait_mutex_);
                 signalled = new_event_cv_.wait_until(lock, deadline, [&] {
-                    return current_position_.load() > checked_pos ||
-                           ephemeral_seq_.load() != edu_at_entry;
+                    return current_position_.load() > checked_pos || edu_changed_locked();
                 });
             }
             if (!signalled) break; // deadline passed with nothing for us
@@ -461,11 +553,13 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
             // existed when the scan started.
             const int64_t head_before_rescan = current_position_.load();
 
-            response = build_incremental_sync(user_id, since_pos, &covered_pos);
+            response = build_incremental_sync(user_id, since_pos, &covered_pos, &truncated);
             // Real events, or an ephemeral change the caller injects typing and
-            // presence from — either is worth returning immediately.
-            if (has_payload(response) ||
-                ephemeral_seq_.load() != edu_at_entry) {
+            // presence from — either is worth returning immediately. A
+            // truncated re-scan is returned too, for the reason given above
+            // the wait: the woken scan has filled a page of hidden rows.
+            if (has_payload(response) || (truncated && covered_pos > since_pos) ||
+                edu_changed()) {
                 return deliver(std::move(response));
             }
             // Woken for an event this user cannot see. Keep the poll parked,
@@ -474,9 +568,11 @@ SyncResponse SyncEngine::handle_sync(const std::string& user_id,
                 checked_pos = covered_pos;
                 continue;
             }
-            // The re-scan covered no new ground. That means it was cut short by
-            // its limit on rows this user cannot read, so re-scanning returns
-            // the same rows forever and covered_pos will never move. Park
+            // The re-scan covered no new ground. That used to mean it was cut
+            // short by its limit on rows this user cannot read; a truncated
+            // scan now returns above (R-3), so this is a backstop that keeps
+            // the loop from spinning should some other path leave covered_pos
+            // where it was. Park
             // against the head AS IT WAS WHEN THIS PASS BEGAN rather than
             // spinning until the deadline; next_batch carries the client past
             // those rows on its next poll.
@@ -612,9 +708,10 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
     return response;
 }
 
-SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int64_t since_pos,
-                                                int64_t* out_covered_pos) {
-    SyncResponse response;
+SyncResult SyncEngine::build_incremental_sync(const std::string& user_id, int64_t since_pos,
+                                              int64_t* out_covered_pos, bool* out_truncated) {
+    SyncResult result;
+    SyncResponse& response = result.response;
     PermissionsEngine perms(store_, config_);
 
     // `delivered_max` is the highest stream position actually scanned. It is
@@ -647,9 +744,11 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
     // Only safe when the scan was complete: if it hit the limit there are
     // certainly rows past `delivered_max` this user still needs, and skipping
     // to the head would drop them permanently.
-    if (static_cast<int>(events.size()) < kScanLimit) {
+    const bool truncated = static_cast<int>(events.size()) >= kScanLimit;
+    if (!truncated) {
         delivered_max = std::max(delivered_max, scan_head);
     }
+    if (out_truncated) *out_truncated = truncated;
 
     std::set<std::string> newly_joined_rooms;
     std::set<std::string> invited_rooms;
@@ -682,6 +781,11 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
         }
         return it->second;
     };
+
+    // Joined rooms in which a channel-permission override changed inside this
+    // range and which the reader can no longer view at all. Candidates for a
+    // rooms.leave "no_access" entry — see the departures pass below.
+    std::set<std::string> lost_view_rooms;
 
     for (auto& event : events) {
         // feat/sync-invites' invite trigger, kept AHEAD of the view switch: a
@@ -719,7 +823,12 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
         }
 
         const RoomView view = view_of(event.room_id);
-        if (view == RoomView::kNone) continue;
+        if (view == RoomView::kNone) {
+            if (event.type == event_type::kChannelPermissions) {
+                lost_view_rooms.insert(event.room_id);
+            }
+            continue;
+        }
 
         if (view == RoomView::kCategoryStub) {
             // Name and ordering changes keep the sidebar node correct. Nothing
@@ -752,6 +861,69 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
 
     for (const auto& room_id : invited_rooms) {
         attach_invite(store_, user_id, room_id, response);
+    }
+
+    // ── rooms.leave: rooms this reader must drop (audit 2026-11-15, R-1) ──
+    //
+    // The scan above cannot see these by construction: it joins on CURRENT
+    // membership, and a departure is the thing that ends it. So they come from
+    // room_departures (schema v31), which the store writes on every join ->
+    // leave/ban and for every joined member of a deleted room, numbered on
+    // the event stream. Bounded by `delivered_max` exactly as account data is
+    // below, so next_batch covers what this response says and nothing more.
+    for (const auto& departure : store_.get_room_departures(user_id, since_pos, delivered_max)) {
+        LeftRoom left;
+        left.reason = departure.reason;
+        if (departure.reason != SqliteStore::kDepartureDeleted) {
+            // Re-joined since: the room is the reader's again, and the join
+            // (with full state) is what they are told — or, if it sits above
+            // this range, what the next poll tells them. Saying "drop it"
+            // here would remove a room they are in.
+            if (membership_of(departure.room_id) == membership::kJoin) continue;
+            // The reader's own member event, as the Matrix leave section
+            // carries it. Also what separates a kick from a leave, which the
+            // store cannot: both are a 'leave' row, and only the event knows
+            // who wrote it. Skipped when the current member event is not a
+            // leave or ban — the handler writes the membership row a moment
+            // before it emits the event, and a poll in that window sends the
+            // departure with no event rather than the stale join.
+            auto own = store_.get_state_event(departure.room_id,
+                                              std::string(event_type::kRoomMember), user_id);
+            if (own) {
+                const auto m = own->content.data.value("membership", "");
+                if (m == membership::kBan) {
+                    left.reason = "ban";
+                    left.timeline.push_back(std::move(*own));
+                } else if (m == membership::kLeave) {
+                    left.reason = own->sender == user_id ? "leave" : "kick";
+                    left.timeline.push_back(std::move(*own));
+                }
+            }
+        }
+        response.rooms.join.erase(departure.room_id);
+        result.leave[departure.room_id] = std::move(left);
+    }
+
+    // Lost VIEW_CHANNEL through a channel override that landed in this range.
+    // The reader is still joined (every account is, see auth/AutoJoin.cpp), so
+    // there is no departure row; what changed is that they may no longer be
+    // shown the room at all.
+    //
+    // ONLY WHEN THE READER IS KNOWN TO HAVE SEEN THE ROOM, which is what the
+    // read-marker test is for: a marker can only be written by a member who
+    // held VIEW_CHANNEL (EventHandler::handle_read_marker). Without that gate
+    // this would name, to every member, each private channel they have never
+    // been able to see whenever someone edited its overrides — the room-id
+    // disclosure /joined_rooms was fixed to stop. A room the reader could see
+    // but never opened is not covered here; the client reconciles that case,
+    // and every role change (which writes no room event), against
+    // GET /joined_rooms, which applies the same visibility rule as this sync.
+    for (const auto& room_id : lost_view_rooms) {
+        if (result.leave.count(room_id)) continue;
+        if (membership_of(room_id) != membership::kJoin) continue;
+        if (store_.get_read_marker(user_id, room_id) <= 0) continue;
+        response.rooms.join.erase(room_id);
+        result.leave[room_id] = LeftRoom{"no_access", {}};
     }
 
     bool joined_direct_room = false;
@@ -826,7 +998,7 @@ SyncResponse SyncEngine::build_incremental_sync(const std::string& user_id, int6
     // internal and is compared as an ordering, which the token deliberately is
     // not.
     if (out_covered_pos) *out_covered_pos = delivered_max;
-    return response;
+    return result;
 }
 
 } // namespace bsfchat
