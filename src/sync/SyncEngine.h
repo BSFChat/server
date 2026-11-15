@@ -99,8 +99,13 @@ private:
     // compare the stream head against — re-reading the head after the scan
     // instead is how an event that landed during the scan ends up neither
     // delivered nor waited for.
+    //
+    // `out_truncated`, when given, is set when the scan stopped at its row
+    // limit, i.e. there are certainly more rows past `out_covered_pos` this
+    // user has not been offered yet.
     SyncResult build_incremental_sync(const std::string& user_id, int64_t since_pos,
-                                      int64_t* out_covered_pos = nullptr);
+                                      int64_t* out_covered_pos = nullptr,
+                                      bool* out_truncated = nullptr);
 
     // The key next_batch is built with, derived from this deployment's instance
     // secret on first use and cached for the process. Lazy rather than

@@ -22,6 +22,8 @@ add_executable(server_tests
     test_sync_leave.cpp
     # POST /createRoom validates before it writes (audit 2026-11-15, R-4).
     test_create_room_validation.cpp
+    # Long-poll wake scoping and scan paging (audit 2026-11-15, R-2, R-3).
+    test_sync_wakes.cpp
     test_call_privacy.cpp
     test_permissions.cpp
     test_media.cpp

@@ -435,8 +435,23 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
     // persisted while the scan was running has a position above this, so the
     // wait below still treats it as unseen and wakes on it at once.
     int64_t covered_pos = since_pos;
-    auto response = build_incremental_sync(user_id, since_pos, &covered_pos);
+    bool truncated = false;
+    auto response = build_incremental_sync(user_id, since_pos, &covered_pos, &truncated);
     if (has_payload(response)) {
+        return deliver(std::move(response));
+    }
+    // A full page of rows this user may not see (audit 2026-11-15, R-3): a
+    // thousand messages in channels they are denied, or an ignored sender's
+    // flood. The scan advanced — covered_pos is past every one of them — but
+    // found nothing to show, and parking here held the client at since_pos
+    // for a whole timeout per thousand hidden rows, DMs and all, because the
+    // re-scans inside the wait start from since_pos again and stop at the
+    // same limit. Return the advanced token now instead; the next poll scans
+    // the next page, and parks normally once a page comes back short.
+    //
+    // It cannot spin: next_batch is covered_pos, strictly above since_pos,
+    // and the rows below it are never scanned again.
+    if (truncated && covered_pos > since_pos) {
         return deliver(std::move(response));
     }
 
@@ -492,10 +507,12 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
             // existed when the scan started.
             const int64_t head_before_rescan = current_position_.load();
 
-            response = build_incremental_sync(user_id, since_pos, &covered_pos);
+            response = build_incremental_sync(user_id, since_pos, &covered_pos, &truncated);
             // Real events, or an ephemeral change the caller injects typing and
-            // presence from — either is worth returning immediately.
-            if (has_payload(response) ||
+            // presence from — either is worth returning immediately. A
+            // truncated re-scan is returned too, for the reason given above
+            // the wait: the woken scan has filled a page of hidden rows.
+            if (has_payload(response) || (truncated && covered_pos > since_pos) ||
                 ephemeral_seq_.load() != edu_at_entry) {
                 return deliver(std::move(response));
             }
@@ -505,9 +522,11 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
                 checked_pos = covered_pos;
                 continue;
             }
-            // The re-scan covered no new ground. That means it was cut short by
-            // its limit on rows this user cannot read, so re-scanning returns
-            // the same rows forever and covered_pos will never move. Park
+            // The re-scan covered no new ground. That used to mean it was cut
+            // short by its limit on rows this user cannot read; a truncated
+            // scan now returns above (R-3), so this is a backstop that keeps
+            // the loop from spinning should some other path leave covered_pos
+            // where it was. Park
             // against the head AS IT WAS WHEN THIS PASS BEGAN rather than
             // spinning until the deadline; next_batch carries the client past
             // those rows on its next poll.
@@ -644,7 +663,7 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
 }
 
 SyncResult SyncEngine::build_incremental_sync(const std::string& user_id, int64_t since_pos,
-                                              int64_t* out_covered_pos) {
+                                              int64_t* out_covered_pos, bool* out_truncated) {
     SyncResult result;
     SyncResponse& response = result.response;
     PermissionsEngine perms(store_, config_);
@@ -679,9 +698,11 @@ SyncResult SyncEngine::build_incremental_sync(const std::string& user_id, int64_
     // Only safe when the scan was complete: if it hit the limit there are
     // certainly rows past `delivered_max` this user still needs, and skipping
     // to the head would drop them permanently.
-    if (static_cast<int>(events.size()) < kScanLimit) {
+    const bool truncated = static_cast<int>(events.size()) >= kScanLimit;
+    if (!truncated) {
         delivered_max = std::max(delivered_max, scan_head);
     }
+    if (out_truncated) *out_truncated = truncated;
 
     std::set<std::string> newly_joined_rooms;
     std::set<std::string> invited_rooms;
