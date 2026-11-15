@@ -32,6 +32,23 @@ Authorization: Bearer <token for the account that will survive>
 { "type": "m.login.token", "token": "<id_token for the identity>" }
 ```
 
+It also needs **step-up** (audit 2026-11-15 S-2): a bearer token proves a client
+holds a token, not that the owner is present, and without it a briefly stolen
+token attached the thief's identity permanently — surviving a password change
+and logout-all. So:
+
+* an account with a password adds `"password": "<current password>"`, verified
+  exactly like `/login` and counted against the same failure lockout;
+* a password-less (identity-only) account passes if its bearer token comes from
+  a sign-in within the last 10 minutes that has never been refreshed, or by
+  adding `"auth": {"type": "m.login.token", "token": "<id_token>"}` for an
+  identity that already signs in to this account (a linked one, or the one the
+  account is the `oidc_*` shadow of).
+
+A missing step-up is a 401 saying what to send; a wrong password is a 403. The
+`account.link` audit record names which step-up was used (`step_up`:
+`password`, `recent_login` or `identity_token`).
+
 The request is authenticated **twice over**, and that is the whole security
 argument: the bearer token proves control of the surviving account, the
 id_token proves control of the identity. Neither alone attaches anything, so
@@ -175,19 +192,29 @@ Either way its history stays put and its id stays taken.
 
 ### If it goes wrong
 
-There is no unlink endpoint yet (see below). Until there is, the recovery is a
-deliberate, visible `DELETE FROM linked_identities WHERE …` by the operator,
-with the server stopped — the identity then mints or reuses its `oidc_*` account
-exactly as it did before, because nothing about that account was destroyed. That
-is the reason nothing is destroyed.
+Unlink it, as the account owner:
+
+```
+POST /_matrix/client/v3/bsfchat/account/unlink_identity
+Authorization: Bearer <token for the account>
+{ "issuer": "<issuer from linked_identities>", "password": "<current password>" }
+```
+
+The same step-up as linking (a password-less account uses a recent sign-in or
+`auth`). It removes every identity from that issuer linked to the caller — by
+issuer, because the subject is never disclosed — and answers
+`{"issuer": ..., "removed": n}`. It refuses (403) when it would leave a
+password-less account with no way to sign in. Each unlink writes an
+`account.unlink` audit record (issuer, count and step-up; never the subject).
+Afterwards the identity mints or reuses its `oidc_*` account exactly as it did
+before, because nothing about that account was destroyed. That is the reason
+nothing is destroyed.
 
 ## Deferred, and why
 
-* **Unlinking.** Needs a decision this work did not want to make blind: an
-  unlink is how a stolen session detaches the real owner's identity from their
-  own account, so it needs re-authentication and probably a notification, and a
-  notification path does not exist. Until then the operator does it by hand,
-  which is rare, visible and reversible.
+* **Unlink notifications.** Unlinking now exists and requires re-authentication
+  (above), but nobody is notified that it happened beyond the audit log; a
+  notification path does not exist yet.
 * **Linking in the other direction** — keeping the `oidc_*` account and
   attaching a *local* account to it. The abandoned id would then be the nice one
   (`@josh`), which is the opposite of what anyone wants, and it also means

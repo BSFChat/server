@@ -261,6 +261,14 @@ computed from data `handle_get_bot_access` already assembles. Whichever is
 chosen, `outranks()` alone must stop being the whole of the gate, because for a
 scoped bot it is a comparison of 0 against 0.
 
+**Follow-up, audit 2026-11-15 S-4 — DMs.** The containment fix above does not
+see direct messages: `compute()` clears overrides in a DM and DM access is
+membership, so a rotator who contained the bot on every channel still received
+every DM a person had with it. `handle_rotate_token` now refuses a
+non-administrator unless they are already a joined member of every DM the bot
+is joined to or invited into ("it is in direct messages you are not part of").
+Administrators are unaffected. Tests: `BotDmRotation.*` in `tests/test_bots.cpp`.
+
 ---
 
 ## F3 — `is_direct` is a caller-controlled bypass of the only check on `POST /createRoom` (Medium-High)
@@ -418,6 +426,17 @@ object the caller uploaded. That second one is a one-line fix and closes the
 server-public variant on its own.
 
 ---
+
+## Follow-up, audit 2026-11-15 S-5 — restructuring needs VIEW_CHANNEL
+
+`bsfchat.room.type` already refused a MANAGE_CHANNELS holder who could not open
+the channel. The same rule now covers every other structural write: channel
+delete, `PUT /rooms/{id}/category` (and the target category), `/order`,
+`/invite`, and every room-scoped MANAGE_CHANNELS state write in
+`handle_set_state` (name, topic, avatar, join rules, history visibility, power
+levels, pins, voice settings, category, channel settings). The refusal is the
+shared `no_channel_access` body. Administrators short-circuit as everywhere.
+Tests: `RestructureNeedsView.*` in `tests/test_category_visibility.cpp`.
 
 ## Medium and low findings
 

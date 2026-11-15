@@ -130,6 +130,11 @@ long poll that is already parked — treat a 401 as "stop and reload credentials
 not as something to retry. See §9. Room membership survives a rotation: it is a
 credential change, not a new account.
 
+The new token reads everything the bot can, including its direct messages, so
+a caller who is not an administrator is refused (`403`) when the bot is in —
+or invited to — a DM the caller is not a member of. Ask an administrator to
+rotate such a bot.
+
 ### Deactivate
 
 ```http

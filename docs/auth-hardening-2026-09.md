@@ -397,6 +397,17 @@ tokens are high-entropy, which is finding 1.)
   fresh token. `/sync` checks it as well.
 * There is no account deactivation feature to have a gap.
 
+**Corrected by audit 2026-11-15 S-7:** this missed pushers. Every path above
+deleted access tokens only, so a signed-out device — or a thief's, after the
+owner pressed logout-all — kept receiving message text through its pusher. The
+store now removes pushers (and their queued notifications) with the sessions:
+`delete_access_token` (logout) takes that device's pushers once no other session
+for the device remains; `delete_other_tokens_for_user` (password change) takes
+every pusher not registered from the device being kept, legacy rows with no
+device id included; `delete_all_tokens_for_user` (logout-all, ban, refused
+refresh, a superseded linked account) takes all of them. Deactivation already
+did. Tests: `PushersFollowSessions.*` in `tests/test_push.cpp`.
+
 ### 17. `X-Forwarded-For` spoofing — REFUTED
 
 `ClientAddressResolver` is carefully built. The header is read **only** when the socket peer is
@@ -549,6 +560,30 @@ ceiling; the server warns at startup when it is off.
 **Nobody is logged out by any of this.** Existing tokens keep working and keep sliding their
 expiry. They were minted by the old generator, though, so they carry the old 32 bits — see the
 recommendation below.
+
+## Follow-ups landed with audit 2026-11-15
+
+* **S-2, step-up for identity linking.** `POST /account/link_identity` needed
+  only a bearer token, so a briefly stolen token attached the thief's identity
+  for good. It now requires the current password (`"password"` in the body,
+  verified like `/login`, under the account's failure lockout). A password-less
+  account instead needs a never-refreshed sign-in from the last 10 minutes, or
+  `"auth": {"type": "m.login.token", "token": "<id_token>"}` for an identity
+  that already signs in to the account. `POST /account/unlink_identity`
+  (`{"issuer": ...}` plus the same step-up) removes links and refuses to strand
+  a password-less account. Both are audited (`account.link` gains `step_up`;
+  `account.unlink` is new). See `docs/account-linking.md`.
+* **S-6, first-run Admin.** `bootstrap_roles` granted Admin to the oldest
+  account whenever its assignment was empty, on every register, first identity
+  login and restart. Now only once per server (persisted
+  `bootstrap.first_admin` marker), only when no account holds an
+  ADMINISTRATOR-bearing role, and only to an oldest account with no assignment
+  at all; it writes a `role.bootstrap_admin` audit record. A server left with no
+  admin is recovered with `bsfchat-server grant-admin`.
+* **S-8, voice and typing limits.** `POST voice/join` and `PUT voice/state`
+  share a per-account `voice_limit` (default 60 per window) and `PUT typing` has
+  `typing_limit` (default 120); voice/join applies `device_id_error()` to the
+  device id it stores.
 
 ## Recommended follow-ups
 
