@@ -5,6 +5,7 @@
 #include "auth/Permissions.h"
 #include "http/Middleware.h"
 #include "http/JsonIo.h"
+#include "http/RateLimitResponse.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
 #include "core/Config.h"
@@ -22,7 +23,7 @@ static constexpr int kMaxTypingTimeoutMs = 30000;
 static constexpr int kDefaultTypingTimeoutMs = 30000;
 
 TypingHandler::TypingHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config)
-    : store_(store), sync_engine_(sync_engine), config_(config) {}
+    : store_(store), sync_engine_(sync_engine), config_(config), limits_(config.send_limits) {}
 
 void TypingHandler::handle_typing(const httplib::Request& req, httplib::Response& res) {
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
@@ -30,6 +31,11 @@ void TypingHandler::handle_typing(const httplib::Request& req, httplib::Response
         res.status = 401;
         res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
         return;
+    }
+
+    // Every write wakes the room's long-polls (audit 2026-11-15 S-8).
+    if (const auto wait = limits_.acquire(SendLimiter::Bucket::kTyping, *user_id)) {
+        return send_rate_limited(res, wait, SendLimiter::message_for(SendLimiter::Bucket::kTyping));
     }
 
     // Extract room_id and target user_id from URL path

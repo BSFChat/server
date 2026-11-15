@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/SendLimiter.h"
+
 #include <httplib.h>
 
 #include <chrono>
@@ -180,6 +182,8 @@ private:
     SqliteStore& store_;
     SyncEngine& sync_engine_;
     const Config& config_;
+    // Bucket::kVoice, shared by join and state (audit 2026-11-15 S-8).
+    SendLimiter limits_;
 
     // Serializes check-then-emit sections across HTTP worker threads and the
     // reaper: the max_participants check and reset-then-join emit in

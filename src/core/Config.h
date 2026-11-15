@@ -375,6 +375,14 @@ struct SendLimitsConfig {
     // somebody sends one of these; a client syncing settings sends a handful.
     int account_data_limit = 60;
 
+    // Voice join + voice state (POST voice/join, PUT voice/state), together,
+    // and typing notifications (PUT typing). Each emits a state or ephemeral
+    // write and wakes every parked /sync in the room (audit 2026-11-15 S-8).
+    // The voice heartbeat is the members poll, not these, so a call costs a
+    // join and a handful of mute toggles.
+    int voice_limit = 60;
+    int typing_limit = 120;
+
     int window_seconds = 60;
 
     // ── How big one write may be, as opposed to how many ──────────────────

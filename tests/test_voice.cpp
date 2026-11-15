@@ -1020,6 +1020,11 @@ TEST_F(VoiceHandlerTest, AJoinRacingASweepIsNeverLeftInactive) {
     // other with the reaper on a real clock, so every reap it performs is
     // one it was entitled to perform, and the only way the assertion can
     // fail is the check-then-emit window.
+    //
+    // 300 joins in a moment is exactly what the voice rate limit refuses, so
+    // it is switched off for this handler: this test is about the race.
+    config.send_limits.voice_limit = 0;
+    handler = std::make_unique<VoiceHandler>(*store, *sync_engine, config);
     auto room_id = generate_room_id("test");
     create_voice_room(room_id, "@alice:test");
     real_join(room_id, "alice-token");
@@ -2577,4 +2582,50 @@ TEST_F(LiveKitTokenTest, AFullChannelIssuesNoTokenToSomeoneWhoCouldNotJoin) {
     EXPECT_EQ(status_of(request_without_joining(capped, "token-mod")), 403)
         << "the cap was bypassed by asking for a media token directly";
     EXPECT_EQ(status_of(request_without_joining(capped, "token-alice")), 200);
+}
+
+// ── Rate limit and device id bound (audit 2026-11-15 S-8) ─────────────────
+
+TEST_F(VoiceHandlerTest, JoinAndStateShareOneRateLimitedBudget) {
+    config.send_limits.voice_limit = 3;
+    handler = std::make_unique<VoiceHandler>(*store, *sync_engine, config);
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    store->set_membership(room_id, "@bob:test", "join");
+
+    auto joined = real_join(room_id, "alice-token");
+    const std::string session = joined.value("session_id", "");
+    for (int i = 0; i < 2; ++i) {
+        httplib::Response res;
+        auto req = make_request("PUT", "/_matrix/client/v3/rooms/" + room_id + "/voice/state",
+                                "alice-token",
+                                json{{"muted", i == 0}, {"session_id", session}}.dump());
+        handler->handle_voice_state(req, res);
+        EXPECT_EQ(status_of(res), 200) << res.body;
+    }
+    httplib::Response limited;
+    auto req = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/join",
+                            "alice-token");
+    handler->handle_voice_join(req, limited);
+    EXPECT_EQ(limited.status, 429) << limited.body;
+    EXPECT_FALSE(limited.get_header_value("Retry-After").empty());
+
+    // Per account: bob's budget is untouched.
+    real_join(room_id, "bob-token");
+}
+
+TEST_F(VoiceHandlerTest, AnOversizeOrControlCharacterDeviceIdIsRefused) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    for (const std::string bad : {std::string(4096, 'D'), std::string("DEV\nforged")}) {
+        httplib::Response res;
+        auto req = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/join",
+                                "alice-token", json{{"device_id", bad}}.dump());
+        handler->handle_voice_join(req, res);
+        EXPECT_EQ(res.status, 400) << res.body;
+    }
+    EXPECT_FALSE(is_active(room_id, "@alice:test"));
+    // An ordinary one still works.
+    real_join(room_id, "alice-token", json{{"device_id", "DEV1"}}.dump());
+    EXPECT_TRUE(is_active(room_id, "@alice:test"));
 }

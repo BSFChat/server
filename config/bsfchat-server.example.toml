@@ -423,6 +423,13 @@ report_limit = 10
 # somebody is one of these; a client syncing its settings is a handful.
 account_data_limit = 60
 
+# Voice joins plus voice state changes (mute, deafen, screen share), together,
+# and typing notifications, per account per window. Each one wakes every
+# parked /sync in the room. The voice heartbeat is the members poll, which is
+# not counted, so a call costs one join and a few toggles.
+voice_limit = 60
+typing_limit = 120
+
 # --- How big one write may be (as opposed to how many) -----------------------
 #
 # The seven numbers above are rates: how OFTEN an account may do a thing. The

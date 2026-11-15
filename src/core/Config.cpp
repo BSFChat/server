@@ -165,6 +165,10 @@ Config Config::load(const std::string& path) {
                 sl.report_limit = v->value_or(sl.report_limit);
             if (auto v = limits_tbl->get("account_data_limit"))
                 sl.account_data_limit = v->value_or(sl.account_data_limit);
+            if (auto v = limits_tbl->get("voice_limit"))
+                sl.voice_limit = v->value_or(sl.voice_limit);
+            if (auto v = limits_tbl->get("typing_limit"))
+                sl.typing_limit = v->value_or(sl.typing_limit);
             if (auto v = limits_tbl->get("window_seconds"))
                 sl.window_seconds = v->value_or(sl.window_seconds);
             // Sizes, not rates. Read as int64 and clamped in validate(): toml++

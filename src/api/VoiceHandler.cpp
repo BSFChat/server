@@ -1,10 +1,12 @@
 #include "api/VoiceHandler.h"
 #include "audit/AuditLog.h"
+#include "auth/LocalAuth.h"
 #include "auth/Permissions.h"
 #include "core/Config.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
 #include "http/JsonIo.h"
+#include "http/RateLimitResponse.h"
 #include "http/Router.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
@@ -119,7 +121,7 @@ void emit_state_event(SqliteStore& store, SyncEngine& sync_engine, const std::st
 } // namespace
 
 VoiceHandler::VoiceHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config)
-    : store_(store), sync_engine_(sync_engine), config_(config) {}
+    : store_(store), sync_engine_(sync_engine), config_(config), limits_(config.send_limits) {}
 
 VoiceHandler::~VoiceHandler() {
     stop_reaper();
@@ -282,6 +284,10 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
         return;
     }
 
+    if (const auto wait = limits_.acquire(SendLimiter::Bucket::kVoice, *user_id)) {
+        return send_rate_limited(res, wait, SendLimiter::message_for(SendLimiter::Bucket::kVoice));
+    }
+
     auto match = match_route("/_matrix/client/v3/rooms/{roomId}/voice/join", req.path);
     if (!match.matched) {
         res.status = 404;
@@ -366,6 +372,13 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
             auto body = parse_request_json(req.body);
             device_id = body.value("device_id", "");
         } catch (...) {}
+    }
+    // Stored in m.call.member and served to every member: the same bound and
+    // control-character rule login applies to a device id (audit S-8).
+    if (auto err = device_id_error(device_id); !device_id.empty() && err) {
+        res.status = 400;
+        res.set_content(MatrixError::invalid_param(*err).to_json().dump(), "application/json");
+        return;
     }
 
     std::string session_id;
@@ -700,6 +713,10 @@ void VoiceHandler::handle_voice_state(const httplib::Request& req, httplib::Resp
         res.status = 401;
         res.set_content(auth_error(req.get_header_value("Authorization")).to_json().dump(), "application/json");
         return;
+    }
+
+    if (const auto wait = limits_.acquire(SendLimiter::Bucket::kVoice, *user_id)) {
+        return send_rate_limited(res, wait, SendLimiter::message_for(SendLimiter::Bucket::kVoice));
     }
 
     auto match = match_route("/_matrix/client/v3/rooms/{roomId}/voice/state", req.path);

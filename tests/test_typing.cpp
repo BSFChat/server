@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 #include "api/TypingHandler.h"
+
+#include <regex>
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
 #include "auth/LocalAuth.h"
@@ -129,4 +131,29 @@ TEST_F(TypingTest, EphemeralEventsRoundTrip) {
 
     ASSERT_EQ(ephemeral.events.size(), 1);
     EXPECT_EQ(ephemeral.events[0].type, "m.typing");
+}
+
+// PUT typing is rate limited per account (audit 2026-11-15 S-8): every write
+// wakes the room's long-polls.
+TEST_F(TypingTest, TypingIsRateLimitedPerAccount) {
+    config.send_limits.typing_limit = 2;
+    TypingHandler limited(*store, *sync_engine, config);
+    store->store_access_token("alice-token", "@alice:test", "DEV1");
+    store->store_access_token("bob-token", "@bob:test", "DEV2");
+
+    const auto put = [&](const std::string& user, const std::string& token) {
+        static const std::regex re(R"(/_matrix/client/v3/rooms/([^/]+)/typing/(.+))");
+        httplib::Request req;
+        req.path = "/_matrix/client/v3/rooms/" + room_id + "/typing/" + user;
+        req.body = json{{"typing", true}, {"timeout", 30000}}.dump();
+        req.set_header("Authorization", "Bearer " + token);
+        EXPECT_TRUE(std::regex_match(req.path, req.matches, re));
+        httplib::Response res;
+        limited.handle_typing(req, res);
+        return res.status == -1 ? 200 : res.status;
+    };
+    EXPECT_NE(put("@alice:test", "alice-token"), 429);
+    EXPECT_NE(put("@alice:test", "alice-token"), 429);
+    EXPECT_EQ(put("@alice:test", "alice-token"), 429);
+    EXPECT_NE(put("@bob:test", "bob-token"), 429);
 }

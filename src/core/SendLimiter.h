@@ -91,6 +91,12 @@ public:
         // input_limits::kMaxAccountDataBytes bounds each row without bounding
         // how many there are.
         kAccountData,
+        // POST voice/join and PUT voice/state, one budget (audit 2026-11-15
+        // S-8): both write m.call.member and wake the room's long-polls.
+        kVoice,
+        // PUT /rooms/{id}/typing/{userId}: ephemeral, but every write wakes
+        // the room's long-polls.
+        kTyping,
     };
 
     SendLimiter(const SendLimitsConfig& config, LimiterClock clock = limiter_steady_now_ms);
@@ -116,6 +122,8 @@ private:
     RateLimiter room_create_;
     RateLimiter report_;
     RateLimiter account_data_;
+    RateLimiter voice_;
+    RateLimiter typing_;
 };
 
 } // namespace bsfchat

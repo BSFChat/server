@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/SendLimiter.h"
+
 #include <httplib.h>
 
 #include <chrono>
@@ -34,6 +36,7 @@ private:
     SqliteStore& store_;
     SyncEngine& sync_engine_;
     const Config& config_;
+    SendLimiter limits_;  // Bucket::kTyping, per account
 
     void cleanup_expired(const std::string& room_id);
 };
