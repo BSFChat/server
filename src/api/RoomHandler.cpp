@@ -1,5 +1,6 @@
 #include "api/RoomHandler.h"
 #include "api/InputLimits.h"
+#include "api/PermissionInput.h"
 #include "api/ChannelAccessRefusal.h"
 #include "auth/MediaAccess.h"
 #include "audit/AuditLog.h"
@@ -2640,6 +2641,14 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
             }
             verdict = perms.may_assign_roles(*user_id, state_key, assignment.role_ids);
         } else {
+            // Shape first: protocol's from_json reads `permissions: -1` as all
+            // ones (audit 2026-11-15 P-1), and this content is stored as sent.
+            if (auto shape = permission_input::role_document_error(content)) {
+                res.status = 400;
+                res.set_content(MatrixError::bad_json(*shape).to_json().dump(),
+                                "application/json");
+                return;
+            }
             ServerRolesContent definitions;
             try {
                 from_json(content, definitions);
@@ -2713,6 +2722,16 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         // because the audit capture two lines up has already paid for that
         // read. `before` defaults to allow = 0, deny = 0, which is exactly
         // what "there is no override" means to compute().
+        //
+        // The proposed override's SHAPE is checked before from_json, which
+        // reads `allow: -1` as every permission and an unparseable string as
+        // none (audit 2026-11-15 P-1). The content is stored as sent, so every
+        // later reader would see the same all-ones value.
+        if (auto shape = permission_input::channel_override_error(content)) {
+            res.status = 400;
+            res.set_content(MatrixError::bad_json(*shape).to_json().dump(), "application/json");
+            return;
+        }
         ChannelPermissionOverride before;
         if (existing) from_json(existing->content.data, before);
         ChannelPermissionOverride proposed;

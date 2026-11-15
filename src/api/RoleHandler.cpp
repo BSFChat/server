@@ -1,4 +1,5 @@
 #include "api/RoleHandler.h"
+#include "api/PermissionInput.h"
 
 #include "auth/Permissions.h"
 #include "auth/RoleBootstrap.h"
@@ -63,7 +64,12 @@ bool valid_color(const std::string& c) {
 // Permissions arrive as the same hex string the wire uses everywhere else, or
 // as a plain integer for a client that has not been updated. Returns nullopt
 // for a field that is present but is neither.
+//
+// Strict on both: a string that is not plain hex used to read as 0 (stripping
+// the role silently), and permission_input is the same rule the generic state
+// route applies before protocol's lenient from_json (audit 2026-11-15 P-1).
 std::optional<permission::Flags> read_permissions(const json& j) {
+    if (!permission_input::is_permission_value(j)) return std::nullopt;
     if (j.is_string()) {
         return permission::flags_from_hex(j.get<std::string>());
     }
@@ -178,7 +184,8 @@ std::optional<MatrixError> apply_role_fields(ServerRole& role, const json& body)
     if (body.contains("permissions")) {
         auto flags = read_permissions(body["permissions"]);
         if (!flags) {
-            return MatrixError::bad_json("permissions must be a hex string or an integer");
+            return MatrixError::bad_json(
+                "permissions must be a hex string or a non-negative integer");
         }
         role.permissions = *flags & permission::kAllFlags;
     }

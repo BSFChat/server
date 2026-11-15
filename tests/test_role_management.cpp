@@ -1529,3 +1529,61 @@ TEST(RoleAssignmentContainment, MakingARoleSelfAssignableNeedsItsPermissions) {
     auto builder = f.add_user("builder", {"builder"});
     EXPECT_TRUE(perms.may_edit_role_definitions(builder, proposed).allowed);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Audit 2026-11-15 P-1: protocol's from_json reads a negative permission as
+// all ones. Every route that hands client JSON to it checks the shape first.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST(PermissionValueShape, NegativeOrMalformedPermissionsAreBadJsonOnEveryRoleRoute) {
+    Fixture f("perm-shape");
+    f.seed_roles();
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    auto room = f.add_channel(admin, "general");
+
+    // Delta endpoints.
+    for (const json& bad : {json(-1), json("-1"), json("0x1ffzz"), json(1.5), json(true),
+                            json("0x10000000000000000")}) {
+        auto res = call(*f.roles, &RoleHandler::handle_create_role, kRolesPath, "token-admin",
+                        json{{"name", "x"}, {"position", 1}, {"permissions", bad}}.dump());
+        EXPECT_TRUE(RefusedBecause(res, 400, "permissions")) << bad.dump();
+    }
+    EXPECT_TRUE(IsOk(call(*f.roles, &RoleHandler::handle_create_role, kRolesPath, "token-admin",
+                          json{{"name", "ok"}, {"position", 1}, {"permissions", 8}}.dump())));
+
+    // The wholesale role document.
+    json doc;
+    {
+        ServerRolesContent c;
+        c.roles = f.current_roles();
+        to_json(doc, c);
+    }
+    json neg = doc;
+    neg["roles"].push_back(json{{"id", "evil"}, {"name", "evil"}, {"position", 1},
+                                {"permissions", -1}});
+    auto res = call(*f.rooms, &RoomHandler::handle_set_state,
+                    state_path(room, event_type::kServerRoles), "token-admin", neg.dump());
+    EXPECT_TRUE(RefusedBecause(res, 400, "permissions"));
+    EXPECT_FALSE(f.find("evil").has_value());
+
+    json wrapped = doc;
+    wrapped["roles"].push_back(json{{"id", "wrap"}, {"name", "wrap"},
+                                    {"position", 4294967297LL}, {"permissions", "0x0"}});
+    res = call(*f.rooms, &RoomHandler::handle_set_state,
+               state_path(room, event_type::kServerRoles), "token-admin", wrapped.dump());
+    EXPECT_TRUE(RefusedBecause(res, 400, "position"));
+
+    // A channel override.
+    for (const char* key : {"allow", "deny"}) {
+        auto ov = call(*f.rooms, &RoomHandler::handle_set_state,
+                       state_path(room, event_type::kChannelPermissions, "role:" + kEveryoneId),
+                       "token-admin", json{{key, -1}}.dump());
+        EXPECT_TRUE(RefusedBecause(ov, 400, key)) << key;
+    }
+    EXPECT_FALSE(f.store->get_state_event(room, std::string(event_type::kChannelPermissions),
+                                          "role:" + kEveryoneId))
+        << "a refused override was stored anyway";
+    EXPECT_TRUE(IsOk(call(*f.rooms, &RoomHandler::handle_set_state,
+                          state_path(room, event_type::kChannelPermissions, "role:" + kEveryoneId),
+                          "token-admin", json{{"allow", "0x0"}, {"deny", 1}}.dump())));
+}
