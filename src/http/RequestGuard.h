@@ -19,7 +19,9 @@ struct Config;
 // Installed as httplib's pre-REQUEST handler, which runs after a route has
 // matched and BEFORE the body is read, so a refusal here costs no buffering at
 // all. It applies to every route except the media upload, which is the one
-// endpoint that takes a large body and the one that never parses it as JSON.
+// endpoint that takes a large body and the one that never parses it as JSON;
+// that route has its own pre-body admission (token, declared length, rate and
+// in-flight caps) in MediaHandler::admit_upload, installed in the same hook.
 //
 // What it refuses, and why each rule is needed rather than nice:
 //

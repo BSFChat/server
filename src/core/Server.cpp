@@ -110,17 +110,9 @@ void Server::register_routes() {
         res.set_content("", "text/plain");
     });
 
-    // Runs after a route matches and BEFORE its body is read: refuses
-    // compressed, chunked and oversized JSON bodies so they are never
-    // buffered, inflated or parsed. See http/RequestGuard.h (audit S6/S2).
-    svr.set_pre_request_handler([this](const httplib::Request& req, httplib::Response& res) {
-        if (auto refusal = refuse_before_body(req, config_)) {
-            res.status = refusal->status;
-            res.set_content(refusal->error.to_json().dump(), "application/json");
-            return httplib::Server::HandlerResponse::Handled;
-        }
-        return httplib::Server::HandlerResponse::Unhandled;
-    });
+    // The pre-request handler (the pre-body guard) is installed with the
+    // media routes below, because the upload route's admission needs the
+    // MediaHandler.
 
     // An exception that escapes a handler used to become a bare, unlogged 500
     // — which is how the presence/sync failure of audit S1 stayed invisible:
@@ -291,6 +283,29 @@ void Server::register_routes() {
     // Same storage object the upload and download paths use, so the reaper can
     // never be pointed at a different backend than the one holding the bytes.
     media_reaper_ = std::make_unique<MediaReaper>(*store_, config_, media_storage_);
+
+    // Runs after a route matches and BEFORE its body is read — httplib 0.47
+    // calls it from Server::dispatch_request() ahead of read_content(), so a
+    // refusal here costs no buffering at all.
+    //
+    // The upload route: authentication, the declared length, the account's
+    // rate bucket and its in-flight cap (MediaHandler::admit_upload, audit
+    // 2026-11-15 S-1). Every other route: compressed, chunked and oversized
+    // JSON bodies are refused so they are never buffered, inflated or parsed
+    // (http/RequestGuard.h, audit S6/S2).
+    svr.set_pre_request_handler([this, media = media_handler](const httplib::Request& req,
+                                                             httplib::Response& res) {
+        if (req.path == api_path::kMediaUpload && req.method == "POST") {
+            return media->admit_upload(req, res) ? httplib::Server::HandlerResponse::Unhandled
+                                                 : httplib::Server::HandlerResponse::Handled;
+        }
+        if (auto refusal = refuse_before_body(req, config_)) {
+            res.status = refusal->status;
+            res.set_content(refusal->error.to_json().dump(), "application/json");
+            return httplib::Server::HandlerResponse::Handled;
+        }
+        return httplib::Server::HandlerResponse::Unhandled;
+    });
 
     svr.Post(std::string(api_path::kMediaUpload),
              [h = media_handler](const httplib::Request& req, httplib::Response& res) { h->handle_upload(req, res); });

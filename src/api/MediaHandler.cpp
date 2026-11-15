@@ -17,6 +17,7 @@
 #include <openssl/rand.h>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cstddef>
 #include <iomanip>
@@ -179,48 +180,127 @@ std::string MediaHandler::generate_media_id() const {
     return oss.str();
 }
 
+namespace {
+
+// res.user_data keys admit_upload() leaves for handle_upload().
+constexpr const char* kUploadUserKey = "bsfchat.upload.user";
+constexpr const char* kUploadSlotKey = "bsfchat.upload.slot";
+
+std::string trim_ows(const std::string& s) {
+    const auto b = s.find_first_not_of(" \t");
+    if (b == std::string::npos) return {};
+    const auto e = s.find_last_not_of(" \t");
+    return s.substr(b, e - b + 1);
+}
+
+void send_upload_too_large(httplib::Response& res) {
+    res.status = 413;
+    nlohmann::json err;
+    err["errcode"] = "M_TOO_LARGE";
+    err["error"] = "Upload exceeds maximum allowed size";
+    res.set_content(err.dump(), "application/json");
+}
+
+} // namespace
+
+bool MediaHandler::admit_upload(const httplib::Request& req, httplib::Response& res) {
+    // Authenticate. Nothing about the body has been read yet, and for a
+    // caller without a valid token nothing will be: httplib drains (and
+    // discards) an unread framed body after the response, it does not buffer
+    // it.
+    const auto auth_header = req.get_header_value("Authorization");
+    const auto user_id = authenticate(store_, auth_header);
+    if (!user_id) {
+        res.status = 401;
+        res.set_content(auth_error(auth_header).to_json().dump(), "application/json");
+        return false;
+    }
+
+    // A declared length over the limit is refused now rather than streamed to
+    // the transport ceiling (which is the limit plus slack) and refused after.
+    // Chunked and length-less bodies have no length to check here; httplib
+    // bounds them by set_payload_max_length while reading, and handle_upload
+    // re-checks the exact size below.
+    const size_t max_bytes = config_.max_upload_size_mb * 1024 * 1024;
+    if (req.has_header("Content-Length") &&
+        !req.has_header("Transfer-Encoding")) {
+        const auto raw = trim_ows(req.get_header_value("Content-Length"));
+        std::size_t len = 0;
+        const auto [ptr, ec] = std::from_chars(raw.data(), raw.data() + raw.size(), len);
+        if (ec == std::errc::result_out_of_range || (ec == std::errc{} && len > max_bytes)) {
+            send_upload_too_large(res);
+            return false;
+        }
+    }
+
+    // Concurrency slot first, so an upload refused for being one too many does
+    // not also spend a token from the rate bucket.
+    std::shared_ptr<void> slot;
+    {
+        std::lock_guard lock(uploads_in_flight_->mu);
+        auto& n = uploads_in_flight_->by_user[*user_id];
+        if (n >= kMaxConcurrentUploadsPerAccount) {
+            res.set_header("Retry-After", "1");
+            res.status = 429;
+            res.set_content(
+                MatrixError::limit_exceeded(
+                    "Too many uploads in progress for this account; wait for one to finish",
+                    1000)
+                    .to_json()
+                    .dump(),
+                "application/json");
+            return false;
+        }
+        ++n;
+        // Released when the last copy of `slot` goes, i.e. when httplib
+        // destroys the Response — on success, on a failed body read and on a
+        // refusal alike.
+        slot = std::shared_ptr<void>(nullptr, [state = uploads_in_flight_, uid = *user_id](void*) {
+            std::lock_guard lock(state->mu);
+            auto it = state->by_user.find(uid);
+            if (it != state->by_user.end() && --it->second <= 0) state->by_user.erase(it);
+        });
+    }
+
+    // Per-account upload ceiling. Charged here, before the body is read, so
+    // it bounds the bandwidth and memory an account can make the server spend
+    // as well as the storage it can fill.
+    if (const auto wait = limits_.acquire(SendLimiter::Bucket::kMediaUpload, *user_id)) {
+        send_rate_limited(res, wait, SendLimiter::message_for(SendLimiter::Bucket::kMediaUpload));
+        return false;
+    }
+
+    res.user_data.set(kUploadUserKey, *user_id);
+    res.user_data.set(kUploadSlotKey, std::move(slot));
+    return true;
+}
+
 void MediaHandler::handle_upload(const httplib::Request& req, httplib::Response& res) {
     auto log = get_logger();
 
-    // Authenticate
-    auto auth_header = req.get_header_value("Authorization");
-    auto user_id = authenticate(store_, auth_header);
-    if (!user_id) {
-        res.status = 401;
-        res.set_content(R"({"errcode":"M_UNKNOWN_TOKEN","error":"Invalid or missing access token"})",
+    // Normally admitted by Server's pre-request handler before the body was
+    // read; a direct caller gets the same checks here.
+    if (!res.user_data.has(kUploadUserKey) && !admit_upload(req, res)) return;
+    const auto* admitted = res.user_data.get<std::string>(kUploadUserKey);
+    if (!admitted) {
+        // Unreachable: admit_upload sets it whenever it returns true.
+        res.status = 500;
+        res.set_content(R"({"errcode":"M_UNKNOWN","error":"Upload was not admitted"})",
                         "application/json");
         return;
     }
-
-    // Per-account upload ceiling, before the body is written anywhere.
-    //
-    // It cannot come any earlier than this — the limiter keys on the account,
-    // which is only known once the token has resolved — and by the time this
-    // runs httplib has already buffered the request body in memory. So this
-    // bounds STORAGE growth and the number of media rows an account can create,
-    // not the bandwidth it can spend; the byte ceiling on any single request is
-    // Server::set_payload_max_length(), configured from max_upload_size_mb.
-    if (const auto wait = limits_.acquire(SendLimiter::Bucket::kMediaUpload, *user_id)) {
-        return send_rate_limited(res, wait,
-                                 SendLimiter::message_for(SendLimiter::Bucket::kMediaUpload));
-    }
+    const std::optional<std::string> user_id = *admitted;
 
     // No copy: `auto body = req.body` duplicated the entire upload, doubling
     // peak memory for every request. MediaStorage::upload takes a const ref.
     //
-    // Note this size check is a backstop only — by the time a handler runs,
-    // httplib has already buffered the whole request body. The real cap is
-    // Server::set_payload_max_length(), configured from max_upload_size_mb, so
-    // an oversized POST is rejected while streaming instead of after it has
-    // been fully materialised in memory.
+    // The exact-size backstop. A declared Content-Length over the limit was
+    // refused in admit_upload before reading; this catches a chunked body,
+    // which httplib bounds only by the transport ceiling (limit plus slack).
     const std::string& body = req.body;
     size_t max_bytes = config_.max_upload_size_mb * 1024 * 1024;
     if (body.size() > max_bytes) {
-        res.status = 413;
-        nlohmann::json err;
-        err["errcode"] = "M_TOO_LARGE";
-        err["error"] = "Upload exceeds maximum allowed size";
-        res.set_content(err.dump(), "application/json");
+        send_upload_too_large(res);
         return;
     }
 

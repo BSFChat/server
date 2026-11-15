@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace bsfchat {
@@ -23,6 +24,38 @@ public:
     MediaHandler(SqliteStore& store, const Config& config,
                  std::shared_ptr<MediaStorage> storage,
                  LimiterClock clock = limiter_steady_now_ms);
+
+    // ── Upload admission, BEFORE the body is read (audit 2026-11-15 S-1) ──
+    //
+    // httplib buffers a regular handler's whole request body into req.body
+    // before the handler runs, and the upload route takes up to
+    // max_upload_size_mb. handle_upload used to authenticate only after that,
+    // so ~40 concurrent unauthenticated 100 MB POSTs held ~4 GB.
+    //
+    // Server installs this in httplib's PRE-REQUEST handler for the upload
+    // route; httplib 0.47 calls that from dispatch_request() after the route
+    // matches and BEFORE read_content(). It refuses, without reading a byte of
+    // the body:
+    //   * no / invalid token                      → 401
+    //   * Content-Length over max_upload_size_mb  → 413 (a chunked or
+    //     length-less body is bounded by the transport ceiling,
+    //     set_payload_max_length, while it streams)
+    //   * the account's upload rate bucket empty  → 429
+    //   * kMaxConcurrentUploadsPerAccount already in flight → 429
+    //
+    // Returns true when the body may be read. On false, `res` holds the
+    // refusal. On true it records the caller and an upload slot in
+    // res.user_data; the slot is released when httplib destroys `res`, i.e.
+    // whether or not the body read and the handler then succeed.
+    //
+    // handle_upload calls this itself when it finds no admission recorded, so
+    // a direct caller (tests) gets the identical checks.
+    bool admit_upload(const httplib::Request& req, httplib::Response& res);
+
+    // Uploads one account may have in flight at once. Each one can hold up to
+    // max_upload_size_mb in memory while its body is read; the rate bucket
+    // bounds how many START per window, this bounds how many are resident.
+    static constexpr int kMaxConcurrentUploadsPerAccount = 4;
 
     void handle_upload(const httplib::Request& req, httplib::Response& res);
     void handle_download(const httplib::Request& req, httplib::Response& res);
@@ -88,6 +121,14 @@ private:
     // authenticated caller can ask for — a whole file into storage, kept — so
     // it gets the tightest of the three budgets.
     SendLimiter limits_;
+
+    // In-flight uploads per account. Shared with every slot handed out so a
+    // slot can outlive nothing it depends on.
+    struct UploadsInFlight {
+        std::mutex mu;
+        std::unordered_map<std::string, int> by_user;
+    };
+    std::shared_ptr<UploadsInFlight> uploads_in_flight_ = std::make_shared<UploadsInFlight>();
 
     std::once_flag ticket_key_once_;
     std::vector<unsigned char> ticket_key_;
