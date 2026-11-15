@@ -934,12 +934,53 @@ std::optional<int64_t> SqliteStore::get_token_expiry(const std::string& token) {
     return sqlite3_column_int64(stmt.get(), 0);
 }
 
+int SqliteStore::delete_session_pushers_locked(const std::string& user_id,
+                                               const char* device_clause,
+                                               const std::string& device_id) {
+    const std::string clause(device_clause);
+    const auto bind = [&](sqlite3_stmt* s) {
+        sqlite3_bind_text(s, 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+        if (!clause.empty()) sqlite3_bind_text(s, 2, device_id.c_str(), -1, SQLITE_TRANSIENT);
+    };
+    // Queue first, while the pushers that identify its rows still exist.
+    auto q = prepare(db_,
+        "DELETE FROM push_queue WHERE EXISTS (SELECT 1 FROM pushers p WHERE p.user_id = ?" +
+        clause + " AND p.user_id = push_queue.user_id AND p.app_id = push_queue.app_id"
+        " AND p.pushkey = push_queue.pushkey)");
+    bind(q.get());
+    sqlite3_step(q.get());
+    auto p = prepare(db_, "DELETE FROM pushers WHERE user_id = ?" + clause);
+    bind(p.get());
+    sqlite3_step(p.get());
+    return sqlite3_changes(db_);
+}
+
 void SqliteStore::delete_access_token(const std::string& token) {
     std::lock_guard lock(mutex_);
     auto token_hash = hash_access_token(token);
+    std::string user_id, device_id;
+    {
+        auto sel = prepare(db_,
+            "SELECT user_id, device_id FROM access_tokens WHERE token_hash = ?");
+        sqlite3_bind_text(sel.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(sel.get()) == SQLITE_ROW) {
+            user_id = column_text_or_empty(sel.get(), 0);
+            device_id = column_text_or_empty(sel.get(), 1);
+        }
+    }
     auto stmt = prepare(db_, "DELETE FROM access_tokens WHERE token_hash = ?");
     sqlite3_bind_text(stmt.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt.get());
+    if (user_id.empty() || device_id.empty()) return;
+
+    // That device's pushers, unless the device still has another session
+    // (two tokens can share a device id across a login on the same device).
+    auto still = prepare(db_,
+        "SELECT 1 FROM access_tokens WHERE user_id = ? AND device_id = ? LIMIT 1");
+    sqlite3_bind_text(still.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(still.get(), 2, device_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(still.get()) == SQLITE_ROW) return;
+    delete_session_pushers_locked(user_id, " AND device_id = ?", device_id);
 }
 
 int SqliteStore::delete_all_tokens_for_user(const std::string& user_id) {
@@ -947,19 +988,31 @@ int SqliteStore::delete_all_tokens_for_user(const std::string& user_id) {
     auto stmt = prepare(db_, "DELETE FROM access_tokens WHERE user_id = ?");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt.get());
-    return sqlite3_changes(db_);
+    const int revoked = sqlite3_changes(db_);
+    delete_session_pushers_locked(user_id, "", {});
+    return revoked;
 }
 
 int SqliteStore::delete_other_tokens_for_user(const std::string& user_id,
                                               const std::string& keep_token) {
     std::lock_guard lock(mutex_);
     auto keep_hash = hash_access_token(keep_token);
+    std::string keep_device;
+    {
+        auto sel = prepare(db_, "SELECT device_id FROM access_tokens WHERE token_hash = ?");
+        sqlite3_bind_text(sel.get(), 1, keep_hash.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(sel.get()) == SQLITE_ROW) keep_device = column_text_or_empty(sel.get(), 0);
+    }
     auto stmt = prepare(db_,
         "DELETE FROM access_tokens WHERE user_id = ? AND token_hash != ?");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, keep_hash.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(stmt.get());
-    return sqlite3_changes(db_);
+    const int revoked = sqlite3_changes(db_);
+    // Every pusher not registered from the device being kept — including
+    // legacy rows with no device id, which cannot be attributed to it.
+    delete_session_pushers_locked(user_id, " AND device_id != ?", keep_device);
+    return revoked;
 }
 
 std::optional<SqliteStore::TokenSession>

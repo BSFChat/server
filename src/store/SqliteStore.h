@@ -250,6 +250,8 @@ public:
     // expiry of a live token that is past the halfway point of its lifetime,
     // so a client that keeps syncing is never logged out.
     std::optional<std::string> get_user_by_token(const std::string& token);
+    // Also removes the pushers registered from that token's device once no
+    // other live session for the same device remains.
     void delete_access_token(const std::string& token);
     // Revokes every session for the account: /logout/all, and a server-wide ban.
     //
@@ -260,10 +262,14 @@ public:
     // access token but left a refresh token able to mint a replacement would be
     // theatre. Returns the number of sessions revoked; 0 is an ordinary result
     // (an account that never logged in, or is already logged out).
+    //
+    // Also removes every pusher of the account (S-7): a session-less account
+    // has nobody to notify.
     int delete_all_tokens_for_user(const std::string& user_id);
     // "Log out everywhere but here": used by the password-change flow so the
     // caller isn't logged out of the session they just re-authenticated in.
-    // Returns the number of sessions revoked.
+    // Returns the number of sessions revoked. Pushers registered from any
+    // other device go with them.
     int delete_other_tokens_for_user(const std::string& user_id,
                                      const std::string& keep_token);
 
@@ -1691,6 +1697,12 @@ public:
 
 private:
     void enqueue_pushes_locked(const std::vector<QueuedPush>& pushes);
+    // Pushers (and their queued notifications) of sessions being ended, so a
+    // logged-out device stops receiving message text (audit 2026-11-15 S-7).
+    // `device_clause` is a literal: "", " AND device_id = ?" or
+    // " AND device_id != ?", binding `device_id` when non-empty.
+    int delete_session_pushers_locked(const std::string& user_id, const char* device_clause,
+                                      const std::string& device_id);
     // Drops spent refresh-token records once no live session could still
     // belong to their family. Called with mutex_ already held.
     void prune_consumed_refresh_tokens_locked();

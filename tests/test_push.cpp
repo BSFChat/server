@@ -1850,3 +1850,91 @@ TEST(Pushers, PusherDataIsBounded) {
     EXPECT_EQ(add_pusher_with_data(f, "alice", "k", {{"blob", std::string(100000, 'x')}}).status, 400);
     EXPECT_TRUE(IsOk(add_pusher_with_data(f, "alice", "k", {{"default_payload", "event_id_only"}})));
 }
+
+// ── Pushers follow the sessions that registered them (audit 2026-11-15 S-7) ─
+//
+// Logging out, logging out everywhere and changing the password removed only
+// access tokens, so a device that had been signed out — or a thief's device
+// after the owner hit the panic button — kept receiving message text.
+
+namespace {
+
+struct SessionPushStore {
+    SqliteStore store{":memory:"};
+    SessionPushStore() {
+        store.initialize();
+        store.create_user("@alice:test", "");
+    }
+    void pusher(const std::string& pushkey, const std::string& device) {
+        SqliteStore::Pusher p;
+        p.user_id = "@alice:test";
+        p.app_id = "app";
+        p.pushkey = pushkey;
+        p.device_id = device;
+        p.kind = "http";
+        p.url = "https://push.example/_matrix/push/v1/notify";
+        p.data_json = "{}";
+        store.upsert_pusher(p);
+        SqliteStore::QueuedPush q;
+        q.user_id = "@alice:test";
+        q.app_id = "app";
+        q.pushkey = pushkey;
+        q.url = p.url;
+        q.payload = "{\"secret\":\"message text\"}";
+        store.enqueue_pushes({q});
+    }
+    std::set<std::string> pushkeys() {
+        std::set<std::string> out;
+        for (const auto& p : store.get_pushers("@alice:test")) out.insert(p.pushkey);
+        return out;
+    }
+};
+
+} // namespace
+
+TEST(PushersFollowSessions, LogoutRemovesOnlyThatDevicesPushersAndQueue) {
+    SessionPushStore s;
+    s.store.store_access_token("t-phone", "@alice:test", "PHONE");
+    s.store.store_access_token("t-laptop", "@alice:test", "LAPTOP");
+    s.pusher("k-phone", "PHONE");
+    s.pusher("k-laptop", "LAPTOP");
+    ASSERT_EQ(s.store.count_queued_pushes(), 2);
+
+    s.store.delete_access_token("t-phone");
+    EXPECT_EQ(s.pushkeys(), std::set<std::string>{"k-laptop"});
+    EXPECT_EQ(s.store.count_queued_pushes(), 1);
+}
+
+TEST(PushersFollowSessions, LogoutKeepsThePusherWhileTheDeviceHasAnotherSession) {
+    SessionPushStore s;
+    s.store.store_access_token("t-a", "@alice:test", "PHONE");
+    s.store.store_access_token("t-b", "@alice:test", "PHONE");
+    s.pusher("k-phone", "PHONE");
+    s.store.delete_access_token("t-a");
+    EXPECT_EQ(s.pushkeys(), std::set<std::string>{"k-phone"});
+    s.store.delete_access_token("t-b");
+    EXPECT_TRUE(s.pushkeys().empty());
+}
+
+TEST(PushersFollowSessions, PasswordChangeKeepsOnlyTheCurrentDevicesPushers) {
+    SessionPushStore s;
+    s.store.store_access_token("t-phone", "@alice:test", "PHONE");
+    s.store.store_access_token("t-laptop", "@alice:test", "LAPTOP");
+    s.pusher("k-phone", "PHONE");
+    s.pusher("k-laptop", "LAPTOP");
+    s.pusher("k-legacy", "");  // pre-device-id row: not attributable to PHONE
+
+    EXPECT_EQ(s.store.delete_other_tokens_for_user("@alice:test", "t-phone"), 1);
+    EXPECT_EQ(s.pushkeys(), std::set<std::string>{"k-phone"});
+    EXPECT_EQ(s.store.count_queued_pushes(), 1);
+}
+
+TEST(PushersFollowSessions, LogoutAllRemovesEveryPusher) {
+    SessionPushStore s;
+    s.store.store_access_token("t-phone", "@alice:test", "PHONE");
+    s.pusher("k-phone", "PHONE");
+    s.pusher("k-legacy", "");
+    EXPECT_EQ(s.store.delete_all_tokens_for_user("@alice:test"), 1);
+    EXPECT_TRUE(s.pushkeys().empty());
+    EXPECT_EQ(s.store.count_queued_pushes(), 0);
+}
