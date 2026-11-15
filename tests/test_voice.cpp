@@ -1263,8 +1263,21 @@ protected:
 
     static int status_of(const httplib::Response& res) { return res.status == -1 ? 200 : res.status; }
 
+    // The token endpoint refuses anyone the roster does not show IN the call
+    // (see handle_livekit_token). Most tests here are about what happens after
+    // that — permissions, keys, rotation — so request() puts the caller in the
+    // call first, directly in the store, which also bypasses max_participants.
+    // Tests about the roster requirement itself use request_without_joining().
     httplib::Response request(const std::string& room_id, const std::string& token,
                               const std::string& body = "") {
+        if (token.rfind("token-", 0) == 0 && !is_active(room_id, "@" + token.substr(6) + ":test")) {
+            mark_in_voice(room_id, "@" + token.substr(6) + ":test");
+        }
+        return request_without_joining(room_id, token, body);
+    }
+
+    httplib::Response request_without_joining(const std::string& room_id, const std::string& token,
+                                              const std::string& body = "") {
         httplib::Request req;
         req.method = "POST";
         req.path = "/_matrix/client/v3/rooms/" + room_id + "/voice/livekit_token";
@@ -2529,4 +2542,39 @@ TEST_F(VoiceHandlerTest, RejoinDoesNotWakeClientsIntoTheRetractionAlone) {
         << "a poll woken by the rejoin came back with the retraction and not the "
            "active row: every client in the room now believes alice left the "
            "voice channel until the next batch";
+}
+
+// ── The roster gates the token ───────────────────────────────────────────────
+// voice/join enforces max_participants and writes the m.call.member row the
+// member list is drawn from. A token issued without it let a client skip both:
+// overfill a full channel, and listen in the SFU room without ever appearing in
+// the list. Both confirmed failing before handle_livekit_token required an
+// active row.
+
+TEST_F(LiveKitTokenTest, NoTokenWithoutJoiningTheCallFirst) {
+    EXPECT_EQ(status_of(request_without_joining(room, "token-alice")), 403);
+
+    ASSERT_EQ(status_of(join(room, "token-alice")), 200);
+    EXPECT_EQ(status_of(request_without_joining(room, "token-alice")), 200);
+
+    ASSERT_EQ(status_of(leave(room, "token-alice")), 200);
+    EXPECT_EQ(status_of(request_without_joining(room, "token-alice")), 403)
+        << "a token was issued to someone who had left the call";
+}
+
+TEST_F(LiveKitTokenTest, AFullChannelIssuesNoTokenToSomeoneWhoCouldNotJoin) {
+    auto capped = generate_room_id("test");
+    store->create_room(capped, alice);
+    store->set_membership(capped, alice, std::string(membership::kJoin));
+    store->set_membership(capped, mod, std::string(membership::kJoin));
+    store->insert_event(generate_event_id("test"), capped, alice,
+                        std::string(event_type::kRoomVoice), std::string(""),
+                        json{{"enabled", true}, {"max_participants", 1}}.dump(), 1000);
+
+    ASSERT_EQ(status_of(join(capped, "token-alice")), 200);
+    ASSERT_EQ(status_of(join(capped, "token-mod")), 403) << "fixture: the channel must be full";
+
+    EXPECT_EQ(status_of(request_without_joining(capped, "token-mod")), 403)
+        << "the cap was bypassed by asking for a media token directly";
+    EXPECT_EQ(status_of(request_without_joining(capped, "token-alice")), 200);
 }

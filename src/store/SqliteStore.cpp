@@ -4143,11 +4143,17 @@ int SqliteStore::delete_pushers_by_pushkey_except(const std::string& pushkey,
     sqlite3_step(stmt.get());
     const int removed = sqlite3_changes(db_);
 
-    // The gateway has told us this device is gone. Retrying its queued
-    // notifications can only send message text to a pushkey that is no longer
-    // anybody's.
-    auto del = prepare(db_, "DELETE FROM push_queue WHERE pushkey = ?");
+    // The pushkey now belongs to keep_user_id alone, so notifications still
+    // queued for the PREVIOUS owners must not be delivered to it. Scoped exactly
+    // like the pushers delete above: unscoped, every /pushers/set (append=false
+    // is the default, and clients re-register on launch) wiped the caller's own
+    // pending pushes, and knowing a device token was enough to wipe other
+    // accounts' queues under any app_id.
+    auto del = prepare(db_,
+        "DELETE FROM push_queue WHERE pushkey = ? AND app_id = ? AND user_id != ?");
     sqlite3_bind_text(del.get(), 1, pushkey.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(del.get(), 2, app_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(del.get(), 3, keep_user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_step(del.get());
     return removed;
 }
@@ -4233,6 +4239,20 @@ void SqliteStore::delete_queued_pushes_for_events_locked(const std::vector<std::
 void SqliteStore::enqueue_pushes(const std::vector<QueuedPush>& pushes) {
     if (pushes.empty()) return;
     std::lock_guard lock(mutex_);
+    // One transaction for the batch: in autocommit every row was its own
+    // fsync'd commit, taken on the sender's /send thread with the store lock
+    // held.
+    exec("BEGIN IMMEDIATE");
+    try {
+        enqueue_pushes_locked(pushes);
+        exec("COMMIT");
+    } catch (...) {
+        exec("ROLLBACK");
+        throw;
+    }
+}
+
+void SqliteStore::enqueue_pushes_locked(const std::vector<QueuedPush>& pushes) {
     auto stmt = prepare(db_,
         "INSERT INTO push_queue (user_id, app_id, pushkey, url, payload, event_id, next_attempt_at) "
         "VALUES (?, ?, ?, ?, ?, ?, 0)");

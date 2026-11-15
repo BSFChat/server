@@ -375,7 +375,7 @@ protected:
         id.provider_url = issuer();
         id.required = true;
         id.allow_local_accounts = false;   // identity-only: no local registration
-        id.client_id = "bsfchat-server";
+        id.client_ids = {"bsfchat-server"};
         config.identity = id;
 
         sync_engine = std::make_unique<SyncEngine>(*store, config);
@@ -393,7 +393,7 @@ protected:
         return "http://127.0.0.1:" + std::to_string(port);
     }
 
-    std::string id_token_for(const std::string& subject) {
+    std::string id_token_for(const std::string& subject, const std::string& azp = "bsfchat-server") {
         const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
         bsfchat::JwtClaims claims;
@@ -404,17 +404,18 @@ protected:
         // which the server now requires, and accepts once.
         static int nonce_counter = 0;
         claims.aud = "https://test";
-        claims.azp = "bsfchat-server";
+        claims.azp = azp;
         claims.nonce = "nonce-" + std::to_string(++nonce_counter);
         claims.iat = now;
         claims.exp = now + 300;
         return bsfchat::jwt_sign(claims, private_pem, "test-key-1");
     }
 
-    httplib::Response login_with(const std::string& subject) {
+    httplib::Response login_with(const std::string& subject,
+                                 const std::string& azp = "bsfchat-server") {
         httplib::Request req;
         req.body = nlohmann::json{{"type", "m.login.token"},
-                                  {"token", id_token_for(subject)}}.dump();
+                                  {"token", id_token_for(subject, azp)}}.dump();
         httplib::Response res;
         handler->handle_login(req, res);
         return res;
@@ -1788,4 +1789,80 @@ TEST(IpInLogs, UntrustedProxyWarningNamesTheNetworkNotTheHost) {
         << "the peer address is still in the log: " << warning;
     // And it must not have leaked the address the header claimed, either.
     EXPECT_EQ(warning.find("203.0.113.5"), std::string::npos) << warning;
+}
+
+// /refresh applies the same gates as /login. Ban and deactivation used to be
+// enforced here only by their token purge, which a refresh in flight could
+// straddle: consume_refresh_token and store_access_token lock separately, so a
+// purge landing between them left the newly minted pair alive and refreshable
+// forever. Each test below puts the store into exactly that post-race state —
+// flag set, a refresh token surviving — and was confirmed to fail before.
+TEST(RefreshGates, ABannedAccountCannotRefresh) {
+    AuthFixture f;
+    auto login = nlohmann::json::parse(f.login("alice", "correct-horse-7", true).body);
+    // The ban's flag is written; its purge "ran before this token existed".
+    f.store->set_server_ban("@alice:test", "@admin:test", "", 1);
+
+    auto r = f.call(&AuthHandler::handle_refresh, {{"refresh_token", login.at("refresh_token")}});
+    EXPECT_EQ(r.status, 403) << r.body;
+    EXPECT_FALSE(f.store->get_user_by_token(login.at("access_token")).has_value())
+        << "a refused refresh must also end the session it came from";
+}
+
+TEST(RefreshGates, ADeactivatedAccountCannotRefresh) {
+    AuthFixture f;
+    ASSERT_TRUE(f.store->deactivate_user("@alice:test", 1));
+    // The pair a refresh minted in the gap, after the purge.
+    f.store->store_access_token("late-access", "@alice:test", "DEV", 60000, "late-refresh");
+
+    auto r = f.call(&AuthHandler::handle_refresh, {{"refresh_token", "late-refresh"}});
+    EXPECT_EQ(r.status, 403) << r.body;
+    EXPECT_FALSE(f.store->get_user_by_token("late-access").has_value());
+}
+
+TEST(RefreshGates, AnOrdinaryRefreshStillWorks) {
+    AuthFixture f;
+    auto login = nlohmann::json::parse(f.login("alice", "correct-horse-7", true).body);
+    auto r = f.call(&AuthHandler::handle_refresh, {{"refresh_token", login.at("refresh_token")}});
+    EXPECT_EQ(r.status, 200) << r.body;
+}
+
+// The first-party apps are two OAuth clients — desktop (loopback redirect) and
+// mobile (claimed https redirect) — so the azp check is an allowlist. Mobile
+// tokens were refused outright before, because the check named one client.
+TEST_F(IdentityLoginTest, EveryListedFirstPartyClientSignsIn) {
+    config.identity->client_ids = {"bsfchat-desktop", "bsfchat-mobile"};
+    auto ok = [](const httplib::Response& r) { return r.status == -1 || r.status == 200; };
+    EXPECT_TRUE(ok(login_with("desk-subject", "bsfchat-desktop")));
+    EXPECT_TRUE(ok(login_with("phone-subject", "bsfchat-mobile")));
+    // A token another relying party obtained for this server still does not.
+    auto other = login_with("rp-subject", "some-other-rp");
+    EXPECT_FALSE(ok(other)) << other.body;
+}
+
+TEST(IdentityClientIdsConfig, DefaultsToBothAppsAndAcceptsTheOldSingleKey) {
+    auto both = write_toml("bsfchat_test_idc_default.toml",
+                           "[identity]\nprovider_url = \"https://id.example\"\n");
+    EXPECT_EQ(Config::load(both.string()).identity->client_ids,
+              (std::vector<std::string>{"bsfchat-desktop", "bsfchat-mobile"}));
+    std::filesystem::remove(both);
+
+    auto legacy = write_toml("bsfchat_test_idc_legacy.toml",
+                             "[identity]\nprovider_url = \"https://id.example\"\n"
+                             "client_id = \"bsfchat-desktop\"\n");
+    EXPECT_EQ(Config::load(legacy.string()).identity->client_ids,
+              (std::vector<std::string>{"bsfchat-desktop"}));
+    std::filesystem::remove(legacy);
+
+    auto list = write_toml("bsfchat_test_idc_list.toml",
+                           "[identity]\nprovider_url = \"https://id.example\"\n"
+                           "client_ids = [\"a\", \"b\"]\n");
+    EXPECT_EQ(Config::load(list.string()).identity->client_ids,
+              (std::vector<std::string>{"a", "b"}));
+    std::filesystem::remove(list);
+
+    auto off = write_toml("bsfchat_test_idc_off.toml",
+                          "[identity]\nprovider_url = \"https://id.example\"\nclient_id = \"\"\n");
+    EXPECT_TRUE(Config::load(off.string()).identity->client_ids.empty());
+    std::filesystem::remove(off);
 }

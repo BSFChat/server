@@ -1039,6 +1039,27 @@ void VoiceHandler::handle_livekit_token(const httplib::Request& req, httplib::Re
         return;
     }
 
+    // Only someone the roster says is IN the call gets a token. voice/join is
+    // where max_participants is enforced (under voice_state_mutex_) and where
+    // the m.call.member row that drives the sidebar member list is written; a
+    // token issued without one let a client skip both — exceed a full
+    // channel's cap, and sit in the SFU room listening without ever appearing
+    // in the member list (docs/livekit-migration.md §6 makes m.call.member the
+    // durable projection of who is in a call). Join first, then fetch a token.
+    // Checked last, so every refusal above keeps its existing precedence.
+    {
+        auto member = store_.get_state_event(room_id, std::string(event_type::kCallMember),
+                                             *user_id);
+        if (!member || !member->content.data.value("active", false)) {
+            res.status = 403;
+            res.set_content(MatrixError::forbidden(
+                "Join the voice channel (voice/join) before requesting a media token")
+                                .to_json().dump(),
+                            "application/json");
+            return;
+        }
+    }
+
     // Optional device_id, same body shape as voice/join.
     //
     // LiveKit identifies a participant solely by `sub`. Two connections with

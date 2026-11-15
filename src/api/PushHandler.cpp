@@ -1,4 +1,5 @@
 #include "api/PushHandler.h"
+#include "push/GatewayPolicy.h"
 
 #include "auth/Permissions.h"
 #include "core/Config.h"
@@ -86,6 +87,11 @@ bool notify_level_refused(SqliteStore& store, const Config& config, const std::s
 // enough that the field is not storage, not a log-flood lever, and not a
 // parser stress test.
 constexpr std::size_t kMaxGatewayUrlLen = 2048;
+
+// Per account: a person's phones, tablets and desktops, with room to spare.
+constexpr std::size_t kMaxPushersPerUser = 20;
+// The serialised `data` object minus url/format, which have their own limits.
+constexpr std::size_t kMaxPusherDataBytes = 4096;
 
 // An IPv4 address in any form inet_aton() accepts, which is what the resolver
 // behind httplib::Client will accept: 1 to 4 parts, each decimal, octal
@@ -350,6 +356,8 @@ bool path_is_within(const std::string& prefix_path, const std::string& url_path)
 }
 
 // Validates a client-supplied push gateway URL. See the block comment above.
+} // namespace
+
 bool gateway_url_allowed(const std::string& url, const PushConfig& cfg, std::string& why) {
     if (url.size() > kMaxGatewayUrlLen) {
         why = "data.url is too long";
@@ -375,6 +383,24 @@ bool gateway_url_allowed(const std::string& url, const PushConfig& cfg, std::str
     if (!parse_gateway_url(url, target)) {
         why = "data.url is not a well-formed absolute http(s) URL";
         return false;
+    }
+
+    // path_is_within() compares the path as written, and it is sent as written.
+    // A gateway or proxy that normalises "/notify/../../admin" or decodes
+    // "%2e%2e%2f" would route the POST outside the allowlisted prefix, so a
+    // dot-segment or an encoded separator is refused outright rather than
+    // normalised: no real notify endpoint needs one.
+    {
+        std::string lower = target.path;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        const std::string segs = lower + "/";
+        if (segs.find("/./") != std::string::npos || segs.find("/../") != std::string::npos ||
+            lower.find('\\') != std::string::npos || lower.find("%2e") != std::string::npos ||
+            lower.find("%2f") != std::string::npos || lower.find("%5c") != std::string::npos) {
+            why = "data.url path must not contain dot-segments or encoded separators";
+            return false;
+        }
     }
 
     // Default CLOSED. An empty allowlist is not "any gateway" — it is "no
@@ -425,6 +451,8 @@ bool gateway_url_allowed(const std::string& url, const PushConfig& cfg, std::str
     }
     return true;
 }
+
+namespace {
 
 json pusher_to_json(const SqliteStore::Pusher& p) {
     auto data = json::parse(p.data_json, nullptr, false);
@@ -556,6 +584,30 @@ void PushHandler::handle_set_pusher(const httplib::Request& req, httplib::Respon
         rest.erase("url");
         rest.erase("format");
         pusher.data_json = rest.dump();
+    }
+    // `data` is copied into EVERY notification payload for this pusher, so its
+    // size is multiplied by every message the account is pushed for. A real
+    // gateway needs a handful of short fields; the 128 KB transport cap is not
+    // a sensible bound for something copied that often.
+    if (pusher.data_json.size() > kMaxPusherDataBytes) {
+        return send_error(res, 400, MatrixError::too_large("data is too large"));
+    }
+    // And the number of pushers is bounded per account, because each one costs
+    // an unread count, a payload build and a queue insert under the store lock
+    // on the SENDER's request, for every message. Unbounded, one account with
+    // ten thousand pushers made every message sent to it stall the server.
+    // Updating an existing (app_id, pushkey) never counts against the cap.
+    {
+        const auto existing = store_.get_pushers(*user_id);
+        const bool is_update = std::any_of(existing.begin(), existing.end(), [&](const auto& p) {
+            return p.app_id == app_id && p.pushkey == pushkey;
+        });
+        if (!is_update && existing.size() >= kMaxPushersPerUser) {
+            // M_INVALID_PARAM, not M_LIMIT_EXCEEDED: the latter means "rate
+            // limited, retry later" to a client, and waiting will not help.
+            return send_error(res, 400, MatrixError::invalid_param(
+                "Too many pushers on this account; remove one before adding another"));
+        }
     }
     if (auto token = extract_access_token(auth_header)) {
         if (auto session = store_.get_session_by_token(*token)) {

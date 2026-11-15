@@ -455,6 +455,67 @@ TEST(RoomVisibility, TypingDoesNotLeakIntoARoomTheCallerCannotView) {
               std::vector<std::string>{alice});
 }
 
+// The second typing pass: rooms with a typist but NO new timeline events, which
+// only an incremental /sync reaches. It walked the listing set — denied
+// categories included, as stubs — with no permission check, so the gate above
+// was undone by simply not posting anything: the room came back with its typing
+// list attached on the next incremental sync.
+TEST(RoomVisibility, IncrementalSyncTypingDoesNotLeakFromADeniedCategory) {
+    Fixture f("typingincr");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+
+    auto category = f.add_channel(alice, "Staff", "category");
+    f.join(category, bob);
+    f.join(category, carol);
+    f.make_private(category);
+    f.set_override(category, "user:" + carol, permission::kViewChannel, 0);
+
+    TypingHandler typing(*f.store, *f.sync, f.config);
+    SyncHandler sync_handler(*f.store, *f.sync, f.config);
+    sync_handler.set_typing_handler(&typing);
+
+    auto incremental_typing = [&](const std::string& token) {
+        auto first = make_request("/_matrix/client/v3/sync", token);
+        first.params.emplace("timeout", "0");
+        httplib::Response r1;
+        sync_handler.handle_sync(first, r1);
+        const auto since = json::parse(r1.body).value("next_batch", "");
+        EXPECT_FALSE(since.empty());
+        return since;
+    };
+    const auto bob_since = incremental_typing("token-bob");
+    const auto carol_since = incremental_typing("token-carol");
+
+    set_typing(typing, category, alice, "token-alice");
+    ASSERT_FALSE(typing.get_typing_users(category).empty());
+
+    auto typing_since = [&](const std::string& token, const std::string& since) {
+        auto req = make_request("/_matrix/client/v3/sync", token);
+        req.params.emplace("timeout", "0");
+        req.params.emplace("since", since);
+        httplib::Response res;
+        sync_handler.handle_sync(req, res);
+        auto join = json::parse(res.body).value("rooms", json::object())
+                        .value("join", json::object());
+        auto it = join.find(category);
+        if (it == join.end()) return std::vector<std::string>{};
+        for (const auto& ev :
+             it->value("ephemeral", json::object()).value("events", json::array())) {
+            if (ev.value("type", "") != std::string(event_type::kTyping)) continue;
+            return ev.value("content", json::object())
+                .value("user_ids", std::vector<std::string>{});
+        }
+        return std::vector<std::string>{};
+    };
+
+    EXPECT_TRUE(typing_since("token-bob", bob_since).empty())
+        << "incremental sync attached typing activity to a category bob is denied";
+    EXPECT_EQ(typing_since("token-carol", carol_since), std::vector<std::string>{alice})
+        << "the gate must be a permission check, not a blanket mute";
+}
+
 // Cost, and the correctness risk the cost fix introduces.
 //
 // The filter runs a permission check per joined room, and the role data behind

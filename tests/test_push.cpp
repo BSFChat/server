@@ -1720,3 +1720,133 @@ TEST(PushRoleMentions, ANonMentionableRolePushesNobody) {
                             "t1")));
     EXPECT_EQ(f.store->count_queued_pushes(), 0);
 }
+
+// ── Gateway policy at delivery, and the pushkey takeover's reach ─────────────
+
+TEST(PushDelivery, APusherTheAllowlistNoLongerCoversIsDroppedNotDelivered) {
+    // Registered while allowed, then the operator narrowed the allowlist (or an
+    // older build stored it while the allowlist was default-open). It must stop
+    // receiving message data at once — not keep it until the device goes away.
+    PushFixture f;
+    f.add_user("alice");
+    f.add_user("bob");
+    f.register_pusher("bob", "bob-device");
+    f.set_level("bob", PushService::kLevelAll);
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "secret"}}, "t1")));
+    ASSERT_EQ(f.store->count_queued_pushes(), 1);
+
+    f.config.push.allowed_gateway_prefixes = {"https://other-gateway.example/"};
+    f.push->drain_once();
+
+    EXPECT_EQ(f.gateway.call_count(), 0u) << "delivered to a gateway the policy no longer allows";
+    EXPECT_EQ(f.store->count_queued_pushes(), 0);
+    EXPECT_TRUE(f.store->get_pushers("@bob:test").empty());
+}
+
+TEST(Pushers, DotSegmentsCannotEscapeTheAllowlistedPath) {
+    PushFixture f;
+    f.config.push.allowed_gateway_prefixes = {"https://gateway.example/_matrix/push/v1/notify"};
+    f.add_user("alice");
+    auto attempt = [&](const std::string& url) {
+        auto req = make_request("/_matrix/client/v3/pushers/set", "token-alice",
+                                json{{"kind", "http"},
+                                     {"pushkey", "k"},
+                                     {"app_id", "a"},
+                                     {"data", {{"url", url}}}}
+                                    .dump());
+        httplib::Response res;
+        f.pushers->handle_set_pusher(req, res);
+        return res;
+    };
+    const std::string base = "https://gateway.example/_matrix/push/v1/notify";
+    EXPECT_EQ(attempt(base + "/../../../admin/x").status, 400);
+    EXPECT_EQ(attempt(base + "/..").status, 400);
+    EXPECT_EQ(attempt(base + "/./x").status, 400);
+    EXPECT_EQ(attempt(base + "/..%2f..%2fadmin").status, 400);
+    EXPECT_EQ(attempt(base + "/%2E%2E/admin").status, 400);
+    // Control: the allowlisted endpoint and a path under it still register.
+    EXPECT_TRUE(IsOk(attempt(base)));
+    EXPECT_TRUE(IsOk(attempt(base + "/v2.beta")));
+}
+
+TEST(Pushers, ReRegisteringKeepsYourOwnQueuedPushes) {
+    // Clients re-register their pusher on every launch (append=false). That must
+    // not throw away the notifications already queued for that same device.
+    PushFixture f;
+    f.add_user("alice");
+    f.add_user("bob");
+    f.register_pusher("bob", "bob-device");
+    f.set_level("bob", PushService::kLevelAll);
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "hi"}}, "t1")));
+    ASSERT_EQ(f.store->count_queued_pushes(), 1);
+
+    f.register_pusher("bob", "bob-device");
+    EXPECT_EQ(f.store->count_queued_pushes(), 1);
+}
+
+TEST(Pushers, TakingOverAPushkeyStillDropsThePreviousOwnersQueue) {
+    // Control for the scoping above: the security property is unchanged.
+    PushFixture f;
+    f.add_user("alice");
+    f.add_user("bob");
+    f.add_user("carol");
+    f.register_pusher("bob", "shared-token");
+    f.set_level("bob", PushService::kLevelAll);
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "for bob"}}, "t1")));
+    ASSERT_EQ(f.store->count_queued_pushes(), 1);
+
+    f.register_pusher("carol", "shared-token");
+    EXPECT_EQ(f.store->count_queued_pushes(), 0)
+        << "bob's message would be delivered to a device that is now carol's";
+}
+
+// ── Pusher volume ─────────────────────────────────────────────────────────────
+// Each pusher costs an unread count, a payload build and a queue insert on the
+// SENDER's request, for every message; `data` is copied into every payload.
+// Unbounded, one account registering thousands of pushers with ~128 KB of data
+// each made every message sent to it stall the whole server.
+
+namespace {
+httplib::Response add_pusher_with_data(PushFixture& f, const std::string& localpart,
+                             const std::string& pushkey, const json& extra_data = json::object()) {
+    json data = {{"url", PushFixture::kGatewayUrl}};
+    data.update(extra_data);
+    auto req = make_request("/_matrix/client/v3/pushers/set", "token-" + localpart,
+                            json{{"pushkey", pushkey}, {"kind", "http"},
+                                 {"app_id", "com.bsfchat.app"}, {"data", data}}
+                                .dump());
+    httplib::Response res;
+    f.pushers->handle_set_pusher(req, res);
+    return res;
+}
+} // namespace
+
+TEST(Pushers, PushersPerAccountAreCapped) {
+    PushFixture f;
+    f.add_user("alice");
+    int accepted = 0;
+    for (int i = 0; i < 200; ++i) {
+        if (IsOk(add_pusher_with_data(f, "alice", "dev-" + std::to_string(i)))) ++accepted;
+    }
+    EXPECT_LT(accepted, 200) << "no cap on pushers per account";
+    EXPECT_GE(accepted, 5) << "the cap must leave room for a person's real devices";
+    EXPECT_EQ(f.store->get_pushers("@alice:test").size(), static_cast<size_t>(accepted));
+
+    // Updating one you already have is never refused by the cap…
+    EXPECT_TRUE(IsOk(add_pusher_with_data(f, "alice", "dev-0")));
+    // …and removing one makes room again.
+    auto del = make_request("/_matrix/client/v3/pushers/set", "token-alice",
+                            json{{"pushkey", "dev-0"}, {"kind", nullptr},
+                                 {"app_id", "com.bsfchat.app"}}.dump());
+    httplib::Response dres;
+    f.pushers->handle_set_pusher(del, dres);
+    ASSERT_TRUE(IsOk(dres));
+    EXPECT_TRUE(IsOk(add_pusher_with_data(f, "alice", "replacement")));
+}
+
+TEST(Pushers, PusherDataIsBounded) {
+    PushFixture f;
+    f.add_user("alice");
+    EXPECT_EQ(add_pusher_with_data(f, "alice", "k", {{"blob", std::string(100000, 'x')}}).status, 400);
+    EXPECT_TRUE(IsOk(add_pusher_with_data(f, "alice", "k", {{"default_payload", "event_id_only"}})));
+}
