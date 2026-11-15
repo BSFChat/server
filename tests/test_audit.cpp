@@ -488,7 +488,7 @@ TEST(AuditMigration, FreshDatabaseGetsV13WithAnAppendOnlySchema) {
     // users.deactivated_at, v30 the updated_pos columns that let /sync deliver
     // account data and read markers). This test's subject remains the v13
     // audit_log shape below.
-    EXPECT_EQ(kTargetSchemaVersion, 30);
+    EXPECT_EQ(kTargetSchemaVersion, 31);
 
     // AUTOINCREMENT, not a bare INTEGER PRIMARY KEY. Without it SQLite reuses
     // max(rowid) + 1, which is exactly the position-reuse defect v4 fixed for
