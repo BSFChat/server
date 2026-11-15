@@ -1943,6 +1943,52 @@ void migrate_v30(sqlite3* db, bool /*fresh_database*/) {
         backfill_pos);
 }
 
+void migrate_v31(sqlite3* db, bool /*fresh_database*/) {
+    // Room departures: the rows that let /sync say "drop this room"
+    // (audit 2026-11-15, R-1).
+    //
+    // An incremental /sync scans events in rooms the reader is CURRENTLY
+    // joined to. That is exactly the set a departure takes a room out of, so
+    // nothing about a room the reader has just left, been kicked or banned
+    // from, or that has been deleted outright, was ever on any stream they
+    // polled: delete_room wrote no event at all, and the reader's own leave
+    // or ban event sat in a room the scan no longer looks at. Other devices
+    // kept the channel in their sidebar indefinitely, and opening it was a 403.
+    //
+    // One row per (user, room), holding the LATEST departure. The position is
+    // claimed from the same stream counter events use (see v30 for why one
+    // clock), so a client's ordinary sync token says whether it has been told.
+    // A later departure from the same room replaces the row; re-joining
+    // deletes it. The table is therefore bounded by users x rooms and in
+    // practice by the departures of the last retention window, which
+    // SqliteStore prunes by `created_at` (kRoomDepartureRetentionMs).
+    //
+    // No foreign keys, on purpose: the whole point of a 'deleted' row is to
+    // outlive the room it names, and a deactivated account's rows do no harm.
+    //
+    // NOTHING IS BACKFILLED. Departures that happened before this build left
+    // no record to derive one from, so a client that is already showing a
+    // stale channel has to reconcile against GET /joined_rooms; this table
+    // fixes every departure from now on.
+    exec(db, R"(
+        CREATE TABLE IF NOT EXISTS room_departures (
+            user_id     TEXT NOT NULL,
+            room_id     TEXT NOT NULL,
+            reason      TEXT NOT NULL,
+            stream_pos  INTEGER NOT NULL,
+            created_at  INTEGER NOT NULL,
+            PRIMARY KEY (user_id, room_id)
+        )
+    )");
+    // The delta query is "this account's departures above the client's
+    // token", exactly the account_data shape in v30.
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_room_departures_user_pos "
+             "ON room_departures(user_id, stream_pos)");
+    get_logger()->info(
+        "Schema v31: leaving, being removed from, or losing a deleted room is now recorded so "
+        "/sync can tell every device to drop it");
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -1977,6 +2023,7 @@ const std::vector<Step>& steps() {
         migrate_v28,
         migrate_v29,
         migrate_v30,
+        migrate_v31,
     };
     return kMigrations;
 }

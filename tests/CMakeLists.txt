@@ -18,6 +18,8 @@ add_executable(server_tests
     test_read_state_sync.cpp
     test_sync_token.cpp
     test_sync_invites.cpp
+    # rooms.leave (audit 2026-11-15, R-1).
+    test_sync_leave.cpp
     test_call_privacy.cpp
     test_permissions.cpp
     test_media.cpp
@@ -238,6 +240,18 @@ set_tests_properties(e2e_invites PROPERTIES
     # can only help it) and T5 is stated as a fraction of the poll timeout it
     # is distinguishing itself from. See the note on e2e_sync_latency above
     # for why RUN_SERIAL is not a defence against load in the first place.
+    RUN_SERIAL TRUE)
+
+add_test(NAME e2e_sync_leave
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/e2e/e2e_sync_leave.sh)
+set_tests_properties(e2e_sync_leave PROPERTIES
+    LABELS e2e
+    ENVIRONMENT "BSFCHAT_SERVER_BIN=$<TARGET_FILE:bsfchat-server>"
+    # rooms.leave is written into the JSON by SyncHandler, after to_json, so
+    # only a real request shows it is on the wire. Registers two accounts
+    # (bcrypt), restarts once, and parks one poll that a deletion must wake.
+    TIMEOUT 300
+    # Fixed port (8913).
     RUN_SERIAL TRUE)
 
 # --- release-channel script --------------------------------------------------

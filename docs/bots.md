@@ -551,6 +551,40 @@ incremental sync. Do not count them twice.
 replacement of the DM map, never a delta, and is safe to ignore unless your bot
 cares about DMs.
 
+### Rooms you must drop: `rooms.leave`
+
+An incremental sync carries a `rooms.leave` section when a room has gone from
+your bot's point of view. **Every key means "drop this room"**:
+
+```jsonc
+"rooms": {
+  "leave": {
+    "!abc:example.org": {
+      "bsfchat.reason": "kick",          // leave | kick | ban | deleted | no_access
+      "timeline": { "events": [ /* your own m.room.member leave/ban event */ ] }
+    }
+  }
+}
+```
+
+- `leave` — you left (from this or another session); `kick` — someone else set
+  your membership to `leave`; `ban` — you were banned from the room.
+- `deleted` — the channel was deleted. There is no member event; the room and
+  its history no longer exist.
+- `no_access` — you are still a member but may no longer view the channel (an
+  override changed). Only sent for a channel you have previously read; for the
+  general case, including role changes, reconcile with `GET /joined_rooms`.
+- `timeline.events` holds your own leave/ban member event when there is one and
+  is otherwise empty.
+- A room you re-joined before the sync was built is not listed; it is in
+  `rooms.join` with its full state instead. A room you were kicked from and
+  re-invited to can appear in both `leave` and `invite` — apply `leave` first.
+- The server keeps departures for 30 days. A token older than that may not be
+  told; `GET /joined_rooms` is the authority.
+- The section is a BSFChat extension of the Matrix shape (the reason key is
+  namespaced) and is never present on an initial sync, which lists only the
+  rooms you are in.
+
 ---
 
 ## 5. Dispatching on messages — the two footguns
@@ -1278,8 +1312,10 @@ Honest list, as of this writing:
 - **No way to fetch one event by id.** If you hold an `event_id` from a relation
   and want its content, you must page `/messages` backwards until you find it.
 - **No `/relations`.** Aggregating reactions, threads and replies is your job.
-- **`/sync` has no `rooms.leave` section.** Being kicked or leaving is not
-  reported as such; the room simply stops appearing.
+- **`rooms.leave` does not cover every loss of access.** Leaving, kicks, bans
+  and channel deletion are reported (§4), but losing `VIEW_CHANNEL` through a
+  role change is not, and an override change only for a channel you have read.
+  Reconcile against `GET /joined_rooms` on reconnect if that matters to you.
 - **`formatted_body` is passed through verbatim** and rendered by the desktop
   client as Qt RichText. Emit only the tag subset in §6.
 - **No structured command framework.** No slash-command registration, no

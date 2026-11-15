@@ -216,8 +216,10 @@ TEST(MigrationV11, PreExistingV8DatabaseUpgradesAndKeepsItsData) {
     // content_reports table and users.deactivated_at, for blocking, reporting
     // and self-service account deletion; 29 -> 30 numbered account data and
     // read markers on the event stream so /sync can carry them to an account's
-    // other devices. A v8 database still upgrades all the way in one go.
-    EXPECT_EQ(kTargetSchemaVersion, 30);
+    // other devices; 30 -> 31 added room_departures, so /sync can tell a client
+    // to drop a room it left, was removed from, or that was deleted. A v8
+    // database still upgrades all the way in one go.
+    EXPECT_EQ(kTargetSchemaVersion, 31);
     std::filesystem::remove(path);
 }
 

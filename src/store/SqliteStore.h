@@ -27,6 +27,15 @@ namespace bsfchat {
 // `auth.access_token_lifetime_days`.
 inline constexpr int64_t kDefaultAccessTokenLifetimeMs = 90LL * 24 * 60 * 60 * 1000;
 
+// How long a room_departures row (schema v31) is kept: the window within which
+// a client resuming from an old sync token is still told, through rooms.leave,
+// that a room it shows has gone. A client offline for longer than this misses
+// the leave and has to reconcile against GET /joined_rooms, which it does on
+// every reconnect anyway. Thirty days is far longer than any desktop or phone
+// session stays suspended, and short enough that the table never grows with
+// the history of the server.
+inline constexpr int64_t kRoomDepartureRetentionMs = 30LL * 24 * 60 * 60 * 1000;
+
 // How stale a bot token's `last_used_at` is allowed to get before a request
 // refreshes it.
 //
@@ -510,6 +519,38 @@ public:
     // It is also the query the CLIENT could not do — it looped over the rooms its
     // own sync had surfaced, which is why unsynced channels kept the user.
     std::vector<std::pair<std::string, std::string>> get_user_memberships(const std::string& user_id);
+
+    // ── Room departures (schema v31) ──────────────────────────────────────
+    //
+    // "This account should drop this room", numbered on the event stream so
+    // /sync can deliver it as rooms.leave (audit 2026-11-15, R-1). Written by
+    // the store itself, never by a handler, so no leave/kick/ban path can
+    // forget it:
+    //
+    //   * set_membership() records one whenever a membership goes from 'join'
+    //     to 'leave' or 'ban', and deletes the row when the user joins again;
+    //   * delete_room() records a 'deleted' one for every joined member before
+    //     the membership rows go.
+    //
+    // `reason` is one of the kDeparture* strings below. The store cannot tell
+    // a kick from a leave — both are set_membership(..., "leave") — so that
+    // distinction is made at delivery, from the sender of the member event.
+    struct RoomDeparture {
+        std::string room_id;
+        std::string reason;
+        int64_t stream_pos = 0;
+    };
+    static constexpr const char* kDepartureLeave = "leave";
+    static constexpr const char* kDepartureBan = "ban";
+    static constexpr const char* kDepartureDeleted = "deleted";
+    // `user_id`'s departures with since_pos < stream_pos <= up_to_pos, oldest
+    // first. One row per room at most.
+    std::vector<RoomDeparture> get_room_departures(const std::string& user_id,
+                                                   int64_t since_pos, int64_t up_to_pos);
+    // Deletes departure rows written before `older_than_ms` and returns how
+    // many went. Also run automatically, at most hourly, whenever a departure
+    // is recorded; public for tests and for an operator CLI.
+    int prune_room_departures(int64_t older_than_ms);
 
     // One phantom membership: a room_members row whose user_id names no account.
     struct OrphanMembership {
@@ -1630,6 +1671,12 @@ private:
     void vacuum_freelist_once_locked(bool fresh_database);
     // Claims the next stream position. Caller must hold mutex_.
     int64_t claim_stream_position_locked();
+    // Writes (replacing) the departure row for (user, room) at `stream_pos`,
+    // and prunes expired rows at most hourly. Caller must hold mutex_ and be
+    // inside a transaction.
+    void record_room_departure_locked(const std::string& user_id, const std::string& room_id,
+                                      const std::string& reason, int64_t stream_pos);
+    int64_t last_departure_prune_ms_ = 0;
     // Re-points `target_event_id` at the newest surviving (non-redacted)
     // replacement, clearing the pointer when none is left. Caller must hold
     // mutex_.

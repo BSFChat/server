@@ -61,7 +61,8 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
         if (!parked_slot) timeout = 0;
     }
 
-    auto response = sync_engine_.handle_sync(*user_id, since, timeout);
+    auto result = sync_engine_.handle_sync_full(*user_id, since, timeout);
+    auto& response = result.response;
 
     // Joined-room list is fetched once and shared by the typing and presence
     // passes below — this used to be queried twice per poll.
@@ -220,6 +221,10 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
     // becomes U+FFFD in one field of one event.
     json resp;
     to_json(resp, response);
+    // rooms.leave is not in the protocol's SyncResponse yet, so it is written
+    // into the JSON here rather than by to_json. Fold it into protocol and
+    // drop this line together with SyncResult — see sync/SyncEngine.h.
+    attach_leave_section(resp, result.leave);
     res.set_content(dump_response_json(resp), "application/json");
 }
 

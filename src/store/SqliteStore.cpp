@@ -1210,6 +1210,30 @@ void SqliteStore::delete_room(const std::string& room_id) {
         run("DELETE FROM push_queue WHERE event_id IN "
             "(SELECT event_id FROM events WHERE room_id = ?)");
         run("DELETE FROM events WHERE room_id = ?");
+
+        // Tell every joined member to drop the room (schema v31, audit R-1).
+        // A deleted room leaves nothing behind for /sync to scan — its events
+        // went on the line above — so without this row no device that was
+        // showing it would ever be told, and it would sit in their sidebar
+        // answering 403. ONE position for all of them: the rows only have to
+        // order against each reader's token, not against each other. Inside
+        // this transaction, so a rollback takes the departures with it; the
+        // caller wakes the long polls once it has committed.
+        {
+            std::vector<std::string> joined;
+            auto sel = prepare(db_,
+                "SELECT user_id FROM room_members WHERE room_id = ? AND membership = 'join'");
+            sqlite3_bind_text(sel.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+            while (sqlite3_step(sel.get()) == SQLITE_ROW) {
+                joined.push_back(column_text_or_empty(sel.get(), 0));
+            }
+            if (!joined.empty()) {
+                const int64_t pos = claim_stream_position_locked();
+                for (const auto& uid : joined) {
+                    record_room_departure_locked(uid, room_id, kDepartureDeleted, pos);
+                }
+            }
+        }
         run("DELETE FROM room_members WHERE room_id = ?");
         run("DELETE FROM rooms WHERE room_id = ?");
         exec("COMMIT");
@@ -1679,13 +1703,133 @@ bool SqliteStore::is_room_member(const std::string& room_id, const std::string& 
 
 void SqliteStore::set_membership(const std::string& room_id, const std::string& user_id, const std::string& membership) {
     std::lock_guard lock(mutex_);
+
+    // The previous membership, read under the same lock as the write, decides
+    // whether this is a DEPARTURE /sync has to announce (schema v31). Only
+    // join -> leave/ban is one: an invite that is declined or revoked is
+    // already handled by the invite restatement (attach_pending_invites drops
+    // it), and leave -> ban (or the reverse) changes nothing the reader's
+    // sidebar is showing.
+    std::optional<std::string> previous;
+    {
+        auto sel = prepare(db_,
+            "SELECT membership FROM room_members WHERE room_id = ? AND user_id = ?");
+        sqlite3_bind_text(sel.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(sel.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(sel.get()) == SQLITE_ROW) previous = column_text_or_empty(sel.get(), 0);
+    }
+    const bool was_joined = previous && *previous == membership::kJoin;
+    const bool departs = was_joined && (membership == membership::kLeave ||
+                                        membership == membership::kBan);
+    const bool rejoins = !was_joined && membership == membership::kJoin;
+
+    auto upsert = [&] {
+        auto stmt = prepare(db_,
+            "INSERT INTO room_members (room_id, user_id, membership, updated_at) VALUES (?, ?, ?, strftime('%s','now') * 1000) "
+            "ON CONFLICT(room_id, user_id) DO UPDATE SET membership = excluded.membership, updated_at = excluded.updated_at");
+        sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt.get(), 3, membership.c_str(), -1, SQLITE_TRANSIENT);
+        return sqlite3_step(stmt.get()) == SQLITE_DONE;
+    };
+
+    if (!departs) {
+        // Errors ignored as they always were here: a membership write into a
+        // room that does not exist fails its foreign key and is a no-op.
+        if (upsert() && rejoins) {
+            // Back in the room, so a departure recorded earlier no longer
+            // describes it. A client whose token predates both is told about
+            // the join (with full state) and never about the leave, which is
+            // the outcome it should see. SyncEngine also re-checks current
+            // membership at delivery, so this is tidiness, not the guard.
+            auto del = prepare(db_,
+                "DELETE FROM room_departures WHERE user_id = ? AND room_id = ?");
+            sqlite3_bind_text(del.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(del.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(del.get());
+        }
+        return;
+    }
+
+    // A departure claims a stream position, so it is ordered against events by
+    // the number a client's sync token carries, and SyncEngine's watermark
+    // (get_events_since samples the head under this mutex) stays true: the
+    // position is claimed and committed while the lock is held. The caller
+    // wakes long polls — every path here goes on to emit the member event,
+    // whose notify_new_event() publishes a head at or above this position.
+    exec("BEGIN IMMEDIATE");
+    try {
+        if (!upsert()) {
+            exec("ROLLBACK");
+            return;
+        }
+        record_room_departure_locked(user_id, room_id, membership,
+                                     claim_stream_position_locked());
+        exec("COMMIT");
+    } catch (...) {
+        try {
+            exec("ROLLBACK");
+        } catch (...) {
+        }
+        throw;
+    }
+}
+
+void SqliteStore::record_room_departure_locked(const std::string& user_id,
+                                               const std::string& room_id,
+                                               const std::string& reason, int64_t stream_pos) {
+    const int64_t now = audit_now_ms();
     auto stmt = prepare(db_,
-        "INSERT INTO room_members (room_id, user_id, membership, updated_at) VALUES (?, ?, ?, strftime('%s','now') * 1000) "
-        "ON CONFLICT(room_id, user_id) DO UPDATE SET membership = excluded.membership, updated_at = excluded.updated_at");
-    sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt.get(), 3, membership.c_str(), -1, SQLITE_TRANSIENT);
+        "INSERT INTO room_departures (user_id, room_id, reason, stream_pos, created_at) "
+        "VALUES (?, ?, ?, ?, ?) "
+        "ON CONFLICT(user_id, room_id) DO UPDATE SET reason = excluded.reason, "
+        "stream_pos = excluded.stream_pos, created_at = excluded.created_at");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, reason.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 4, stream_pos);
+    sqlite3_bind_int64(stmt.get(), 5, now);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        throw std::runtime_error(std::string("Failed to record room departure: ") +
+                                 sqlite3_errmsg(db_));
+    }
+
+    // Retention rides the write path, throttled, rather than a timer of its
+    // own: departures are rare, so the prune costs nothing on an idle server
+    // and runs at most once an hour on a busy one.
+    constexpr int64_t kPruneIntervalMs = 60LL * 60 * 1000;
+    if (now - last_departure_prune_ms_ >= kPruneIntervalMs) {
+        last_departure_prune_ms_ = now;
+        auto prune = prepare(db_, "DELETE FROM room_departures WHERE created_at < ?");
+        sqlite3_bind_int64(prune.get(), 1, now - kRoomDepartureRetentionMs);
+        sqlite3_step(prune.get());
+    }
+}
+
+std::vector<SqliteStore::RoomDeparture> SqliteStore::get_room_departures(
+    const std::string& user_id, int64_t since_pos, int64_t up_to_pos) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT room_id, reason, stream_pos FROM room_departures "
+        "WHERE user_id = ? AND stream_pos > ? AND stream_pos <= ? ORDER BY stream_pos");
+    sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 2, since_pos);
+    sqlite3_bind_int64(stmt.get(), 3, up_to_pos);
+    std::vector<RoomDeparture> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        out.push_back(RoomDeparture{column_text_or_empty(stmt.get(), 0),
+                                    column_text_or_empty(stmt.get(), 1),
+                                    sqlite3_column_int64(stmt.get(), 2)});
+    }
+    return out;
+}
+
+int SqliteStore::prune_room_departures(int64_t older_than_ms) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "DELETE FROM room_departures WHERE created_at < ?");
+    sqlite3_bind_int64(stmt.get(), 1, older_than_ms);
     sqlite3_step(stmt.get());
+    return sqlite3_changes(db_);
 }
 
 std::optional<std::string> SqliteStore::find_membership(const std::string& room_id,

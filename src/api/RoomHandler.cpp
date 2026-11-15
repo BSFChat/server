@@ -1326,9 +1326,11 @@ void RoomHandler::handle_delete_room(const httplib::Request& req, httplib::Respo
     audit_room_deletion(store_, *user_id, room_id);
 
     store_.delete_room(room_id);
-    // Wake long-polls so clients notice and drop the room on their next
-    // sync (the server's VIEW_CHANNEL filter now trivially excludes it —
-    // they're no longer a joined member of anything by that id).
+    // delete_room recorded a 'deleted' departure for every joined member, at a
+    // freshly claimed stream position; publishing that head wakes their long
+    // polls, and each comes back with the room in rooms.leave (audit R-1).
+    // Before that row existed this wake delivered nothing: the room's events
+    // were gone, so no device that showed the channel was ever told to drop it.
     sync_engine_.notify_new_event();
 
     get_logger()->info("Room {} deleted by {}", room_id, *user_id);

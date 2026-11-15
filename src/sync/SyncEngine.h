@@ -5,14 +5,53 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
+
+#include <nlohmann/json.hpp>
 
 namespace bsfchat {
 
 class SqliteStore;
 struct Config;
+
+// One entry of /sync's rooms.leave section (audit 2026-11-15, R-1): "drop this
+// room". Every key in the section means exactly that, whatever the reason.
+//
+// NOT IN THE PROTOCOL TYPES YET. bsfchat-protocol's SyncResponse has no leave
+// field and CI builds this server against protocol main, so the section is
+// carried beside the response and written into the serialised JSON by
+// attach_leave_section() below. Fold it into SyncResponse (as
+// rooms.leave: map<room_id, LeftRoom>) the next time protocol is released,
+// and delete the side channel.
+struct LeftRoom {
+    // "leave" | "kick" | "ban" | "deleted" | "no_access". On the wire as
+    // `bsfchat.reason`.
+    std::string reason;
+    // The reader's own m.room.member leave/ban event, when there is one. Empty
+    // for "deleted" and "no_access", and for a departure whose member event had
+    // not been written yet when the response was built.
+    std::vector<RoomEvent> timeline;
+};
+using LeftRooms = std::map<std::string, LeftRoom>;
+
+// A /sync answer: the protocol response plus the sections the protocol type
+// cannot carry yet.
+struct SyncResult {
+    SyncResponse response;
+    LeftRooms leave;
+};
+
+// Writes `leave` into a serialised /sync response as
+//   "rooms": { "leave": { "<room_id>": {
+//       "bsfchat.reason": "...",
+//       "timeline": { "events": [ ... ] } } } }
+// No-op when `leave` is empty, so a response with nothing to drop is
+// byte-identical to what this server sent before the section existed.
+// Temporary — see LeftRoom.
+void attach_leave_section(nlohmann::json& response_json, const LeftRooms& leave);
 
 class SyncEngine {
 public:
@@ -37,6 +76,12 @@ public:
     SyncResponse handle_sync(const std::string& user_id,
                               const std::string& since_token,
                               int timeout_ms);
+    // The same, plus rooms.leave. What SyncHandler serves; handle_sync() is
+    // this with the leave section dropped, kept so the many callers that only
+    // read the protocol response do not have to change.
+    SyncResult handle_sync_full(const std::string& user_id,
+                                const std::string& since_token,
+                                int timeout_ms);
 
     // Test seam. Runs inside build_incremental_sync, in the instant after the
     // scan (and the stream head that goes with it) has been taken and before
@@ -54,8 +99,8 @@ private:
     // compare the stream head against — re-reading the head after the scan
     // instead is how an event that landed during the scan ends up neither
     // delivered nor waited for.
-    SyncResponse build_incremental_sync(const std::string& user_id, int64_t since_pos,
-                                        int64_t* out_covered_pos = nullptr);
+    SyncResult build_incremental_sync(const std::string& user_id, int64_t since_pos,
+                                      int64_t* out_covered_pos = nullptr);
 
     // The key next_batch is built with, derived from this deployment's instance
     // secret on first use and cached for the process. Lazy rather than
