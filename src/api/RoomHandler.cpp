@@ -1396,6 +1396,14 @@ void RoomHandler::handle_delete_room(const httplib::Request& req, httplib::Respo
         res.set_content(MatrixError::forbidden("Insufficient permissions to delete this channel").to_json().dump(), "application/json");
         return;
     }
+    // And you may not restructure a channel you cannot open (audit 2026-11-15
+    // S-5): MANAGE_CHANNELS makes a builder, not someone entitled to delete a
+    // channel that denies them VIEW_CHANNEL. Administrators short-circuit.
+    if (!perms.can(*user_id, room_id, permission::kViewChannel)) {
+        res.status = 403;
+        res.set_content(no_channel_access(store_, *user_id).to_json().dump(), "application/json");
+        return;
+    }
 
     // Audited BEFORE the deletion, and this ordering is load-bearing: the record
     // captures the channel's name, type, parent category and member count, none of
@@ -2041,6 +2049,15 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
                         "application/json");
         return;
     }
+    // And you may not restructure a channel you cannot open (audit 2026-11-15
+    // S-5): MANAGE_CHANNELS makes a builder, not someone entitled to invite
+    // people into a channel that denies them VIEW_CHANNEL. Administrators
+    // short-circuit.
+    if (!perms.can(*user_id, room_id, permission::kViewChannel)) {
+        res.status = 403;
+        res.set_content(no_channel_access(store_, *user_id).to_json().dump(), "application/json");
+        return;
+    }
 
     // Check target user is not already banned
     auto target_membership = store_.get_membership(room_id, target_user);
@@ -2625,6 +2642,15 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         res.set_content(MatrixError::forbidden("Insufficient permissions for this state event").to_json().dump(), "application/json");
         return;
     }
+    // You may not restructure a channel you cannot open (audit 2026-11-15
+    // S-5) — the rule bsfchat.room.type already applies below, extended to
+    // every channel-structure write: rename, topic, join rules, category, ...
+    if (gate.scope == Scope::kRoom && gate.required == permission::kManageChannels &&
+        !perms.can(*user_id, room_id, permission::kViewChannel)) {
+        res.status = 403;
+        res.set_content(no_channel_access(store_, *user_id).to_json().dump(), "application/json");
+        return;
+    }
 
     // ── bsfchat.room.type: the conversion gate ────────────────────────────
     //
@@ -2885,6 +2911,14 @@ void RoomHandler::handle_move_channel(const httplib::Request& req, httplib::Resp
         res.set_content(MatrixError::forbidden("Insufficient permissions to move channels").to_json().dump(), "application/json");
         return;
     }
+    // And you may not restructure a channel you cannot open (audit 2026-11-15
+    // S-5): MANAGE_CHANNELS makes a builder, not someone entitled to move a
+    // channel that denies them VIEW_CHANNEL. Administrators short-circuit.
+    if (!perms.can(*user_id, room_id, permission::kViewChannel)) {
+        res.status = 403;
+        res.set_content(no_channel_access(store_, *user_id).to_json().dump(), "application/json");
+        return;
+    }
 
     json body;
     try {
@@ -2925,6 +2959,12 @@ void RoomHandler::handle_move_channel(const httplib::Request& req, httplib::Resp
     if (!is_category_room(store_, parent_id)) {
         res.status = 400;
         res.set_content(MatrixError::bad_json("Parent room is not a category").to_json().dump(), "application/json");
+        return;
+    }
+    // Nor file it under a category you cannot open.
+    if (!perms.can(*user_id, parent_id, permission::kViewChannel)) {
+        res.status = 403;
+        res.set_content(no_channel_access(store_, *user_id).to_json().dump(), "application/json");
         return;
     }
 
@@ -2973,6 +3013,14 @@ void RoomHandler::handle_set_order(const httplib::Request& req, httplib::Respons
     if (!perms.can(*user_id, room_id, permission::kManageChannels)) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Insufficient permissions to reorder channels").to_json().dump(), "application/json");
+        return;
+    }
+    // And you may not restructure a channel you cannot open (audit 2026-11-15
+    // S-5): MANAGE_CHANNELS makes a builder, not someone entitled to reorder a
+    // channel that denies them VIEW_CHANNEL. Administrators short-circuit.
+    if (!perms.can(*user_id, room_id, permission::kViewChannel)) {
+        res.status = 403;
+        res.set_content(no_channel_access(store_, *user_id).to_json().dump(), "application/json");
         return;
     }
 

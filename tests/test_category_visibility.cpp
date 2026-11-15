@@ -582,3 +582,113 @@ TEST(CategoryVisibility, AnUnchangedTypeWriteRecordsNothing) {
                           room_type_body("text"))));
     EXPECT_TRUE(f.records().empty());
 }
+
+// ══ S-5 (audit 2026-11-15): no restructuring a channel you cannot open ════
+//
+// The retype rule above, extended to every other structural write: delete,
+// rename, topic, join rules, move, reorder and invite. Each case denies the
+// builder VIEW_CHANNEL with a USER override (so @everyone-deny logic cannot be
+// what refuses) and asserts the refusal names channel access, not permission.
+
+namespace {
+
+struct HiddenChannel {
+    Fixture f;
+    std::string admin, mallory, channel, category;
+    explicit HiddenChannel(const std::string& name) : f(name) {
+        admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+        mallory = f.add_user("mallory", {"builder"});
+        f.add_user("victim");
+        channel = f.add_room(admin, "staff", "text");
+        category = f.add_room(admin, "Team", "category");
+        f.join(channel, mallory);
+        f.join(category, mallory);
+        f.set_override(channel, "user:" + mallory, 0, permission::kViewChannel);
+    }
+};
+
+} // namespace
+
+TEST(RestructureNeedsView, DeleteRenameTopicJoinRulesMoveOrderInviteAllRefuse) {
+    HiddenChannel h("s5-refuse");
+    PermissionsEngine perms(*h.f.store, h.f.config);
+    ASSERT_TRUE(perms.can(h.mallory, h.channel, permission::kManageChannels))
+        << "the actor must clear the MANAGE_CHANNELS gate, or this tests the wrong rule";
+    ASSERT_FALSE(perms.can(h.mallory, h.channel, permission::kViewChannel));
+
+    RoomHandler handler(*h.f.store, *h.f.sync, h.f.config);
+    const std::string room = kRoomsPrefix + h.channel;
+    const std::string no_access = "No access to this channel";
+
+    EXPECT_TRUE(IsForbiddenBecause(
+        call(handler, &RoomHandler::handle_delete_room, room, "token-mallory"), no_access));
+    EXPECT_TRUE(h.f.store->room_exists(h.channel));
+
+    EXPECT_TRUE(IsForbiddenBecause(
+        call(handler, &RoomHandler::handle_set_state,
+             state_event_path(h.channel, event_type::kRoomName), "token-mallory",
+             json{{"name", "pwned"}}.dump()),
+        no_access));
+    EXPECT_TRUE(IsForbiddenBecause(
+        call(handler, &RoomHandler::handle_set_state,
+             state_event_path(h.channel, event_type::kRoomTopic), "token-mallory",
+             json{{"topic", "pwned"}}.dump()),
+        no_access));
+    EXPECT_TRUE(IsForbiddenBecause(
+        call(handler, &RoomHandler::handle_set_state,
+             state_event_path(h.channel, event_type::kRoomJoinRules), "token-mallory",
+             json{{"join_rule", "public"}}.dump()),
+        no_access));
+    EXPECT_TRUE(IsForbiddenBecause(
+        call(handler, &RoomHandler::handle_move_channel, room + "/category", "token-mallory",
+             json{{"parent_id", h.category}}.dump()),
+        no_access));
+    EXPECT_TRUE(IsForbiddenBecause(
+        call(handler, &RoomHandler::handle_set_order, room + "/order", "token-mallory",
+             json{{"order", 3}}.dump()),
+        no_access));
+    EXPECT_TRUE(IsForbiddenBecause(
+        call(handler, &RoomHandler::handle_invite, room + "/invite", "token-mallory",
+             json{{"user_id", "@victim:test"}}.dump()),
+        no_access));
+
+    auto name = h.f.store->get_state_event(h.channel, std::string(event_type::kRoomName), "");
+    ASSERT_TRUE(name.has_value());
+    EXPECT_EQ(name->content.data.value("name", ""), "staff");
+    EXPECT_NE(h.f.store->get_membership(h.channel, "@victim:test"), membership::kInvite);
+}
+
+TEST(RestructureNeedsView, MovingIntoAHiddenCategoryIsRefused) {
+    HiddenChannel h("s5-parent");
+    auto open = h.f.add_room(h.admin, "general", "text");
+    h.f.join(open, h.mallory);
+    h.f.set_override(h.category, "user:" + h.mallory, 0, permission::kViewChannel);
+
+    RoomHandler handler(*h.f.store, *h.f.sync, h.f.config);
+    EXPECT_TRUE(IsForbiddenBecause(
+        call(handler, &RoomHandler::handle_move_channel, kRoomsPrefix + open + "/category",
+             "token-mallory", json{{"parent_id", h.category}}.dump()),
+        "No access to this channel"));
+}
+
+TEST(RestructureNeedsView, AVisibleChannelAndAnAdministratorAreUnaffected) {
+    HiddenChannel h("s5-control");
+    auto open = h.f.add_room(h.admin, "general", "text");
+    h.f.join(open, h.mallory);
+
+    RoomHandler handler(*h.f.store, *h.f.sync, h.f.config);
+    EXPECT_TRUE(IsOk(call(handler, &RoomHandler::handle_set_state,
+                          state_event_path(open, event_type::kRoomName), "token-mallory",
+                          json{{"name", "renamed"}}.dump())));
+    EXPECT_TRUE(IsOk(call(handler, &RoomHandler::handle_move_channel,
+                          kRoomsPrefix + open + "/category", "token-mallory",
+                          json{{"parent_id", h.category}}.dump())));
+    // The admin is not a member of anything mallory hid from herself; the
+    // override is user-scoped and administrators short-circuit regardless.
+    EXPECT_TRUE(IsOk(call(handler, &RoomHandler::handle_set_state,
+                          state_event_path(h.channel, event_type::kRoomTopic), "token-admin",
+                          json{{"topic", "fine"}}.dump())));
+    EXPECT_TRUE(IsOk(call(handler, &RoomHandler::handle_delete_room,
+                          kRoomsPrefix + h.channel, "token-admin")));
+    EXPECT_FALSE(h.f.store->room_exists(h.channel));
+}
