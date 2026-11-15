@@ -1675,8 +1675,25 @@ public:
     /// which holds server-scoped documents that are NOT events and so are not
     /// in media_refs. The last is scanned in C++ with media_uris_in_content(),
     /// the same extractor insert_event indexes with, so the two cannot drift.
+    /// A fourth, since schema v33: url_previews.image_mxc, the og:image the
+    /// server stored for a link preview, protected while its cache row lives.
     std::vector<MediaMeta> find_orphaned_media(const std::string& server_name,
                                                int64_t created_before_ms, int limit);
+
+    // --- URL preview cache (schema v33, api/UrlPreviewHandler.h) ----------
+    //
+    // `response_json` nullopt is a negative entry. `image_mxc` (may be empty)
+    // is the server-owned og:image the response names; while the row exists
+    // find_orphaned_media() treats it as referenced.
+    struct UrlPreviewRow {
+        std::optional<std::string> response_json;
+        int64_t fetched_at_ms = 0;
+    };
+    std::optional<UrlPreviewRow> get_url_preview(const std::string& url);
+    void put_url_preview(const std::string& url, const std::optional<std::string>& response_json,
+                         const std::string& image_mxc, int64_t fetched_at_ms);
+    // Deletes rows fetched before `fetched_before_ms`; returns how many.
+    int prune_url_previews(int64_t fetched_before_ms);
 
 private:
     // Drops spent refresh-token records once no live session could still

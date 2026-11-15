@@ -613,6 +613,25 @@ struct Config {
     // plays through without the client re-minting mid-stream.
     int media_ticket_ttl_seconds = 300;
 
+    // ── Server-side URL previews ([media] url_preview_*) ──────────────────
+    //
+    // GET /_matrix/media/v3/preview_url. The server fetches the page so the
+    // clients do not have to (which leaked every reader's IP to every linked
+    // site). Every fetch goes through the SSRF policy in api/UrlPreviewHandler
+    // — see docs/url-previews.md. Sizes and timeouts are clamped at use.
+    bool url_preview_enabled = true;
+    int64_t url_preview_max_bytes = 1024 * 1024;            // HTML read cap
+    int64_t url_preview_image_max_bytes = 5 * 1024 * 1024;  // og:image cap
+    int url_preview_timeout_seconds = 8;                    // per fetch, all hops
+    // Extra CIDRs to refuse on top of the built-in private/reserved ranges.
+    // A malformed entry fails startup rather than being silently skipped.
+    std::vector<std::string> url_preview_ip_denylist;
+    // Empty means "BSFChat-URL-Preview/<version> (+https://bsfchat.com)".
+    std::string url_preview_user_agent;
+    std::vector<int> url_preview_allowed_ports = {80, 443};
+    int url_preview_rate_per_minute = 30;     // outbound fetches per account
+    int url_preview_max_concurrent = 8;       // fetches in flight, server-wide
+
     // Storage
     StorageConfig storage;
 

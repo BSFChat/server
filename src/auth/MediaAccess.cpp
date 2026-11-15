@@ -39,6 +39,12 @@ bool MediaAccess::may_read(const std::string& user_id, const std::string& media_
     //    and the PUT /send that attaches it to a room.
     if (meta.uploader == user_id) return true;
 
+    // 1b. A link-preview image. The server fetched it from a public URL that
+    //     any account could ask to preview and receive the same URI for, so
+    //     it is no more private than the web page it came from. Any
+    //     authenticated caller (the caller has already been authenticated).
+    if (meta.uploader == kUrlPreviewUploader) return true;
+
     // The whole URI, not the bare id — see SqliteStore::get_media_rooms().
     const std::string mxc_uri = "mxc://" + config_.server_name + "/" + media_id;
 

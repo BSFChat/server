@@ -4649,6 +4649,52 @@ bool SqliteStore::is_avatar_of(const std::string& mxc_uri, const std::string& us
     return sqlite3_step(stmt.get()) == SQLITE_ROW;
 }
 
+std::optional<SqliteStore::UrlPreviewRow> SqliteStore::get_url_preview(const std::string& url) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "SELECT response, fetched_at FROM url_previews WHERE url = ?");
+    sqlite3_bind_text(stmt.get(), 1, url.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    UrlPreviewRow row;
+    if (sqlite3_column_type(stmt.get(), 0) != SQLITE_NULL) {
+        row.response_json = column_text_or_empty(stmt.get(), 0);
+    }
+    row.fetched_at_ms = sqlite3_column_int64(stmt.get(), 1);
+    return row;
+}
+
+void SqliteStore::put_url_preview(const std::string& url,
+                                  const std::optional<std::string>& response_json,
+                                  const std::string& image_mxc, int64_t fetched_at_ms) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "INSERT INTO url_previews (url, response, image_mxc, fetched_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(url) DO UPDATE SET response = excluded.response, "
+        "image_mxc = excluded.image_mxc, fetched_at = excluded.fetched_at");
+    sqlite3_bind_text(stmt.get(), 1, url.c_str(), -1, SQLITE_TRANSIENT);
+    if (response_json) {
+        sqlite3_bind_text(stmt.get(), 2, response_json->c_str(), -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt.get(), 2);
+    }
+    if (image_mxc.empty()) {
+        sqlite3_bind_null(stmt.get(), 3);
+    } else {
+        sqlite3_bind_text(stmt.get(), 3, image_mxc.c_str(), -1, SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_int64(stmt.get(), 4, fetched_at_ms);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
+        throw std::runtime_error(std::string("Failed to store URL preview: ") + sqlite3_errmsg(db_));
+    }
+}
+
+int SqliteStore::prune_url_previews(int64_t fetched_before_ms) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_, "DELETE FROM url_previews WHERE fetched_at < ?");
+    sqlite3_bind_int64(stmt.get(), 1, fetched_before_ms);
+    if (sqlite3_step(stmt.get()) != SQLITE_DONE) return 0;
+    return sqlite3_changes(db_);
+}
+
 std::vector<SqliteStore::MediaMeta> SqliteStore::find_orphaned_media(
     const std::string& server_name, int64_t created_before_ms, int limit) {
     std::lock_guard lock(mutex_);
@@ -4691,12 +4737,16 @@ std::vector<SqliteStore::MediaMeta> SqliteStore::find_orphaned_media(
         "  AND NOT EXISTS (SELECT 1 FROM media_refs r WHERE r.mxc_uri = ? || m.media_id) "
         "  AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_url = ? || m.media_id "
         "                     AND u.user_id = m.uploader) "
+        // A link preview's stored og:image, while its cache row still hands
+        // the URI out (schema v33).
+        "  AND NOT EXISTS (SELECT 1 FROM url_previews p WHERE p.image_mxc = ? || m.media_id) "
         "ORDER BY m.created_at "
         "LIMIT ?");
     sqlite3_bind_int64(stmt.get(), 1, created_before_ms);
     sqlite3_bind_text(stmt.get(), 2, prefix.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 3, prefix.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt.get(), 4, limit);
+    sqlite3_bind_text(stmt.get(), 4, prefix.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt.get(), 5, limit);
 
     std::vector<MediaMeta> out;
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {

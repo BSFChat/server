@@ -13,6 +13,12 @@ namespace bsfchat {
 class PermissionsEngine;
 struct Config;
 
+// The `media.uploader` recorded for an og:image the server fetched for a link
+// preview (api/UrlPreviewHandler). Not a user id — it has no '@', so it can
+// never equal an account — which keeps the image from being attributed to,
+// or counted against, whoever first asked for the preview. See may_read().
+inline constexpr const char* kUrlPreviewUploader = "bsfchat.url_preview";
+
 // The single authority on "may this account have these bytes", and therefore
 // also on "may this account create a reference to them".
 //

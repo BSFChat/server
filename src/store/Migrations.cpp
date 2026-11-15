@@ -2050,6 +2050,29 @@ void migrate_v32(sqlite3* db, bool /*fresh_database*/) {
              "ON events(relates_to, sender) WHERE relates_to IS NOT NULL");
 }
 
+void migrate_v33(sqlite3* db, bool /*fresh_database*/) {
+    // Server-side URL preview cache (docs/url-previews.md).
+    //
+    // `url` is the normalised URL (api/UrlPreview.h, ParsedUrl::normalised).
+    // `response` is the JSON body served for it, or NULL for a negative result
+    // ("nothing to preview"), which is cached for an hour instead of a day.
+    // `image_mxc` is the og:image the server stored on the page's behalf: the
+    // media reaper treats a row here as a reference, so the image outlives the
+    // cache entry that hands out its URI and is collected once the row is
+    // pruned (UrlPreviewHandler prunes rows older than twice the positive TTL).
+    exec(db, R"(
+        CREATE TABLE IF NOT EXISTS url_previews (
+            url         TEXT PRIMARY KEY,
+            response    TEXT,
+            image_mxc   TEXT,
+            fetched_at  INTEGER NOT NULL
+        )
+    )");
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_url_previews_image ON url_previews(image_mxc) "
+             "WHERE image_mxc IS NOT NULL");
+    exec(db, "CREATE INDEX IF NOT EXISTS idx_url_previews_fetched_at ON url_previews(fetched_at)");
+}
+
 using Step = void (*)(sqlite3*, bool);
 
 const std::vector<Step>& steps() {
@@ -2086,6 +2109,7 @@ const std::vector<Step>& steps() {
         migrate_v30,
         migrate_v31,
         migrate_v32,
+        migrate_v33,
     };
     return kMigrations;
 }
