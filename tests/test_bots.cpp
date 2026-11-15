@@ -2004,3 +2004,82 @@ TEST(BotInvite, CreateRoomWithABotInTheInviteArrayJoinsIt) {
     EXPECT_EQ(fx.store->get_membership(room_id, human), membership::kInvite)
         << "a human must still be merely invited";
 }
+
+// ── S-4 (audit 2026-11-15): a bot's DMs are part of what its token reads ────
+//
+// outranks() looks at roles and channel overrides; a DM has neither (compute()
+// clears overrides there), so a delegated MANAGE_BOTS holder who outranked the
+// bot everywhere still received a credential for every DM a person had with it.
+
+namespace {
+
+std::string make_dm(Fixture& fx, const std::string& a, const std::string& b) {
+    auto room_id = generate_room_id("test");
+    fx.store->create_room(room_id, a, /*is_direct=*/true);
+    fx.store->set_membership(room_id, a, std::string(membership::kJoin));
+    fx.store->set_membership(room_id, b, std::string(membership::kJoin));
+    return room_id;
+}
+
+} // namespace
+
+TEST(BotDmRotation, ANonAdminCannotRotateABotThatIsInSomebodyElsesDm) {
+    Fixture fx("dm-rotate-refused");
+    fx.seed_roles();
+    fx.add_user("root", {std::string(permission::role_id::kAdmin)});
+    auto botmod = fx.add_user("botmod_user", {"botmod"});
+    auto carol = fx.add_user("carol");
+    auto [bot_id, first] = fx.make_bot("token-root", "bot_helper");
+    make_dm(fx, carol, bot_id);
+
+    {
+        PermissionsEngine perms(*fx.store, fx.config);
+        ASSERT_TRUE(perms.outranks(botmod, bot_id))
+            << "precondition: the rank check alone would let this rotation through";
+    }
+
+    auto res = call(*fx.bots, &BotHandler::handle_rotate_token, bot_token_path(bot_id),
+                    "token-botmod_user");
+    EXPECT_TRUE(RefusedBecause(res, 403, "direct messages you are not part of"));
+    EXPECT_FALSE(json::parse(res.body).contains("token"));
+    // The old token still works: a refused rotation revokes nothing.
+    EXPECT_EQ(authenticate(*fx.store, "Bearer " + first).value_or(""), bot_id);
+}
+
+TEST(BotDmRotation, APendingDmInviteCountsToo) {
+    Fixture fx("dm-rotate-invite");
+    fx.seed_roles();
+    fx.add_user("root", {std::string(permission::role_id::kAdmin)});
+    fx.add_user("botmod_user", {"botmod"});
+    auto carol = fx.add_user("carol");
+    auto [bot_id, first] = fx.make_bot("token-root", "bot_invited");
+    auto room_id = generate_room_id("test");
+    fx.store->create_room(room_id, carol, /*is_direct=*/true);
+    fx.store->set_membership(room_id, carol, std::string(membership::kJoin));
+    fx.store->set_membership(room_id, bot_id, std::string(membership::kInvite));
+
+    EXPECT_TRUE(RefusedBecause(call(*fx.bots, &BotHandler::handle_rotate_token,
+                                    bot_token_path(bot_id), "token-botmod_user"),
+                               403, "direct messages"));
+}
+
+TEST(BotDmRotation, ARotatorWhoIsInEveryDmAndAnAdministratorMayRotate) {
+    Fixture fx("dm-rotate-allowed");
+    fx.seed_roles();
+    fx.add_user("root", {std::string(permission::role_id::kAdmin)});
+    auto botmod = fx.add_user("botmod_user", {"botmod"});
+    auto carol = fx.add_user("carol");
+    auto [bot_id, first] = fx.make_bot("token-root", "bot_shared");
+
+    // Only a DM with the rotator themselves: nothing new to read.
+    make_dm(fx, botmod, bot_id);
+    EXPECT_TRUE(IsOk(call(*fx.bots, &BotHandler::handle_rotate_token, bot_token_path(bot_id),
+                          "token-botmod_user")));
+
+    // A DM with someone else: only an administrator may rotate now.
+    make_dm(fx, carol, bot_id);
+    EXPECT_TRUE(HasStatus(call(*fx.bots, &BotHandler::handle_rotate_token,
+                               bot_token_path(bot_id), "token-botmod_user"), 403));
+    EXPECT_TRUE(IsOk(call(*fx.bots, &BotHandler::handle_rotate_token, bot_token_path(bot_id),
+                          "token-root")));
+}

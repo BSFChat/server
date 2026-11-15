@@ -365,6 +365,32 @@ void BotHandler::handle_rotate_token(const httplib::Request& req, httplib::Respo
             "That bot is deactivated; deactivated bots cannot be issued new tokens"));
     }
 
+    // S-4: the bot's DIRECT MESSAGES. outranks() cannot see them — compute()
+    // clears overrides in a DM, and DM access is membership, not permission —
+    // so a rotator who outranks the bot on every channel still walked away
+    // with every DM a person had with it. A non-administrator may rotate only
+    // if they are already a joined member of each DM the bot is joined to or
+    // invited into, i.e. the credential reads nothing they cannot.
+    {
+        PermissionsEngine perms(store_, config_);
+        if (!perms.can(actor, kServerScope, permission::kAdministrator)) {
+            auto rooms = store_.get_joined_rooms(user_id);
+            auto invited = store_.get_invited_rooms(user_id);
+            rooms.insert(rooms.end(), invited.begin(), invited.end());
+            for (const auto& room_id : rooms) {
+                if (store_.is_direct_room(room_id) && !store_.is_room_member(room_id, actor)) {
+                    get_logger()->warn(
+                        "Refused token rotation by {} for bot {}: the bot is in a direct "
+                        "message {} they are not part of", actor, user_id, room_id);
+                    return send_error(res, 403, MatrixError::forbidden(
+                        "You cannot rotate this bot's token: it is in direct messages you are "
+                        "not part of, and its token would let you read them. Ask an "
+                        "administrator."));
+                }
+            }
+        }
+    }
+
     const auto token = generate_access_token();
     if (!store_.rotate_bot_token(user_id, token, generate_device_id())) {
         // get_bot() found a bots row, so the users row must say kind = 'bot'
