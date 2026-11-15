@@ -5,6 +5,7 @@
 #include <bsfchat/MatrixTypes.h>
 #include <sqlite3.h>
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -108,6 +109,21 @@ inline constexpr const char* kIgnoredUsersKey = "ignored_users";
 class SqliteStore {
 public:
     explicit SqliteStore(const std::string& db_path);
+
+    // Changes whenever anything that decides which rooms an account may be
+    // shown might have changed: a membership row, a room's existence, any
+    // room STATE event (channel overrides and bsfchat.room.type are state),
+    // a redaction (which can strip an override), and any server_state write
+    // (role definitions and assignments). Bumped AFTER the write, so a reader
+    // that samples it, then computes, and finds it unchanged afterwards has
+    // computed from data no older than that sample.
+    //
+    // For caches of derived visibility only — /sync's restatement pass caches
+    // the caller's visible joined rooms against it (audit 2026-11-15, R-2).
+    // Deliberately coarse: a spurious bump costs one recomputation, a missed
+    // one is a privacy bug, so every new write path that can change any of
+    // the above must bump it too.
+    uint64_t visibility_generation() const { return visibility_generation_.load(); }
     ~SqliteStore();
 
     SqliteStore(const SqliteStore&) = delete;
@@ -517,6 +533,11 @@ public:
     // of who may see this account's presence, which is what a wake audience
     // needs (SyncEngine::notify_ephemeral_for). Not an access decision.
     std::vector<std::string> get_co_members(const std::string& user_id);
+    // Every account joined to at least one of `room_ids`, each once. One
+    // statement for the whole list rather than get_room_members() per room,
+    // which handed /sync's presence pass rooms x members rows to dedupe on
+    // every delivered poll (audit 2026-11-15, R-2).
+    std::vector<std::string> get_joined_members_of_rooms(const std::vector<std::string>& room_ids);
     // Every (room_id, membership) row this user has, in any state. This is the
     // list a server-wide ban has to be projected across, and it is deliberately
     // NOT get_joined_rooms(): a ban must also reach rooms where the user is
@@ -1733,6 +1754,13 @@ private:
     // Kept so the file mode can be re-applied after a VACUUM replaces the file.
     std::string db_path_;
     std::mutex mutex_;
+    std::atomic<uint64_t> visibility_generation_{0};
+    // Bumps visibility_generation_ when it goes out of scope, i.e. after the
+    // write it guards. Declare it AFTER the lock_guard, so it runs first.
+    struct VisibilityBump {
+        std::atomic<uint64_t>& generation;
+        ~VisibilityBump() { ++generation; }
+    };
     // Monotonic; never reused even after delete_room removes the newest rows.
     // Mirrored into server_meta so it survives a restart.
     int64_t next_stream_position_ = 1;

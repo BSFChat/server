@@ -1081,6 +1081,7 @@ void SqliteStore::prune_consumed_refresh_tokens_locked() {
 std::string SqliteStore::create_room(const std::string& room_id, const std::string& creator,
                                       bool is_direct) {
     std::lock_guard lock(mutex_);
+    VisibilityBump bump{visibility_generation_};
     auto stmt = prepare(db_, "INSERT INTO rooms (room_id, creator, is_direct) VALUES (?, ?, ?)");
     sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, creator.c_str(), -1, SQLITE_TRANSIENT);
@@ -1167,6 +1168,7 @@ std::optional<std::string> SqliteStore::find_direct_room(const std::string& user
 
 void SqliteStore::delete_room(const std::string& room_id) {
     std::lock_guard lock(mutex_);
+    VisibilityBump bump{visibility_generation_};
     // foreign_keys=ON means rooms can't be deleted while events or members
     // reference them — delete the dependents first, wrapped in a transaction
     // so we don't end up with a half-removed room.
@@ -1703,6 +1705,7 @@ bool SqliteStore::is_room_member(const std::string& room_id, const std::string& 
 
 void SqliteStore::set_membership(const std::string& room_id, const std::string& user_id, const std::string& membership) {
     std::lock_guard lock(mutex_);
+    VisibilityBump bump{visibility_generation_};
 
     // The previous membership, read under the same lock as the write, decides
     // whether this is a DEPARTURE /sync has to announce (schema v31). Only
@@ -1894,6 +1897,31 @@ std::vector<std::string> SqliteStore::get_co_members(const std::string& user_id)
     std::vector<std::string> out;
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) out.emplace_back(column_text_or_empty(stmt.get(), 0));
     return out;
+}
+
+std::vector<std::string> SqliteStore::get_joined_members_of_rooms(
+    const std::vector<std::string>& room_ids) {
+    std::lock_guard lock(mutex_);
+    // Chunked so the statement never approaches SQLITE_MAX_VARIABLE_NUMBER
+    // (999 on older builds), and deduplicated across chunks here.
+    constexpr size_t kChunk = 500;
+    std::set<std::string> seen;
+    for (size_t at = 0; at < room_ids.size(); at += kChunk) {
+        const size_t n = std::min(kChunk, room_ids.size() - at);
+        std::string sql = "SELECT DISTINCT user_id FROM room_members "
+                          "WHERE membership = 'join' AND room_id IN (";
+        for (size_t i = 0; i < n; ++i) sql += i ? ",?" : "?";
+        sql += ")";
+        auto stmt = prepare(db_, sql);
+        for (size_t i = 0; i < n; ++i) {
+            sqlite3_bind_text(stmt.get(), static_cast<int>(i + 1), room_ids[at + i].c_str(), -1,
+                              SQLITE_TRANSIENT);
+        }
+        while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+            seen.emplace(column_text_or_empty(stmt.get(), 0));
+        }
+    }
+    return {seen.begin(), seen.end()};
 }
 
 std::vector<std::pair<std::string, std::string>>
@@ -2249,6 +2277,9 @@ int64_t SqliteStore::insert_event(const std::string& event_id, const std::string
         }
 
         exec("COMMIT");
+        // Any room state can bear on visibility (overrides, room type,
+        // membership); a plain message cannot. See visibility_generation().
+        if (state_key) ++visibility_generation_;
         return stream_pos;
     } catch (...) {
         // Best-effort rollback: some SQLite errors (SQLITE_FULL, SQLITE_IOERR)
@@ -2601,6 +2632,7 @@ std::vector<std::string> SqliteStore::edit_family_locked(const std::string& even
 
 bool SqliteStore::redact_event(const std::string& event_id, const std::string& redacted_by) {
     std::lock_guard lock(mutex_);
+    VisibilityBump bump{visibility_generation_};
 
     // Capture the relation before the content is stripped: if this event is
     // itself a replacement, its target has to be re-resolved afterwards.
@@ -2813,6 +2845,7 @@ SqliteStore::ServerStateWrite SqliteStore::set_server_state(
     const std::string& event_type, const std::string& state_key, const std::string& sender,
     const std::string& content_json, const ExpectedServerState* expected) {
     std::lock_guard lock(mutex_);
+    VisibilityBump bump{visibility_generation_};
 
     // The content about to be replaced, read under the same lock as the write so
     // the caller's audit record cannot attribute a "before" that another writer
@@ -4897,6 +4930,7 @@ SqliteStore::ReportPage SqliteStore::list_content_reports(int limit,
 
 bool SqliteStore::deactivate_user(const std::string& user_id, int64_t when_ms) {
     std::lock_guard lock(mutex_);
+    VisibilityBump bump{visibility_generation_};
 
     exec("BEGIN IMMEDIATE");
     try {

@@ -27,6 +27,61 @@ using json = nlohmann::json;
 SyncHandler::SyncHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config)
     : store_(store), sync_engine_(sync_engine), config_(config) {}
 
+namespace {
+// Bounds on the restate cache. Far above any real deployment's account count
+// and number of distinct visibility profiles; past them the cache is simply
+// cleared and refilled, so a flood of accounts costs recomputation, not RAM.
+constexpr size_t kMaxCachedUsers = 8192;
+constexpr size_t kMaxCachedRoomSets = 256;
+} // namespace
+
+SyncHandler::RoomList SyncHandler::visible_rooms_for(const std::string& user_id,
+                                                     PermissionsEngine& perms) {
+    // Sampled BEFORE computing. A write that lands while we compute bumps the
+    // generation past this value, so whatever we cache below is discarded by
+    // the next caller rather than trusted.
+    const uint64_t generation = store_.visibility_generation();
+    {
+        std::lock_guard lock(restate_mutex_);
+        if (restate_generation_ != generation) {
+            visible_rooms_cache_.clear();
+            peers_cache_.clear();
+            restate_generation_ = generation;
+        }
+        auto it = visible_rooms_cache_.find(user_id);
+        if (it != visible_rooms_cache_.end()) return it->second;
+    }
+    auto rooms = std::make_shared<const std::vector<std::string>>(
+        visible_joined_rooms(store_, perms, user_id));
+    std::lock_guard lock(restate_mutex_);
+    if (restate_generation_ == generation && store_.visibility_generation() == generation) {
+        if (visible_rooms_cache_.size() >= kMaxCachedUsers) visible_rooms_cache_.clear();
+        visible_rooms_cache_[user_id] = rooms;
+    }
+    return rooms;
+}
+
+SyncHandler::RoomList SyncHandler::peers_of(const RoomList& rooms) {
+    std::vector<std::string> key = *rooms;
+    std::sort(key.begin(), key.end());
+    const uint64_t generation = store_.visibility_generation();
+    {
+        std::lock_guard lock(restate_mutex_);
+        if (restate_generation_ == generation) {
+            auto it = peers_cache_.find(key);
+            if (it != peers_cache_.end()) return it->second;
+        }
+    }
+    auto peers = std::make_shared<const std::vector<std::string>>(
+        store_.get_joined_members_of_rooms(key));
+    std::lock_guard lock(restate_mutex_);
+    if (restate_generation_ == generation && store_.visibility_generation() == generation) {
+        if (peers_cache_.size() >= kMaxCachedRoomSets) peers_cache_.clear();
+        peers_cache_[std::move(key)] = peers;
+    }
+    return peers;
+}
+
 void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& res) {
     auto user_id = authenticate(store_, req.get_header_value("Authorization"));
     if (!user_id) {
@@ -78,12 +133,17 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
     // One engine spans both passes and the whole list; see
     // auth/RoomVisibility.h for why per-room construction is the expensive way
     // to write this.
-    std::vector<std::string> joined_rooms;
+    //
+    // Cached across polls (visible_rooms_for): an idle poll that returns on a
+    // typing wake no longer re-derives the caller's whole room list.
+    RoomList joined_rooms_ptr;
     std::optional<PermissionsEngine> perms;
     if (typing_handler_ || presence_handler_) {
         perms.emplace(store_, config_);
-        joined_rooms = visible_joined_rooms(store_, *perms, *user_id);
+        joined_rooms_ptr = visible_rooms_for(*user_id, *perms);
     }
+    static const std::vector<std::string> kNoRooms;
+    const std::vector<std::string>& joined_rooms = joined_rooms_ptr ? *joined_rooms_ptr : kNoRooms;
 
     // Inject typing indicators into joined rooms
     if (typing_handler_) {
@@ -168,14 +228,14 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
         // here is a live disclosure today. It is the mechanism that per-
         // channel-visible user lists would be built on, and a filter that is
         // wrong now would be a bypass then.
+        //
+        // One statement over the whole visible list, joined rows only, cached
+        // per visible-room set (peers_of) — it used to be get_room_members()
+        // per room, rooms x members rows, on every delivered poll.
         std::set<std::string> seen;
-        for (const auto& room_id : joined_rooms) {
-            auto members = store_.get_room_members(room_id);
-            for (const auto& [m_uid, m_state] : members) {
-                if (m_uid == *user_id) continue;
-                if (m_state != membership::kJoin) continue;
-                seen.insert(m_uid);
-            }
+        for (const auto& m_uid : *peers_of(joined_rooms_ptr)) {
+            if (m_uid == *user_id) continue;
+            seen.insert(m_uid);
         }
         // Touch ourselves so other peers see us as recently-active
         // simply by virtue of having opened a sync stream.

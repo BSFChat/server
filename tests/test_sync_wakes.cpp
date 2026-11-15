@@ -16,6 +16,7 @@
 #include "api/EventHandler.h"
 #include "api/PresenceHandler.h"
 #include "api/RoomHandler.h"
+#include "api/SyncHandler.h"
 #include "api/TypingHandler.h"
 #include "auth/LocalAuth.h"
 #include "core/Config.h"
@@ -340,4 +341,70 @@ TEST(SyncScopedWakes, TypingWakesTheRoomsMembersAndNobodyElse) {
 
     EXPECT_LT(bob_poll.join(), 3000) << "a member of the room was not woken by typing in it";
     EXPECT_GE(carol_poll.join(), 1000) << "typing woke an account that is not in the room";
+}
+
+// ── R-2: the restatement cache ──────────────────────────────────────────────
+
+TEST(SyncRestateCache, VisibilityGenerationMovesOnEveryVisibilityWrite) {
+    Fixture f("generation");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto room = f.add_channel(alice, "general");
+
+    auto moved = [&](auto&& write) {
+        const auto before = f.store->visibility_generation();
+        write();
+        return f.store->visibility_generation() != before;
+    };
+    EXPECT_TRUE(moved([&] { f.store->set_membership(room, bob, "join"); }));
+    EXPECT_TRUE(moved([&] { f.set_override(room, "user:" + bob, 0, permission::kViewChannel); }));
+    EXPECT_TRUE(moved([&] {
+        f.store->set_server_state(std::string(event_type::kMemberRoles), bob, "@server:test",
+                                  json{{"role_ids", json::array()}}.dump());
+    }));
+    std::string ev = generate_event_id("test");
+    EXPECT_TRUE(moved([&] {
+        f.store->insert_event(ev, room, alice, std::string(event_type::kRoomType), std::string(""),
+                              json{{"type", "category"}}.dump(), f.ts++);
+    }));
+    EXPECT_TRUE(moved([&] { f.store->redact_event(ev, alice); }));
+    EXPECT_TRUE(moved([&] { f.store->create_room(generate_room_id("test"), alice); }));
+    EXPECT_FALSE(moved([&] { say(f, room, alice, "a message changes nobody's visibility"); }));
+    EXPECT_TRUE(moved([&] { f.store->delete_room(room); }));
+}
+
+TEST(SyncRestateCache, LosingViewChannelDropsTheCachedRoomFromTheTypingPass) {
+    // The cache is only safe if a visibility change invalidates it. Prime it
+    // with a sync that shows bob alice typing, deny bob the channel, and the
+    // very next sync must not mention the room.
+    Fixture f("cache-invalidation");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto room = f.add_channel(alice, "general");
+    f.join_member(room, bob);
+    TypingHandler typing(*f.store, *f.sync, f.config);
+    SyncHandler handler(*f.store, *f.sync, f.config);
+    handler.set_typing_handler(&typing);
+    type_in(f, typing, room, alice, "token-alice");
+
+    auto since = f.token_now(bob);
+    auto poll = [&] {
+        httplib::Request req;
+        req.path = "/_matrix/client/v3/sync";
+        req.params.emplace("since", since);
+        req.params.emplace("timeout", "0");
+        req.set_header("Authorization", "Bearer token-bob");
+        httplib::Response res;
+        handler.handle_sync(req, res);
+        return json::parse(res.body);
+    };
+
+    auto first = poll();
+    ASSERT_TRUE(first["rooms"]["join"].contains(room)) << "typing should show while visible";
+    since = first["next_batch"].get<std::string>();
+
+    f.set_override(room, "user:" + bob, 0, permission::kViewChannel);
+    auto second = poll();
+    EXPECT_FALSE(second["rooms"]["join"].contains(room))
+        << "a stale cached room list carried typing from a channel bob may no longer view";
 }
