@@ -1415,3 +1415,117 @@ TEST(ServerStateCompareAndSwap, TheDeltaEndpointsStillApplyUncontendedEdits) {
                           "token-builder")));
     EXPECT_FALSE(f.find(id).has_value());
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Audit 2026-11-15 S-3: assigning a role is conferring its permissions.
+//
+// may_assign_roles checked only POSITION, so a builder at 10 holding nothing
+// but MANAGE_ROLES could hand out a role an administrator had put at 5 with
+// BAN_MEMBERS (or ADMINISTRATOR) — to a friend or to themselves.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+std::string assignment_body(const std::vector<std::string>& ids) {
+    MemberRolesContent c;
+    c.role_ids = ids;
+    json j;
+    to_json(j, c);
+    return j.dump();
+}
+
+const std::string kEveryoneId{permission::role_id::kEveryone};
+
+} // namespace
+
+TEST(RoleAssignmentContainment, CannotAssignALowerRoleCarryingAPermissionYouLack) {
+    Fixture f("assign-lacking");
+    // Below the builder's 10, so position alone would allow it.
+    f.seed_roles({role("enforcer", 5, permission::kEveryoneDefault | permission::kBanMembers)});
+    auto builder = f.add_user("builder", {"builder"});
+    auto member = f.add_user("member");
+    auto room = f.add_channel(builder, "general");
+
+    for (const auto& target : {member, builder}) {
+        auto res = call(*f.rooms, &RoomHandler::handle_set_state,
+                        state_path(room, event_type::kMemberRoles, target), "token-builder",
+                        assignment_body({kEveryoneId, "enforcer"}));
+        EXPECT_TRUE(RefusedBecause(res, 403, "permission you do not hold")) << target;
+        EXPECT_FALSE(f.holds(target, "enforcer")) << target;
+    }
+
+    PermissionsEngine perms(*f.store, f.config);
+    auto verdict = perms.may_assign_roles(builder, member, {kEveryoneId, "enforcer"});
+    EXPECT_FALSE(verdict.allowed);
+    EXPECT_NE(verdict.reason.find(permission::flags_to_hex(permission::kBanMembers)),
+              std::string::npos)
+        << verdict.reason;
+}
+
+TEST(RoleAssignmentContainment, OnlyAnAdministratorMayAssignAnAdministratorRole) {
+    Fixture f("assign-admin-role");
+    f.seed_roles({role("lowadmin", 1, permission::kAdministrator)});
+    auto builder = f.add_user("builder", {"builder"});
+    auto member = f.add_user("member");
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+
+    PermissionsEngine perms(*f.store, f.config);
+    auto refused = perms.may_assign_roles(builder, member, {kEveryoneId, "lowadmin"});
+    EXPECT_FALSE(refused.allowed);
+    EXPECT_NE(refused.reason.find("Only an administrator"), std::string::npos) << refused.reason;
+
+    EXPECT_TRUE(perms.may_assign_roles(admin, member, {kEveryoneId, "lowadmin"}).allowed);
+}
+
+TEST(RoleAssignmentContainment, DelegationEchoAndRemovalStillWork) {
+    Fixture f("assign-legit");
+    f.seed_roles({role("enforcer", 5, permission::kEveryoneDefault | permission::kBanMembers),
+                  role("deputy", 5, permission::kEveryoneDefault | permission::kManageRoles)});
+    auto builder = f.add_user("builder", {"builder"});
+    auto member = f.add_user("member", {"enforcer"});  // granted by an admin earlier
+
+    PermissionsEngine perms(*f.store, f.config);
+    // A role whose bits the builder holds is assignable — delegation works.
+    EXPECT_TRUE(perms.may_assign_roles(builder, member, {kEveryoneId, "enforcer", "deputy"})
+                    .allowed)
+        << "an already-held role echoed back alongside a new grantable one";
+    // Taking a role away is not conferring anything.
+    EXPECT_TRUE(perms.may_assign_roles(builder, member, {kEveryoneId}).allowed);
+    // An unchanged assignment is fine.
+    EXPECT_TRUE(perms.may_assign_roles(builder, member, {kEveryoneId, "enforcer"}).allowed);
+}
+
+// Making a role self-assignable hands it to everyone, so the whole role must be
+// within what the actor holds. A scoped bot (no implicit @everyone) holding
+// MANAGE_ROLES is the actor for whom containment-against-@everyone and
+// containment-against-the-actor differ.
+TEST(RoleAssignmentContainment, MakingARoleSelfAssignableNeedsItsPermissions) {
+    Fixture f("selfassign-flip");
+    f.seed_roles({role("rolebot", 10, permission::kManageRoles),
+                  role("links", 5, permission::kEmbedLinks)});
+    const std::string bot = "@bot_roles:test";
+    f.store->create_user(bot, hash_password("password", 10));
+    {
+        MemberRolesContent c;
+        c.role_ids = {"rolebot"};
+        json j;
+        to_json(j, c);
+        f.store->set_server_state(std::string(event_type::kMemberRoles), bot, "@server:test",
+                                  j.dump());
+    }
+
+    auto proposed = f.current_roles();
+    for (auto& r : proposed) {
+        if (r.id == "links") r.self_assignable = true;
+    }
+    PermissionsEngine perms(*f.store, f.config);
+    ASSERT_FALSE(perms.can(bot, std::string(), permission::kEmbedLinks))
+        << "the actor must lack the flag, or this test proves nothing";
+    auto verdict = perms.may_edit_role_definitions(bot, proposed);
+    EXPECT_FALSE(verdict.allowed);
+    EXPECT_NE(verdict.reason.find("self-assignable"), std::string::npos) << verdict.reason;
+
+    // The builder (who holds @everyone, and so EMBED_LINKS) may.
+    auto builder = f.add_user("builder", {"builder"});
+    EXPECT_TRUE(perms.may_edit_role_definitions(builder, proposed).allowed);
+}
