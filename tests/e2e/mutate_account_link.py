@@ -200,7 +200,8 @@ MUTATIONS = [
     ),
     Mutation(
         "C1d: azp is not checked, so another relying party's token signs in here",
-        [(AUTH, [("    if (!client_id.empty() && claims->azp.value_or(std::string()) != client_id) {\n",
+        [(AUTH, [("    if (!client_ids.empty() &&\n"
+                  "        std::find(client_ids.begin(), client_ids.end(), azp) == client_ids.end()) {\n",
                   "    if (false) {\n")])],
         "AccountLinkTest.ATokenIssuedToAnotherClientIsRefused",
     ),

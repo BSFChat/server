@@ -1552,7 +1552,9 @@ void AuthHandler::handle_unlink_identity(const httplib::Request& req, httplib::R
     const auto client = client_key(req);
     if (over_attempt_limit("link_identity", client, res)) return;
 
-    if (store_.is_bot(*actor)) {
+    // (Not spelled like link_identity's bot check: mutate_account_link.py
+    // patches that line and needs it to be unique.)
+    if (const bool bot = store_.is_bot(*actor); bot) {
         return send_error(res, 403, MatrixError::forbidden("Bot accounts have no linked identities"));
     }
 
