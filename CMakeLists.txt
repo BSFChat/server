@@ -30,6 +30,7 @@ add_executable(bsfchat-server
     src/core/Utf8.cpp
     src/http/HttpServer.cpp
     src/http/ClientAddress.cpp
+    src/http/OutboundAddress.cpp
     src/http/JsonIo.cpp
     src/http/RequestGuard.cpp
     src/http/Router.cpp
@@ -59,6 +60,8 @@ add_executable(bsfchat-server
     src/api/MediaHandler.cpp
     src/api/MediaPolicy.cpp
     src/api/MediaTicket.cpp
+    src/api/UrlPreview.cpp
+    src/api/UrlPreviewHandler.cpp
     src/api/ProfileHandler.cpp
     src/api/VoiceHandler.cpp
     src/api/PushHandler.cpp
