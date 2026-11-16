@@ -220,7 +220,7 @@ TEST(MigrationV11, PreExistingV8DatabaseUpgradesAndKeepsItsData) {
     // to drop a room it left, was removed from, or that was deleted; 31 -> 32
     // indexed events.replaces and added events.relates_to for reactions. A v8
     // database still upgrades all the way in one go.
-    EXPECT_EQ(kTargetSchemaVersion, 32);
+    EXPECT_EQ(kTargetSchemaVersion, 33);
     std::filesystem::remove(path);
 }
 
