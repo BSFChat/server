@@ -1,9 +1,11 @@
 #pragma once
 
+#include "sync/InitialSyncGate.h"
 #include "sync/ParkedSyncGate.h"
 
 #include <httplib.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -42,6 +44,16 @@ public:
     // Tests only: the gate is otherwise fixed at kMaxParkedSyncsPerAccount.
     ParkedSyncGate& parked_sync_gate_for_test() { return parked_; }
 
+    // Initial syncs building at once, and how long one waits for a turn
+    // before going ahead regardless; see sync/InitialSyncGate.h (S2-4).
+    static constexpr std::size_t kMaxConcurrentInitialSyncs = 8;
+    static constexpr std::chrono::milliseconds kInitialSyncPatience{20000};
+    InitialSyncGate& initial_sync_gate_for_test() { return initial_syncs_; }
+
+    // How often an account's delivered polls restate every peer's presence
+    // even when only a delta is due; see the presence pass (S2-4).
+    static constexpr std::chrono::seconds kFullPresenceInterval{60};
+
 private:
     using RoomList = std::shared_ptr<const std::vector<std::string>>;
 
@@ -63,6 +75,14 @@ private:
     uint64_t restate_generation_ = UINT64_MAX;
     std::unordered_map<std::string, RoomList> visible_rooms_cache_;
     std::map<std::vector<std::string>, RoomList> peers_cache_;
+    // When each account last had every peer's presence restated, and the
+    // visibility generation its peer list was computed under. Guarded by
+    // restate_mutex_; cleared wholesale past kMaxCachedUsers like the rest.
+    struct FullPresence {
+        std::chrono::steady_clock::time_point at;
+        uint64_t generation = 0;
+    };
+    std::unordered_map<std::string, FullPresence> last_full_presence_;
 
     SqliteStore& store_;
     SyncEngine& sync_engine_;
@@ -70,6 +90,7 @@ private:
     TypingHandler* typing_handler_ = nullptr;
     PresenceHandler* presence_handler_ = nullptr;
     ParkedSyncGate parked_{kMaxParkedSyncsPerAccount};
+    InitialSyncGate initial_syncs_{kMaxConcurrentInitialSyncs};
 };
 
 } // namespace bsfchat

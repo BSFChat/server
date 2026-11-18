@@ -24,6 +24,9 @@ add_executable(server_tests
     test_create_room_validation.cpp
     # Long-poll wake scoping and scan paging (audit 2026-11-15, R-2, R-3).
     test_sync_wakes.cpp
+    # Fan-out cost: reader pool, cross-poll view cache, presence delta,
+    # initial-sync gate (audit 2-2026-11-18, S2-4).
+    test_sync_fanout.cpp
     # Indexed edit/reaction lookups and the v32 backfill (audit R-7/8).
     test_store_indexes.cpp
     test_call_privacy.cpp

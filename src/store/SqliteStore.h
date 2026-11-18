@@ -6,6 +6,7 @@
 #include <sqlite3.h>
 
 #include <atomic>
+#include <cstddef>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -125,6 +126,12 @@ public:
     // the above must bump it too.
     uint64_t visibility_generation() const { return visibility_generation_.load(); }
     ~SqliteStore();
+
+    // How many read-only connections serve the hot read path (see reader()).
+    // 0 for an in-memory or non-WAL database, where every read goes through
+    // the main connection under mutex_ as before. Opens the pool if it has not
+    // been opened yet. For tests.
+    std::size_t reader_connections_for_test();
 
     SqliteStore(const SqliteStore&) = delete;
     SqliteStore& operator=(const SqliteStore&) = delete;
@@ -690,6 +697,10 @@ public:
     // an unban distinguish "lifted a ban" from "there was nothing to lift".
     bool clear_server_ban(const std::string& user_id);
     bool is_server_banned(const std::string& user_id);
+    // Every banned account id, in one statement. For a caller that would
+    // otherwise ask is_server_banned() once per peer (the /sync presence pass,
+    // audit 2-2026-11-18 S2-4). The table is tiny on any real deployment.
+    std::vector<std::string> get_server_banned_user_ids();
     std::optional<ServerBan> get_server_ban(const std::string& user_id);
 
     // Every ban, newest first. Convenience for tests and for callers that know the
@@ -971,7 +982,9 @@ public:
     // ever asks for it again. Writes are serialised by this same mutex_ and a
     // position is both claimed and committed while it is held, so a head taken
     // inside the lock is a genuine watermark: every position at or below it is
-    // committed and was offered to the query.
+    // committed and was offered to the query. The scan itself runs after the
+    // sample, off the lock (S2-4), and is bounded by `<= head`, so it returns
+    // exactly the rows of that watermark and nothing past it.
     std::vector<RoomEvent> get_events_since(const std::string& user_id, int64_t since_position,
                                             int64_t& out_max_position, int64_t& out_stream_head,
                                             int limit);
@@ -1737,6 +1750,9 @@ private:
     // past refresh_deadline_ms). Throttled to hourly unless `force`. Called
     // with mutex_ already held.
     void reap_expired_tokens_locked(int64_t now, bool force);
+    // get_user_by_token() with mutex_ held throughout: the path that may write
+    // (reap an expired row, slide the expiry, stamp a bot's last use).
+    std::optional<std::string> get_user_by_token_writing(const std::string& token_hash);
     int64_t last_token_sweep_ms_ = 0;
 
     void exec(const std::string& sql);
@@ -1800,6 +1816,36 @@ private:
     // Cached result of "does event_search_fts exist"; -1 = not yet checked.
     int fts5_available_ = -1;
     bool fts5_available_locked();
+
+    // ── Read-only connection pool (audit 2-2026-11-18, S2-4) ─────────────
+    //
+    // Every store call used to serialise on mutex_, reads included, so the
+    // ~a dozen reads each woken /sync makes queued behind each other and
+    // behind every write: at 200 parked polls one message became a lock convoy
+    // that capped the process at ~3 cores. Under WAL, SQLite serves readers on
+    // other connections concurrently with the writer, each statement seeing
+    // the database as of its first step — i.e. every transaction committed
+    // before it started.
+    //
+    // That is exactly the guarantee the old lock gave a read: writers commit
+    // before releasing mutex_ and before returning, so a read that begins
+    // after a write call returned, or after a head sampled under mutex_, sees
+    // that write. What a pooled read can NOT do is rely on mutex_ to see a
+    // stream head and the rows below it as one snapshot; get_events_since
+    // therefore still samples the head under mutex_ and bounds its scan by it.
+    //
+    // Only for methods that took mutex_ for a single self-contained read and
+    // call no other locking member while holding it — a nested lease could
+    // exhaust the pool. A method converted to reader() must keep that shape.
+    struct ReaderPool;
+    class ReadLease;
+    // A pooled connection when the pool is open, else the main connection
+    // with mutex_ held for the lease's lifetime (the old behaviour).
+    ReadLease reader();
+    void open_readers();
+    std::unique_ptr<ReaderPool> readers_;
+    std::once_flag readers_once_;
+    bool wal_mode_ = false;
 
     sqlite3* db_ = nullptr;
     // Kept so the file mode can be re-applied after a VACUUM replaces the file.
