@@ -214,6 +214,23 @@ permission::Flags PermissionsEngine::channel_access_excess(const std::string& su
     return excess;
 }
 
+permission::Flags PermissionsEngine::role_override_excess(const std::string& role_id,
+                                                          const std::string& actor_id) {
+    if (is_server_actor(actor_id, config_)) return 0;
+    if (can(actor_id, std::string(), permission::kAdministrator)) return 0;
+    const std::string key = "role:" + role_id;
+    permission::Flags excess = 0;
+    for (const auto& room_id : override_rooms()) {
+        // compute() ignores overrides on a direct room, so they grant nothing.
+        if (is_direct_room(room_id)) continue;
+        const auto overrides = store_.get_channel_overrides(room_id);
+        const auto it = overrides.find(key);
+        if (it == overrides.end() || it->second.allow == 0) continue;
+        excess |= it->second.allow & ~compute(actor_id, room_id);
+    }
+    return excess;
+}
+
 bool PermissionsEngine::outranks(const std::string& actor_id, const std::string& target_id) {
     if (is_server_actor(actor_id, config_)) return true;
     // The role half first: it is two in-memory lookups against data this
@@ -324,6 +341,15 @@ PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_assign_roles(
         if (lacking != 0) {
             return {false, "You cannot assign a role with a permission you do not hold yourself ("
                                + permission::flags_to_hex(lacking) + ")"};
+        }
+        // ...nor one whose channel overrides let its holder do something in a
+        // channel that you cannot do there (audit 2-2026-11-18 S2-2): a
+        // `role:<id>` ALLOW VIEW_CHANNEL on a private channel is access the
+        // role's own bits never show.
+        if (const auto excess = role_override_excess(id, actor_id); excess != 0) {
+            return {false, "You cannot assign a role whose channel overrides grant a permission "
+                           "you do not hold in that channel ("
+                               + permission::flags_to_hex(excess) + ")"};
         }
     }
 
@@ -515,6 +541,12 @@ PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_edit_role_definition
             if (lacking != 0) {
                 return {false, "You cannot make a role self-assignable that has a permission you "
                                "do not hold yourself (" + permission::flags_to_hex(lacking) + ")"};
+            }
+            // Its channel overrides go to every member with it (S2-2).
+            if (const auto excess = role_override_excess(role.id, actor_id); excess != 0) {
+                return {false, "You cannot make a role self-assignable whose channel overrides "
+                               "grant a permission you do not hold in that channel ("
+                                   + permission::flags_to_hex(excess) + ")"};
             }
         }
 

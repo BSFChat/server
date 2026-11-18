@@ -1531,6 +1531,106 @@ TEST(RoleAssignmentContainment, MakingARoleSelfAssignableNeedsItsPermissions) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Audit 2-2026-11-18 S2-2: a role's channel overrides are part of what
+// assigning it hands out. A builder holding MANAGE_ROLES could give
+// themselves (or make self-assignable) a role whose `role:<id>` ALLOW
+// VIEW_CHANNEL unlocks a private channel they are kept out of.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// A private channel (@everyone DENY VIEW_CHANNEL) that role "staff" unlocks.
+std::string private_channel_unlocked_by(Fixture& f, const std::string& creator,
+                                        const std::string& role_id) {
+    auto room = f.add_channel(creator, "staff-room");
+    const auto write = [&](const std::string& key, permission::Flags allow,
+                           permission::Flags deny) {
+        ChannelPermissionOverride ov;
+        ov.allow = allow;
+        ov.deny = deny;
+        json j;
+        to_json(j, ov);
+        f.store->insert_event(generate_event_id("test"), room, "@server:test",
+                              std::string(event_type::kChannelPermissions), key, j.dump(), 1002);
+    };
+    write("role:" + std::string(permission::role_id::kEveryone), 0, permission::kViewChannel);
+    write("role:" + role_id, permission::kViewChannel, 0);
+    return room;
+}
+
+} // namespace
+
+TEST(RoleOverrideContainment, CannotAssignARoleWhoseOverrideUnlocksAChannelYouCannotSee) {
+    Fixture f("s2-2-assign");
+    // Same bits as @everyone: the role itself grants nothing the builder lacks.
+    f.seed_roles({role("staff", 5, permission::kEveryoneDefault)});
+    auto builder = f.add_user("builder", {"builder"});
+    auto member = f.add_user("member");
+    auto room = private_channel_unlocked_by(f, builder, "staff");
+
+    PermissionsEngine perms(*f.store, f.config);
+    ASSERT_FALSE(perms.can(builder, room, permission::kViewChannel))
+        << "fixture: the builder must be kept out of the channel";
+
+    for (const auto& target : {builder, member}) {
+        auto verdict = perms.may_assign_roles(builder, target, {kEveryoneId, "staff"});
+        EXPECT_FALSE(verdict.allowed) << target;
+        EXPECT_NE(verdict.reason.find(permission::flags_to_hex(permission::kViewChannel)),
+                  std::string::npos)
+            << verdict.reason;
+    }
+    // Through the route, too.
+    auto res = call(*f.rooms, &RoomHandler::handle_set_state,
+                    state_path(f.add_channel(builder, "general"), event_type::kMemberRoles,
+                               builder),
+                    "token-builder", assignment_body({kEveryoneId, "staff"}));
+    EXPECT_TRUE(RefusedBecause(res, 403, "channel overrides")) << res.body;
+    EXPECT_FALSE(f.holds(builder, "staff"));
+
+    // An administrator may; so may a builder who can see the channel.
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    EXPECT_TRUE(perms.may_assign_roles(admin, member, {kEveryoneId, "staff"}).allowed);
+}
+
+TEST(RoleOverrideContainment, ABuilderInsideTheChannelMayHandItOut) {
+    Fixture f("s2-2-assign-ok");
+    f.seed_roles({role("staff", 5, permission::kEveryoneDefault)});
+    auto builder = f.add_user("builder", {"builder"});
+    auto member = f.add_user("member");
+    auto room = private_channel_unlocked_by(f, builder, "staff");
+    ChannelPermissionOverride ov;
+    ov.allow = permission::kViewChannel;
+    json j;
+    to_json(j, ov);
+    f.store->insert_event(generate_event_id("test"), room, "@server:test",
+                          std::string(event_type::kChannelPermissions), "user:" + builder,
+                          j.dump(), 1003);
+
+    PermissionsEngine perms(*f.store, f.config);
+    ASSERT_TRUE(perms.can(builder, room, permission::kViewChannel));
+    EXPECT_TRUE(perms.may_assign_roles(builder, member, {kEveryoneId, "staff"}).allowed);
+}
+
+TEST(RoleOverrideContainment, CannotMakeSuchARoleSelfAssignable) {
+    Fixture f("s2-2-selfassign");
+    f.seed_roles({role("staff", 5, permission::kEveryoneDefault)});
+    auto builder = f.add_user("builder", {"builder"});
+    private_channel_unlocked_by(f, builder, "staff");
+
+    auto proposed = f.current_roles();
+    for (auto& r : proposed) {
+        if (r.id == "staff") r.self_assignable = true;
+    }
+    PermissionsEngine perms(*f.store, f.config);
+    auto verdict = perms.may_edit_role_definitions(builder, proposed);
+    EXPECT_FALSE(verdict.allowed);
+    EXPECT_NE(verdict.reason.find("channel overrides"), std::string::npos) << verdict.reason;
+
+    auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
+    EXPECT_TRUE(perms.may_edit_role_definitions(admin, proposed).allowed);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Audit 2026-11-15 P-1: protocol's from_json reads a negative permission as
 // all ones. Every route that hands client JSON to it checks the shape first.
 // ═══════════════════════════════════════════════════════════════════════════

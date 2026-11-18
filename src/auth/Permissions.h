@@ -369,6 +369,15 @@ private:
     // one request.
     const std::vector<std::string>& override_rooms();
 
+    // Flags the `role:<role_id>` channel overrides ALLOW somewhere that the
+    // actor does not hold in that same channel (audit 2-2026-11-18 S2-2).
+    // Handing out a role hands out its overrides too, so the containment rule
+    // for assigning a role, or making it self-assignable, has to read them:
+    // the role's own permission bits can be a subset of the actor's while its
+    // override in a private channel unlocks that channel. Zero = contained.
+    permission::Flags role_override_excess(const std::string& role_id,
+                                           const std::string& actor_id);
+
     SqliteStore& store_;
     const Config& config_;
 
