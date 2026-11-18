@@ -27,6 +27,7 @@
 #include <gtest/gtest.h>
 
 #include "api/AuthHandler.h"
+#include "http/JsonIo.h"
 #include "api/EventHandler.h"
 #include "api/ProfileHandler.h"
 #include "api/RoomHandler.h"
@@ -1276,4 +1277,18 @@ TEST(MessageShape, ReactionContentIsCheckedToo) {
         f, reaction_path(room, "r-ok"),
         json{{"m.relates_to",
               {{"rel_type", "m.annotation"}, {"event_id", target}, {"key", "+1"}}}})));
+}
+
+// Audit 2-2026-11-18 S2-3: the typed field readers the handlers use instead of
+// json::value(), which throws type_error on a field of another type.
+TEST(TypedFieldReaders, AWrongTypeReadsAsAbsentAndNeverThrows) {
+    const nlohmann::json body = {{"s", "text"}, {"n", 5}, {"b", true}, {"o", {{"k", 1}}}};
+    EXPECT_EQ(bsfchat::json_string_or(body, "s"), "text");
+    EXPECT_EQ(bsfchat::json_string_or(body, "n"), "");
+    EXPECT_EQ(bsfchat::json_string_or(body, "missing", "dflt"), "dflt");
+    EXPECT_EQ(bsfchat::json_string_or(nlohmann::json::array(), "s", "x"), "x");
+    EXPECT_TRUE(bsfchat::json_bool_or(body, "b", false));
+    EXPECT_FALSE(bsfchat::json_bool_or(body, "s", false));
+    EXPECT_TRUE(bsfchat::json_bool_or(body, "o", true));
+    EXPECT_TRUE(bsfchat::json_bool_or(nlohmann::json(3), "b", true));
 }

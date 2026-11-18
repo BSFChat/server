@@ -495,8 +495,8 @@ void PushHandler::handle_set_pusher(const httplib::Request& req, httplib::Respon
         return send_error(res, 400, MatrixError::bad_json("Request body must be an object"));
     }
 
-    const std::string pushkey = body.value("pushkey", "");
-    const std::string app_id = body.value("app_id", "");
+    const std::string pushkey = json_string_or(body, "pushkey");
+    const std::string app_id = json_string_or(body, "app_id");
     if (pushkey.empty() || app_id.empty()) {
         return send_error(res, 400,
             MatrixError::invalid_param("pushkey and app_id are required"));
@@ -514,7 +514,7 @@ void PushHandler::handle_set_pusher(const httplib::Request& req, httplib::Respon
         return;
     }
 
-    const std::string kind = body.value("kind", "");
+    const std::string kind = json_string_or(body, "kind");
     if (kind != "http") {
         // Only the HTTP gateway kind is implemented. Saying so beats silently
         // storing an "email" pusher that will never deliver anything.
@@ -524,7 +524,7 @@ void PushHandler::handle_set_pusher(const httplib::Request& req, httplib::Respon
 
     json data = json::object();
     if (auto it = body.find("data"); it != body.end() && it->is_object()) data = *it;
-    const std::string url = data.value("url", "");
+    const std::string url = json_string_or(data, "url");
     if (url.empty()) {
         return send_error(res, 400,
             MatrixError::invalid_param("data.url is required for kind \"http\""));
@@ -548,7 +548,7 @@ void PushHandler::handle_set_pusher(const httplib::Request& req, httplib::Respon
     // the only thing a client can turn into an honest greyed-out option. The
     // ceiling is re-applied at send time too (PushService), for pushers stored
     // before an operator lowered it.
-    const std::string format = data.value("format", "");
+    const std::string format = json_string_or(data, "format");
     if (!format.empty()) {
         const auto level = push_payload::level_for_format(format);
         const auto ceiling = config_.push.effective_max_payload();
@@ -571,10 +571,10 @@ void PushHandler::handle_set_pusher(const httplib::Request& req, httplib::Respon
     pusher.app_id = app_id;
     pusher.pushkey = pushkey;
     pusher.kind = kind;
-    pusher.app_display_name = body.value("app_display_name", "");
-    pusher.device_display_name = body.value("device_display_name", "");
-    pusher.profile_tag = body.value("profile_tag", "");
-    pusher.lang = body.value("lang", "");
+    pusher.app_display_name = json_string_or(body, "app_display_name");
+    pusher.device_display_name = json_string_or(body, "device_display_name");
+    pusher.profile_tag = json_string_or(body, "profile_tag");
+    pusher.lang = json_string_or(body, "lang");
     pusher.url = url;
     pusher.format = format;
     // url/format are promoted to columns; keep the rest of `data` verbatim so a
@@ -633,7 +633,7 @@ void PushHandler::handle_set_pusher(const httplib::Request& req, httplib::Respon
     // victim's notifications. Not fixable without breaking the recycled-token
     // case, which is the worse leak (the previous owner's messages would keep
     // arriving on someone else's phone). Logged so it is at least visible.
-    if (!body.value("append", false)) {
+    if (!json_bool_or(body, "append", false)) {
         int removed = store_.delete_pushers_by_pushkey_except(pushkey, app_id, *user_id);
         if (removed > 0) {
             get_logger()->info(
@@ -700,7 +700,7 @@ void PushHandler::handle_put_notify_level(const httplib::Request& req, httplib::
     } catch (...) {
         return send_error(res, 400, MatrixError::bad_json());
     }
-    const std::string level = body.value("level", "");
+    const std::string level = json_string_or(body, "level");
     if (!PushService::is_valid_level(level)) {
         return send_error(res, 400, MatrixError::invalid_param(
             "level must be one of \"all\", \"mentions\", \"none\""));

@@ -31,6 +31,7 @@
 #include <bsfchat/Constants.h>
 
 #include <filesystem>
+#include <nlohmann/json.hpp>
 
 namespace bsfchat {
 
@@ -125,14 +126,30 @@ void Server::register_routes() {
     svr.set_exception_handler([](const httplib::Request& req, httplib::Response& res,
                                  std::exception_ptr ep) {
         std::string what = "non-standard exception";
+        bool bad_input = false;
         try {
             if (ep) std::rethrow_exception(ep);
+        } catch (const nlohmann::json::type_error& e) {
+            what = e.what();
+            // Backstop for audit 2-2026-11-18 S2-3: a request-body field of the
+            // wrong type reaching value()/get<>() unchecked (302 "type must
+            // be", 304/305/306 "cannot use ... with"). That is the client's
+            // malformed JSON, not a server fault. 316 (invalid UTF-8 on dump)
+            // and the rest stay 500.
+            bad_input = e.id == 302 || e.id == 304 || e.id == 305 || e.id == 306;
         } catch (const std::exception& e) {
             what = e.what();
         } catch (...) {
         }
-        get_logger()->error("Unhandled exception in {} {}: {}", req.method,
-                            log_safe(req.matched_route.empty() ? req.path : req.matched_route, 200),
+        const auto route = log_safe(req.matched_route.empty() ? req.path : req.matched_route, 200);
+        if (bad_input) {
+            get_logger()->warn("Ill-typed request body in {} {}: {}", req.method, route,
+                               log_safe(what, 300));
+            res.status = 400;
+            res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
+            return;
+        }
+        get_logger()->error("Unhandled exception in {} {}: {}", req.method, route,
                             log_safe(what, 300));
         res.status = 500;
         res.set_content(MatrixError::unknown().to_json().dump(), "application/json");

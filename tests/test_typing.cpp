@@ -157,3 +157,31 @@ TEST_F(TypingTest, TypingIsRateLimitedPerAccount) {
     EXPECT_EQ(put("@alice:test", "alice-token"), 429);
     EXPECT_NE(put("@bob:test", "bob-token"), 429);
 }
+
+// Audit 2-2026-11-18 S2-3: `typing` of any type but boolean (and a non-number
+// `timeout`) used to throw out of json::value() as a 500. Now a 400.
+TEST_F(TypingTest, WrongTypedFieldsAreBadJsonNotAServerError) {
+    store->store_access_token("alice-token", "@alice:test", "DEV1");
+    const auto put = [&](const std::string& body) {
+        static const std::regex re(R"(/_matrix/client/v3/rooms/([^/]+)/typing/(.+))");
+        httplib::Request req;
+        req.path = "/_matrix/client/v3/rooms/" + room_id + "/typing/@alice:test";
+        req.body = body;
+        req.set_header("Authorization", "Bearer alice-token");
+        EXPECT_TRUE(std::regex_match(req.path, req.matches, re));
+        httplib::Response res;
+        EXPECT_NO_THROW(handler->handle_typing(req, res)) << body;
+        return res.status == -1 ? 200 : res.status;
+    };
+    EXPECT_EQ(put(R"({"typing": "yes"})"), 400);
+    EXPECT_EQ(put(R"({"typing": 1})"), 400);
+    EXPECT_EQ(put(R"({"typing": true, "timeout": "30000"})"), 400);
+    EXPECT_EQ(put(R"([true])"), 400);
+    EXPECT_TRUE(handler->get_typing_users(room_id).empty());
+
+    // Well-typed bodies still work, including an absurd timeout (clamped).
+    EXPECT_EQ(put(R"({"typing": true, "timeout": 1e300})"), 200);
+    EXPECT_EQ(handler->get_typing_users(room_id).size(), 1u);
+    EXPECT_EQ(put(R"({"typing": false})"), 200);
+    EXPECT_TRUE(handler->get_typing_users(room_id).empty());
+}

@@ -50,6 +50,26 @@ struct JsonTooDeep : std::invalid_argument {
 // false): returns a discarded value on malformed OR over-deep input.
 [[nodiscard]] nlohmann::json parse_request_json_or_discarded(std::string_view body);
 
+// ── Reading fields (audit 2-2026-11-18 S2-3) ──────────────────────────────
+// json::value(key, default) throws type_error when the field exists with a
+// different type (or `obj` is not an object), and an unchecked one on a request
+// body was a 500. These read a field of the wrong type as if it were absent:
+// for the call sites below every absent-field path is already a refusal or a
+// safe default. Server.cpp's exception handler maps any type_error a handler
+// still lets escape to 400 M_BAD_JSON as a backstop.
+[[nodiscard]] inline std::string json_string_or(const nlohmann::json& obj, const char* key,
+                                                std::string fallback = {}) {
+    if (!obj.is_object()) return fallback;
+    auto it = obj.find(key);
+    return it != obj.end() && it->is_string() ? it->get<std::string>() : fallback;
+}
+
+[[nodiscard]] inline bool json_bool_or(const nlohmann::json& obj, const char* key, bool fallback) {
+    if (!obj.is_object()) return fallback;
+    auto it = obj.find(key);
+    return it != obj.end() && it->is_boolean() ? it->get<bool>() : fallback;
+}
+
 // ── Serialising (finding S1) ──────────────────────────────────────────────
 // dump() with invalid UTF-8 replaced by U+FFFD instead of throwing
 // type_error.316. For responses that aggregate OTHER users' data — /sync above

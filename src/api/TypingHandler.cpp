@@ -92,6 +92,17 @@ void TypingHandler::handle_typing(const httplib::Request& req, httplib::Response
         return;
     }
 
+    // value() throws type_error on a non-object body or a field of the wrong
+    // type (audit 2-2026-11-18 S2-3: `{"typing": "yes"}` was a 500).
+    if (!body.is_object() ||
+        (body.contains("typing") && !body["typing"].is_boolean()) ||
+        (body.contains("timeout") && !body["timeout"].is_number())) {
+        res.status = 400;
+        res.set_content(MatrixError::bad_json(
+            "typing must be a boolean and timeout a number").to_json().dump(),
+            "application/json");
+        return;
+    }
     bool typing = body.value("typing", false);
 
     {
@@ -100,8 +111,12 @@ void TypingHandler::handle_typing(const httplib::Request& req, httplib::Response
         auto& entries = typing_[room_id];
 
         if (typing) {
-            int timeout_ms = body.value("timeout", kDefaultTypingTimeoutMs);
-            timeout_ms = std::min(timeout_ms, kMaxTypingTimeoutMs);
+            // Clamped as a double first: a huge or fractional number must not
+            // overflow the int conversion.
+            const double requested = body.value("timeout", double(kDefaultTypingTimeoutMs));
+            const int timeout_ms = requested > 0
+                ? int(std::min(requested, double(kMaxTypingTimeoutMs)))
+                : 0;
             auto expires = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
             // Update existing entry or add new one
