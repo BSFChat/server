@@ -56,8 +56,13 @@ max_workers = 512
 # only the server's own user can reach, and encrypt the disk underneath it if
 # the host is not yours alone.
 #
-# Three things the server does on its own, with no setting to turn them on:
+# Four things the server does on its own, with no setting to turn them on:
 #
+#   * It holds an advisory lock on "<path>.lock" while it runs and refuses to
+#     start if another process has it: two servers on one database (easy with
+#     SO_REUSEPORT) hand out the same event stream positions. The kernel drops
+#     the lock when the process exits, so there is nothing to clean up after a
+#     crash. The admin CLI refuses to run while the lock is held.
 #   * On every start it strips group and other access from this file and its
 #     -wal/-shm siblings. Nothing used to set a mode at all, so the database
 #     was created at the process umask (0644) and readable by every local

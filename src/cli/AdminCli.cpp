@@ -2,6 +2,7 @@
 
 #include "auth/RoleBootstrap.h"
 #include "core/Config.h"
+#include "core/DatabaseLock.h"
 #include "core/Logger.h"
 #include "store/SqliteStore.h"
 
@@ -106,6 +107,14 @@ bool load_config(const std::string& path, Config& config, std::ostream& out) {
 // written behind: it is a stream-position collision, not a lock contention
 // problem, so SQLite will happily let this succeed and break the server later.
 bool refuse_if_running(const Config& config, const ListenProbe& probe, std::ostream& out) {
+    // The server's own database lock first (core/DatabaseLock.h): it holds
+    // whatever namespace or port the server is in, which the probe cannot see.
+    if (DatabaseLock::held_elsewhere(config.database_path)) {
+        out << "error: a running server holds " << DatabaseLock::lock_path_for(config.database_path)
+            << ".\n       Stop it first. Writing behind a live server makes the two processes\n"
+               "       hand out the same event stream positions.\n";
+        return true;
+    }
     if (!probe(config.bind_address, config.port)) return false;
     out << "error: something is listening on " << config.bind_address << ":" << config.port
         << ", which means the server is probably still running.\n"

@@ -105,6 +105,7 @@ target_sources(server_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/src/core/Logger.cpp
     ${CMAKE_SOURCE_DIR}/src/core/InstanceSecret.cpp
     ${CMAKE_SOURCE_DIR}/src/core/Config.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/DatabaseLock.cpp
     ${CMAKE_SOURCE_DIR}/src/core/RateLimiter.cpp
     ${CMAKE_SOURCE_DIR}/src/core/SendLimiter.cpp
     ${CMAKE_SOURCE_DIR}/src/core/Utf8.cpp

@@ -22,6 +22,7 @@ add_executable(bsfchat-server
     src/cli/AdminCli.cpp
     src/core/Server.cpp
     src/core/Config.cpp
+    src/core/DatabaseLock.cpp
     src/core/FirstRun.cpp
     src/core/Logger.cpp
     src/core/InstanceSecret.cpp

@@ -43,6 +43,10 @@ Server::Server(Config config)
     if (!db_dir.empty()) std::filesystem::create_directories(db_dir);
     std::filesystem::create_directories(config_.media_path);
 
+    // Refuse to start beside another server on this database, before opening
+    // it at all: even initialize() writes (migrations).
+    db_lock_ = DatabaseLock::acquire(config_.database_path);
+
     store_ = std::make_unique<SqliteStore>(config_.database_path);
     store_->initialize();
 

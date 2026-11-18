@@ -2,6 +2,7 @@
 
 #include "auth/OidcAuth.h"
 #include "core/Config.h"
+#include "core/DatabaseLock.h"
 #include "http/HttpServer.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
@@ -31,6 +32,9 @@ private:
     void register_routes();
 
     Config config_;
+    // Declared before store_ so it is released after the store closes. See
+    // core/DatabaseLock.h (audit 2-2026-11-18 S2-10).
+    std::unique_ptr<DatabaseLock> db_lock_;
     std::unique_ptr<SqliteStore> store_;
     std::unique_ptr<SyncEngine> sync_engine_;
     // Owns the out-of-band push delivery worker; started/stopped with the

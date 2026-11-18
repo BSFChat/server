@@ -267,3 +267,43 @@ TEST(DeleteRoomDepartures, DeletingAChannelEndsItsCallFirst) {
                                            f.store->get_current_stream_position()).size(),
               1u);
 }
+
+// ── S2-10: one server process per database ─────────────────────────────────
+
+#include "core/DatabaseLock.h"
+
+#include <filesystem>
+#include <unistd.h>
+
+TEST(DatabaseLockTest, ASecondHolderIsRefusedUntilTheFirstLetsGo) {
+    const auto db = (std::filesystem::temp_directory_path() /
+                     ("bsfchat-dblock-" + std::to_string(::getpid()) + ".db"))
+                        .string();
+    std::filesystem::remove(DatabaseLock::lock_path_for(db));
+
+    EXPECT_FALSE(DatabaseLock::held_elsewhere(db));
+    auto first = DatabaseLock::acquire(db);
+    ASSERT_TRUE(first);
+    EXPECT_TRUE(DatabaseLock::held_elsewhere(db));
+
+    try {
+        auto second = DatabaseLock::acquire(db);
+        FAIL() << "a second server was allowed onto the same database";
+    } catch (const std::runtime_error& e) {
+        EXPECT_NE(std::string(e.what()).find("already using"), std::string::npos) << e.what();
+        EXPECT_NE(std::string(e.what()).find(std::to_string(::getpid())), std::string::npos)
+            << "the message should name the holder's pid: " << e.what();
+    }
+    // The probe did not steal it.
+    EXPECT_TRUE(DatabaseLock::held_elsewhere(db));
+
+    first.reset();
+    EXPECT_FALSE(DatabaseLock::held_elsewhere(db));
+    EXPECT_TRUE(DatabaseLock::acquire(db));
+    std::filesystem::remove(DatabaseLock::lock_path_for(db));
+}
+
+TEST(DatabaseLockTest, AnInMemoryDatabaseNeedsNoLock) {
+    EXPECT_EQ(DatabaseLock::acquire(":memory:"), nullptr);
+    EXPECT_FALSE(DatabaseLock::held_elsewhere(":memory:"));
+}
