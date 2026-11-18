@@ -2943,7 +2943,16 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
             return;
         }
         ChannelPermissionOverride before;
-        if (existing) from_json(existing->content.data, before);
+        // Stored by an older build that did not shape-check it, perhaps; an
+        // unreadable override is treated as absent rather than thrown out of
+        // the handler (audit 2-2026-11-18 I2-4).
+        if (existing) {
+            try {
+                from_json(existing->content.data, before);
+            } catch (const std::exception&) {
+                before = ChannelPermissionOverride{};
+            }
+        }
         ChannelPermissionOverride proposed;
         from_json(content, proposed);
 
