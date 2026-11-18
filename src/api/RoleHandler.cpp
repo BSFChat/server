@@ -1,4 +1,5 @@
 #include "api/RoleHandler.h"
+#include "api/VoiceHandler.h"
 #include "api/PermissionInput.h"
 
 #include "auth/Permissions.h"
@@ -282,6 +283,11 @@ RoleHandler::Commit RoleHandler::commit_roles(const std::string& actor,
     if (!applied) return Commit::Conflict;
 
     sync_engine_.notify_new_event();
+    // A definition edit can take VIEW_CHANNEL away from whoever holds the role;
+    // their calls in channels they can no longer see end now rather than at
+    // the reaper (audit 2-2026-11-18 V2-7).
+    retract_calls_after_role_write(store_, sync_engine_, config_,
+                                   std::string(event_type::kServerRoles), std::string());
     return Commit::Ok;
 }
 
@@ -552,6 +558,8 @@ void RoleHandler::handle_delete_role(const httplib::Request& req, httplib::Respo
     }
     if (stripped > 0) {
         sync_engine_.notify_new_event();
+        retract_calls_after_role_write(store_, sync_engine_, config_,
+                                       std::string(event_type::kServerRoles), std::string());
         get_logger()->info("Role {} deleted by {}; stripped from {} member(s)", role_id, *actor,
                            stripped);
     }
@@ -649,6 +657,10 @@ void RoleHandler::change_self_role(const httplib::Request& req, httplib::Respons
         if (write_server_scoped_state(store_, config_, std::string(event_type::kMemberRoles),
                                       *actor, j.dump(), mirror_room(), *actor, &doc.raw)) {
             sync_engine_.notify_new_event();
+            if (!add) {
+                retract_calls_after_role_write(store_, sync_engine_, config_,
+                                               std::string(event_type::kMemberRoles), *actor);
+            }
             send_json(res, json{{"role_ids", ids}});
             return;
         }

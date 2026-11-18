@@ -17,6 +17,8 @@ SendLimiter::SendLimiter(const SendLimitsConfig& config, LimiterClock clock)
     , account_data_(config.account_data_limit, std::chrono::seconds(config.window_seconds),
                     clock)
     , voice_(config.voice_limit, std::chrono::seconds(config.window_seconds), clock)
+    , voice_state_(config.voice_state_limit, std::chrono::seconds(config.window_seconds),
+                   clock)
     , typing_(config.typing_limit, std::chrono::seconds(config.window_seconds), clock) {}
 
 int64_t SendLimiter::acquire(Bucket bucket, const std::string& identity) {
@@ -30,6 +32,7 @@ int64_t SendLimiter::acquire(Bucket bucket, const std::string& identity) {
         case Bucket::kReport:      return report_.acquire(identity);
         case Bucket::kAccountData: return account_data_.acquire(identity);
         case Bucket::kVoice:       return voice_.acquire(identity);
+        case Bucket::kVoiceState:  return voice_state_.acquire(identity);
         case Bucket::kTyping:      return typing_.acquire(identity);
     }
     return 0;
@@ -57,6 +60,8 @@ const char* SendLimiter::message_for(Bucket bucket) {
             return "Too many settings changes in a row. Try again shortly.";
         case Bucket::kVoice:
             return "Too many voice changes in a row. Try again shortly.";
+        case Bucket::kVoiceState:
+            return "Too many mute or sharing changes in a row. Try again shortly.";
         case Bucket::kTyping:
             return "Too many typing updates. Try again shortly.";
     }

@@ -2,7 +2,10 @@
 
 #include "core/SendLimiter.h"
 
+#include <bsfchat/MatrixTypes.h>
+
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <condition_variable>
@@ -12,12 +15,61 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace bsfchat {
 
 class SqliteStore;
 class SyncEngine;
 struct Config;
+
+// m.room.voice content parsed without throwing. The content is whatever a
+// MANAGE_CHANNELS holder PUT; a marker that will not parse reads as disabled.
+VoiceChannelContent read_voice_channel(const nlohmann::json& content);
+
+// The participant cap voice/join enforces for a channel: the channel's own
+// max_participants when it sets one (> 0), otherwise the server default
+// voice.default_max_participants (0 there = unlimited). Returns 0 for
+// unlimited.
+int effective_voice_cap(const VoiceChannelContent& channel, const Config& config);
+
+// Process-wide lock over every check-then-emit on m.call.member rows: voice
+// join/leave/state, the reaper, and the server-side retractions below. One
+// mutex rather than one per VoiceHandler so RoomHandler and RoleHandler can
+// retract a row without racing a join that is re-activating it.
+std::mutex& voice_roster_mutex();
+
+// Writes active=false over `user_id`'s m.call.member row in `room_id` if it is
+// active, waking /sync. The server-side half of "kicked or banned users stay in
+// the call" (audit 2-2026-11-18 V2-7): called when the user leaves, is kicked
+// or banned, loses VIEW_CHANNEL on the channel, or the channel is deleted.
+// Returns true when it wrote a retraction. Takes voice_roster_mutex(); must not
+// be called with it held.
+bool retract_call_member(SqliteStore& store, SyncEngine& sync_engine,
+                         const std::string& server_name, const std::string& room_id,
+                         const std::string& user_id, const char* why);
+
+// Every user with an ACTIVE m.call.member row in `room_id`.
+std::vector<std::string> active_call_members(SqliteStore& store, const std::string& room_id);
+
+// Retracts every active call member of `room_id` who no longer holds
+// VIEW_CHANNEL there. For writes that change who may see one channel (its
+// bsfchat.channel.permissions). Returns how many rows it retracted.
+size_t retract_call_members_without_view(SqliteStore& store, SyncEngine& sync_engine,
+                                         const Config& config, const std::string& room_id);
+
+// Retracts `user_id`'s active call rows in every room they are joined to where
+// they no longer hold VIEW_CHANNEL. For writes that change one user's roles.
+size_t retract_user_calls_without_view(SqliteStore& store, SyncEngine& sync_engine,
+                                       const Config& config, const std::string& user_id);
+
+// After a server-scoped role write: a bsfchat.member.roles write for one user
+// re-checks that user's calls; a bsfchat.server.roles write re-checks every
+// active call on the server (the same walk the reaper makes every 10 s). Any
+// other type is a no-op.
+size_t retract_calls_after_role_write(SqliteStore& store, SyncEngine& sync_engine,
+                                      const Config& config, const std::string& event_type,
+                                      const std::string& state_key);
 
 class VoiceHandler {
 public:
@@ -182,7 +234,8 @@ private:
     SqliteStore& store_;
     SyncEngine& sync_engine_;
     const Config& config_;
-    // Bucket::kVoice, shared by join and state (audit 2026-11-15 S-8).
+    // Bucket::kVoice for join, Bucket::kVoiceState for state (audit 2026-11-15
+    // S-8; split by audit 2-2026-11-18 V2-2).
     SendLimiter limits_;
 
     // Serializes check-then-emit sections across HTTP worker threads and the
@@ -193,7 +246,10 @@ private:
     //
     // Lock order where both are held: voice_state_mutex_ then
     // heartbeat_mutex_. Never the other way round.
-    std::mutex voice_state_mutex_;
+    //
+    // A reference to the process-wide voice_roster_mutex(), so the
+    // retractions other handlers write serialise with these sections too.
+    std::mutex& voice_state_mutex_ = voice_roster_mutex();
 
     // (room_id, user_id) -> last heartbeat. Guarded by heartbeat_mutex_.
     std::mutex heartbeat_mutex_;

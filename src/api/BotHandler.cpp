@@ -1,4 +1,5 @@
 #include "api/BotHandler.h"
+#include "api/VoiceHandler.h"
 #include "api/InputLimits.h"
 
 #include "audit/AuditLog.h"
@@ -164,9 +165,9 @@ void BotHandler::handle_create_bot(const httplib::Request& req, httplib::Respons
     }
     if (!body.is_object()) return send_error(res, 400, MatrixError::bad_json());
 
-    const std::string localpart = body.value("localpart", "");
-    const std::string display_name = body.value("display_name", "");
-    const std::string description = body.value("description", "");
+    const std::string localpart = json_string_or(body, "localpart");
+    const std::string display_name = json_string_or(body, "display_name");
+    const std::string description = json_string_or(body, "description");
 
     if (!valid_bot_localpart(localpart)) {
         return send_error(res, 400, MatrixError::invalid_username(
@@ -443,6 +444,8 @@ void BotHandler::handle_deactivate_bot(const httplib::Request& req, httplib::Res
         store_.insert_event(generate_event_id(config_.server_name), room_id, user_id,
                             std::string(event_type::kRoomMember), user_id,
                             json{{"membership", membership::kLeave}}.dump(), now_ms());
+        retract_call_member(store_, sync_engine_, config_.server_name, room_id, user_id,
+                            "bot deactivated");
         ++left;
     }
     if (left > 0) sync_engine_.notify_new_event();

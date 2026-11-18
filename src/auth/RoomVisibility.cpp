@@ -1,4 +1,5 @@
 #include "auth/RoomVisibility.h"
+#include "http/JsonIo.h"
 
 #include "auth/Permissions.h"
 #include "store/SqliteStore.h"
@@ -17,7 +18,8 @@ namespace bsfchat {
 bool is_category_room(SqliteStore& store, const std::string& room_id) {
     auto ev = store.get_state_event(room_id, std::string(event_type::kRoomType), "");
     if (!ev) return false;
-    return ev->content.data.value("type", "") == room_type::kCategory;
+    // Typed read: the content is whatever a MANAGE_CHANNELS holder PUT.
+    return json_string_or(ev->content.data, "type") == room_type::kCategory;
 }
 
 bool can_view_room(SqliteStore& store, PermissionsEngine& perms,

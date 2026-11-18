@@ -1,4 +1,5 @@
 #include "api/RoomHandler.h"
+#include "api/VoiceHandler.h"
 #include "api/InputLimits.h"
 #include "api/PermissionInput.h"
 #include "api/ChannelAccessRefusal.h"
@@ -596,6 +597,42 @@ std::optional<MatrixError> read_reason(const json& body, std::string& out) {
     return oversize_field("reason", out, input_limits::kMaxReasonBytes);
 }
 
+// The parent rules handle_move_channel applies, for the other two doors that
+// file a channel under a category: PUT bsfchat.room.category (audit
+// 2-2026-11-18 S2-6). Returns {status, error} to refuse with, or nullopt.
+std::optional<std::pair<int, MatrixError>> category_parent_refusal(
+    SqliteStore& store, PermissionsEngine& perms, const std::string& user_id, const std::string& room_id,
+    const json& content) {
+    if (!content.is_object()) {
+        return std::pair{400, MatrixError::bad_json("Request body must be a JSON object")};
+    }
+    std::string parent_id;
+    if (auto it = content.find("parent_id"); it != content.end() && !it->is_null()) {
+        if (!it->is_string()) {
+            return std::pair{400, MatrixError::bad_json("parent_id must be a room id string")};
+        }
+        parent_id = it->get<std::string>();
+    }
+    if (auto it = content.find("order"); it != content.end() && !it->is_number_integer()) {
+        return std::pair{400, MatrixError::bad_json("order must be an integer")};
+    }
+    if (parent_id.empty()) return std::nullopt;  // top level: no parent to check
+    if (parent_id == room_id) {
+        return std::pair{400, MatrixError::bad_json("A channel cannot be its own category")};
+    }
+    // The same three checks, in the same order, as handle_move_channel.
+    if (!store.room_exists(parent_id)) {
+        return std::pair{404, MatrixError::not_found("Parent room not found")};
+    }
+    if (!is_category_room(store, parent_id)) {
+        return std::pair{400, MatrixError::bad_json("Parent room is not a category")};
+    }
+    if (!perms.can(user_id, parent_id, permission::kViewChannel)) {
+        return std::pair{403, no_channel_access(store, user_id)};
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 RoomHandler::RoomHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config)
@@ -614,6 +651,21 @@ std::string RoomHandler::emit_state_event(const std::string& room_id, const std:
     insert_event_vetted(store_, config_, event_id, room_id, sender, event_type, state_key,
                         content.dump(), now_ms());
     sync_engine_.notify_new_event();
+    // The server half of ending a call on removal (audit 2-2026-11-18 V2-7):
+    // a leave, kick or ban retracts the user's m.call.member row here, the one
+    // place every membership event this handler writes passes through; a
+    // channel-override write retracts whoever it took VIEW_CHANNEL from.
+    // Neither needed the client to cooperate before the reaper's 30-40 s.
+    // (`event_type` is the parameter here, hence the qualified constants.)
+    if (event_type == ::bsfchat::event_type::kRoomMember && !state_key.empty()) {
+        const auto m = json_string_or(content, "membership");
+        if (m == membership::kLeave || m == membership::kBan) {
+            retract_call_member(store_, sync_engine_, config_.server_name, room_id, state_key,
+                                m == membership::kBan ? "banned" : "left or was removed");
+        }
+    } else if (event_type == ::bsfchat::event_type::kChannelPermissions) {
+        retract_call_members_without_view(store_, sync_engine_, config_, room_id);
+    }
     return event_id;
 }
 
@@ -995,6 +1047,21 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
         if (!store_.room_exists(*parent_id)) {
             res.status = 400;
             res.set_content(MatrixError::bad_json("Parent room does not exist").to_json().dump(),
+                            "application/json");
+            return;
+        }
+        // And the rest of move_channel's parent rules (audit 2-2026-11-18
+        // S2-6): a parent must be a category the creator can open.
+        PermissionsEngine parent_perms(store_, config_);
+        if (!is_category_room(store_, *parent_id)) {
+            res.status = 400;
+            res.set_content(MatrixError::bad_json("Parent room is not a category").to_json().dump(),
+                            "application/json");
+            return;
+        }
+        if (!parent_perms.can(*user_id, *parent_id, permission::kViewChannel)) {
+            res.status = 403;
+            res.set_content(no_channel_access(store_, *user_id).to_json().dump(),
                             "application/json");
             return;
         }
@@ -1412,7 +1479,27 @@ void RoomHandler::handle_delete_room(const httplib::Request& req, httplib::Respo
     // there would delete itself along with the thing it documents.
     audit_room_deletion(store_, *user_id, room_id);
 
-    store_.delete_room(room_id);
+    // A 'deleted' departure names the room id to whoever reads it, so it goes
+    // only to the members who could see the room in their sidebar before it
+    // went (audit 2-2026-11-18 S2-5): deleting a private channel used to
+    // announce its id to every account force-joined into it. Evaluated before
+    // the transaction because nothing about the room survives it. Same rule
+    // /sync lists a room by, so exactly the devices that show it drop it.
+    std::vector<std::string> viewers;
+    for (const auto& [member, membership_value] : store_.get_room_members(room_id)) {
+        if (membership_value != membership::kJoin) continue;
+        if (can_view_room(store_, perms, member, room_id)) viewers.push_back(member);
+    }
+
+    // End any call in it first. The rows are deleted with the room a moment
+    // later; the retraction is for a long poll that reads in between, and the
+    // departure above is what every viewer's client acts on after.
+    for (const auto& caller : active_call_members(store_, room_id)) {
+        retract_call_member(store_, sync_engine_, config_.server_name, room_id, caller,
+                            "channel deleted");
+    }
+
+    store_.delete_room(room_id, &viewers);
     // delete_room recorded a 'deleted' departure for every joined member, at a
     // freshly claimed stream position; publishing that head wakes their long
     // polls, and each comes back with the room in rooms.leave (audit R-1).
@@ -2652,6 +2739,19 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         return;
     }
 
+    // ── bsfchat.room.category: the move_channel parent rules ─────────────
+    //
+    // POST /rooms/{id}/category refuses a parent that is not a category and
+    // one the caller cannot open; this route wrote the same state event with
+    // neither check, which made the rule optional (audit 2-2026-11-18 S2-6).
+    if (evt_type == std::string(event_type::kRoomCategory)) {
+        if (auto refusal = category_parent_refusal(store_, perms, *user_id, room_id, content)) {
+            res.status = refusal->first;
+            res.set_content(refusal->second.to_json().dump(), "application/json");
+            return;
+        }
+    }
+
     // ── bsfchat.room.type: the conversion gate ────────────────────────────
     //
     // Retyping an existing channel as a category used to be a silent,
@@ -2668,8 +2768,8 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
     std::string previous_room_type;
     if (is_room_type_change) {
         auto existing = store_.get_state_event(room_id, evt_type, state_key);
-        previous_room_type = existing ? existing->content.data.value("type", "") : "";
-        const std::string new_room_type = content.value("type", "");
+        previous_room_type = existing ? json_string_or(existing->content.data, "type") : "";
+        const std::string new_room_type = json_string_or(content, "type");
 
         // You may not restructure a channel you are not allowed to open. A
         // server-wide MANAGE_CHANNELS holder is a builder, not an
@@ -2781,6 +2881,9 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         write_server_scoped_state(store_, config_, evt_type, state_key, content.dump(),
                                   room_id, *user_id);
         sync_engine_.notify_new_event();
+        // Whoever this took VIEW_CHANNEL from leaves the calls they can no
+        // longer see (audit 2-2026-11-18 V2-7).
+        retract_calls_after_role_write(store_, sync_engine_, config_, evt_type, state_key);
         auto mirrored = store_.get_state_event(room_id, evt_type, state_key);
         res.set_content(
             json{{"event_id", mirrored ? mirrored->event_id : std::string()}}.dump(),
@@ -2943,6 +3046,12 @@ void RoomHandler::handle_move_channel(const httplib::Request& req, httplib::Resp
         return;
     }
 
+    if (!body["parent_id"].is_string()) {
+        res.status = 400;
+        res.set_content(MatrixError::bad_json("parent_id must be a room id string or null")
+                            .to_json().dump(), "application/json");
+        return;
+    }
     auto parent_id = body["parent_id"].get<std::string>();
 
     // Validate parent room exists
@@ -2972,7 +3081,9 @@ void RoomHandler::handle_move_channel(const httplib::Request& req, httplib::Resp
     int order = 0;
     auto existing = store_.get_state_event(room_id, std::string(event_type::kRoomCategory), "");
     if (existing) {
-        order = existing->content.data.value("order", 0);
+        // Stored content is whatever a MANAGE_CHANNELS holder PUT; read it typed.
+        const auto it = existing->content.data.find("order");
+        if (it != existing->content.data.end() && it->is_number_integer()) order = it->get<int>();
     }
 
     emit_state_event(room_id, *user_id, std::string(event_type::kRoomCategory), "",
@@ -3045,7 +3156,7 @@ void RoomHandler::handle_set_order(const httplib::Request& req, httplib::Respons
     auto existing = store_.get_state_event(room_id, std::string(event_type::kRoomCategory), "");
     std::string parent_id;
     if (existing) {
-        parent_id = existing->content.data.value("parent_id", "");
+        parent_id = json_string_or(existing->content.data, "parent_id");
     }
 
     emit_state_event(room_id, *user_id, std::string(event_type::kRoomCategory), "",

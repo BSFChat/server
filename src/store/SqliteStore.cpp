@@ -1264,7 +1264,8 @@ std::optional<std::string> SqliteStore::find_direct_room(const std::string& user
     return std::string(reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0)));
 }
 
-void SqliteStore::delete_room(const std::string& room_id) {
+void SqliteStore::delete_room(const std::string& room_id,
+                              const std::vector<std::string>* departures_for) {
     std::lock_guard lock(mutex_);
     VisibilityBump bump{visibility_generation_};
     // foreign_keys=ON means rooms can't be deleted while events or members
@@ -1321,11 +1322,15 @@ void SqliteStore::delete_room(const std::string& room_id) {
         // caller wakes the long polls once it has committed.
         {
             std::vector<std::string> joined;
+            std::unordered_set<std::string> allowed;
+            if (departures_for) allowed.insert(departures_for->begin(), departures_for->end());
             auto sel = prepare(db_,
                 "SELECT user_id FROM room_members WHERE room_id = ? AND membership = 'join'");
             sqlite3_bind_text(sel.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
             while (sqlite3_step(sel.get()) == SQLITE_ROW) {
-                joined.push_back(column_text_or_empty(sel.get(), 0));
+                auto uid = column_text_or_empty(sel.get(), 0);
+                if (departures_for && !allowed.count(uid)) continue;
+                joined.push_back(std::move(uid));
             }
             if (!joined.empty()) {
                 const int64_t pos = claim_stream_position_locked();

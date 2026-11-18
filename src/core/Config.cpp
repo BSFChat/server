@@ -196,6 +196,8 @@ Config Config::load(const std::string& path) {
                 sl.account_data_limit = v->value_or(sl.account_data_limit);
             if (auto v = limits_tbl->get("voice_limit"))
                 sl.voice_limit = v->value_or(sl.voice_limit);
+            if (auto v = limits_tbl->get("voice_state_limit"))
+                sl.voice_state_limit = v->value_or(sl.voice_state_limit);
             if (auto v = limits_tbl->get("typing_limit"))
                 sl.typing_limit = v->value_or(sl.typing_limit);
             if (auto v = limits_tbl->get("window_seconds"))
@@ -255,6 +257,11 @@ Config Config::load(const std::string& path) {
             if (auto v = voice->get("turn_password")) cfg.voice.turn_password = v->value_or(cfg.voice.turn_password);
             if (auto v = voice->get("turn_secret")) cfg.voice.turn_secret = v->value_or(cfg.voice.turn_secret);
             if (auto v = voice->get("turn_ttl")) cfg.voice.turn_ttl = v->value_or(cfg.voice.turn_ttl);
+            if (auto v = voice->get("default_max_participants")) {
+                cfg.voice.default_max_participants = static_cast<int>(std::clamp<int64_t>(
+                    v->value_or(int64_t(cfg.voice.default_max_participants)), 0,
+                    limits::kMaxVoiceParticipants));
+            }
             if (auto v = voice->get("stun_uri")) cfg.voice.stun_uri = v->value_or(cfg.voice.stun_uri);
             if (auto v = voice->get("allow_peer_to_peer")) cfg.voice.allow_peer_to_peer = v->value_or(cfg.voice.allow_peer_to_peer);
 

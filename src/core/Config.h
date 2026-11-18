@@ -146,7 +146,14 @@ struct VoiceConfig {
     // When set, /voip/turnServer returns time-limited ephemeral credentials
     // instead of the static turn_username/turn_password.
     std::string turn_secret;
-    int64_t turn_ttl = 3600; // Ephemeral credential lifetime, seconds
+    // Ephemeral credential lifetime, seconds. A day since audit 2-2026-11-18
+    // (V2-6): a peer connection keeps the credential it was opened with, and
+    // with an hour every relayed call dropped about hourly.
+    int64_t turn_ttl = 86400;
+    // Participant cap voice/join applies to a channel whose m.room.voice sets
+    // no max_participants (or 0). 0 here means unlimited. A full mesh gives
+    // out at about 6-8 cameras (audit 2-2026-11-18 V2-7).
+    int default_max_participants = 10;
     std::string stun_uri; // No default — admin should configure their own STUN/TURN
     // Was `false` ("TURN-only for IP privacy") while turn_uris/stun_uri
     // defaulted to EMPTY and voice.enabled defaulted true — relay-only with
@@ -375,12 +382,15 @@ struct SendLimitsConfig {
     // somebody sends one of these; a client syncing settings sends a handful.
     int account_data_limit = 60;
 
-    // Voice join + voice state (POST voice/join, PUT voice/state), together,
-    // and typing notifications (PUT typing). Each emits a state or ephemeral
-    // write and wakes every parked /sync in the room (audit 2026-11-15 S-8).
-    // The voice heartbeat is the members poll, not these, so a call costs a
-    // join and a handful of mute toggles.
-    int voice_limit = 60;
+    // Voice join (POST voice/join), voice state (PUT voice/state, its own
+    // budget) and typing notifications (PUT typing). Each emits a state or
+    // ephemeral write and wakes every parked /sync in the room (audit
+    // 2026-11-15 S-8). The voice heartbeat is the members poll, not these.
+    // State has its own, larger budget since audit 2-2026-11-18 V2-2:
+    // push-to-talk sends a state PUT per press, and those must not spend the
+    // joins a reconnecting client needs.
+    int voice_limit = 120;
+    int voice_state_limit = 240;
     int typing_limit = 120;
 
     int window_seconds = 60;

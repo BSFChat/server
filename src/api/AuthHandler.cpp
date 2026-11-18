@@ -1,4 +1,5 @@
 #include "api/AuthHandler.h"
+#include "api/VoiceHandler.h"
 #include "audit/AuditLog.h"
 #include "auth/AutoJoin.h"
 #include "auth/LocalAuth.h"
@@ -984,13 +985,13 @@ void AuthHandler::handle_password_change(const httplib::Request& req, httplib::R
     }
 
     const auto& auth = body["auth"];
-    if (auth.value("type", "") != "m.login.password") {
+    if (json_string_or(auth, "type") != "m.login.password") {
         return send_error(res, 400, MatrixError::unknown("Unsupported auth type"));
     }
     // If the client names a user, it must be the authenticated one — a token
     // must never be usable to re-authenticate as somebody else.
     if (auth.contains("identifier") && auth["identifier"].is_object()) {
-        auto named = auth["identifier"].value("user", "");
+        auto named = json_string_or(auth["identifier"], "user");
         if (!named.empty()) {
             if (named[0] != '@') named = "@" + named + ":" + config_.server_name;
             if (named != *user_id) {
@@ -999,7 +1000,7 @@ void AuthHandler::handle_password_change(const httplib::Request& req, httplib::R
             }
         }
     }
-    const std::string current_password = auth.value("password", "");
+    const std::string current_password = json_string_or(auth, "password");
 
     std::string new_password;
     if (body.contains("new_password") && body["new_password"].is_string()) {
@@ -1087,7 +1088,7 @@ void AuthHandler::handle_password_change(const httplib::Request& req, httplib::R
     // leaving the leaked token alive defeats the exercise. The session that
     // just re-authenticated is kept so the user isn't kicked out of the client
     // they made the change from.
-    const bool logout_devices = body.value("logout_devices", true);
+    const bool logout_devices = json_bool_or(body, "logout_devices", true);
     int revoked = 0;
     if (logout_devices) {
         revoked = store_.delete_other_tokens_for_user(*user_id, *token);
@@ -1349,7 +1350,7 @@ void AuthHandler::handle_link_identity(const httplib::Request& req, httplib::Res
     // `type` is required and must be m.login.token, mirroring /login's body.
     // Accepting a bare token would leave no room to add a second proof shape
     // later without guessing what an old client meant.
-    if (!body.is_object() || body.value("type", "") != "m.login.token" ||
+    if (!body.is_object() || json_string_or(body, "type") != "m.login.token" ||
         !body.contains("token") || !body["token"].is_string()) {
         send_error(res, 400, MatrixError::bad_json(
             "Expected {\"type\": \"m.login.token\", \"token\": \"<id_token>\"}"));
@@ -1729,7 +1730,7 @@ void AuthHandler::handle_deactivate_account(const httplib::Request& req,
         }
 
         const auto& auth = body["auth"];
-        if (auth.value("type", "") != "m.login.password") {
+        if (json_string_or(auth, "type") != "m.login.password") {
             return send_error(res, 400, MatrixError::unknown("Unsupported auth type"));
         }
         // A named identifier must be the authenticated account. A token must
@@ -1737,7 +1738,7 @@ void AuthHandler::handle_deactivate_account(const httplib::Request& req,
         // handle_password_change carries, and here the consequence of missing
         // it would be deleting an account you are not signed in as.
         if (auth.contains("identifier") && auth["identifier"].is_object()) {
-            auto named = auth["identifier"].value("user", "");
+            auto named = json_string_or(auth["identifier"], "user");
             if (!named.empty()) {
                 if (named[0] != '@') named = "@" + named + ":" + config_.server_name;
                 if (named != *user_id) {
@@ -1750,7 +1751,7 @@ void AuthHandler::handle_deactivate_account(const httplib::Request& req,
         const auto user_key = user_failure_key(*user_id);
         if (locked_out(client, user_key, res)) return;
 
-        if (!verify_password(auth.value("password", ""), *stored)) {
+        if (!verify_password(json_string_or(auth, "password"), *stored)) {
             // Counted against the SAME failure trackers a wrong password at
             // /login is counted against. A separate counter here would be a
             // second, unlimited place to guess the same password from — the
@@ -1784,6 +1785,8 @@ void AuthHandler::handle_deactivate_account(const httplib::Request& req,
         store_.insert_event(generate_event_id(config_.server_name), room_id, *user_id,
                             std::string(event_type::kRoomMember), *user_id,
                             json{{"membership", membership::kLeave}}.dump(), now_ms());
+        retract_call_member(store_, sync_engine_, config_.server_name, room_id, *user_id,
+                            "account deleted");
     }
     if (!rooms.empty()) sync_engine_.notify_new_event();
 

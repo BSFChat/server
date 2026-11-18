@@ -692,3 +692,84 @@ TEST(RestructureNeedsView, AVisibleChannelAndAnAdministratorAreUnaffected) {
                           kRoomsPrefix + h.channel, "token-admin")));
     EXPECT_FALSE(h.f.store->room_exists(h.channel));
 }
+
+// ── Audit 2-2026-11-18 S2-6: the other two doors into a category ────────────
+//
+// handle_move_channel refuses a parent that is not a category and one the
+// caller cannot open. PUT bsfchat.room.category and createRoom's parent_id
+// wrote the same filing with neither check.
+
+TEST(RestructureNeedsView, PuttingTheCategoryStateObeysTheMoveChannelRules) {
+    HiddenChannel h("s2-6-state");
+    auto open = h.f.add_room(h.admin, "general", "text");
+    auto other_text = h.f.add_room(h.admin, "random", "text");
+    h.f.join(open, h.mallory);
+    h.f.join(other_text, h.mallory);
+    RoomHandler handler(*h.f.store, *h.f.sync, h.f.config);
+    const auto path = state_event_path(open, event_type::kRoomCategory);
+
+    // A parent that is not a category.
+    auto not_category = call(handler, &RoomHandler::handle_set_state, path, "token-mallory",
+                             json{{"parent_id", other_text}, {"order", 0}}.dump());
+    EXPECT_EQ(not_category.status, 400) << not_category.body;
+    // A parent that does not exist.
+    auto missing = call(handler, &RoomHandler::handle_set_state, path, "token-mallory",
+                        json{{"parent_id", "!nowhere:test"}, {"order", 0}}.dump());
+    EXPECT_EQ(missing.status, 404) << missing.body;
+    // Ill-typed fields.
+    EXPECT_EQ(call(handler, &RoomHandler::handle_set_state, path, "token-mallory",
+                   json{{"parent_id", 5}}.dump()).status, 400);
+    EXPECT_EQ(call(handler, &RoomHandler::handle_set_state, path, "token-mallory",
+                   json{{"parent_id", h.category}, {"order", "1"}}.dump()).status, 400);
+    EXPECT_FALSE(h.f.store->get_state_event(open, std::string(event_type::kRoomCategory), "")
+                     .has_value());
+
+    // A category the caller cannot open.
+    h.f.set_override(h.category, "user:" + h.mallory, 0, permission::kViewChannel);
+    EXPECT_TRUE(IsForbiddenBecause(
+        call(handler, &RoomHandler::handle_set_state, path, "token-mallory",
+             json{{"parent_id", h.category}, {"order", 0}}.dump()),
+        "No access to this channel"));
+    EXPECT_FALSE(h.f.store->get_state_event(open, std::string(event_type::kRoomCategory), "")
+                     .has_value());
+
+    // Top level is always fine.
+    EXPECT_TRUE(IsOk(call(handler, &RoomHandler::handle_set_state, path, "token-mallory",
+                          json{{"parent_id", ""}, {"order", 2}}.dump())));
+}
+
+TEST(RestructureNeedsView, PuttingTheCategoryStateIntoAVisibleCategoryWorks) {
+    HiddenChannel h("s2-6-state-ok");
+    auto open = h.f.add_room(h.admin, "general", "text");
+    h.f.join(open, h.mallory);
+    RoomHandler handler(*h.f.store, *h.f.sync, h.f.config);
+    EXPECT_TRUE(IsOk(call(handler, &RoomHandler::handle_set_state,
+                          state_event_path(open, event_type::kRoomCategory), "token-mallory",
+                          json{{"parent_id", h.category}, {"order", 1}}.dump())));
+}
+
+TEST(RestructureNeedsView, CreatingARoomUnderAHiddenOrNonCategoryParentIsRefused) {
+    HiddenChannel h("s2-6-create");
+    auto text_parent = h.f.add_room(h.admin, "random", "text");
+    h.f.join(text_parent, h.mallory);
+    RoomHandler handler(*h.f.store, *h.f.sync, h.f.config);
+    const auto rooms_before = h.f.store->list_room_directory_rows().size();
+
+    auto not_category = call(handler, &RoomHandler::handle_create_room,
+                             "/_matrix/client/v3/createRoom", "token-mallory",
+                             json{{"name", "child"}, {"parent_id", text_parent}}.dump());
+    EXPECT_EQ(not_category.status, 400) << not_category.body;
+
+    h.f.set_override(h.category, "user:" + h.mallory, 0, permission::kViewChannel);
+    EXPECT_TRUE(IsForbiddenBecause(
+        call(handler, &RoomHandler::handle_create_room, "/_matrix/client/v3/createRoom",
+             "token-mallory", json{{"name", "child"}, {"parent_id", h.category}}.dump()),
+        "No access to this channel"));
+    EXPECT_EQ(h.f.store->list_room_directory_rows().size(), rooms_before)
+        << "a refused parent still created a room";
+
+    // The administrator can file under it.
+    EXPECT_TRUE(IsOk(call(handler, &RoomHandler::handle_create_room,
+                          "/_matrix/client/v3/createRoom", "token-admin",
+                          json{{"name", "child"}, {"parent_id", h.category}}.dump())));
+}

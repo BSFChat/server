@@ -338,7 +338,7 @@ TEST(VoiceConfig, TurnUriAcceptsStringOrArray) {
     ASSERT_EQ(cfg2.voice.turn_uris.size(), 2u);
     EXPECT_EQ(cfg2.voice.turn_uris[0], "turn:turn.example.com:3478?transport=udp");
     EXPECT_EQ(cfg2.voice.turn_uris[1], "turn:turn.example.com:3478?transport=tcp");
-    EXPECT_EQ(cfg2.voice.turn_ttl, 3600); // default
+    EXPECT_EQ(cfg2.voice.turn_ttl, 86400); // default (audit 2-2026-11-18 V2-6)
 
     std::filesystem::remove(single);
     std::filesystem::remove(arr);
@@ -377,7 +377,7 @@ TEST(VoiceConfig, LiveKitSubTableIsParsed) {
     EXPECT_TRUE(cfg.voice.livekit.configured());
     // The SFU config must not disturb the existing TURN settings.
     EXPECT_TRUE(cfg.voice.enabled);
-    EXPECT_EQ(cfg.voice.turn_ttl, 3600);
+    EXPECT_EQ(cfg.voice.turn_ttl, 86400);
 }
 
 TEST(VoiceConfig, LiveKitDefaultsToUnconfigured) {
@@ -697,23 +697,29 @@ TEST_F(VoiceHandlerTest, LeaveResetsMediaFlags) {
     EXPECT_FALSE(ev->content.data.value("camera_on", false));
 }
 
-TEST_F(VoiceHandlerTest, LeaveRequiresRoomMembership) {
+// Audit 2-2026-11-18 V2-7: voice/leave used to answer 403 to a non-member,
+// which stranded exactly the user a kick or ban had just removed. It now
+// retracts the caller's own row whatever their membership, and a non-member
+// with nothing to retract gets the constant no-op answer.
+TEST_F(VoiceHandlerTest, LeaveWorksForANonMemberAndOnlyTouchesTheirOwnRow) {
     auto room_id = generate_room_id("test");
     create_voice_room(room_id, "@alice:test");
 
-    // Bob is not a member of the room: 403.
-    httplib::Response res;
-    auto req = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/leave", "bob-token");
-    handler->handle_voice_leave(req, res);
-    EXPECT_EQ(res.status, 403);
-    auto err = json::parse(res.body);
-    EXPECT_EQ(err["errcode"], "M_FORBIDDEN");
+    // Bob is not a member and has no row: a no-op 200, nothing written.
+    auto none = real_leave(room_id, "bob-token");
+    EXPECT_FALSE(none.value("changed", true));
+    EXPECT_EQ(none.value("reason", ""), "not_active");
+    EXPECT_TRUE(member_event_history(room_id, "@bob:test").empty());
 
-    // Alice is a member: succeeds.
-    httplib::Response res2;
-    auto req2 = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/leave", "alice-token");
-    handler->handle_voice_leave(req2, res2);
-    EXPECT_EQ(status_of(res2), 200);
+    // Bob had an active row and was then removed from the room: his own
+    // teardown clears it.
+    join_voice(room_id, "@bob:test");
+    join_voice(room_id, "@alice:test");
+    store->set_membership(room_id, "@bob:test", "leave");
+    auto cleared = real_leave(room_id, "bob-token");
+    EXPECT_TRUE(cleared.value("changed", false));
+    EXPECT_FALSE(is_active(room_id, "@bob:test"));
+    EXPECT_TRUE(is_active(room_id, "@alice:test"));
 }
 
 // --- V-M6 / V-H1: join and leave state checks ---
@@ -2586,32 +2592,136 @@ TEST_F(LiveKitTokenTest, AFullChannelIssuesNoTokenToSomeoneWhoCouldNotJoin) {
 
 // ── Rate limit and device id bound (audit 2026-11-15 S-8) ─────────────────
 
-TEST_F(VoiceHandlerTest, JoinAndStateShareOneRateLimitedBudget) {
-    config.send_limits.voice_limit = 3;
+// Audit 2-2026-11-18 V2-2: state PUTs (push-to-talk, mute) have their own
+// budget, so a burst of them cannot lock the account out of voice/join.
+TEST_F(VoiceHandlerTest, StateUpdatesDoNotSpendTheJoinBudget) {
+    config.send_limits.voice_limit = 2;
+    config.send_limits.voice_state_limit = 3;
     handler = std::make_unique<VoiceHandler>(*store, *sync_engine, config);
     auto room_id = generate_room_id("test");
     create_voice_room(room_id, "@alice:test");
     store->set_membership(room_id, "@bob:test", "join");
 
-    auto joined = real_join(room_id, "alice-token");
-    const std::string session = joined.value("session_id", "");
-    for (int i = 0; i < 2; ++i) {
+    const auto put_state = [&](bool muted, const std::string& session) {
         httplib::Response res;
         auto req = make_request("PUT", "/_matrix/client/v3/rooms/" + room_id + "/voice/state",
                                 "alice-token",
-                                json{{"muted", i == 0}, {"session_id", session}}.dump());
+                                json{{"muted", muted}, {"session_id", session}}.dump());
         handler->handle_voice_state(req, res);
+        return res;
+    };
+
+    auto joined = real_join(room_id, "alice-token");
+    const std::string session = joined.value("session_id", "");
+    for (int i = 0; i < 3; ++i) {
+        auto res = put_state(i % 2 == 0, session);
         EXPECT_EQ(status_of(res), 200) << res.body;
     }
-    httplib::Response limited;
-    auto req = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/join",
-                            "alice-token");
-    handler->handle_voice_join(req, limited);
+    auto limited = put_state(true, session);
     EXPECT_EQ(limited.status, 429) << limited.body;
     EXPECT_FALSE(limited.get_header_value("Retry-After").empty());
 
+    // The join budget is untouched by the three state PUTs: one join left.
+    real_join(room_id, "alice-token");
+    httplib::Response join_limited;
+    auto req = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/join",
+                            "alice-token");
+    handler->handle_voice_join(req, join_limited);
+    EXPECT_EQ(join_limited.status, 429) << join_limited.body;
+
     // Per account: bob's budget is untouched.
     real_join(room_id, "bob-token");
+}
+
+TEST_F(VoiceHandlerTest, VoiceLimitDefaultsAreRaised) {
+    const Config defaults = Config::defaults();
+    EXPECT_EQ(defaults.send_limits.voice_limit, 120);
+    EXPECT_GE(defaults.send_limits.voice_state_limit, defaults.send_limits.voice_limit);
+    EXPECT_EQ(defaults.voice.turn_ttl, 86400);
+    EXPECT_EQ(defaults.voice.default_max_participants, 10);
+}
+
+// A state PUT that restates the current flags heartbeats but emits nothing.
+TEST_F(VoiceHandlerTest, AStatePutThatChangesNothingWritesNoEvent) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    auto joined = real_join(room_id, "alice-token");
+    const auto before = member_event_history(room_id, "@alice:test").size();
+    httplib::Response res;
+    auto req = make_request("PUT", "/_matrix/client/v3/rooms/" + room_id + "/voice/state",
+                            "alice-token", json{{"muted", false}}.dump());
+    handler->handle_voice_state(req, res);
+    EXPECT_EQ(status_of(res), 200) << res.body;
+    EXPECT_EQ(member_event_history(room_id, "@alice:test").size(), before);
+}
+
+// Audit 2-2026-11-18 S2-3: a wrong-typed flag is a 400, not a 500.
+TEST_F(VoiceHandlerTest, AWrongTypedStateFlagIsBadJson) {
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");
+    real_join(room_id, "alice-token");
+    for (const auto& body : {json{{"muted", "yes"}}, json{{"camera_on", 1}}, json::array()}) {
+        httplib::Response res;
+        auto req = make_request("PUT", "/_matrix/client/v3/rooms/" + room_id + "/voice/state",
+                                "alice-token", body.dump());
+        EXPECT_NO_THROW(handler->handle_voice_state(req, res));
+        EXPECT_EQ(res.status, 400) << body.dump();
+    }
+}
+
+// Audit 2-2026-11-18 I2-4: m.room.voice is caller-written state; a non-boolean
+// `enabled` made join throw. It now reads as disabled.
+TEST_F(VoiceHandlerTest, AMalformedVoiceMarkerReadsAsDisabledNotA500) {
+    auto room_id = generate_room_id("test");
+    store->create_room(room_id, "@alice:test");
+    store->set_membership(room_id, "@alice:test", "join");
+    store->insert_event(generate_event_id("test"), room_id, "@alice:test",
+                        std::string(event_type::kRoomVoice), "",
+                        json{{"enabled", "sure"}, {"max_participants", "lots"}}.dump(), 1000);
+    httplib::Response res;
+    auto req = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/join",
+                            "alice-token");
+    EXPECT_NO_THROW(handler->handle_voice_join(req, res));
+    EXPECT_EQ(res.status, 403) << res.body;
+    EXPECT_FALSE(is_active(room_id, "@alice:test"));
+
+    EXPECT_FALSE(read_voice_channel(json{{"enabled", 3}}).enabled);
+    EXPECT_FALSE(read_voice_channel(json::array()).enabled);
+    EXPECT_TRUE(read_voice_channel(json{{"enabled", true}}).enabled);
+}
+
+// Audit 2-2026-11-18 V2-7: a channel with no cap of its own gets
+// voice.default_max_participants; 0 there means unlimited.
+TEST_F(VoiceHandlerTest, AnUncappedChannelGetsTheServerDefaultCap) {
+    config.voice.default_max_participants = 1;
+    config.send_limits.voice_limit = 0;
+    handler = std::make_unique<VoiceHandler>(*store, *sync_engine, config);
+    auto room_id = generate_room_id("test");
+    create_voice_room(room_id, "@alice:test");  // max_participants 0
+    store->set_membership(room_id, "@bob:test", "join");
+
+    real_join(room_id, "alice-token");
+    httplib::Response full;
+    auto req = make_request("POST", "/_matrix/client/v3/rooms/" + room_id + "/voice/join",
+                            "bob-token");
+    handler->handle_voice_join(req, full);
+    ASSERT_EQ(full.status, 403) << full.body;
+    auto err = json::parse(full.body);
+    EXPECT_EQ(err.value("bsfchat.errcode", ""), "BSFCHAT.VOICE_CHANNEL_FULL");
+    EXPECT_EQ(err.value("max_participants", 0), 1);
+    EXPECT_NE(err.value("error", "").find("full"), std::string::npos);
+
+    // A channel's own cap wins over the default.
+    VoiceChannelContent own;
+    own.max_participants = 5;
+    EXPECT_EQ(effective_voice_cap(own, config), 5);
+    own.max_participants = 0;
+    EXPECT_EQ(effective_voice_cap(own, config), 1);
+    config.voice.default_max_participants = 0;
+    EXPECT_EQ(effective_voice_cap(own, config), 0);  // unlimited
+
+    // The rejoin over one's own row in a full channel still works.
+    real_join(room_id, "alice-token");
 }
 
 TEST_F(VoiceHandlerTest, AnOversizeOrControlCharacterDeviceIdIsRefused) {

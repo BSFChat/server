@@ -240,6 +240,8 @@ TEST(CreateRoomValidation, AWellFormedBodyStillWorks) {
     Fixture f("ok");
     f.add_user("alice", {std::string(permission::role_id::kAdmin)});
     auto parent = f.add_channel("@alice:test", "parent");
+    // A parent must be a category (audit 2-2026-11-18 S2-6).
+    f.state(parent, "@alice:test", event_type::kRoomType, "", json{{"type", "category"}});
 
     auto res = create(f, "token-alice",
                       json{{"name", "child"}, {"parent_id", parent}, {"sort_order", 3},

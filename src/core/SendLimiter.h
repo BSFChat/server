@@ -91,9 +91,14 @@ public:
         // input_limits::kMaxAccountDataBytes bounds each row without bounding
         // how many there are.
         kAccountData,
-        // POST voice/join and PUT voice/state, one budget (audit 2026-11-15
-        // S-8): both write m.call.member and wake the room's long-polls.
+        // POST voice/join (audit 2026-11-15 S-8): writes m.call.member and
+        // wakes the room's long-polls.
         kVoice,
+        // PUT voice/state. Its own bucket since audit 2-2026-11-18 (V2-2):
+        // push-to-talk and mute toggles are frequent and change no membership,
+        // so a burst of them must not spend the join budget and lock a user
+        // out of rejoining. Still bounded, because each one wakes the room.
+        kVoiceState,
         // PUT /rooms/{id}/typing/{userId}: ephemeral, but every write wakes
         // the room's long-polls.
         kTyping,
@@ -123,6 +128,7 @@ private:
     RateLimiter report_;
     RateLimiter account_data_;
     RateLimiter voice_;
+    RateLimiter voice_state_;
     RateLimiter typing_;
 };
 

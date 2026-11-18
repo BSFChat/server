@@ -75,6 +75,9 @@ add_executable(server_tests
     test_first_run.cpp
     # Server-side link previews: SSRF policy, OG parsing, cache (schema v33).
     test_url_preview.cpp
+    # Audit 2 (2026-11-18): call retraction on removal, deletion departures,
+    # and the other server findings fixed with them.
+    test_audit2_server.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)

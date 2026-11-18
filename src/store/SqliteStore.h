@@ -472,7 +472,13 @@ public:
                                                 const std::string& user_b);
     // Remove a room and everything that references it (events, members,
     // read markers). Destructive; intended for admin-driven channel deletion.
-    void delete_room(const std::string& room_id);
+    //
+    // `departures_for`, when given, limits the 'deleted' departures to the
+    // joined members it names (audit 2-2026-11-18 S2-5): a departure names the
+    // room id to its reader, so the handler passes only the members who could
+    // VIEW the room. Null keeps the old behaviour, every joined member.
+    void delete_room(const std::string& room_id,
+                     const std::vector<std::string>* departures_for = nullptr);
     std::vector<std::string> get_joined_rooms(const std::string& user_id);
     // Rooms the user has been invited to and has not answered. The complement
     // of get_joined_rooms for /sync's purposes: those two together are every

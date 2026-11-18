@@ -118,7 +118,129 @@ void emit_state_event(SqliteStore& store, SyncEngine& sync_engine, const std::st
     if (wake) sync_engine.notify_new_event();
 }
 
+constexpr const char* kVoiceFlags[] = {"muted", "deafened", "screen_sharing", "camera_on"};
+
+bool voice_flags_are_booleans(const json& body) {
+    for (const char* key : kVoiceFlags) {
+        auto it = body.find(key);
+        if (it != body.end() && !it->is_boolean()) return false;
+    }
+    return true;
+}
+
 } // namespace
+
+// m.room.voice is written through PUT state by any MANAGE_CHANNELS holder and
+// its content is not shape-checked there, and the protocol from_json throws on
+// a non-boolean `enabled` (audit 2-2026-11-18 I2-4). Reached unwrapped, that was
+// a 500 on every join/token/rekey for the channel. A marker that will not parse
+// reads as voice disabled: refusing is the fail-closed answer, and the channel
+// owner fixes it with a well-formed PUT.
+VoiceChannelContent read_voice_channel(const json& content) {
+    VoiceChannelContent voice;
+    if (content.is_object()) {
+        try {
+            from_json(content, voice);
+            return voice;
+        } catch (const json::exception&) {
+        }
+    }
+    voice.enabled = false;
+    voice.max_participants = 0;
+    return voice;
+}
+
+int effective_voice_cap(const VoiceChannelContent& channel, const Config& config) {
+    if (channel.max_participants > 0) return channel.max_participants;
+    return std::max(0, config.voice.default_max_participants);
+}
+
+std::mutex& voice_roster_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+bool retract_call_member(SqliteStore& store, SyncEngine& sync_engine,
+                         const std::string& server_name, const std::string& room_id,
+                         const std::string& user_id, const char* why) {
+    std::lock_guard<std::mutex> lock(voice_roster_mutex());
+    auto current = store.get_state_event(room_id, std::string(event_type::kCallMember), user_id);
+    if (!current || !json_bool_or(current->content.data, "active", false)) return false;
+
+    VoiceMemberContent member;
+    member.active = false;
+    json member_json;
+    to_json(member_json, member);
+    member_json["session_id"] = json_string_or(current->content.data, "session_id");
+    emit_state_event(store, sync_engine, server_name, room_id, user_id,
+                     std::string(event_type::kCallMember), user_id, member_json);
+    get_logger()->info("Retracted {}'s voice session in room {} ({})", user_id, room_id, why);
+    return true;
+}
+
+std::vector<std::string> active_call_members(SqliteStore& store, const std::string& room_id) {
+    std::vector<std::string> out;
+    for (const auto& ev : store.get_state_events(room_id)) {
+        if (ev.type == event_type::kCallMember && ev.state_key &&
+            json_bool_or(ev.content.data, "active", false)) {
+            out.push_back(*ev.state_key);
+        }
+    }
+    return out;
+}
+
+size_t retract_call_members_without_view(SqliteStore& store, SyncEngine& sync_engine,
+                                         const Config& config, const std::string& room_id) {
+    size_t retracted = 0;
+    PermissionsEngine perms(store, config);
+    for (const auto& uid : active_call_members(store, room_id)) {
+        if (store.is_room_member(room_id, uid) &&
+            permission::has(perms.compute(uid, room_id), permission::kViewChannel)) {
+            continue;
+        }
+        if (retract_call_member(store, sync_engine, config.server_name, room_id, uid,
+                                "lost access to the channel")) {
+            ++retracted;
+        }
+    }
+    return retracted;
+}
+
+size_t retract_user_calls_without_view(SqliteStore& store, SyncEngine& sync_engine,
+                                       const Config& config, const std::string& user_id) {
+    size_t retracted = 0;
+    PermissionsEngine perms(store, config);
+    for (const auto& room_id : store.get_joined_rooms(user_id)) {
+        // One indexed lookup per joined room; only rooms with an active row
+        // are worth a permission evaluation.
+        auto row = store.get_state_event(room_id, std::string(event_type::kCallMember), user_id);
+        if (!row || !json_bool_or(row->content.data, "active", false)) continue;
+        if (permission::has(perms.compute(user_id, room_id), permission::kViewChannel)) continue;
+        if (retract_call_member(store, sync_engine, config.server_name, room_id, user_id,
+                                "lost VIEW_CHANNEL")) {
+            ++retracted;
+        }
+    }
+    return retracted;
+}
+
+size_t retract_calls_after_role_write(SqliteStore& store, SyncEngine& sync_engine,
+                                      const Config& config, const std::string& type,
+                                      const std::string& state_key) {
+    if (type == event_type::kMemberRoles) {
+        return state_key.empty() ? 0
+                                 : retract_user_calls_without_view(store, sync_engine, config,
+                                                                   state_key);
+    }
+    if (type == event_type::kServerRoles) {
+        size_t retracted = 0;
+        for (const auto& room_id : store.list_all_non_category_rooms()) {
+            retracted += retract_call_members_without_view(store, sync_engine, config, room_id);
+        }
+        return retracted;
+    }
+    return 0;
+}
 
 VoiceHandler::VoiceHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config)
     : store_(store), sync_engine_(sync_engine), config_(config), limits_(config.send_limits) {}
@@ -357,8 +479,7 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
         return;
     }
 
-    VoiceChannelContent voice_channel;
-    from_json(voice_state->content.data, voice_channel);
+    const VoiceChannelContent voice_channel = read_voice_channel(voice_state->content.data);
     if (!voice_channel.enabled) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Voice is disabled in this room").to_json().dump(), "application/json");
@@ -392,8 +513,11 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
         auto existing = store_.get_state_event(room_id, std::string(event_type::kCallMember), *user_id);
         const bool was_active = existing && existing->content.data.value("active", false);
 
-        // Check max participants if set
-        if (voice_channel.max_participants > 0) {
+        // The channel's own cap, or voice.default_max_participants when it
+        // sets none (audit 2-2026-11-18 V2-7: a full mesh gives out at about
+        // 6-8 cameras, so "unset" no longer means unlimited).
+        const int cap = effective_voice_cap(voice_channel, config_);
+        if (cap > 0) {
             // Count active members
             auto state_events = store_.get_state_events(room_id);
             int active_count = 0;
@@ -409,9 +533,13 @@ void VoiceHandler::handle_voice_join(const httplib::Request& req, httplib::Respo
                     }
                 }
             }
-            if (active_count >= voice_channel.max_participants) {
+            if (active_count >= cap) {
                 res.status = 403;
-                res.set_content(MatrixError::forbidden("Voice channel is full").to_json().dump(), "application/json");
+                json err = MatrixError::forbidden(
+                    "Voice channel is full (" + std::to_string(cap) + " participants)",
+                    "BSFCHAT.VOICE_CHANNEL_FULL").to_json();
+                err["max_participants"] = cap;
+                res.set_content(err.dump(), "application/json");
                 return;
             }
         }
@@ -555,11 +683,15 @@ void VoiceHandler::handle_voice_leave(const httplib::Request& req, httplib::Resp
     // is the one voice act that takes access away, and the gate would cost more
     // than it buys. test_voice.cpp pins this so a later reader "fixing" the
     // asymmetry has to argue with a failing test rather than a comment.
-    if (!store_.is_room_member(room_id, *user_id)) {
-        res.status = 403;
-        res.set_content(MatrixError::forbidden("Not a member of this room").to_json().dump(), "application/json");
-        return;
-    }
+    //
+    // AND NOT EVEN MEMBERSHIP, since audit 2-2026-11-18 (V2-7). The same
+    // argument applies one step further: a user who was kicked or banned while
+    // in a call is exactly the one whose teardown POST must work, and a 403
+    // here left their row active until the reaper. The server now retracts on
+    // kick/ban/leave itself, but a row written before that, or one racing it,
+    // is still the caller's own to clear. A non-member with no active row gets
+    // the same {"changed": false} a nonexistent room does, so this says
+    // nothing about rooms the caller is not in.
 
     // Optional session echo. A client that got a session_id from voice/join
     // should send it back here; joined_at is accepted as a weaker fallback for
@@ -715,8 +847,9 @@ void VoiceHandler::handle_voice_state(const httplib::Request& req, httplib::Resp
         return;
     }
 
-    if (const auto wait = limits_.acquire(SendLimiter::Bucket::kVoice, *user_id)) {
-        return send_rate_limited(res, wait, SendLimiter::message_for(SendLimiter::Bucket::kVoice));
+    if (const auto wait = limits_.acquire(SendLimiter::Bucket::kVoiceState, *user_id)) {
+        return send_rate_limited(res, wait,
+                                 SendLimiter::message_for(SendLimiter::Bucket::kVoiceState));
     }
 
     auto match = match_route("/_matrix/client/v3/rooms/{roomId}/voice/state", req.path);
@@ -778,6 +911,14 @@ void VoiceHandler::handle_voice_state(const httplib::Request& req, httplib::Resp
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
         return;
     }
+    // get<bool>() below throws on any other type (audit 2-2026-11-18 S2-3).
+    if (!body.is_object() || !voice_flags_are_booleans(body)) {
+        res.status = 400;
+        res.set_content(MatrixError::bad_json(
+            "muted, deafened, screen_sharing and camera_on must be booleans").to_json().dump(),
+            "application/json");
+        return;
+    }
 
     {
         // Serialize the read-modify-write so concurrent updates from other
@@ -822,8 +963,13 @@ void VoiceHandler::handle_voice_state(const httplib::Request& req, httplib::Resp
         if (body.contains("screen_sharing")) updated["screen_sharing"] = body["screen_sharing"].get<bool>();
         if (body.contains("camera_on")) updated["camera_on"] = body["camera_on"].get<bool>();
 
-        emit_state_event(store_, sync_engine_, config_.server_name,
-                         room_id, *user_id, std::string(event_type::kCallMember), *user_id, updated);
+        // A PUT that changes nothing (a push-to-talk client re-announcing the
+        // state it is already in) still heartbeats but writes no event and
+        // wakes nobody.
+        if (updated != current->content.data) {
+            emit_state_event(store_, sync_engine_, config_.server_name, room_id, *user_id,
+                             std::string(event_type::kCallMember), *user_id, updated);
+        }
     }
 
     record_heartbeat(room_id, *user_id);
@@ -1048,8 +1194,7 @@ void VoiceHandler::handle_livekit_token(const httplib::Request& req, httplib::Re
         res.set_content(MatrixError::forbidden("Room is not voice-capable").to_json().dump(), "application/json");
         return;
     }
-    VoiceChannelContent voice_channel;
-    from_json(voice_state->content.data, voice_channel);
+    const VoiceChannelContent voice_channel = read_voice_channel(voice_state->content.data);
     if (!voice_channel.enabled) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Voice is disabled in this room").to_json().dump(), "application/json");
@@ -1301,8 +1446,7 @@ void VoiceHandler::handle_livekit_rekey(const httplib::Request& req, httplib::Re
         res.set_content(MatrixError::forbidden("Room is not voice-capable").to_json().dump(), "application/json");
         return;
     }
-    VoiceChannelContent voice_channel;
-    from_json(voice_state->content.data, voice_channel);
+    const VoiceChannelContent voice_channel = read_voice_channel(voice_state->content.data);
     if (!voice_channel.enabled) {
         res.status = 403;
         res.set_content(MatrixError::forbidden("Voice is disabled in this room").to_json().dump(), "application/json");
