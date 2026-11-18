@@ -237,7 +237,12 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
         // per visible-room set (peers_of) — it used to be get_room_members()
         // per room, rooms x members rows, on every delivered poll.
         std::set<std::string> seen;
-        for (const auto& m_uid : *peers_of(joined_rooms_ptr)) {
+        // Bind first: peers_of returns a shared_ptr by value, and a range-for
+        // over `*temporary` does not keep the temporary alive in C++20. When
+        // the cache declines to keep the vector (a visibility write raced the
+        // build), this was the only owner and the loop read freed memory.
+        const auto peers = peers_of(joined_rooms_ptr);
+        for (const auto& m_uid : *peers) {
             if (m_uid == *user_id) continue;
             seen.insert(m_uid);
         }
