@@ -721,8 +721,11 @@ TEST(RestructureNeedsView, PuttingTheCategoryStateObeysTheMoveChannelRules) {
                    json{{"parent_id", 5}}.dump()).status, 400);
     EXPECT_EQ(call(handler, &RoomHandler::handle_set_state, path, "token-mallory",
                    json{{"parent_id", h.category}, {"order", "1"}}.dump()).status, 400);
-    EXPECT_FALSE(h.f.store->get_state_event(open, std::string(event_type::kRoomCategory), "")
-                     .has_value());
+    // The fixture files every room at the top level (parent_id ""); a refused
+    // write must leave that filing untouched.
+    EXPECT_EQ(h.f.store->get_state_event(open, std::string(event_type::kRoomCategory), "")
+                  ->content.data.value("parent_id", std::string("?")),
+              "");
 
     // A category the caller cannot open.
     h.f.set_override(h.category, "user:" + h.mallory, 0, permission::kViewChannel);
@@ -730,8 +733,11 @@ TEST(RestructureNeedsView, PuttingTheCategoryStateObeysTheMoveChannelRules) {
         call(handler, &RoomHandler::handle_set_state, path, "token-mallory",
              json{{"parent_id", h.category}, {"order", 0}}.dump()),
         "No access to this channel"));
-    EXPECT_FALSE(h.f.store->get_state_event(open, std::string(event_type::kRoomCategory), "")
-                     .has_value());
+    // The fixture files every room at the top level (parent_id ""); a refused
+    // write must leave that filing untouched.
+    EXPECT_EQ(h.f.store->get_state_event(open, std::string(event_type::kRoomCategory), "")
+                  ->content.data.value("parent_id", std::string("?")),
+              "");
 
     // Top level is always fine.
     EXPECT_TRUE(IsOk(call(handler, &RoomHandler::handle_set_state, path, "token-mallory",

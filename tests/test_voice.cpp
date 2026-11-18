@@ -308,7 +308,7 @@ TEST(VoiceConfig, TurnServerResponseFormat) {
     EXPECT_EQ(resp["uris"].size(), 2u);
     EXPECT_EQ(resp["uris"][0], "stun:stun.l.google.com:19302");
     EXPECT_EQ(resp["uris"][1], "turn:turn.example.com:3478");
-    EXPECT_EQ(resp["ttl"], 3600);
+    EXPECT_EQ(resp["ttl"], 86400);  // the default since audit 2 (V2-6)
 }
 
 TEST(VoiceConfig, TurnUriAcceptsStringOrArray) {
