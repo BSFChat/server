@@ -3,10 +3,12 @@
 #include <httplib.h>
 
 #include <chrono>
+#include <cstdint>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace bsfchat {
@@ -42,11 +44,34 @@ public:
         // typing, message). Used to compute last_active_ago for the
         // sync payload so other clients can render "5 min ago".
         std::chrono::steady_clock::time_point last_active_at;
+        // The store's stream head when what a client renders from this entry
+        // (presence, status_msg, or its coming online) last changed. See
+        // live_for_sync(). last_active_at moving is not a change.
+        int64_t changed_at_pos = 0;
     };
 
     // Look up by user; nullopt if we've never seen them, or if their
     // entry has gone stale (treated as "not online" by callers).
     std::optional<Entry> get_for(const std::string& user_id) const;
+
+    // The live entries a /sync presence pass shows (audit 2-2026-11-18,
+    // S2-4): `self`'s, whenever it is live, and each of `peers` (sorted
+    // ascending, as SyncHandler's peer list is) whose entry changed at or
+    // after `since_pos` — or every live peer when `since_pos` < 0, the full
+    // restatement.
+    //
+    // Restating every peer on every delivered poll made each woken /sync
+    // O(peers), so one message to N parked polls cost O(N²). A peer's entry
+    // is only news to a poll if it changed after that poll's token was minted:
+    // an entry stamped below the token was already live when the response
+    // carrying that token ran its own presence pass (the pass runs after the
+    // scan that saw the head reach the token, and the stamp is taken under
+    // the same lock as the change), so it was delivered then, or earlier.
+    // `>=` rather than `>` because a change while the head stood still is
+    // stamped with the very position a poll may already hold.
+    std::vector<std::pair<std::string, Entry>> live_for_sync(
+        const std::vector<std::string>& peers, const std::string& self,
+        int64_t since_pos) const;
 
     // Bump last_active_at for a user — invoked by other handlers
     // (message send, typing, etc.) so presence implicitly reflects
@@ -75,6 +100,8 @@ private:
 
     mutable std::mutex mutex_;
     std::map<std::string, Entry> entries_;
+    // Guarded by mutex_. See sweep_expired().
+    std::chrono::steady_clock::time_point last_sweep_{};
     SqliteStore& store_;
     SyncEngine& sync_engine_;
     const Config& config_;

@@ -78,6 +78,37 @@ RoomView room_view(SqliteStore& store, PermissionsEngine& perms, const std::stri
     return RoomView::kNone;
 }
 
+// room_view(), remembered across polls in `cache` — see SyncEngine::ViewCache.
+// Sampled-before / checked-after on the generation, so an answer computed
+// while a visibility write was landing is used once and not kept.
+constexpr std::size_t kMaxCachedViews = 1u << 16;
+
+RoomView cached_room_view(SyncEngine::ViewCache& cache, SqliteStore& store,
+                          PermissionsEngine& perms, const std::string& user_id,
+                          const std::string& room_id) {
+    const uint64_t generation = store.visibility_generation();
+    std::string key;
+    key.reserve(user_id.size() + 1 + room_id.size());
+    key.append(user_id).push_back('\x1f');
+    key.append(room_id);
+    {
+        std::lock_guard lock(cache.mutex);
+        if (cache.generation != generation) {
+            cache.views.clear();
+            cache.generation = generation;
+        }
+        auto it = cache.views.find(key);
+        if (it != cache.views.end()) return static_cast<RoomView>(it->second);
+    }
+    const RoomView view = room_view(store, perms, user_id, room_id);
+    std::lock_guard lock(cache.mutex);
+    if (cache.generation == generation && store.visibility_generation() == generation) {
+        if (cache.views.size() >= kMaxCachedViews) cache.views.clear();
+        cache.views[std::move(key)] = static_cast<int>(view);
+    }
+    return view;
+}
+
 // The sidebar node, and only the sidebar node. No timeline, so no prev_batch
 // and no `limited`; no member list; no unread or highlight counts (a count is
 // a message-volume oracle on a channel you cannot read).
@@ -412,6 +443,15 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
         attach_pending_invites(store_, config_, user_id, r.response);
         return std::move(r);
     };
+    // A response returned because something happened — the fan-out path,
+    // once per parked poll per message — restates only presence that changed
+    // since the caller's token. The idle and timeout=0 replies below keep the
+    // full restatement, which bounds how long anything the delta cannot see
+    // (a peer who became one without changing) stays unsaid.
+    auto deliver_woken = [&](SyncResult&& r, int64_t from_pos) {
+        r.presence_since = from_pos;
+        return deliver(std::move(r));
+    };
 
     // What counts as "something for this user", i.e. worth returning now
     // rather than parking on. An invite is content: the whole complaint is
@@ -485,7 +525,7 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
     bool truncated = false;
     auto response = build_incremental_sync(user_id, since_pos, &covered_pos, &truncated);
     if (has_payload(response)) {
-        return deliver(std::move(response));
+        return deliver_woken(std::move(response), since_pos);
     }
     // A full page of rows this user may not see (audit 2026-11-15, R-3): a
     // thousand messages in channels they are denied, or an ignored sender's
@@ -499,7 +539,7 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
     // It cannot spin: next_batch is covered_pos, strictly above since_pos,
     // and the rows below it are never scanned again.
     if (truncated && covered_pos > since_pos) {
-        return deliver(std::move(response));
+        return deliver_woken(std::move(response), since_pos);
     }
 
     if (timeout_ms > 0) {
@@ -560,7 +600,7 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
             // the wait: the woken scan has filled a page of hidden rows.
             if (has_payload(response) || (truncated && covered_pos > since_pos) ||
                 edu_changed()) {
-                return deliver(std::move(response));
+                return deliver_woken(std::move(response), since_pos);
             }
             // Woken for an event this user cannot see. Keep the poll parked,
             // now against the position that re-scan reached.
@@ -620,7 +660,7 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
     std::set<std::string> stubbed;
 
     for (const auto& room_id : rooms) {
-        const RoomView view = room_view(store_, perms, user_id, room_id);
+        const RoomView view = cached_room_view(view_cache_, store_, perms, user_id, room_id);
         if (view == RoomView::kNone) continue;
         if (view == RoomView::kCategoryStub) {
             response.rooms.join[room_id] = category_stub(store_, room_id);
@@ -758,7 +798,7 @@ SyncResult SyncEngine::build_incremental_sync(const std::string& user_id, int64_
     auto view_of = [&](const std::string& room_id) -> RoomView {
         auto it = view_cache.find(room_id);
         if (it != view_cache.end()) return it->second;
-        RoomView view = room_view(store_, perms, user_id, room_id);
+        RoomView view = cached_room_view(view_cache_, store_, perms, user_id, room_id);
         view_cache.emplace(room_id, view);
         return view;
     };

@@ -2192,6 +2192,8 @@ std::vector<std::string> SqliteStore::get_joined_members_of_rooms(
             seen.emplace(column_text_or_empty(stmt.get(), 0));
         }
     }
+    // Sorted and unique, from the set: SyncHandler's presence pass binary-
+    // searches this list (PresenceHandler::live_for_sync).
     return {seen.begin(), seen.end()};
 }
 

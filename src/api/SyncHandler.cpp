@@ -10,6 +10,7 @@
 #include "sync/SyncEngine.h"
 
 #include <algorithm>
+#include <chrono>
 #include <optional>
 #include <set>
 
@@ -110,6 +111,11 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
     // the poll is answered immediately instead of parked — see
     // sync/ParkedSyncGate.h for why that and not a 429. The slot lives until
     // this function returns, i.e. for exactly as long as the worker is held.
+    // Declared before everything the response is built into, so it is
+    // released only after the JSON DOM below has been destroyed.
+    InitialSyncGate::Slot initial_slot;
+    if (since.empty()) initial_slot = initial_syncs_.enter(kInitialSyncPatience);
+
     ParkedSyncGate::Slot parked_slot;
     if (!since.empty() && timeout > 0) {
         parked_slot = parked_.try_park(*user_id);
@@ -165,10 +171,14 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
             // one. Same gate and same shape as PUT /rooms/{id}/typing/{user},
             // which refuses to let a denied user publish the indicator in the
             // first place; this is the read half of that write.
-            if (!perms->can(*user_id, room_id, permission::kViewChannel)) continue;
-
+            //
+            // Asked only for a room someone is typing in: the typing list is
+            // an in-memory read, the permission check is store reads, and
+            // this pass runs on every woken poll (S2-4).
             auto typing_users = typing_handler_->get_typing_users(room_id);
-            if (!typing_users.empty()) {
+            if (typing_users.empty()) continue;
+            if (!perms->can(*user_id, room_id, permission::kViewChannel)) continue;
+            {
                 RoomEvent typing_event;
                 typing_event.type = std::string(event_type::kTyping);
                 typing_event.content.data = {{"user_ids", typing_users}};
@@ -183,9 +193,11 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
             // The same gate as the pass above. joined_rooms is the LISTING set,
             // which keeps denied categories as stubs; without this, a room the
             // first pass refused came straight back here with its typing list.
-            if (!perms->can(*user_id, room_id, permission::kViewChannel)) continue;
+            // Typing list first, for the reason given in the pass above.
             auto typing_users = typing_handler_->get_typing_users(room_id);
-            if (!typing_users.empty()) {
+            if (typing_users.empty()) continue;
+            if (!perms->can(*user_id, room_id, permission::kViewChannel)) continue;
+            {
                 JoinedRoom joined;
                 RoomEvent typing_event;
                 typing_event.type = std::string(event_type::kTyping);
@@ -236,43 +248,80 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
         // One statement over the whole visible list, joined rows only, cached
         // per visible-room set (peers_of) — it used to be get_room_members()
         // per room, rooms x members rows, on every delivered poll.
-        std::set<std::string> seen;
+        //
+        // Sampled before the peer list is derived, for the full-restatement
+        // rule below.
+        const uint64_t peers_generation = store_.visibility_generation();
         // Bind first: peers_of returns a shared_ptr by value, and a range-for
         // over `*temporary` does not keep the temporary alive in C++20. When
         // the cache declines to keep the vector (a visibility write raced the
         // build), this was the only owner and the loop read freed memory.
+        // Sorted (get_joined_members_of_rooms returns set order), which
+        // live_for_sync's binary search relies on.
         const auto peers = peers_of(joined_rooms_ptr);
-        for (const auto& m_uid : *peers) {
-            if (m_uid == *user_id) continue;
-            seen.insert(m_uid);
-        }
         // Touch ourselves so other peers see us as recently-active
         // simply by virtue of having opened a sync stream.
         presence_handler_->touch(*user_id);
-        seen.insert(*user_id);
+
+        // Which peers to restate (audit 2-2026-11-18, S2-4). This pass used to
+        // emit every online peer, with one is_server_banned() query each, on
+        // every delivered poll: a message to N parked polls cost N² queries
+        // and N² presence events. A poll that returned because something
+        // happened now carries only the peers whose presence changed since its
+        // token (PresenceHandler::live_for_sync() argues why nothing is
+        // missed), and the ban backstop is one statement.
+        //
+        // The full restatement stays for an initial sync and an idle reply.
+        // It is also forced on an account's first delivered poll after its
+        // peer list may have changed (a new visibility generation) — the
+        // delta cannot see somebody who BECAME a peer, e.g. through a newly
+        // shared private room, without their presence changing — and at
+        // least once per kFullPresenceInterval regardless, as a backstop: on
+        // a busy server a client may never sit out an idle timeout. Both are
+        // per account and rare next to messages, so neither puts O(N) back on
+        // the per-message path.
+        int64_t presence_since = result.presence_since;
+        {
+            const auto now = std::chrono::steady_clock::now();
+            std::lock_guard lock(restate_mutex_);
+            auto it = last_full_presence_.find(*user_id);
+            if (it == last_full_presence_.end() || it->second.generation != peers_generation ||
+                now - it->second.at >= kFullPresenceInterval) {
+                presence_since = -1;
+            }
+            if (presence_since < 0) {
+                if (it == last_full_presence_.end() &&
+                    last_full_presence_.size() >= kMaxCachedUsers) {
+                    last_full_presence_.clear();
+                }
+                last_full_presence_[*user_id] = FullPresence{now, peers_generation};
+            }
+        }
+        auto shown = presence_handler_->live_for_sync(*peers, *user_id, presence_since);
+
+        // Only people who are actually there: `peers` is joined rows only
+        // (see peers_of), and server-banned accounts are dropped here as the
+        // backstop for a crash between the ban-list write and the ban
+        // projection, which would leave a 'join' row behind.
+        std::vector<std::string> banned;
+        if (!shown.empty()) banned = store_.get_server_banned_user_ids();
+        std::sort(banned.begin(), banned.end());
 
         PresenceEvents pe;
-        for (const auto& uid : seen) {
-            auto entry = presence_handler_->get_for(uid);
-            if (!entry) continue;
-            // After get_for(), not before, and not up in the membership loop.
-            // This is a per-user store read on the endpoint every client polls
-            // continuously: up there it would run once per (user, room) pair,
-            // here it runs at most once per peer who is actually online, which
-            // on any real deployment is a small fraction of the member set.
-            if (store_.is_server_banned(uid)) continue;
+        for (const auto& [uid, entry] : shown) {
+            if (std::binary_search(banned.begin(), banned.end(), uid)) continue;
             RoomEvent ev;
             ev.type = std::string(event_type::kPresence);
             ev.sender = uid;
-            json content = {{"presence", entry->presence}};
-            if (!entry->status_msg.empty()) {
-                content["status_msg"] = entry->status_msg;
+            json content = {{"presence", entry.presence}};
+            if (!entry.status_msg.empty()) {
+                content["status_msg"] = entry.status_msg;
             }
             // Optional last_active_ago in ms — clients use this to
             // render "5 min ago" hints. We compute against the
             // entry's last_active_at in the steady_clock domain.
             auto ago = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - entry->last_active_at).count();
+                std::chrono::steady_clock::now() - entry.last_active_at).count();
             if (ago >= 0) content["last_active_ago"] = ago;
             ev.content.data = std::move(content);
             pe.events.push_back(std::move(ev));

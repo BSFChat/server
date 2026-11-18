@@ -3,6 +3,7 @@
 #include <bsfchat/MatrixTypes.h>
 
 #include <atomic>
+#include <cstdint>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -43,6 +44,12 @@ using LeftRooms = std::map<std::string, LeftRoom>;
 struct SyncResult {
     SyncResponse response;
     LeftRooms leave;
+    // For SyncHandler's presence pass (S2-4): the stream position the
+    // caller's token named when this response returned because something
+    // happened, so only presence that changed since then need be restated;
+    // -1 (restate every peer) for an initial sync, an idle timeout reply and
+    // a timeout=0 poll. See PresenceHandler::live_for_sync().
+    int64_t presence_since = -1;
 };
 
 // Writes `leave` into a serialised /sync response as
@@ -108,6 +115,22 @@ public:
     // trying to hit the window with sleeps. Never set in production.
     void set_post_scan_hook_for_test(std::function<void()> hook);
 
+    // Per-(account, room) visibility answers carried ACROSS polls (S2-4),
+    // keyed on SqliteStore::visibility_generation() exactly like
+    // SyncHandler's restate cache: every write that can change a room's
+    // VIEW_CHANNEL answer or its category-ness bumps the generation, and a
+    // stale generation drops the lot. Without it each woken poll re-ran a
+    // permission evaluation (roles, member roles, overrides, room type) per
+    // room in its delta — once per parked poll per message.
+    //
+    // Values are the .cpp's RoomView. Public only so the free helper there can
+    // reach it; nothing outside SyncEngine.cpp touches it.
+    struct ViewCache {
+        std::mutex mutex;
+        uint64_t generation = UINT64_MAX;
+        std::unordered_map<std::string, int> views;  // "<user>\x1f<room>" -> RoomView
+    };
+
 private:
     SyncResponse build_initial_sync(const std::string& user_id);
     // `out_covered_pos`, when given, receives the stream position this scan is
@@ -159,6 +182,7 @@ private:
     uint64_t user_ephemeral_clock_ = 0;
     // Caller must hold wait_mutex_. 0 for an account never notified.
     uint64_t user_ephemeral_seq_locked(const std::string& user_id) const;
+    ViewCache view_cache_;
     // Set once before any sync runs, by tests only.
     std::function<void()> post_scan_hook_for_test_;
 };
