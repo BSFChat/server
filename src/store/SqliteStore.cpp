@@ -1012,8 +1012,38 @@ void SqliteStore::reap_expired_tokens_locked(int64_t now, bool force) {
 }
 
 std::optional<std::string> SqliteStore::get_user_by_token(const std::string& token) {
-    std::lock_guard lock(mutex_);
     auto token_hash = hash_access_token(token);
+
+    // Read-only fast path on a pooled reader (S2-4): every request, and above
+    // all every /sync poll, authenticates here, and almost none of them has
+    // anything to write — the slide is written only past half the lifetime
+    // and a bot's last use once per interval. Those, and anything the fast
+    // path is unsure of, go round again with mutex_ held, which re-reads the
+    // row and decides from scratch exactly as before. A logout or revocation
+    // commits before it returns, so a request that starts afterwards cannot
+    // see the row here.
+    {
+        auto rd = reader();
+        auto stmt = rd.prepare(
+            "SELECT user_id, expires_at, lifetime_ms, COALESCE(last_used_at, 0) "
+            "FROM access_tokens WHERE token_hash = ?");
+        sqlite3_bind_text(stmt.get(), 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+        const int64_t expires_at = sqlite3_column_int64(stmt.get(), 1);
+        const int64_t lifetime_ms = sqlite3_column_int64(stmt.get(), 2);
+        const int64_t last_used_at = sqlite3_column_int64(stmt.get(), 3);
+        const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        const bool nothing_to_write =
+            lifetime_ms > 0 ? (expires_at > now && (expires_at - now) >= lifetime_ms / 2)
+                            : (last_used_at + kBotLastSeenIntervalMs > now);
+        if (nothing_to_write) return column_text_or_empty(stmt.get(), 0);
+    }
+    return get_user_by_token_writing(token_hash);
+}
+
+std::optional<std::string> SqliteStore::get_user_by_token_writing(const std::string& token_hash) {
+    std::lock_guard lock(mutex_);
 
     std::string user_id;
     int64_t expires_at = 0;

@@ -1740,6 +1740,9 @@ private:
     // past refresh_deadline_ms). Throttled to hourly unless `force`. Called
     // with mutex_ already held.
     void reap_expired_tokens_locked(int64_t now, bool force);
+    // get_user_by_token() with mutex_ held throughout: the path that may write
+    // (reap an expired row, slide the expiry, stamp a bot's last use).
+    std::optional<std::string> get_user_by_token_writing(const std::string& token_hash);
     int64_t last_token_sweep_ms_ = 0;
 
     void exec(const std::string& sql);
