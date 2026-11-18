@@ -203,9 +203,21 @@ because ADMINISTRATOR short-circuits every flag.
 
 ### Deliberately left alone
 
-- **`POST /rooms/{id}/voice/leave`** is membership-only and stays that way.
-  Hanging up must never be refused — gating it would strand a user in a call
-  they had just lost permission to be in.
+- **`POST /rooms/{id}/voice/leave`** is ungated and stays that way. Hanging
+  up must never be refused — gating it would strand a user in a call they had
+  just lost permission to be in. Since audit 2-2026-11-18 (V2-7) it does not
+  even require membership: a kicked or banned user's own teardown clears their
+  row, and a non-member with nothing to clear gets the same
+  `{"changed": false, "reason": "not_active"}` a nonexistent room does.
+
+  **The server no longer waits for the client, either.** A leave, kick or ban
+  (any `leave`/`ban` m.room.member the room handler writes, including a server
+  ban's projection into every room), account or bot deactivation, a
+  `bsfchat.channel.permissions` write, a role assignment or role-definition
+  change that takes VIEW_CHANNEL away, and channel deletion each write
+  `active=false` over the affected user's `m.call.member` row at once
+  (`retract_call_member` and friends in `api/VoiceHandler.h`). The reaper's
+  forty seconds is now only the fallback for a client that vanished.
 
   **Re-raised and declined again** as permissions audit F9 (September 2026),
   which recommended adding the `kViewChannel` pair for symmetry with the other

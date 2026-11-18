@@ -257,6 +257,13 @@ Today there are two overlapping sources of truth:
   "the session I am running was expired" from "an older session of mine was
   cleaned up".
 
+  The server also retracts a row itself (same shape, naming the stored
+  session) when the user leaves or is removed from the room, loses
+  VIEW_CHANNEL there, or the channel is deleted (audit 2-2026-11-18 V2-7).
+  `voice/join` refuses a full channel with 403 and
+  `bsfchat.errcode: "BSFCHAT.VOICE_CHANNEL_FULL"` plus `max_participants`;
+  a channel with no cap of its own gets `voice.default_max_participants` (10).
+
   A join over a row that is still `active` now emits `active: false` and then
   the new `active: true`, in that order. A mesh peer keys its peer connection
   on the active transition; overwriting one active row with another gave it no

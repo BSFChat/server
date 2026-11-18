@@ -584,10 +584,12 @@ recommendation below.
   ADMINISTRATOR-bearing role, and only to an oldest account with no assignment
   at all; it writes a `role.bootstrap_admin` audit record. A server left with no
   admin is recovered with `bsfchat-server grant-admin`.
-* **S-8, voice and typing limits.** `POST voice/join` and `PUT voice/state`
-  share a per-account `voice_limit` (default 60 per window) and `PUT typing` has
-  `typing_limit` (default 120); voice/join applies `device_id_error()` to the
-  device id it stores.
+* **S-8, voice and typing limits.** `POST voice/join` has a per-account
+  `voice_limit` and `PUT typing` has `typing_limit` (default 120); voice/join
+  applies `device_id_error()` to the device id it stores. Since audit
+  2-2026-11-18 (V2-2) `voice_limit` defaults to 120 and `PUT voice/state` has
+  its own `voice_state_limit` (default 240), so push-to-talk toggles do not
+  spend the join budget; a state PUT that changes nothing writes no event.
 
 ## Recommended follow-ups
 

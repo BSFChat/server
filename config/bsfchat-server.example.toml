@@ -469,11 +469,13 @@ report_limit = 10
 # somebody is one of these; a client syncing its settings is a handful.
 account_data_limit = 60
 
-# Voice joins plus voice state changes (mute, deafen, screen share), together,
+# Voice joins, voice state changes (mute, deafen, push-to-talk, screen share)
 # and typing notifications, per account per window. Each one wakes every
-# parked /sync in the room. The voice heartbeat is the members poll, which is
-# not counted, so a call costs one join and a few toggles.
-voice_limit = 60
+# parked /sync in the room. State changes have their own, larger budget so a
+# push-to-talk user cannot spend the joins a reconnect needs. The voice
+# heartbeat is the members poll, which is not counted.
+voice_limit = 120
+voice_state_limit = 240
 typing_limit = 120
 
 # --- How big one write may be (as opposed to how many) -----------------------
@@ -544,6 +546,11 @@ use_path_style = true
 [voice]
 enabled = true
 
+# Participant cap for voice channels that set none of their own
+# (max_participants 0 or unset). A peer-to-peer mesh gives out at about 6-8
+# cameras. 0 = unlimited.
+default_max_participants = 10
+
 # Public STUN (covers ~70% of NAT setups with no infrastructure from you).
 stun_uri = "stun:stun.l.google.com:19302"
 
@@ -555,7 +562,9 @@ stun_uri = "stun:stun.l.google.com:19302"
 # Preferred: time-limited credentials (coturn `use-auth-secret`, with
 # `static-auth-secret` set to the same value as turn_secret):
 # turn_secret = "<random-secret>"
-# turn_ttl = 3600
+# Credential lifetime in seconds. A peer connection keeps the credential it
+# was opened with, so a short TTL drops relayed calls when it runs out.
+# turn_ttl = 86400
 #
 # Or static credentials (coturn `lt-cred-mech`). SINGLE-USER DEVELOPMENT ONLY:
 # in this mode the server hands the SAME username and password below to every
