@@ -1713,8 +1713,12 @@ public:
         int64_t fetched_at_ms = 0;
     };
     std::optional<UrlPreviewRow> get_url_preview(const std::string& url);
+    // A refetch that replaces a row's image parks the old image under
+    // kRetiredPreviewImagePrefix + mxc (fetched_at = now) instead of dropping
+    // the last reference to it, so it lives until the ordinary prune.
     void put_url_preview(const std::string& url, const std::optional<std::string>& response_json,
                          const std::string& image_mxc, int64_t fetched_at_ms);
+    static constexpr const char* kRetiredPreviewImagePrefix = "retired-image:";
     // Deletes rows fetched before `fetched_before_ms`; returns how many.
     int prune_url_previews(int64_t fetched_before_ms);
 

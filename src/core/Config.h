@@ -656,6 +656,13 @@ struct Config {
     std::vector<int> url_preview_allowed_ports = {80, 443};
     int url_preview_rate_per_minute = 30;     // outbound fetches per account
     int url_preview_max_concurrent = 8;       // fetches in flight, server-wide
+    // Fetches in flight for ONE account (audit 2-2026-11-18 S2-7): without it
+    // one account could hold every server-wide slot. Clamped 1..max_concurrent.
+    int url_preview_max_concurrent_per_account = 2;
+    // Bytes of preview images one account's cache misses may store per day
+    // (S2-8). Past it, previews are still made, without an image. 0 = no
+    // images at all for anyone; clamped at use to 1 TiB.
+    int64_t url_preview_image_bytes_per_account_per_day = 200LL * 1024 * 1024;
 
     // Storage
     StorageConfig storage;

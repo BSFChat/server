@@ -63,8 +63,9 @@ That is the classic SSRF setup, so the rules below are strict.
    - HTML beyond `url_preview_max_bytes` (1 MiB) is cut off and the start of
      the page is parsed.
    - An image beyond `url_preview_image_max_bytes` (5 MiB) is dropped.
-   - `url_preview_timeout_seconds` (8 s) is one deadline across all hops of a
-     fetch. The page and its image are separate fetches.
+   - `url_preview_timeout_seconds` (8 s) is one deadline for the whole
+     preview: every hop of the page fetch and the og:image fetch after it.
+     A slow page leaves the image only what is left.
 6. **Types.** Only `text/html` and `application/xhtml+xml` are parsed. Images
    are stored only as `image/png`, `jpeg`, `gif` or `webp`, and only when the
    file's magic bytes match the type (`media_policy::normalise_content_type`).
@@ -77,7 +78,13 @@ That is the classic SSRF setup, so the rules below are strict.
 8. **Load.** Each account gets `url_preview_rate_per_minute` (30) fetches per
    minute. Only cache misses count. At most `url_preview_max_concurrent` (8)
    fetches run at once across the server, because each one holds an HTTP
-   worker. Requests beyond either limit get 429.
+   worker, and at most `url_preview_max_concurrent_per_account` (2) of them
+   for one account, so one account cannot take every slot. Requests beyond
+   any of these limits get 429.
+9. **Image budget.** The images an account's cache misses store count against
+   `url_preview_image_bytes_per_account_per_day` (200 MiB per rolling 24 h,
+   kept in memory). Past it, the preview is still made but has no `og:image`;
+   a URL that is itself an image then has nothing to preview (404).
 
 ## What is returned
 
@@ -110,6 +117,11 @@ That is the classic SSRF setup, so the rules below are strict.
   Rows older than 48 h are pruned (checked at most once an hour).
 - **Image cleanup.** The media reaper keeps an image while its cache row
   exists, and collects it as an orphan after the row is pruned.
+- **Refetch.** When a refetch replaces or drops a row's image, the old image
+  is kept: it is parked in a `url_previews` row keyed
+  `retired-image:<mxc>` (no URL normalises to that) with the refetch time,
+  so clients that already hold the old mxc keep it until the same 48 h prune
+  releases it to the reaper.
 
 ## Config (`[media]`)
 
@@ -124,6 +136,8 @@ That is the classic SSRF setup, so the rules below are strict.
 | `url_preview_user_agent` | `""`, which means the default above |
 | `url_preview_rate_per_minute` | `30` (clamped 1 to 600) |
 | `url_preview_max_concurrent` | `8` (clamped 1 to 64) |
+| `url_preview_max_concurrent_per_account` | `2` (clamped 1 to `url_preview_max_concurrent`) |
+| `url_preview_image_bytes_per_account_per_day` | `209715200` (200 MiB; `0` = never store images) |
 
 ## Known limits
 

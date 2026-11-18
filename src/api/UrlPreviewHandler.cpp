@@ -107,7 +107,11 @@ UrlPreviewHandler::UrlPreviewHandler(SqliteStore& store, const Config& config,
       timeout_ms_(std::clamp(config.url_preview_timeout_seconds, 1, 30) * 1000),
       max_concurrent_(std::clamp(config.url_preview_max_concurrent, 1, 64)),
       limiter_(std::clamp(config.url_preview_rate_per_minute, 1, 600), std::chrono::seconds(60),
-               clock) {
+               clock),
+      max_per_account_(std::clamp(config.url_preview_max_concurrent_per_account, 1,
+                                  max_concurrent_)),
+      image_bytes_per_day_(std::clamp<int64_t>(config.url_preview_image_bytes_per_account_per_day,
+                                               0, int64_t(1) << 40)) {
     for (const auto& entry : config.url_preview_ip_denylist) {
         auto cidr = outbound::parse_cidr(entry);
         // Fail startup: a typo silently dropping a range the operator meant to
@@ -187,10 +191,27 @@ void UrlPreviewHandler::maybe_prune() {
     store_.prune_url_previews(wall_now() - 2 * url_preview::kPositiveTtlMs);
 }
 
-UrlPreviewHandler::Fetched UrlPreviewHandler::fetch(const ParsedUrl& start, bool accept_html) {
+int64_t UrlPreviewHandler::image_budget_left(const std::string& user_id) {
+    constexpr int64_t kDayMs = 24LL * 60 * 60 * 1000;
+    const int64_t now = clock_();
+    std::lock_guard lock(account_mu_);
+    auto& b = image_budget_[user_id];
+    if (b.window_start_ms == 0 || now - b.window_start_ms >= kDayMs) {
+        b.window_start_ms = now;
+        b.used = 0;
+    }
+    return std::max<int64_t>(0, image_bytes_per_day_ - b.used);
+}
+
+void UrlPreviewHandler::charge_image_budget(const std::string& user_id, int64_t bytes) {
+    std::lock_guard lock(account_mu_);
+    image_budget_[user_id].used += bytes;
+}
+
+UrlPreviewHandler::Fetched UrlPreviewHandler::fetch(const ParsedUrl& start, bool accept_html,
+                                                    int64_t deadline) {
     auto log = get_logger();
     Fetched out;
-    const int64_t deadline = steady_ms() + timeout_ms_;
     ParsedUrl url = start;
 
     for (int hop = 0; hop <= kMaxRedirects; ++hop) {
@@ -364,12 +385,22 @@ std::string UrlPreviewHandler::store_image(const std::string& body,
 }
 
 bool UrlPreviewHandler::attach_image(nlohmann::json& out, std::string& image_mxc,
-                                     const std::string& body, const std::string& content_type) {
+                                     const std::string& body, const std::string& content_type,
+                                     const std::string& user_id) {
     // The header is a claim; the magic bytes decide (api/MediaPolicy.h).
     const std::string sniffed = media_policy::normalise_content_type(content_type, body);
     if (!is_preview_image_type(sniffed)) return false;
+    // A stored preview image is anonymous media that any account can make the
+    // server keep (audit 2-2026-11-18 S2-8: about 9 GiB/h per account before
+    // this). Charged to the account whose miss caused the store.
+    if (static_cast<int64_t>(body.size()) > image_budget_left(user_id)) {
+        get_logger()->info("URL preview: {} is over the daily preview-image budget; "
+                           "previewing without the image", user_id);
+        return false;
+    }
     const std::string media_id = store_image(body, sniffed);
     if (media_id.empty()) return false;
+    charge_image_budget(user_id, static_cast<int64_t>(body.size()));
     image_mxc = "mxc://" + config_.server_name + "/" + media_id;
     out["og:image"] = image_mxc;
     out["matrix:image:size"] = static_cast<int64_t>(body.size());
@@ -426,7 +457,29 @@ void UrlPreviewHandler::handle_preview(const httplib::Request& req, httplib::Res
         send_rate_limited(res, wait, "Too many link previews; try again shortly");
         return;
     }
-    // Each fetch holds an HTTP worker for up to two timeouts (page + image).
+    // Each fetch holds an HTTP worker for up to one timeout (page + image).
+    // The account's share first, so one account cannot hold every server-wide
+    // slot (audit 2-2026-11-18 S2-7).
+    {
+        std::lock_guard lock(account_mu_);
+        int& mine = account_in_flight_[*user_id];
+        if (mine >= max_per_account_) {
+            send_rate_limited(res, 1000, "Too many link previews in progress; try again shortly");
+            return;
+        }
+        ++mine;
+    }
+    struct AccountSlot {
+        UrlPreviewHandler& h;
+        const std::string& user;
+        ~AccountSlot() {
+            std::lock_guard lock(h.account_mu_);
+            auto it = h.account_in_flight_.find(user);
+            if (it != h.account_in_flight_.end() && --it->second <= 0) {
+                h.account_in_flight_.erase(it);
+            }
+        }
+    } account_slot{*this, *user_id};
     if (in_flight_.fetch_add(1) >= max_concurrent_) {
         in_flight_.fetch_sub(1);
         send_rate_limited(res, 1000, "The server is busy fetching other previews");
@@ -439,7 +492,10 @@ void UrlPreviewHandler::handle_preview(const httplib::Request& req, httplib::Res
 
     maybe_prune();
 
-    Fetched page = fetch(*parsed, true);
+    // ONE deadline for the whole preview: the page, its redirects, and the
+    // og:image fetch after it.
+    const int64_t deadline = steady_ms() + timeout_ms_;
+    Fetched page = fetch(*parsed, true, deadline);
     if (page.status == FetchStatus::kForbidden) {
         send_error(res, 400, MatrixError::invalid_param(page.why));
         return;
@@ -448,7 +504,7 @@ void UrlPreviewHandler::handle_preview(const httplib::Request& req, httplib::Res
     nlohmann::json out = nlohmann::json::object();
     std::string image_mxc;
     if (page.status == FetchStatus::kOk && !page.is_html) {
-        attach_image(out, image_mxc, page.body, page.content_type);
+        attach_image(out, image_mxc, page.body, page.content_type, *user_id);
     } else if (page.status == FetchStatus::kOk) {
         const auto tags = url_preview::parse_html(page.body);
         const std::string charset = !page.charset.empty()
@@ -465,12 +521,14 @@ void UrlPreviewHandler::handle_preview(const httplib::Request& req, httplib::Res
             auto abs = url_preview::resolve_reference(page.final_url, *tags.url);
             if (auto u = abs ? url_preview::parse_url(*abs) : std::nullopt) out["og:url"] = u->normalised();
         }
-        if (tags.image) {
+        // No image fetch at all once the account's image budget is spent, or
+        // once the shared deadline has.
+        if (tags.image && image_budget_left(*user_id) > 0 && steady_ms() < deadline) {
             auto abs = url_preview::resolve_reference(page.final_url, *tags.image);
             if (auto u = abs ? url_preview::parse_url(*abs) : std::nullopt) {
-                Fetched img = fetch(*u, false);
+                Fetched img = fetch(*u, false, deadline);
                 if (img.status == FetchStatus::kOk &&
-                    attach_image(out, image_mxc, img.body, img.content_type) &&
+                    attach_image(out, image_mxc, img.body, img.content_type, *user_id) &&
                     !out.contains("og:image:width")) {
                     // Header unreadable: fall back to what the page declared.
                     if (auto w = positive_int(tags.image_width)) out["og:image:width"] = *w;

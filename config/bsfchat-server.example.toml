@@ -162,8 +162,8 @@ url_preview_enabled = true
 # <head> is what matters); an image past its cap is dropped.
 url_preview_max_bytes = 1048576
 url_preview_image_max_bytes = 5242880
-# Total time for one fetch, including redirects (the page and its image are
-# separate fetches). Clamped to 1..30.
+# Total time for one preview, including redirects and the page's og:image (one
+# deadline for both). Clamped to 1..30.
 url_preview_timeout_seconds = 8
 # Ports a previewed URL may use.
 url_preview_allowed_ports = [80, 443]
@@ -177,6 +177,11 @@ url_preview_ip_denylist = []
 # flight across the whole server; past the latter requests get 429.
 url_preview_rate_per_minute = 30
 url_preview_max_concurrent = 8
+# Of those, how many one account may hold at once.
+url_preview_max_concurrent_per_account = 2
+# Bytes of preview images one account's previews may store per day; past it,
+# previews are still made but without an image. 0 = never store images.
+url_preview_image_bytes_per_account_per_day = 209715200
 
 # What a server that has never held a room builds for itself the first time it
 # starts: a #general text channel and a General Voice channel.

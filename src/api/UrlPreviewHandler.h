@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace bsfchat {
@@ -42,8 +43,11 @@ struct Config;
 //     streaming; one deadline across all hops of a fetch.
 //   * Type: only text/html (or xhtml) is parsed; image/png|jpeg|gif|webp is
 //     the only thing stored, and only when its magic bytes agree.
-//   * Load: a per-account rate limit on cache misses and a server-wide cap on
-//     fetches in flight (each one holds an HTTP worker), 429 past either.
+//   * Load: a per-account rate limit on cache misses, a server-wide cap on
+//     fetches in flight (each one holds an HTTP worker) and a per-account
+//     share of it, 429 past any; one deadline covers the page AND its image.
+//   * Storage: a per-account daily byte budget for stored preview images;
+//     past it a preview is still made, without the image.
 //   * No cookies, no Authorization, no Referer; a fixed User-Agent.
 //
 // The og:image is stored in the media repository with uploader
@@ -92,15 +96,23 @@ private:
     };
 
     // One fetch with redirects. `accept_html` false means only an image will do.
-    Fetched fetch(const url_preview::ParsedUrl& start, bool accept_html);
+    // `deadline_ms` is on the steady clock and is shared by every fetch one
+    // preview makes, so the page and its image together take at most one
+    // timeout (audit 2-2026-11-18 S2-7).
+    Fetched fetch(const url_preview::ParsedUrl& start, bool accept_html, int64_t deadline_ms);
 
     // Store an image body as a server-owned media object; returns its media id
     // or empty on failure.
     std::string store_image(const std::string& body, const std::string& content_type);
 
-    // Adds og:image (+ size, dimensions) for an image body to `out`.
+    // Adds og:image (+ size, dimensions) for an image body to `out`, charging
+    // `user_id`'s daily image budget. False (and nothing stored) past it.
     bool attach_image(nlohmann::json& out, std::string& image_mxc, const std::string& body,
-                      const std::string& content_type);
+                      const std::string& content_type, const std::string& user_id);
+
+    // Bytes `user_id` may still store today; refreshed per 24 h window.
+    int64_t image_budget_left(const std::string& user_id);
+    void charge_image_budget(const std::string& user_id, int64_t bytes);
 
     const char* address_refusal(const outbound::IpAddress& a) const;
     bool port_allowed(int port) const;
@@ -122,6 +134,16 @@ private:
 
     RateLimiter limiter_;
     std::atomic<int> in_flight_{0};
+
+    int max_per_account_;
+    int64_t image_bytes_per_day_;
+    std::mutex account_mu_;
+    std::unordered_map<std::string, int> account_in_flight_;  // guarded by account_mu_
+    struct ImageBudget {
+        int64_t window_start_ms = 0;
+        int64_t used = 0;
+    };
+    std::unordered_map<std::string, ImageBudget> image_budget_;  // guarded by account_mu_
 
     std::mutex prune_mu_;
     int64_t last_prune_ms_ = 0;

@@ -451,6 +451,8 @@ struct Origin {
     std::atomic<int> hits{0};
     std::string last_user_agent;
     std::string last_cookie;
+    std::atomic<int> slow_waiting{0};
+    std::atomic<bool> release{false};
 
     Origin() {
         svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response&) {
@@ -496,6 +498,23 @@ struct Origin {
             res.status = 302;
             res.set_header("Location", n <= 1 ? "/page" : "/r" + std::to_string(n - 1));
         });
+        // Held open until `release` (audit 2-2026-11-18 S2-7 tests).
+        svr.Get("/slow", [this](const httplib::Request&, httplib::Response& res) {
+            ++slow_waiting;
+            while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            --slow_waiting;
+            res.set_content("<meta property=og:title content=Slow>", "text/html");
+        });
+        svr.Get("/slowpage", [](const httplib::Request&, httplib::Response& res) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+            res.set_content("<meta property=og:title content=SlowPage>"
+                            "<meta property=og:image content=/slowimg.png>",
+                            "text/html");
+        });
+        svr.Get("/slowimg.png", [](const httplib::Request&, httplib::Response& res) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+            res.set_content(png(8, 8), "image/png");
+        });
         svr.Get("/to-private", [](const httplib::Request&, httplib::Response& res) {
             res.status = 301;
             res.set_header("Location", "http://10.0.0.1/");
@@ -505,6 +524,7 @@ struct Origin {
         svr.wait_until_ready();
     }
     ~Origin() {
+        release = true;
         svr.stop();
         thread.join();
     }
@@ -544,12 +564,21 @@ struct PreviewFixture {
             if (host == "preview.test")
                 return std::vector<outbound::IpAddress>{*outbound::IpAddress::parse("127.0.0.1")};
             return UrlPreviewHandler::system_resolve(host);  // numeric only in these tests
-        }) {
+        },
+        LimiterClock clock = limiter_steady_now_ms) {
         UrlPreviewHandler::TestSeams seams;
         seams.resolver = std::move(resolver);
         seams.allow_loopback = true;
-        return std::make_unique<UrlPreviewHandler>(*store, config, storage, limiter_steady_now_ms,
+        return std::make_unique<UrlPreviewHandler>(*store, config, storage, std::move(clock),
                                                    std::move(seams));
+    }
+
+    static UrlPreviewHandler::Resolver default_resolver() {
+        return [](const std::string& host) {
+            if (host == "preview.test")
+                return std::vector<outbound::IpAddress>{*outbound::IpAddress::parse("127.0.0.1")};
+            return UrlPreviewHandler::system_resolve(host);
+        };
     }
 
     std::string url(const std::string& path) const {
@@ -763,4 +792,122 @@ TEST(UrlPreviewHandlerTest, SecondUserCanTicketAndDownloadPreviewImage) {
     // Not opened up: bob still cannot ticket alice's unattached upload.
     EXPECT_EQ(mint("mxc://test/cafe0000cafe0000cafe0000cafe0000", "bob").status, 404);
     EXPECT_EQ(mint("mxc://test/cafe0000cafe0000cafe0000cafe0000", "alice").status, 200);
+}
+
+// ── Audit 2-2026-11-18 S2-7 / S2-8 ──────────────────────────────────────────
+
+// One account may hold at most url_preview_max_concurrent_per_account of the
+// server-wide fetch slots; other accounts are unaffected.
+TEST(UrlPreviewHandlerTest, OneAccountCannotHoldEveryFetchSlot) {
+    PreviewFixture f;
+    f.config.url_preview_max_concurrent = 8;
+    f.config.url_preview_max_concurrent_per_account = 2;
+    f.config.url_preview_rate_per_minute = 600;
+    auto h = f.seamed();
+
+    std::vector<std::thread> held;
+    std::vector<int> statuses(2, 0);
+    for (int i = 0; i < 2; ++i) {
+        held.emplace_back([&, i] {
+            statuses[i] = f.get(*h, f.url("/slow?n=" + std::to_string(i))).status;
+        });
+    }
+    for (int i = 0; i < 400 && f.origin.slow_waiting.load() < 2; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_EQ(f.origin.slow_waiting.load(), 2) << "fixture: both fetches must be in flight";
+
+    auto third = f.get(*h, f.url("/slow?n=3"));
+    EXPECT_EQ(third.status, 429) << third.body;
+    EXPECT_EQ(errcode(third), "M_LIMIT_EXCEEDED");
+    // Another account still gets a slot.
+    EXPECT_EQ(f.get(*h, f.url("/page"), "bob").status, 200);
+
+    f.origin.release = true;
+    for (auto& t : held) t.join();
+    EXPECT_EQ(statuses[0], 200);
+    EXPECT_EQ(statuses[1], 200);
+    // The slots were given back.
+    EXPECT_EQ(f.get(*h, f.url("/slow?n=4")).status, 200);
+}
+
+// One deadline covers the page and its image: a slow page leaves the image
+// only what remains of url_preview_timeout_seconds, not a fresh timeout.
+TEST(UrlPreviewHandlerTest, ThePageAndItsImageShareOneDeadline) {
+    PreviewFixture f;
+    f.config.url_preview_timeout_seconds = 2;  // page 1.2 s + image 1.2 s > 2 s
+    auto h = f.seamed();
+    const auto t0 = std::chrono::steady_clock::now();
+    auto res = f.get(*h, f.url("/slowpage"));
+    const auto took = std::chrono::steady_clock::now() - t0;
+    ASSERT_EQ(res.status, 200) << res.body;
+    auto j = json::parse(res.body);
+    EXPECT_EQ(j["og:title"], "SlowPage");
+    EXPECT_FALSE(j.contains("og:image")) << "the image fetch got a deadline of its own";
+    EXPECT_LT(took, std::chrono::milliseconds(2600));
+}
+
+// Stored preview images are charged to the account whose miss stored them;
+// past the daily budget a preview is still made, without the image.
+TEST(UrlPreviewHandlerTest, PreviewImagesHaveADailyPerAccountBudget) {
+    PreviewFixture f;
+    f.config.url_preview_rate_per_minute = 600;
+    const int64_t one_image = static_cast<int64_t>(png(64, 32).size());
+    f.config.url_preview_image_bytes_per_account_per_day = one_image + 10;
+    auto now = std::make_shared<std::atomic<int64_t>>(1'000'000);
+    auto h = f.seamed(PreviewFixture::default_resolver(), [now] { return now->load(); });
+
+    auto first = f.get(*h, f.url("/page?n=1"));
+    ASSERT_EQ(first.status, 200) << first.body;
+    EXPECT_TRUE(json::parse(first.body).contains("og:image"));
+
+    auto second = f.get(*h, f.url("/page?n=2"));
+    ASSERT_EQ(second.status, 200) << second.body;
+    auto j = json::parse(second.body);
+    EXPECT_EQ(j["og:title"], "Hello & welcome");
+    EXPECT_FALSE(j.contains("og:image")) << "the budget did not stop the store";
+
+    // Per account.
+    auto bobs = f.get(*h, f.url("/page?n=3"), "bob");
+    EXPECT_TRUE(json::parse(bobs.body).contains("og:image"));
+
+    // A day later the budget is back.
+    *now += 24LL * 3600 * 1000;
+    auto later = f.get(*h, f.url("/page?n=4"));
+    EXPECT_TRUE(json::parse(later.body).contains("og:image"));
+
+    // 0 = no preview images at all.
+    f.config.url_preview_image_bytes_per_account_per_day = 0;
+    auto none = f.seamed();
+    auto direct = f.get(*none, f.url("/direct.png"));
+    EXPECT_EQ(direct.status, 404) << "an image-only preview with no image is nothing";
+}
+
+// A refetch that replaces the image keeps the old one referenced until the
+// ordinary prune, so a client holding the old mxc does not lose it at once.
+TEST(UrlPreviewCache, ARefetchParksTheOldImageUntilThePrune) {
+    SqliteStore store(":memory:");
+    store.initialize();
+    store.insert_media("aaaa", kUrlPreviewUploader, "image/png", "", 10, "aaaa");
+    store.insert_media("bbbb", kUrlPreviewUploader, "image/png", "", 10, "bbbb");
+    const int64_t future = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count() + 3600 * 1000;
+    store.put_url_preview("https://a.example/", std::string("{}"), "mxc://test/aaaa", 1000);
+    store.put_url_preview("https://a.example/", std::string("{}"), "mxc://test/bbbb", 2000);
+    EXPECT_TRUE(store.find_orphaned_media("test", future, 100).empty())
+        << "the previous image was orphaned by the refetch";
+    // The parked row is not a preview anybody can look up.
+    EXPECT_FALSE(store.get_url_preview(std::string(SqliteStore::kRetiredPreviewImagePrefix) +
+                                       "mxc://test/aaaa")
+                     ->response_json);
+    // Same image again: nothing parked twice, nothing lost.
+    store.put_url_preview("https://a.example/", std::string("{}"), "mxc://test/bbbb", 3000);
+    EXPECT_TRUE(store.find_orphaned_media("test", future, 100).empty());
+
+    // The prune releases it on the usual schedule (parked at the refetch time).
+    store.prune_url_previews(2500);
+    auto orphans = store.find_orphaned_media("test", future, 100);
+    ASSERT_EQ(orphans.size(), 1u);
+    EXPECT_EQ(orphans[0].media_id, "aaaa");
 }

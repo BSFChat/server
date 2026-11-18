@@ -4773,6 +4773,29 @@ void SqliteStore::put_url_preview(const std::string& url,
                                   const std::optional<std::string>& response_json,
                                   const std::string& image_mxc, int64_t fetched_at_ms) {
     std::lock_guard lock(mutex_);
+    // A refetch that changes (or drops) the image must not orphan the old one
+    // at once (audit 2-2026-11-18 S2-8): clients that got the previous answer
+    // still hold its mxc. It is parked under a key no URL can normalise to
+    // ("retired-image:", not http/https), with the refetch time, so the hourly
+    // prune releases it to the reaper on the same schedule as any other row.
+    {
+        auto prev = prepare(db_, "SELECT image_mxc FROM url_previews WHERE url = ?");
+        sqlite3_bind_text(prev.get(), 1, url.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(prev.get()) == SQLITE_ROW) {
+            const std::string old = column_text_or_empty(prev.get(), 0);
+            if (!old.empty() && old != image_mxc) {
+                auto park = prepare(db_,
+                    "INSERT INTO url_previews (url, response, image_mxc, fetched_at) "
+                    "VALUES (?, NULL, ?, ?) ON CONFLICT(url) DO UPDATE SET "
+                    "fetched_at = excluded.fetched_at");
+                const std::string key = std::string(kRetiredPreviewImagePrefix) + old;
+                sqlite3_bind_text(park.get(), 1, key.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(park.get(), 2, old.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(park.get(), 3, fetched_at_ms);
+                sqlite3_step(park.get());
+            }
+        }
+    }
     auto stmt = prepare(db_,
         "INSERT INTO url_previews (url, response, image_mxc, fetched_at) VALUES (?, ?, ?, ?) "
         "ON CONFLICT(url) DO UPDATE SET response = excluded.response, "

@@ -109,6 +109,12 @@ Config Config::load(const std::string& path) {
             if (auto v = media->get("url_preview_max_concurrent"))
                 cfg.url_preview_max_concurrent = static_cast<int>(
                     v->value_or(static_cast<int64_t>(cfg.url_preview_max_concurrent)));
+            if (auto v = media->get("url_preview_max_concurrent_per_account"))
+                cfg.url_preview_max_concurrent_per_account = static_cast<int>(v->value_or(
+                    static_cast<int64_t>(cfg.url_preview_max_concurrent_per_account)));
+            if (auto v = media->get("url_preview_image_bytes_per_account_per_day"))
+                cfg.url_preview_image_bytes_per_account_per_day =
+                    v->value_or(cfg.url_preview_image_bytes_per_account_per_day);
             if (auto arr = media->get_as<toml::array>("url_preview_ip_denylist")) {
                 cfg.url_preview_ip_denylist.clear();
                 for (const auto& el : *arr) {
