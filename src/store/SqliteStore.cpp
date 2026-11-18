@@ -16,6 +16,8 @@
 #include <set>
 #include <stdexcept>
 #include <unordered_set>
+#include <unordered_map>
+#include <condition_variable>
 
 // For tightening the mode on the database file. POSIX-only, which matches the
 // only platforms the server is deployed on; the Windows build of the server is
@@ -227,6 +229,120 @@ RoomEvent read_event_row(sqlite3_stmt* stmt) {
 
 } // namespace
 
+// ── Read-only connection pool (S2-4) ──────────────────────────────────────
+//
+// See the header for what may use it. Each pooled connection also keeps its
+// prepared statements: the sync hot path runs the same dozen statements on
+// every wake, and preparing them again each time was a large share of a
+// woken poll's CPU.
+
+struct SqliteStore::ReaderPool {
+    struct Conn {
+        sqlite3* db = nullptr;
+        std::unordered_map<std::string, sqlite3_stmt*> statements;
+        Conn() = default;
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+        ~Conn() {
+            for (auto& entry : statements) sqlite3_finalize(entry.second);
+            if (db) sqlite3_close(db);
+        }
+    };
+    // Enough to keep the cores busy when every parked poll wakes for one
+    // message; each connection costs its own page cache (~2 MB by default).
+    static constexpr std::size_t kConnections = 8;
+    // Per connection. Statements are keyed by their exact SQL, and a few are
+    // built with a variable-length IN list, so this bounds the cache rather
+    // than the set of statements: past it, a statement is prepared and
+    // finalised per use as everywhere else.
+    static constexpr std::size_t kMaxCachedStatements = 64;
+
+    std::mutex mutex;
+    std::condition_variable available;
+    std::vector<std::unique_ptr<Conn>> all;
+    std::vector<Conn*> idle;
+};
+
+namespace {
+
+// A prepared statement on a leased connection. Cached ones are reset and
+// unbound on release (and stay owned by the connection); others are finalised.
+class LeasedStatement {
+public:
+    LeasedStatement(sqlite3_stmt* stmt, bool cached) : stmt_(stmt), cached_(cached) {}
+    LeasedStatement(LeasedStatement&& o) noexcept : stmt_(o.stmt_), cached_(o.cached_) {
+        o.stmt_ = nullptr;
+    }
+    LeasedStatement(const LeasedStatement&) = delete;
+    LeasedStatement& operator=(const LeasedStatement&) = delete;
+    LeasedStatement& operator=(LeasedStatement&&) = delete;
+    ~LeasedStatement() {
+        if (!stmt_) return;
+        if (cached_) {
+            sqlite3_reset(stmt_);
+            sqlite3_clear_bindings(stmt_);
+        } else {
+            sqlite3_finalize(stmt_);
+        }
+    }
+    sqlite3_stmt* get() const { return stmt_; }
+
+private:
+    sqlite3_stmt* stmt_;
+    bool cached_;
+};
+
+} // namespace
+
+class SqliteStore::ReadLease {
+public:
+    // The main connection, serialised by mutex_ exactly as before the pool.
+    explicit ReadLease(SqliteStore& store) : lock_(store.mutex_), db_(store.db_) {}
+    ReadLease(ReaderPool* pool, ReaderPool::Conn* conn)
+        : pool_(pool), conn_(conn), db_(conn->db) {}
+    ReadLease(const ReadLease&) = delete;
+    ReadLease& operator=(const ReadLease&) = delete;
+    ~ReadLease() {
+        if (!conn_) return;
+        {
+            std::lock_guard lock(pool_->mutex);
+            pool_->idle.push_back(conn_);
+        }
+        pool_->available.notify_one();
+    }
+
+    sqlite3* db() const { return db_; }
+
+    LeasedStatement prepare(const std::string& sql) {
+        if (conn_) {
+            auto it = conn_->statements.find(sql);
+            // Busy means another statement of this lease with the same SQL is
+            // still stepping; never hand the same handle out twice.
+            if (it != conn_->statements.end() && !sqlite3_stmt_busy(it->second)) {
+                return LeasedStatement(it->second, true);
+            }
+        }
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+            if (stmt) sqlite3_finalize(stmt);
+            throw std::runtime_error(std::string("SQL prepare error: ") + sqlite3_errmsg(db_) +
+                                     " [" + sql + "]");
+        }
+        if (conn_ && !conn_->statements.count(sql) &&
+            conn_->statements.size() < ReaderPool::kMaxCachedStatements) {
+            conn_->statements.emplace(sql, stmt);
+            return LeasedStatement(stmt, true);
+        }
+        return LeasedStatement(stmt, false);
+    }
+
+private:
+    std::unique_lock<std::mutex> lock_;
+    ReaderPool* pool_ = nullptr;
+    ReaderPool::Conn* conn_ = nullptr;
+    sqlite3* db_ = nullptr;
+};
+
 SqliteStore::SqliteStore(const std::string& db_path) : db_path_(db_path) {
     if (sqlite3_open(db_path.c_str(), &db_) != SQLITE_OK) {
         throw std::runtime_error(std::string("Failed to open database: ") + sqlite3_errmsg(db_));
@@ -246,7 +362,10 @@ SqliteStore::SqliteStore(const std::string& db_path) : db_path_(db_path) {
         auto mode = prepare(db_, "PRAGMA journal_mode");
         std::string current;
         if (sqlite3_step(mode.get()) == SQLITE_ROW) current = column_text_or_empty(mode.get(), 0);
-        if (current == "wal") exec("PRAGMA synchronous=NORMAL");
+        if (current == "wal") {
+            exec("PRAGMA synchronous=NORMAL");
+            wal_mode_ = true;
+        }
     }
     exec("PRAGMA foreign_keys=ON");
     exec("PRAGMA busy_timeout=5000");
@@ -282,6 +401,7 @@ SqliteStore::SqliteStore(const std::string& db_path) : db_path_(db_path) {
 }
 
 SqliteStore::~SqliteStore() {
+    readers_.reset();
     if (db_) sqlite3_close(db_);
 }
 
@@ -304,6 +424,59 @@ bool is_in_memory_path(const std::string& path) {
 }
 
 } // namespace
+
+// Opened on first use rather than in the constructor so that nothing is open
+// beside the main connection while initialize() migrates and vacuums.
+//
+// Any failure leaves the pool empty, never half-built: every read then takes
+// the main connection under mutex_, which is slower and otherwise identical.
+void SqliteStore::open_readers() {
+    auto pool = std::make_unique<ReaderPool>();
+    // A pooled reader needs WAL to run beside the writer, and an in-memory
+    // database is private to its one connection.
+    if (wal_mode_ && !is_in_memory_path(db_path_)) {
+        for (std::size_t i = 0; i < ReaderPool::kConnections; ++i) {
+            auto conn = std::make_unique<ReaderPool::Conn>();
+            // READWRITE rather than READONLY: a read-only handle on a WAL
+            // database has extra failure modes around the -shm file, and
+            // query_only gives the same guarantee that nothing is written.
+            // No CREATE: the main connection has already created the file.
+            if (sqlite3_open_v2(db_path_.c_str(), &conn->db,
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX,
+                                nullptr) != SQLITE_OK ||
+                sqlite3_exec(conn->db, "PRAGMA busy_timeout=5000", nullptr, nullptr, nullptr) !=
+                    SQLITE_OK ||
+                sqlite3_exec(conn->db, "PRAGMA query_only=ON", nullptr, nullptr, nullptr) !=
+                    SQLITE_OK) {
+                get_logger()->warn("read connection pool unavailable ({}); reads stay on the "
+                                   "main connection",
+                                   conn->db ? sqlite3_errmsg(conn->db) : "out of memory");
+                pool->all.clear();
+                pool->idle.clear();
+                break;
+            }
+            pool->idle.push_back(conn.get());
+            pool->all.push_back(std::move(conn));
+        }
+    }
+    readers_ = std::move(pool);
+}
+
+SqliteStore::ReadLease SqliteStore::reader() {
+    std::call_once(readers_once_, [this] { open_readers(); });
+    if (readers_->all.empty()) return ReadLease(*this);
+    std::unique_lock lock(readers_->mutex);
+    readers_->available.wait(lock, [this] { return !readers_->idle.empty(); });
+    ReaderPool::Conn* conn = readers_->idle.back();
+    readers_->idle.pop_back();
+    lock.unlock();
+    return ReadLease(readers_.get(), conn);
+}
+
+std::size_t SqliteStore::reader_connections_for_test() {
+    std::call_once(readers_once_, [this] { open_readers(); });
+    return readers_->all.size();
+}
 
 // The database is the most sensitive file this process owns: every message
 // body, a second full copy of each body in the search index, queued push
@@ -1191,8 +1364,8 @@ std::string SqliteStore::create_room(const std::string& room_id, const std::stri
 }
 
 bool SqliteStore::is_direct_room(const std::string& room_id) {
-    std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "SELECT is_direct FROM rooms WHERE room_id = ?");
+    auto rd = reader();
+    auto stmt = rd.prepare( "SELECT is_direct FROM rooms WHERE room_id = ?");
     sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt.get()) != SQLITE_ROW) return false;
     return sqlite3_column_int(stmt.get(), 0) != 0;
@@ -1200,8 +1373,8 @@ bool SqliteStore::is_direct_room(const std::string& room_id) {
 
 std::vector<std::pair<std::string, std::string>> SqliteStore::get_direct_rooms(
     const std::string& user_id) {
-    std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, R"(
+    auto rd = reader();
+    auto stmt = rd.prepare( R"(
         SELECT me.room_id, peer.user_id
         FROM room_members me
         JOIN rooms r ON r.room_id = me.room_id AND r.is_direct = 1
@@ -1351,8 +1524,8 @@ bool SqliteStore::room_exists(const std::string& room_id) {
 }
 
 std::vector<std::string> SqliteStore::get_joined_rooms(const std::string& user_id) {
-    std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "SELECT room_id FROM room_members WHERE user_id = ? AND membership = 'join'");
+    auto rd = reader();
+    auto stmt = rd.prepare( "SELECT room_id FROM room_members WHERE user_id = ? AND membership = 'join'");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
 
     std::vector<std::string> rooms;
@@ -1909,8 +2082,8 @@ void SqliteStore::record_room_departure_locked(const std::string& user_id,
 
 std::vector<SqliteStore::RoomDeparture> SqliteStore::get_room_departures(
     const std::string& user_id, int64_t since_pos, int64_t up_to_pos) {
-    std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_,
+    auto rd = reader();
+    auto stmt = rd.prepare(
         "SELECT room_id, reason, stream_pos FROM room_departures "
         "WHERE user_id = ? AND stream_pos > ? AND stream_pos <= ? ORDER BY stream_pos");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -1946,8 +2119,8 @@ std::optional<std::string> SqliteStore::find_membership(const std::string& room_
 }
 
 std::vector<std::string> SqliteStore::get_invited_rooms(const std::string& user_id) {
-    std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_,
+    auto rd = reader();
+    auto stmt = rd.prepare(
         "SELECT room_id FROM room_members WHERE user_id = ? AND membership = 'invite'");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
 
@@ -1959,8 +2132,8 @@ std::vector<std::string> SqliteStore::get_invited_rooms(const std::string& user_
 }
 
 std::string SqliteStore::get_membership(const std::string& room_id, const std::string& user_id) {
-    std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "SELECT membership FROM room_members WHERE room_id = ? AND user_id = ?");
+    auto rd = reader();
+    auto stmt = rd.prepare( "SELECT membership FROM room_members WHERE room_id = ? AND user_id = ?");
     sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, user_id.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt.get()) == SQLITE_ROW) {
@@ -1999,7 +2172,7 @@ std::vector<std::string> SqliteStore::get_co_members(const std::string& user_id)
 
 std::vector<std::string> SqliteStore::get_joined_members_of_rooms(
     const std::vector<std::string>& room_ids) {
-    std::lock_guard lock(mutex_);
+    auto rd = reader();
     // Chunked so the statement never approaches SQLITE_MAX_VARIABLE_NUMBER
     // (999 on older builds), and deduplicated across chunks here.
     constexpr size_t kChunk = 500;
@@ -2010,7 +2183,7 @@ std::vector<std::string> SqliteStore::get_joined_members_of_rooms(
                           "WHERE membership = 'join' AND room_id IN (";
         for (size_t i = 0; i < n; ++i) sql += i ? ",?" : "?";
         sql += ")";
-        auto stmt = prepare(db_, sql);
+        auto stmt = rd.prepare( sql);
         for (size_t i = 0; i < n; ++i) {
             sqlite3_bind_text(stmt.get(), static_cast<int>(i + 1), room_ids[at + i].c_str(), -1,
                               SQLITE_TRANSIENT);
@@ -2120,9 +2293,17 @@ bool SqliteStore::clear_server_ban(const std::string& user_id) {
     return sqlite3_changes(db_) > 0;
 }
 
+std::vector<std::string> SqliteStore::get_server_banned_user_ids() {
+    auto rd = reader();
+    auto stmt = rd.prepare("SELECT user_id FROM server_bans");
+    std::vector<std::string> out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) out.emplace_back(column_text_or_empty(stmt.get(), 0));
+    return out;
+}
+
 bool SqliteStore::is_server_banned(const std::string& user_id) {
-    std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_, "SELECT 1 FROM server_bans WHERE user_id = ?");
+    auto rd = reader();
+    auto stmt = rd.prepare( "SELECT 1 FROM server_bans WHERE user_id = ?");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
     return sqlite3_step(stmt.get()) == SQLITE_ROW;
 }
@@ -2418,7 +2599,7 @@ SqliteStore::get_room_events_paginated(const std::string& room_id, int limit,
                                         const std::optional<std::string>& from,
                                         const std::optional<std::string>& viewer,
                                         const std::optional<std::string>& ignoring_user) {
-    std::lock_guard lock(mutex_);
+    auto rd = reader();
 
     // Same query shape as get_room_events, but we also pull stream_position
     // so the handler can construct the `end` pagination token without a
@@ -2509,7 +2690,7 @@ SqliteStore::get_room_events_paginated(const std::string& room_id, int limit,
     // would be right in one branch and wrong in the other. A misbound LIMIT
     // reads as zero and returns an empty page: a channel that looks empty, not
     // an error anyone would see.
-    auto stmt = prepare(db_, sql);
+    auto stmt = rd.prepare( sql);
     sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
     if (viewer) {
         sqlite3_bind_text(stmt.get(), 2, viewer->c_str(), -1, SQLITE_TRANSIENT);
@@ -2549,7 +2730,7 @@ std::vector<RoomEvent> SqliteStore::get_room_events(const std::string& room_id, 
 }
 
 std::vector<RoomEvent> SqliteStore::get_state_events(const std::string& room_id) {
-    std::lock_guard lock(mutex_);
+    auto rd = reader();
 
     // Get the latest state event for each (event_type, state_key) pair.
     //
@@ -2569,7 +2750,7 @@ std::vector<RoomEvent> SqliteStore::get_state_events(const std::string& room_id)
     // legitimate state event underneath it.
     //
     // See store/CallSignalling.h for what the rule is and why.
-    auto stmt = prepare(db_,
+    auto stmt = rd.prepare(
         "SELECT e.event_id, e.room_id, e.sender, e.event_type, e.state_key, e.content, e.origin_server_ts "
         "FROM events e "
         "INNER JOIN (SELECT event_type, state_key, MAX(stream_position) as max_pos "
@@ -3015,8 +3196,8 @@ SqliteStore::ServerStateWrite SqliteStore::set_server_state(
 
 std::optional<std::string> SqliteStore::get_server_state(const std::string& event_type,
                                                           const std::string& state_key) {
-    std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_,
+    auto rd = reader();
+    auto stmt = rd.prepare(
         "SELECT content FROM server_state WHERE event_type = ? AND state_key = ?");
     sqlite3_bind_text(stmt.get(), 1, event_type.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, state_key.c_str(), -1, SQLITE_TRANSIENT);
@@ -3048,7 +3229,7 @@ void SqliteStore::set_meta(const std::string& key, const std::string& value) {
 
 std::vector<RoomEvent> SqliteStore::get_invite_state(const std::string& room_id,
                                                       const std::string& invitee) {
-    std::lock_guard lock(mutex_);
+    auto rd = reader();
 
     // Latest event per (type, state_key), like get_state_events — but the
     // whitelist is inside the subquery, so a row outside it is never read at
@@ -3094,7 +3275,7 @@ std::vector<RoomEvent> SqliteStore::get_invite_state(const std::string& room_id,
     // is what makes this testable.
     std::vector<std::pair<int64_t, RoomEvent>> found;
     auto run = [&](const std::string& member_state_key, bool with_room_level) {
-        auto stmt = prepare(db_, build_sql(with_room_level));
+        auto stmt = rd.prepare( build_sql(with_room_level));
         sqlite3_bind_text(stmt.get(), 1, room_id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(stmt.get(), 2, member_state_key.c_str(), -1, SQLITE_TRANSIENT);
         while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
@@ -3202,8 +3383,8 @@ SqliteStore::VoiceKeyRotation SqliteStore::bump_voice_key_generation(const std::
 std::optional<RoomEvent> SqliteStore::get_state_event(const std::string& room_id,
                                                        const std::string& event_type,
                                                        const std::string& state_key) {
-    std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_,
+    auto rd = reader();
+    auto stmt = rd.prepare(
         "SELECT event_id, room_id, sender, event_type, state_key, content, origin_server_ts "
         "FROM events WHERE room_id = ? AND event_type = ? AND state_key = ? "
         "ORDER BY stream_position DESC LIMIT 1");
@@ -3241,15 +3422,28 @@ std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id,
 std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id, int64_t since_position,
                                                      int64_t& out_max_position,
                                                      int64_t& out_stream_head, int limit) {
-    std::lock_guard lock(mutex_);
-
     out_max_position = since_position;
-    // Sampled inside the lock, together with the scan below. insert_event
-    // claims its position and commits its transaction while holding this same
-    // mutex_, so while we hold it there is no position that has been issued
-    // but not yet committed: everything at or below this head is in the table
-    // now and is therefore offered to the statement we are about to run.
-    out_stream_head = next_stream_position_ - 1;
+    // Sampled under mutex_, and the scan below is BOUNDED by it. insert_event
+    // (and every other writer that claims a position) claims and commits
+    // while holding mutex_, so at the instant we hold it there is no position
+    // that has been issued but not yet committed: everything at or below this
+    // head is committed, and the scan — which starts after this — sees all of
+    // it, whether it runs on a pooled reader (a WAL snapshot taken at its
+    // first step) or on the main connection.
+    //
+    // The scan no longer runs under the same lock as the sample (S2-4: that
+    // lock is what every woken poll queued on), so rows committed between the
+    // two may be visible to it. `<= head` keeps them out: the caller builds
+    // next_batch from out_stream_head, and a row above it is simply the next
+    // poll's — the wait in SyncEngine compares the published head against
+    // exactly this value, so it wakes for them at once.
+    int64_t head = 0;
+    {
+        std::lock_guard lock(mutex_);
+        head = next_stream_position_ - 1;
+    }
+    out_stream_head = head;
+    auto rd = reader();
 
     // The recipient filter. Addressed call signalling reaches exactly two
     // people: the sender and the addressee named in its content. Room
@@ -3287,12 +3481,12 @@ std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id,
     //
     // It also means the invite advances out_max_position like any other row, so
     // next_batch covers it and no later sync has a hole where it was.
-    auto stmt = prepare(db_,
+    auto stmt = rd.prepare(
         std::string("SELECT ") + kEventColumns + ", e.stream_position "
         "FROM events e "
         "INNER JOIN room_members rm ON e.room_id = rm.room_id AND rm.user_id = ?1 " +
         kEditJoin +
-        "WHERE e.stream_position > ?2 "
+        "WHERE e.stream_position > ?2 AND e.stream_position <= ?4 "
         "AND (rm.membership = 'join' "
         "     OR (rm.membership = 'invite' "
         "         AND e.event_type = '" + std::string(event_type::kRoomMember) + "' "
@@ -3323,6 +3517,7 @@ std::vector<RoomEvent> SqliteStore::get_events_since(const std::string& user_id,
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt.get(), 2, since_position);
     sqlite3_bind_int(stmt.get(), 3, limit);
+    sqlite3_bind_int64(stmt.get(), 4, head);
 
     std::vector<RoomEvent> events;
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
@@ -3459,10 +3654,10 @@ bool SqliteStore::set_read_marker(const std::string& user_id, const std::string&
 
 std::vector<SqliteStore::ReadMarker> SqliteStore::get_read_markers_changed(
     const std::string& user_id, int64_t since_pos, int64_t until_pos) {
-    std::lock_guard lock(mutex_);
+    auto rd = reader();
     std::vector<ReadMarker> out;
     if (until_pos <= since_pos) return out;
-    auto stmt = prepare(db_,
+    auto stmt = rd.prepare(
         "SELECT room_id, last_read_pos FROM read_markers "
         "WHERE user_id = ? AND updated_pos > ? AND updated_pos <= ? "
         "ORDER BY updated_pos ASC");
@@ -3477,9 +3672,9 @@ std::vector<SqliteStore::ReadMarker> SqliteStore::get_read_markers_changed(
 }
 
 std::vector<SqliteStore::ReadMarker> SqliteStore::get_read_markers(const std::string& user_id) {
-    std::lock_guard lock(mutex_);
+    auto rd = reader();
     std::vector<ReadMarker> out;
-    auto stmt = prepare(db_,
+    auto stmt = rd.prepare(
         "SELECT room_id, last_read_pos FROM read_markers WHERE user_id = ?");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
@@ -3491,11 +3686,11 @@ std::vector<SqliteStore::ReadMarker> SqliteStore::get_read_markers(const std::st
 
 std::optional<SqliteStore::MarkedEvent> SqliteStore::resolve_read_marker(
     const std::string& room_id, int64_t last_read_pos) {
-    std::lock_guard lock(mutex_);
+    auto rd = reader();
     if (last_read_pos <= 0) return std::nullopt;
     // idx_events_room_stream covers this exactly: one room, descending by
     // position, first row.
-    auto stmt = prepare(db_,
+    auto stmt = rd.prepare(
         "SELECT event_id, origin_server_ts FROM events "
         "WHERE room_id = ? AND stream_position <= ? "
         "ORDER BY stream_position DESC LIMIT 1");
@@ -3507,8 +3702,8 @@ std::optional<SqliteStore::MarkedEvent> SqliteStore::resolve_read_marker(
 }
 
 int64_t SqliteStore::get_read_marker(const std::string& user_id, const std::string& room_id) {
-    std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_,
+    auto rd = reader();
+    auto stmt = rd.prepare(
         "SELECT last_read_pos FROM read_markers WHERE user_id = ? AND room_id = ?");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -3519,7 +3714,7 @@ int64_t SqliteStore::get_read_marker(const std::string& user_id, const std::stri
 }
 
 int SqliteStore::count_unread(const std::string& user_id, const std::string& room_id) {
-    std::lock_guard lock(mutex_);
+    auto rd = reader();
     // `replaces IS NULL` — an m.replace replacement is a rewrite of a message
     // the reader has already been told about, not a new message. Without this,
     // anyone editing their own text bumped the unread badge for every other
@@ -3528,7 +3723,7 @@ int SqliteStore::count_unread(const std::string& user_id, const std::string& roo
     // `redacted_by IS NULL` — the same bug in the other direction: a deleted
     // message kept its badge lit forever, inviting the reader to open a room to
     // find content that no longer exists.
-    auto stmt = prepare(db_,
+    auto stmt = rd.prepare(
         "SELECT COUNT(*) FROM events "
         "WHERE room_id = ? AND event_type = 'm.room.message' "
         "AND sender != ? "
@@ -3704,7 +3899,7 @@ std::map<std::string, int> SqliteStore::get_unread_mention_counts(const std::str
     // exists for is preserved.
     const auto keys = mention_match_keys(user_id);
 
-    std::lock_guard lock(mutex_);
+    auto rd = reader();
     // One grouped query for every room, rather than count_unread_mentions() in a
     // loop: /sync asks about every joined room on every poll, and each of those
     // calls would serialise behind this store's single global mutex.
@@ -3722,7 +3917,7 @@ std::map<std::string, int> SqliteStore::get_unread_mention_counts(const std::str
     // send path drops a target without VIEW_CHANNEL) whereas a sentinel row
     // cannot be — it names no one in particular. See the PushService for the
     // other delivery path, which does its own per-candidate check.
-    auto stmt = prepare(db_,
+    auto stmt = rd.prepare(
         "SELECT m.room_id, COUNT(*) FROM event_mentions m "
         "WHERE m.user_id IN (" + placeholders(keys.size()) + ") AND m.sender != ? "
         "AND m.stream_position > COALESCE("
@@ -3795,10 +3990,10 @@ std::vector<std::string> SqliteStore::rooms_with_channel_overrides() {
 
 std::map<std::string, ChannelPermissionOverride>
 SqliteStore::get_channel_overrides(const std::string& room_id) {
-    std::lock_guard lock(mutex_);
+    auto rd = reader();
     // Latest event per state_key for this room and type.
     std::string type(event_type::kChannelPermissions);
-    auto stmt = prepare(db_,
+    auto stmt = rd.prepare(
         "SELECT e.state_key, e.content FROM events e "
         "INNER JOIN (SELECT state_key, MAX(stream_position) AS mp FROM events "
         "            WHERE room_id = ? AND event_type = ? AND state_key IS NOT NULL "
@@ -4887,10 +5082,10 @@ std::optional<std::string> SqliteStore::get_account_data(const std::string& user
 
 std::vector<SqliteStore::AccountDataDocument> SqliteStore::get_account_data_changed(
     const std::string& user_id, int64_t since_pos, int64_t until_pos) {
-    std::lock_guard lock(mutex_);
+    auto rd = reader();
     std::vector<AccountDataDocument> out;
     if (until_pos <= since_pos) return out;
-    auto stmt = prepare(db_,
+    auto stmt = rd.prepare(
         "SELECT type, content FROM account_data "
         "WHERE user_id = ? AND updated_pos > ? AND updated_pos <= ? "
         "ORDER BY updated_pos ASC");
@@ -4906,9 +5101,9 @@ std::vector<SqliteStore::AccountDataDocument> SqliteStore::get_account_data_chan
 
 std::vector<SqliteStore::AccountDataDocument> SqliteStore::get_all_account_data(
     const std::string& user_id) {
-    std::lock_guard lock(mutex_);
+    auto rd = reader();
     std::vector<AccountDataDocument> out;
-    auto stmt = prepare(db_, "SELECT type, content FROM account_data WHERE user_id = ?");
+    auto stmt = rd.prepare( "SELECT type, content FROM account_data WHERE user_id = ?");
     sqlite3_bind_text(stmt.get(), 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         out.push_back({std::string(column_text_or_empty(stmt.get(), 0)),
@@ -5022,8 +5217,8 @@ std::vector<std::string> SqliteStore::get_ignored_users(const std::string& user_
 }
 
 bool SqliteStore::is_ignoring(const std::string& ignorer, const std::string& sender) {
-    std::lock_guard lock(mutex_);
-    auto stmt = prepare(db_,
+    auto rd = reader();
+    auto stmt = rd.prepare(
         "SELECT 1 FROM ignored_users WHERE user_id = ? AND ignored_user_id = ?");
     sqlite3_bind_text(stmt.get(), 1, ignorer.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt.get(), 2, sender.c_str(), -1, SQLITE_TRANSIENT);
@@ -5032,11 +5227,11 @@ bool SqliteStore::is_ignoring(const std::string& ignorer, const std::string& sen
 
 std::optional<std::string> SqliteStore::get_invite_sender(const std::string& room_id,
                                                           const std::string& invitee) {
-    std::lock_guard lock(mutex_);
+    auto rd = reader();
     // Ordered by stream_position DESC and limited to one: the LATEST invite,
     // for the reason given in the header. No kEditJoin — a state event is not
     // editable, and resolving an edit here would be asking a different question.
-    auto stmt = prepare(db_,
+    auto stmt = rd.prepare(
         "SELECT sender FROM events "
         "WHERE room_id = ? AND event_type = ? AND state_key = ? "
         "  AND json_extract(content, '$.membership') = 'invite' "
