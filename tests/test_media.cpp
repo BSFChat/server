@@ -1696,3 +1696,34 @@ TEST_F(UploadAdmissionTest, InFlightUploadsPerAccountAreCappedAndReleased) {
     httplib::Response bob;
     EXPECT_TRUE(handler_->admit_upload(req, bob)) << bob.body;
 }
+
+// Audit 2-2026-11-18 S2-9: a server-wide cap on uploads being received, on top
+// of the per-account one; N accounts x 4 x max_upload_size_mb was unbounded.
+TEST_F(UploadAdmissionTest, InFlightUploadsAreCappedServerWide) {
+    config_.max_uploads_in_flight = 3;
+    std::vector<std::unique_ptr<httplib::Response>> held;
+    std::vector<std::string> tokens;
+    for (int i = 0; i < 3; ++i) {
+        const std::string uid = "@u" + std::to_string(i) + ":test";
+        const std::string tok = "tok-" + std::to_string(i);
+        store_->create_user(uid, "x");
+        store_->store_access_token(tok, uid, "dev");
+        auto req = upload_request(false, "10");
+        req.set_header("Authorization", "Bearer " + tok);
+        held.push_back(std::make_unique<httplib::Response>());
+        ASSERT_TRUE(handler_->admit_upload(req, *held.back())) << held.back()->body;
+    }
+    // A fourth account, well under its own cap, is refused by the server's.
+    httplib::Response over;
+    EXPECT_FALSE(handler_->admit_upload(upload_request(true, "10"), over));
+    EXPECT_EQ(over.status, 429);
+    EXPECT_NE(over.body.find("M_LIMIT_EXCEEDED"), std::string::npos) << over.body;
+    EXPECT_FALSE(over.get_header_value("Retry-After").empty());
+
+    // One finishing frees a server-wide slot.
+    held.pop_back();
+    httplib::Response again;
+    EXPECT_TRUE(handler_->admit_upload(upload_request(true, "10"), again)) << again.body;
+
+    EXPECT_EQ(Config::defaults().max_uploads_in_flight, 16);
+}

@@ -238,6 +238,22 @@ bool MediaHandler::admit_upload(const httplib::Request& req, httplib::Response& 
     std::shared_ptr<void> slot;
     {
         std::lock_guard lock(uploads_in_flight_->mu);
+        // Server-wide first (audit 2-2026-11-18 S2-9): the per-account cap
+        // alone let N accounts hold N x 4 bodies of up to max_upload_size_mb
+        // each in memory at once.
+        const int server_cap = std::max(1, config_.max_uploads_in_flight);
+        if (uploads_in_flight_->total >= server_cap) {
+            res.set_header("Retry-After", "2");
+            res.status = 429;
+            res.set_content(
+                MatrixError::limit_exceeded("The server is busy with other uploads; try again "
+                                            "shortly",
+                                            2000)
+                    .to_json()
+                    .dump(),
+                "application/json");
+            return false;
+        }
         auto& n = uploads_in_flight_->by_user[*user_id];
         if (n >= kMaxConcurrentUploadsPerAccount) {
             res.set_header("Retry-After", "1");
@@ -252,11 +268,13 @@ bool MediaHandler::admit_upload(const httplib::Request& req, httplib::Response& 
             return false;
         }
         ++n;
+        ++uploads_in_flight_->total;
         // Released when the last copy of `slot` goes, i.e. when httplib
         // destroys the Response — on success, on a failed body read and on a
         // refusal alike.
         slot = std::shared_ptr<void>(nullptr, [state = uploads_in_flight_, uid = *user_id](void*) {
             std::lock_guard lock(state->mu);
+            --state->total;
             auto it = state->by_user.find(uid);
             if (it != state->by_user.end() && --it->second <= 0) state->by_user.erase(it);
         });

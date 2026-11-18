@@ -78,6 +78,9 @@ Config Config::load(const std::string& path) {
             if (auto v = media->get("max_upload_size_mb"))
                 cfg.max_upload_size_mb = static_cast<size_t>(
                     v->value_or(static_cast<int64_t>(cfg.max_upload_size_mb)));
+            if (auto v = media->get("max_uploads_in_flight"))
+                cfg.max_uploads_in_flight = static_cast<int>(std::clamp<int64_t>(
+                    v->value_or(static_cast<int64_t>(cfg.max_uploads_in_flight)), 1, 1024));
             if (auto v = media->get("require_auth"))
                 cfg.require_media_auth = v->value_or(cfg.require_media_auth);
             if (auto v = media->get("reaper_enabled"))

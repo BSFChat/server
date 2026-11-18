@@ -127,6 +127,8 @@ private:
     struct UploadsInFlight {
         std::mutex mu;
         std::unordered_map<std::string, int> by_user;
+        // Across all accounts (audit 2-2026-11-18 S2-9); guarded by mu.
+        int total = 0;
     };
     std::shared_ptr<UploadsInFlight> uploads_in_flight_ = std::make_shared<UploadsInFlight>();
 

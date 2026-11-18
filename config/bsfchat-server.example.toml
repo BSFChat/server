@@ -85,6 +85,9 @@ path = "./data/media/"
 # Also enforced at the HTTP layer, so an oversized request is rejected while
 # streaming rather than after being buffered in memory.
 max_upload_size_mb = 500
+# Uploads received at once across all accounts (each may buffer up to
+# max_upload_size_mb in memory); 429 past it. Per account the cap is 4.
+max_uploads_in_flight = 16
 # Require an access token on media downloads (Authorization header or
 # ?access_token=). On by default: media ids are 128-bit random, so with this
 # off a download URL is an unguessable capability URL with no revocation and

@@ -574,6 +574,10 @@ struct Config {
     // Media
     std::string media_path = "./data/media/";
     size_t max_upload_size_mb = 50;
+    // Uploads being received at once, across every account (audit
+    // 2-2026-11-18 S2-9). Each holds up to max_upload_size_mb in memory, so
+    // this bounds upload memory at roughly this times that. 429 past it.
+    int max_uploads_in_flight = 16;
     // Require an access token (header or ?access_token=) on media downloads.
     // On by default. The desktop client appends ?access_token= (see
     // util/MediaUrl.h) because QML Image.source cannot set headers.
