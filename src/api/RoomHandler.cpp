@@ -1,4 +1,5 @@
 #include "api/RoomHandler.h"
+#include "api/StateContentRules.h"
 #include "api/VoiceHandler.h"
 #include "api/InputLimits.h"
 #include "api/PermissionInput.h"
@@ -316,7 +317,7 @@ bool was_removed_by_moderator(SqliteStore& store, const std::string& room_id,
     if (!ev) return false;
     if (ev->sender == user_id) return false;
     if (!ev->content.data.is_object()) return false;
-    if (ev->content.data.value("membership", "") != membership::kLeave) return false;
+    if (json_string_or(ev->content.data, "membership") != membership::kLeave) return false;
     return ev->content.data.contains(std::string(kRemovedByKey));
 }
 
@@ -1314,7 +1315,8 @@ void RoomHandler::handle_join(const httplib::Request& req, httplib::Response& re
     // Check join rules
     auto join_rules = store_.get_state_event(room_id, std::string(event_type::kRoomJoinRules), "");
     if (join_rules) {
-        auto rule = join_rules->content.data.value("join_rule", "invite");
+        // An unreadable rule reads as the restrictive one (audit 3 #3).
+        auto rule = json_string_or(join_rules->content.data, "join_rule", "invite");
         if (rule == "invite") {
             auto current_membership = store_.get_membership(room_id, *user_id);
             if (current_membership != "invite" && current_membership != "join") {
@@ -2647,6 +2649,16 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         }
     }
 
+    // A membership write is read field by field below; refuse a wrong type
+    // here, naming it, rather than reading it as absent.
+    if (evt_type == event_type::kRoomMember) {
+        if (auto shape = state_content_error(evt_type, content)) {
+            res.status = 400;
+            res.set_content(MatrixError::bad_json(*shape).to_json().dump(), "application/json");
+            return;
+        }
+    }
+
     // Self-membership: a joined member may update their own m.room.member
     // event, but only to a membership the server recognises, and the profile
     // fields are filled in server-side. Previously this path mapped down to
@@ -2736,6 +2748,14 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         !perms.can(*user_id, room_id, permission::kViewChannel)) {
         res.status = 403;
         res.set_content(no_channel_access(store_, *user_id).to_json().dump(), "application/json");
+        return;
+    }
+
+    // Shape, before anything below reads a field of it and before it is
+    // stored for every other reader (audit 3, fix-first #3).
+    if (auto shape = state_content_error(evt_type, content)) {
+        res.status = 400;
+        res.set_content(MatrixError::bad_json(*shape).to_json().dump(), "application/json");
         return;
     }
 
@@ -2983,7 +3003,7 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         // the outbound leg would leave the log showing a channel that had
         // always been a channel.
         audit_room_type_change(store_, *user_id, room_id, previous_room_type,
-                               content.value("type", ""));
+                               json_string_or(content, "type"));
     }
 
     res.set_content(json{{"event_id", event_id}}.dump(), "application/json");

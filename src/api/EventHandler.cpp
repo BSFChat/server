@@ -821,8 +821,8 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
                     if (!target->content.data.is_object()) break;
                     auto it = target->content.data.find("m.relates_to");
                     if (it == target->content.data.end() || !it->is_object()) break;
-                    if (it->value("rel_type", "") != "m.replace") break;
-                    auto parent_id = it->value("event_id", "");
+                    if (json_string_or(*it, "rel_type") != "m.replace") break;
+                    auto parent_id = json_string_or(*it, "event_id");
                     if (parent_id.empty() || parent_id == target->event_id) break;
                     auto parent = store_.get_event_by_id(parent_id);
                     if (!parent || parent->room_id != room_id) break;

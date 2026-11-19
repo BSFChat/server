@@ -15,13 +15,15 @@
 
 namespace bsfchat {
 
+// auth/RoomVisibility.h's, declared alone because that header's can_view_room
+// would collide with this file's own.
+bool is_category_room(SqliteStore& store, const std::string& room_id);
+
 namespace {
 
-bool is_category_room(SqliteStore& store, const std::string& room_id) {
-    auto ev = store.get_state_event(room_id, std::string(event_type::kRoomType), "");
-    if (!ev) return false;
-    return ev->content.data.value("type", "") == room_type::kCategory;
-}
+// is_category_room is RoomVisibility's: the copy that used to live here read
+// the stored content with json::value(), so a `{"type":5}` turned every
+// non-viewer's /sync into an error (audit 3, fix-first #3).
 
 // How much of a room a user may be shown. Three answers, not two, because a
 // category is genuinely a third case and collapsing it into `true` is what

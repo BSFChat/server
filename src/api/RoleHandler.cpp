@@ -10,6 +10,7 @@
 #include "http/JsonIo.h"
 #include "http/Router.h"
 #include "store/SqliteStore.h"
+#include "store/StoredContent.h"
 #include "sync/SyncEngine.h"
 
 #include <bsfchat/Constants.h>
@@ -110,9 +111,7 @@ VersionedDocument<std::vector<ServerRole>> read_role_document(SqliteStore& store
     if (!doc.raw) return doc;
     auto j = json::parse(*doc.raw, nullptr, false);
     if (j.is_discarded()) return doc;
-    ServerRolesContent content;
-    from_json(j, content);
-    doc.parsed = std::move(content.roles);
+    doc.parsed = parse_server_roles_lenient(j);
     return doc;
 }
 

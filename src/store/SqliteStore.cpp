@@ -1,6 +1,7 @@
 #include "store/SqliteStore.h"
 #include "store/CallSignalling.h"
 #include "store/MediaReferences.h"
+#include "store/StoredContent.h"
 #include "auth/LocalAuth.h"
 #include "core/Logger.h"
 #include "identity/Localpart.h"
@@ -3996,9 +3997,7 @@ std::vector<ServerRole> SqliteStore::get_server_roles() {
     if (!content_json) return {};
     auto json = nlohmann::json::parse(*content_json, nullptr, false);
     if (json.is_discarded()) return {};
-    ServerRolesContent content;
-    from_json(json, content);
-    return content.roles;
+    return parse_server_roles_lenient(json);
 }
 
 std::vector<std::string> SqliteStore::get_member_role_ids(const std::string& user_id) {

@@ -70,6 +70,28 @@ struct JsonTooDeep : std::invalid_argument {
     return it != obj.end() && it->is_boolean() ? it->get<bool>() : fallback;
 }
 
+// ── Which body a type_error came from (audit 3, fix-first #3) ──────────────
+// The exception handler used to map every escaping type_error 302/304-306 to
+// 400 M_BAD_JSON, on the theory that it was the caller's ill-typed field. It
+// was just as often STORED state of the wrong type (a bsfchat.room.type of
+// {"type":5}), and then a bodyless GET /sync answered every co-member "400
+// Invalid JSON" for something none of them sent. The backstop now needs both:
+// the request has a body, and that body was parsed on this thread by
+// parse_request_json. Anything else is a server fault: 500 and an error log.
+//
+// The mark is thread-local (a handler and its exception handler run on the
+// same httplib worker) and keyed on the body's buffer, so a stale mark from a
+// previous request on the same worker does not match the next one.
+void mark_request_body_parsed(std::string_view body) noexcept;
+[[nodiscard]] bool request_body_was_parsed(std::string_view body) noexcept;
+void clear_request_body_mark() noexcept;
+
+// The backstop's decision, in one place so it is testable without a socket:
+// true when `type_error_id` is an ill-typed-field error AND `body` is a
+// non-empty request body this thread parsed.
+[[nodiscard]] bool type_error_is_bad_request_body(int type_error_id,
+                                                  std::string_view body) noexcept;
+
 // ── Serialising (finding S1) ──────────────────────────────────────────────
 // dump() with invalid UTF-8 replaced by U+FFFD instead of throwing
 // type_error.316. For responses that aggregate OTHER users' data — /sync above

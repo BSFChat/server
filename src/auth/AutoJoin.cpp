@@ -3,6 +3,7 @@
 
 #include "core/Config.h"
 #include "core/Logger.h"
+#include "http/JsonIo.h"
 #include "identity/Nickname.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
@@ -171,7 +172,7 @@ void publicize_legacy_channels(SqliteStore& store, const Config& config) {
     for (const auto& room_id : legacy_rooms) {
         auto jr = store.get_state_event(room_id,
             std::string(event_type::kRoomJoinRules), "");
-        std::string current_rule = jr ? jr->content.data.value("join_rule", "") : "";
+        std::string current_rule = jr ? json_string_or(jr->content.data, "join_rule") : "";
         if (current_rule == "public") continue;
 
         auto event_id = generate_event_id(config.server_name);

@@ -352,7 +352,7 @@ void AuthHandler::handle_login(const httplib::Request& req, httplib::Response& r
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
@@ -700,7 +700,7 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         res.status = 400;
         res.set_content(MatrixError::bad_json().to_json().dump(), "application/json");
@@ -960,7 +960,7 @@ void AuthHandler::handle_password_change(const httplib::Request& req, httplib::R
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         return send_error(res, 400, MatrixError::bad_json());
     }
@@ -1107,7 +1107,7 @@ void AuthHandler::handle_refresh(const httplib::Request& req, httplib::Response&
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         return send_error(res, 400, MatrixError::bad_json());
     }
@@ -1342,7 +1342,7 @@ void AuthHandler::handle_link_identity(const httplib::Request& req, httplib::Res
 
     json body;
     try {
-        body = json::parse(req.body);
+        body = parse_request_json(req.body);
     } catch (...) {
         send_error(res, 400, MatrixError::bad_json());
         return;

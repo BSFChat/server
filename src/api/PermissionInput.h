@@ -50,6 +50,15 @@ inline std::optional<std::string> role_document_error(const nlohmann::json& cont
     if (!roles.is_array()) return "roles must be an array";
     for (const auto& r : roles) {
         if (!r.is_object()) return "Each role must be a JSON object";
+        // Read with value() by every role reader; a wrong type there threw
+        // out of every permission check on the server (audit 3 #3).
+        for (const char* key : {"id", "name", "color"}) {
+            if (r.contains(key) && !r[key].is_string()) return std::string(key) + " must be a string";
+        }
+        for (const char* key : {"mentionable", "hoist", "self_assignable"}) {
+            if (r.contains(key) && !r[key].is_boolean()) return std::string(key) + " must be a boolean";
+        }
+        if (r.contains("level") && !r["level"].is_number_integer()) return "level must be an integer";
         if (r.contains("permissions") && !is_permission_value(r["permissions"])) {
             return "permissions must be a hex string or a non-negative integer";
         }
