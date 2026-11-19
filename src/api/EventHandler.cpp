@@ -1069,13 +1069,44 @@ void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Resp
         return send_error(res, 400, MatrixError::bad_json());
     }
 
+    if (!body.is_object()) {
+        return send_error(res, 400, MatrixError::bad_json("Request body must be a JSON object"));
+    }
+
+    // Where the marker goes (audit 3). A named event means THAT event: the
+    // marker used to go to the room's newest event whatever the client named,
+    // so a spec client — or a second device racing the first — marked unread
+    // messages as read. `m.read` is the spec's receipt and this server's one
+    // marker serves both, so the later of the two named events wins. `{}` (or
+    // neither key) still means "everything", which is what the desktop client
+    // sends; `last_read_pos` is its older explicit form.
     int64_t pos = 0;
-    if (body.contains("last_read_pos") && body["last_read_pos"].is_number_integer()) {
-        pos = body["last_read_pos"].get<int64_t>();
-    } else if (body.contains("m.fully_read") && body["m.fully_read"].is_string()) {
-        pos = store_.get_room_max_stream_position(room_id);
-    } else {
-        pos = store_.get_room_max_stream_position(room_id);
+    bool named = false;
+    for (const char* key : {"m.fully_read", "m.read"}) {
+        const auto it = body.find(key);
+        if (it == body.end() || it->is_null()) continue;
+        if (!it->is_string()) {
+            return send_error(res, 400,
+                              MatrixError::bad_json(std::string(key) + " must be an event id"));
+        }
+        // An id that is not an event in this room moves nothing (and is not
+        // an error a client could act on — a marker is idempotent).
+        if (const auto at = store_.get_event_stream_position(room_id, it->get<std::string>())) {
+            pos = std::max(pos, *at);
+        }
+        named = true;
+    }
+    if (auto it = body.find("last_read_pos"); it != body.end() && !it->is_null()) {
+        if (!it->is_number_integer()) {
+            return send_error(res, 400, MatrixError::bad_json("last_read_pos must be an integer"));
+        }
+        if (!named) pos = it->get<int64_t>();
+        named = true;
+    }
+    if (!named) pos = store_.get_room_max_stream_position(room_id);
+    if (pos <= 0) {
+        res.set_content("{}", "application/json");
+        return;
     }
 
     // Nothing moved: the marker is already at or past `pos`. The client posts

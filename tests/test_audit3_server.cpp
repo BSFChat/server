@@ -543,3 +543,47 @@ TEST(Ignore, TypingFromAnIgnoredUserIsLeftOutForTheIgnorer) {
     EXPECT_TRUE(typing.get_typing_users_for(f.room, f.alice).empty());
     EXPECT_EQ(typing.get_typing_users_for(f.room, f.mod).size(), 1u);
 }
+
+// ── The read marker goes where the client says ────────────────────────────
+
+namespace {
+
+httplib::Response read_marker(Fixture& f, const std::string& who, const json& body) {
+    return f.call_on(*f.events, &EventHandler::handle_read_marker,
+                     kRooms + f.room + "/read_marker", who, body.dump());
+}
+
+} // namespace
+
+TEST(ReadMarker, ANamedEventMarksUpToThatEventNotTheLatest) {
+    Fixture f;
+    const auto first = f.send_text(f.room, "bob", "one");
+    f.send_text(f.room, "bob", "two");
+    const auto first_pos = f.store->get_event_stream_position(f.room, first);
+    ASSERT_TRUE(first_pos);
+
+    ASSERT_TRUE(IsOk(read_marker(f, "alice", {{"m.fully_read", first}})));
+    EXPECT_EQ(f.store->get_read_marker(f.alice, f.room), *first_pos);
+
+    ASSERT_TRUE(IsOk(read_marker(f, "alice", json::object())));
+    EXPECT_EQ(f.store->get_read_marker(f.alice, f.room),
+              f.store->get_room_max_stream_position(f.room))
+        << "{} still means everything";
+}
+
+TEST(ReadMarker, TheReceiptAloneMovesItToo) {
+    Fixture f;
+    const auto first = f.send_text(f.room, "bob", "one");
+    f.send_text(f.room, "bob", "two");
+    ASSERT_TRUE(IsOk(read_marker(f, "alice", {{"m.read", first}})));
+    EXPECT_EQ(f.store->get_read_marker(f.alice, f.room),
+              *f.store->get_event_stream_position(f.room, first));
+}
+
+TEST(ReadMarker, ANonStringMarkerIsRefused) {
+    Fixture f;
+    auto res = read_marker(f, "alice", {{"m.fully_read", 5}});
+    EXPECT_TRUE(HasStatus(res, 400));
+    EXPECT_EQ(errcode(res), "M_BAD_JSON");
+    EXPECT_TRUE(HasStatus(read_marker(f, "alice", {{"last_read_pos", "9"}}), 400));
+}

@@ -3641,6 +3641,17 @@ int64_t SqliteStore::get_room_max_stream_position(const std::string& room_id) {
     return sqlite3_column_int64(stmt.get(), 0);
 }
 
+std::optional<int64_t> SqliteStore::get_event_stream_position(const std::string& room_id,
+                                                              const std::string& event_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT stream_position FROM events WHERE event_id = ? AND room_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    return sqlite3_column_int64(stmt.get(), 0);
+}
+
 // Read markers
 
 bool SqliteStore::set_read_marker(const std::string& user_id, const std::string& room_id, int64_t stream_pos) {
