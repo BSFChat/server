@@ -455,3 +455,77 @@ TEST(StoreStatementCache, InListsOfEveryLengthTakeOnlyAFewSlots) {
     EXPECT_LE(f.store->cached_reader_statements_for_test(), before + 5)
         << "one cache slot per IN-list length evicts the hot fixed statements";
 }
+
+// ── Initial-sync gate: per account, and garbage since is refused ───────────
+
+TEST(InitialSyncGatePerAccount, OneAccountCannotTakeMoreThanItsShare) {
+    InitialSyncGate gate(8, 2);
+    auto a1 = gate.enter("@a:test", std::chrono::milliseconds(1000), std::chrono::milliseconds(50));
+    auto a2 = gate.enter("@a:test", std::chrono::milliseconds(1000), std::chrono::milliseconds(50));
+    ASSERT_TRUE(a1);
+    ASSERT_TRUE(a2);
+    const auto start = clk::now();
+    auto a3 = gate.enter("@a:test", std::chrono::milliseconds(1000), std::chrono::milliseconds(50));
+    EXPECT_TRUE(a3.refused()) << "a third concurrent initial sync for one account was admitted";
+    EXPECT_FALSE(a3);
+    EXPECT_LT(ms_since(start), 900) << "the account limit waits its own patience, not the global";
+    // Another account is unaffected.
+    auto b1 = gate.enter("@b:test", std::chrono::milliseconds(1000), std::chrono::milliseconds(50));
+    EXPECT_TRUE(b1);
+    EXPECT_EQ(gate.in_flight(), 3u);
+    EXPECT_EQ(gate.in_flight_for("@a:test"), 2u);
+
+    // A freed slot of its own admits the account again.
+    a1 = InitialSyncGate::Slot();
+    auto a4 = gate.enter("@a:test", std::chrono::milliseconds(1000), std::chrono::milliseconds(50));
+    EXPECT_TRUE(a4);
+    EXPECT_FALSE(a4.refused());
+}
+
+TEST(InitialSyncGatePerAccount, AWaiterIsWokenWhenItsAccountFreesASlot) {
+    InitialSyncGate gate(8, 1);
+    auto held = gate.enter("@a:test", std::chrono::milliseconds(5000), std::chrono::milliseconds(5000));
+    ASSERT_TRUE(held);
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        held = InitialSyncGate::Slot();
+    });
+    const auto start = clk::now();
+    auto next = gate.enter("@a:test", std::chrono::milliseconds(5000), std::chrono::milliseconds(5000));
+    releaser.join();
+    EXPECT_TRUE(next);
+    EXPECT_LT(ms_since(start), 2000);
+}
+
+TEST(SyncSinceValidation, AGarbageSinceIs400NotAFullInitialSync) {
+    Fixture f("since-garbage");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    f.add_channel(alice, "general");
+    auto bob = f.add_user("bob");
+    SyncHandler handler(*f.store, *f.sync, f.config);
+
+    auto poll = [&](const std::string& token, const std::string& since) {
+        httplib::Request req;
+        req.path = "/_matrix/client/v3/sync";
+        req.params.emplace("since", since);
+        req.params.emplace("timeout", "0");
+        req.set_header("Authorization", "Bearer " + token);
+        httplib::Response res;
+        handler.handle_sync(req, res);
+        return res;
+    };
+    for (const auto& junk : {"banana", "t_", "t_zzzz", "s", "s-1"}) {
+        auto res = poll("token-alice", junk);
+        EXPECT_EQ(res.status, 400) << junk;
+        EXPECT_EQ(json::parse(res.body).value("errcode", ""), "M_INVALID_PARAM") << junk;
+    }
+    // Another account's token is not this account's position either.
+    auto bobs = f.token_now(bob);
+    EXPECT_EQ(poll("token-alice", bobs).status, 400);
+
+    // A real token, and the legacy numeric form, still work.
+    auto ok = poll("token-alice", f.token_now(alice));
+    EXPECT_TRUE(ok.status == -1 || ok.status == 200) << ok.status << " " << ok.body;
+    auto legacy = poll("token-alice", "s" + std::to_string(f.store->get_current_stream_position()));
+    EXPECT_TRUE(legacy.status == -1 || legacy.status == 200) << legacy.status;
+}

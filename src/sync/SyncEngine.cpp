@@ -302,6 +302,11 @@ int64_t SyncEngine::parse_token(const std::string& user_id, const std::string& t
     return *pos;
 }
 
+bool SyncEngine::accepts_since(const std::string& user_id, const std::string& since_token) {
+    auto pos = sync_token::parse(token_key(), user_id, since_token);
+    return pos && *pos >= 0;
+}
+
 void SyncEngine::notify_new_event() {
     auto pos = store_.get_current_stream_position();
     {

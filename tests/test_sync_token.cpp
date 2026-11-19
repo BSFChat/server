@@ -412,8 +412,10 @@ TEST(SyncTokenCompat, AGarbageTokenIsAFullReplayRatherThanAnError) {
     f.join(room, bob);
     f.message(room, admin, "hello");
 
-    // Long-standing behaviour, kept: /sync has never answered 400 for a
-    // malformed token, and a hardening pass is the wrong place to start.
+    // The ENGINE still treats a malformed token as position 0. The HTTP
+    // handler no longer gets that far: since audit 3 (2026-11-19) SyncHandler
+    // answers 400 M_INVALID_PARAM for any token accepts_since() refuses, so
+    // this replay is no longer reachable from the wire.
     for (const auto& junk : {"banana", "t_", "t_zzzz", "s", "s-1", "t_0123"}) {
         auto resp = f.sync->handle_sync(bob, junk, 0);
         EXPECT_EQ(resp.rooms.join.count(room), 1u) << "junk token: " << junk;

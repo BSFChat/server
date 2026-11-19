@@ -6,6 +6,7 @@
 #include "core/Config.h"
 #include "http/JsonIo.h"
 #include "http/Middleware.h"
+#include "http/RateLimitResponse.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
 
@@ -125,8 +126,31 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
     // this function returns, i.e. for exactly as long as the worker is held.
     // Declared before everything the response is built into, so it is
     // released only after the JSON DOM below has been destroyed.
+    //
+    // A `since` this server did not mint for this account is refused, not
+    // served as a full replay from position 0 (audit 3): that was an initial
+    // sync's worth of scanning that bypassed the gate below. The desktop
+    // client drops a rejected resumed token on M_INVALID_PARAM and falls back
+    // to a real initial sync, which does pass the gate.
+    if (!since.empty() && !sync_engine_.accepts_since(*user_id, since)) {
+        res.status = 400;
+        res.set_content(
+            MatrixError::invalid_param("Unrecognised since token; start again without one")
+                .to_json()
+                .dump(),
+            "application/json");
+        return;
+    }
+
     InitialSyncGate::Slot initial_slot;
-    if (since.empty()) initial_slot = initial_syncs_.enter(kInitialSyncPatience);
+    if (since.empty()) {
+        initial_slot = initial_syncs_.enter(*user_id, kInitialSyncPatience,
+                                            kInitialSyncAccountPatience);
+        if (initial_slot.refused()) {
+            send_rate_limited(res, 1000, "Too many initial syncs in progress for this account");
+            return;
+        }
+    }
 
     ParkedSyncGate::Slot parked_slot;
     if (!since.empty() && timeout > 0) {

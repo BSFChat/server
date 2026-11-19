@@ -48,6 +48,10 @@ public:
     // before going ahead regardless; see sync/InitialSyncGate.h (S2-4).
     static constexpr std::size_t kMaxConcurrentInitialSyncs = 8;
     static constexpr std::chrono::milliseconds kInitialSyncPatience{20000};
+    // Per account (audit 3): at most this many of the global slots, and a
+    // request beyond it waits this long for one of its own, then gets 429.
+    static constexpr std::size_t kMaxInitialSyncsPerAccount = 2;
+    static constexpr std::chrono::milliseconds kInitialSyncAccountPatience{3000};
     InitialSyncGate& initial_sync_gate_for_test() { return initial_syncs_; }
 
     // How often an account's delivered polls restate every peer's presence
@@ -91,7 +95,7 @@ private:
     TypingHandler* typing_handler_ = nullptr;
     PresenceHandler* presence_handler_ = nullptr;
     ParkedSyncGate parked_{kMaxParkedSyncsPerAccount};
-    InitialSyncGate initial_syncs_{kMaxConcurrentInitialSyncs};
+    InitialSyncGate initial_syncs_{kMaxConcurrentInitialSyncs, kMaxInitialSyncsPerAccount};
 };
 
 } // namespace bsfchat

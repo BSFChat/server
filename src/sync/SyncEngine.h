@@ -118,6 +118,13 @@ public:
                                 int timeout_ms,
                                 const std::string& device_key = {});
 
+    // Whether `since_token` is a token this engine would resume `user_id`
+    // from: an opaque token it minted for that account, or the legacy
+    // "s<pos>" form. SyncHandler answers anything else 400 M_INVALID_PARAM
+    // (audit 3, 2026-11-19) rather than a full replay, which cost an initial
+    // sync's work without passing the initial-sync gate.
+    bool accepts_since(const std::string& user_id, const std::string& since_token);
+
     // Test seam. Runs inside build_incremental_sync, in the instant after the
     // scan (and the stream head that goes with it) has been taken and before
     // anything is built from it — i.e. exactly the window in which a racing
