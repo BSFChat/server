@@ -11,6 +11,8 @@
 #include "api/PresenceHandler.h"
 #include "api/SyncHandler.h"
 #include "http/HttpServer.h"
+#include "cli/AdminCli.h"
+#include "core/DatabaseLock.h"
 #include "auth/LocalAuth.h"
 #include "core/Config.h"
 #include "store/SqliteStore.h"
@@ -30,6 +32,8 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <regex>
 #include <set>
 #include <string>
@@ -545,4 +549,57 @@ TEST(HttpServerBind, ASecondServerOnTheSamePortFailsLoudly) {
     HttpServer second(cfg);
     EXPECT_THROW(second.bind(), std::runtime_error)
         << "SO_REUSEPORT let a second server silently share the first one's port";
+}
+
+// ── The admin CLI holds the database lock; the server waits out a probe ─────
+
+TEST(DatabaseLockAudit3, TheAdminCliHoldsTheLockForItsWholeRun) {
+    const auto db = temp_db_path("cli-lock");
+    const auto toml = db + ".toml";
+    remove_db(db);
+    std::filesystem::remove(DatabaseLock::lock_path_for(db));
+    std::ofstream(toml) << "[server]\nname = \"test\"\nport = 18449\n"
+                        << "[database]\npath = \"" << db << "\"\n";
+
+    bool held_during_run = false;
+    std::ostringstream out;
+    const int code = run_admin_cli({"list-users", "--config", toml}, out,
+                                   [&](const std::string&, int) {
+                                       // Runs inside the command, after the lock check.
+                                       held_during_run = DatabaseLock::held_elsewhere(db);
+                                       return false;
+                                   });
+    EXPECT_EQ(code, 0) << out.str();
+    EXPECT_TRUE(held_during_run) << "the CLI checked the lock and let go of it";
+    EXPECT_FALSE(DatabaseLock::held_elsewhere(db)) << "and released it when done";
+
+    // A server's lock refuses the CLI outright.
+    auto server = DatabaseLock::acquire(db);
+    ASSERT_TRUE(server);
+    std::ostringstream refused;
+    EXPECT_EQ(run_admin_cli({"list-users", "--config", toml}, refused,
+                            [](const std::string&, int) { return false; }),
+              1);
+    server.reset();
+
+    remove_db(db);
+    std::filesystem::remove(toml);
+    std::filesystem::remove(DatabaseLock::lock_path_for(db));
+}
+
+TEST(DatabaseLockAudit3, AServerStartingDuringABriefHoldWaitsInsteadOfFailing) {
+    const auto db = temp_db_path("lock-patience");
+    std::filesystem::remove(DatabaseLock::lock_path_for(db));
+    auto brief = DatabaseLock::acquire(db);
+    ASSERT_TRUE(brief);
+    std::thread release([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        brief.reset();
+    });
+    std::unique_ptr<DatabaseLock> server;
+    EXPECT_NO_THROW(server = DatabaseLock::acquire(db, std::chrono::seconds(3)));
+    release.join();
+    EXPECT_TRUE(server);
+    server.reset();
+    std::filesystem::remove(DatabaseLock::lock_path_for(db));
 }

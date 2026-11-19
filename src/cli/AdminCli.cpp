@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <memory>
 #include <ostream>
 #include <string>
 #include <vector>
@@ -106,13 +107,19 @@ bool load_config(const std::string& path, Config& config, std::ostream& out) {
 // The stopped-server check. See the header for why a live server must not be
 // written behind: it is a stream-position collision, not a lock contention
 // problem, so SQLite will happily let this succeed and break the server later.
-bool refuse_if_running(const Config& config, const ListenProbe& probe, std::ostream& out) {
+//
+// On success `held` owns the server's database lock, and the caller keeps it
+// for the whole command (audit 3, 2026-11-19): checking and letting go left a
+// window in which a server could start and write beside this command.
+bool refuse_if_running(const Config& config, const ListenProbe& probe, std::ostream& out,
+                       std::unique_ptr<DatabaseLock>& held) {
     // The server's own database lock first (core/DatabaseLock.h): it holds
     // whatever namespace or port the server is in, which the probe cannot see.
-    if (DatabaseLock::held_elsewhere(config.database_path)) {
-        out << "error: a running server holds " << DatabaseLock::lock_path_for(config.database_path)
-            << ".\n       Stop it first. Writing behind a live server makes the two processes\n"
-               "       hand out the same event stream positions.\n";
+    try {
+        held = DatabaseLock::acquire(config.database_path);
+    } catch (const std::exception& e) {
+        out << "error: " << e.what() << "\n       Stop it first. Writing behind a live server "
+               "makes the two processes\n       hand out the same event stream positions.\n";
         return true;
     }
     if (!probe(config.bind_address, config.port)) return false;
@@ -129,7 +136,8 @@ bool refuse_if_running(const Config& config, const ListenProbe& probe, std::ostr
 int cmd_list_users(const CommonArgs& args, std::ostream& out, const ListenProbe& probe) {
     Config config;
     if (!load_config(args.config_path, config, out)) return 1;
-    if (refuse_if_running(config, probe, out)) return 1;
+    std::unique_ptr<DatabaseLock> db_lock;  // held until the command returns
+    if (refuse_if_running(config, probe, out, db_lock)) return 1;
 
     // Read-only, but gated on the same stopped-server check as the write
     // commands on purpose: this exists to tell an operator which id to pass to
@@ -176,7 +184,8 @@ int cmd_list_orphan_members(const CommonArgs& args, std::ostream& out,
     // OPENING the database is not. SqliteStore::initialize() runs the migration
     // pass, so pointing this at a live server is a second writer, which is the
     // stream-position collision the header describes.
-    if (refuse_if_running(config, probe, out)) return 1;
+    std::unique_ptr<DatabaseLock> db_lock;  // held until the command returns
+    if (refuse_if_running(config, probe, out, db_lock)) return 1;
 
     SqliteStore store(config.database_path);
     store.initialize();
@@ -224,7 +233,8 @@ int cmd_list_fake_dms(const CommonArgs& args, std::ostream& out, const ListenPro
     // Same stopped-server gate as list-orphan-members, and for the same reason:
     // the command is read-only but SqliteStore::initialize() runs the migration
     // pass, so pointing it at a live server is a second writer.
-    if (refuse_if_running(config, probe, out)) return 1;
+    std::unique_ptr<DatabaseLock> db_lock;  // held until the command returns
+    if (refuse_if_running(config, probe, out, db_lock)) return 1;
 
     SqliteStore store(config.database_path);
     store.initialize();
@@ -270,7 +280,8 @@ int cmd_list_fake_dms(const CommonArgs& args, std::ostream& out, const ListenPro
 int cmd_grant_admin(const CommonArgs& args, std::ostream& out, const ListenProbe& probe) {
     Config config;
     if (!load_config(args.config_path, config, out)) return 1;
-    if (refuse_if_running(config, probe, out)) return 1;
+    std::unique_ptr<DatabaseLock> db_lock;  // held until the command returns
+    if (refuse_if_running(config, probe, out, db_lock)) return 1;
 
     if (!UserId::is_valid(args.user_id)) {
         out << "error: " << log_safe(args.user_id)

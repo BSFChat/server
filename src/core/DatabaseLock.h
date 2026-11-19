@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <string>
 
@@ -18,6 +19,10 @@ namespace bsfchat {
 // when the process exits however it exits, so a crash never leaves a stale
 // lock to clear by hand. It is per open file, so a second acquire in the SAME
 // process conflicts too (which is what the tests rely on).
+//
+// The admin CLI takes the same lock and HOLDS it for its whole run (audit 3,
+// 2026-11-19): it used to check and let go, so a server started while a
+// grant-admin was writing came up beside it.
 class DatabaseLock {
 public:
     ~DatabaseLock();
@@ -27,7 +32,15 @@ public:
     // Takes the lock for `database_path`, or throws std::runtime_error with an
     // operator-facing message when another process holds it. Returns null for
     // an in-memory database (":memory:" or empty), which nothing can share.
-    static std::unique_ptr<DatabaseLock> acquire(const std::string& database_path);
+    //
+    // `patience`: how long to keep retrying a held lock before giving up. The
+    // server passes a few seconds (audit 3, 2026-11-19) so that one starting
+    // while something holds the lock only momentarily — held_elsewhere()'s
+    // probe takes it for an instant — does not fail spuriously. The admin CLI
+    // passes zero: a running server will not let go, and it should say so.
+    static std::unique_ptr<DatabaseLock> acquire(
+        const std::string& database_path,
+        std::chrono::milliseconds patience = std::chrono::milliseconds(0));
 
     // True when another holder has the lock right now. Probes without keeping
     // it; for the admin CLI's stopped-server check.

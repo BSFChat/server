@@ -45,7 +45,9 @@ Server::Server(Config config)
 
     // Refuse to start beside another server on this database, before opening
     // it at all: even initialize() writes (migrations).
-    db_lock_ = DatabaseLock::acquire(config_.database_path);
+    // A few seconds' patience: an admin command's probe, or one finishing as
+    // the server is started after it, holds the lock only briefly.
+    db_lock_ = DatabaseLock::acquire(config_.database_path, std::chrono::seconds(3));
 
     store_ = std::make_unique<SqliteStore>(config_.database_path);
     store_->initialize();
