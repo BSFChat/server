@@ -308,10 +308,67 @@ int PushService::evaluate_message(const MessageNotification& n, PermissionsEngin
     // A local INSERT and nothing more. Delivery happens on the worker thread.
     store_.enqueue_pushes(queue);
     {
+        // These devices now show a count for this room; notify_read() owes
+        // them a clear once it is read.
+        std::lock_guard lock(badged_mutex_);
+        if (badged_.size() >= kMaxBadged) badged_.clear();
+        for (const auto& q : queue) badged_.emplace(q.user_id, n.room_id);
+    }
+    wake_worker();
+    return static_cast<int>(queue.size());
+}
+
+void PushService::wake_worker() {
+    {
         std::lock_guard lock(wake_mutex_);
         ++wake_seq_;
     }
     wake_cv_.notify_all();
+}
+
+int PushService::notify_read(const std::string& user_id, const std::string& room_id) {
+    if (!config_.push.enabled) return 0;
+    {
+        // Nothing was pushed for this room since the last clear: there is no
+        // badge to clear, and this is the common case — one set lookup.
+        std::lock_guard lock(badged_mutex_);
+        if (!badged_.count({user_id, room_id})) return 0;
+    }
+    // Still unread (a marker short of the end): the badge is still right.
+    if (store_.count_unread(user_id, room_id) != 0) return 0;
+    {
+        std::lock_guard lock(badged_mutex_);
+        // Re-checked: two racing markers must not both send the clear.
+        if (!badged_.erase({user_id, room_id})) return 0;
+    }
+
+    std::vector<SqliteStore::QueuedPush> queue;
+    for (const auto& pusher : store_.get_pushers(user_id)) {
+        json device = {
+            {"app_id", pusher.app_id},
+            {"pushkey", pusher.pushkey},
+        };
+        auto data = json::parse(pusher.data_json, nullptr, false);
+        if (!data.is_discarded() && data.is_object()) device["data"] = std::move(data);
+        // No event_id, type, sender or content at any payload level: this says
+        // only what event_id_only already says (a room and a count).
+        json notification = {
+            {"room_id", room_id},
+            {"prio", "low"},
+            {"counts", {{"unread", 0}}},
+            {"devices", json::array({std::move(device)})},
+        };
+        SqliteStore::QueuedPush q;
+        q.user_id = pusher.user_id;
+        q.app_id = pusher.app_id;
+        q.pushkey = pusher.pushkey;
+        q.url = pusher.url;
+        q.payload = json{{"notification", std::move(notification)}}.dump();
+        queue.push_back(std::move(q));
+    }
+    if (queue.empty()) return 0;
+    store_.enqueue_pushes(queue);
+    wake_worker();
     return static_cast<int>(queue.size());
 }
 

@@ -19,6 +19,7 @@
 #include "auth/Permissions.h"
 #include "core/Config.h"
 #include "core/Logger.h"
+#include "push/GatewayPolicy.h"
 #include "push/PushService.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
@@ -426,10 +427,10 @@ TEST(Pushers, AddressesAdjacentToPrivateRangesAreStillAllowed) {
         return res;
     };
 
-    EXPECT_TRUE(IsOk(attempt("http://172.15.0.1/notify")));
-    EXPECT_TRUE(IsOk(attempt("http://172.32.0.1/notify")));
-    EXPECT_TRUE(IsOk(attempt("http://11.0.0.1/notify")));
-    EXPECT_TRUE(IsOk(attempt("http://8.8.8.8/notify")));
+    EXPECT_TRUE(IsOk(attempt("http://172.15.0.1/_matrix/push/v1/notify")));
+    EXPECT_TRUE(IsOk(attempt("http://172.32.0.1/_matrix/push/v1/notify")));
+    EXPECT_TRUE(IsOk(attempt("http://11.0.0.1/_matrix/push/v1/notify")));
+    EXPECT_TRUE(IsOk(attempt("http://8.8.8.8/_matrix/push/v1/notify")));
 }
 
 // A deployment whose gateway really is on localhost (sygnal in the same compose
@@ -446,7 +447,7 @@ TEST(Pushers, AllowlistPlusOptInReachesAnInternalGateway) {
                             json{{"kind", "http"},
                                  {"pushkey", "k"},
                                  {"app_id", "a"},
-                                 {"data", {{"url", "http://127.0.0.1:9999/notify"}}}}
+                                 {"data", {{"url", "http://127.0.0.1:9999/_matrix/push/v1/notify"}}}}
                                 .dump());
     httplib::Response res;
     f.pushers->handle_set_pusher(req, res);
@@ -480,7 +481,7 @@ TEST(Pushers, GatewayAllowlistIsEnforcedWhenConfigured) {
                                 json{{"kind", "http"},
                                      {"pushkey", "k"},
                                      {"app_id", "a"},
-                                     {"data", {{"url", "https://gateway.example/notify"}}}}
+                                     {"data", {{"url", "https://gateway.example/_matrix/push/v1/notify"}}}}
                                     .dump());
         httplib::Response res;
         f.pushers->handle_set_pusher(req, res);
@@ -1036,7 +1037,7 @@ TEST(PushAllowlist, MatchesOnOriginNotRawStringPrefix) {
     EXPECT_EQ(attempt_register(f, "https://push.example.com:8443/n"), 400);
     // The gateway itself still works, case-insensitively on the host.
     EXPECT_EQ(attempt_register(f, "https://push.example.com/_matrix/push/v1/notify"), 200);
-    EXPECT_EQ(attempt_register(f, "https://PUSH.EXAMPLE.COM/notify"), 200);
+    EXPECT_EQ(attempt_register(f, "https://PUSH.EXAMPLE.COM/_matrix/push/v1/notify"), 200);
 }
 
 // B6. An entry with a path scopes to that path, on a segment boundary — so
@@ -1047,7 +1048,8 @@ TEST(PushAllowlist, PathScopingHonoursSegmentBoundaries) {
     f.add_user("alice");
 
     EXPECT_EQ(attempt_register(f, "https://push.example.com/_matrix/push/v1/notify"), 200);
-    EXPECT_EQ(attempt_register(f, "https://push.example.com/_matrix/push/v1"), 200);
+    EXPECT_EQ(attempt_register(f, "https://push.example.com/_matrix/push/v1"), 400)
+        << "allowlisted, but not the notify endpoint (audit 3)";
     EXPECT_EQ(attempt_register(f, "https://push.example.com/_matrix/push/v1backdoor"), 400);
     EXPECT_EQ(attempt_register(f, "https://push.example.com/admin"), 400);
 }
@@ -1077,7 +1079,7 @@ TEST(PushSsrf, ObfuscatedLoopbackFormsAreRecognised) {
     // ...and accurate in the other direction: inet_aton reads "010" as octal 8,
     // so this is 8.0.0.1, a public address. The old sscanf("%u") parser read it
     // as 10.0.0.1 and blocked a legitimate gateway.
-    EXPECT_EQ(attempt_register(f, "http://010.0.0.1/n"), 200) << "octal 8.0.0.1 is public";
+    EXPECT_EQ(attempt_register(f, "http://010.0.0.1/_matrix/push/v1/notify"), 200) << "octal 8.0.0.1 is public";
     EXPECT_EQ(attempt_register(f, "http://0177.1/n"), 400) << "octal short form";
     EXPECT_EQ(attempt_register(f, "http://[0:0:0:0:0:ffff:7f00:1]/n"), 400)
         << "uncompressed IPv4-mapped IPv6";
@@ -1095,7 +1097,7 @@ TEST(PushSsrf, InternalGatewayNeedsAnExplicitOptIn) {
     EXPECT_EQ(attempt_register(f, "http://127.0.0.1:9999/notify"), 400);
 
     f.config.push.allow_internal_gateway = true;
-    EXPECT_EQ(attempt_register(f, "http://127.0.0.1:9999/notify"), 200);
+    EXPECT_EQ(attempt_register(f, "http://127.0.0.1:9999/_matrix/push/v1/notify"), 200);
 }
 
 // A17. `data.url` had no length bound at all — only pushkey and app_id did.
@@ -1207,8 +1209,8 @@ TEST(PushGatewayTrust, PushkeyTakeoverIsScopedToTheSameAppId) {
     f.add_user("mallory");
 
     // Alice's phone: the same device token registered by two different apps.
-    ASSERT_EQ(attempt_register(f, "https://gateway.example/n", "device-token", "com.bsfchat.app"), 200);
-    ASSERT_EQ(attempt_register(f, "https://gateway.example/n", "device-token", "com.bsfchat.beta"), 200);
+    ASSERT_EQ(attempt_register(f, "https://gateway.example/_matrix/push/v1/notify", "device-token", "com.bsfchat.app"), 200);
+    ASSERT_EQ(attempt_register(f, "https://gateway.example/_matrix/push/v1/notify", "device-token", "com.bsfchat.beta"), 200);
     ASSERT_EQ(f.store->get_pushers("@alice:test").size(), 2u);
 
     // Mallory knows the token and claims it for ONE app id.
@@ -1216,7 +1218,7 @@ TEST(PushGatewayTrust, PushkeyTakeoverIsScopedToTheSameAppId) {
                             json{{"kind", "http"},
                                  {"pushkey", "device-token"},
                                  {"app_id", "com.bsfchat.app"},
-                                 {"data", {{"url", "https://gateway.example/n"}}}}
+                                 {"data", {{"url", "https://gateway.example/_matrix/push/v1/notify"}}}}
                                 .dump());
     httplib::Response res;
     f.pushers->handle_set_pusher(req, res);
@@ -1937,4 +1939,101 @@ TEST(PushersFollowSessions, LogoutAllRemovesEveryPusher) {
     EXPECT_EQ(s.store.delete_all_tokens_for_user("@alice:test"), 1);
     EXPECT_TRUE(s.pushkeys().empty());
     EXPECT_EQ(s.store.count_queued_pushes(), 0);
+}
+
+// ── Audit 3 (2026-11-19) ─────────────────────────────────────────────────────
+
+namespace {
+
+httplib::Response read_room(PushFixture& f, const std::string& localpart,
+                            const std::string& room_id = PushFixture::kRoom) {
+    auto req = make_request("/_matrix/client/v3/rooms/" + room_id + "/read_marker",
+                            "token-" + localpart, "{}");
+    httplib::Response res;
+    f.events->handle_read_marker(req, res);
+    return res;
+}
+
+} // namespace
+
+// Reading a room that had been pushed clears the phone badge with a
+// count-only notification — once, not on every marker move.
+TEST(PushBadgeClear, ReadingAPushedRoomSendsOneCountOnlyPush) {
+    PushFixture f;
+    f.add_user("alice");
+    f.add_user("bob");
+    f.register_pusher("bob", "bob-device");
+    f.set_level("bob", PushService::kLevelAll);
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "hi"}}, "t1")));
+    ASSERT_EQ(f.push->drain_once().delivered, 1);
+    ASSERT_EQ(f.gateway.last_payload()["notification"]["counts"]["unread"], 1);
+
+    ASSERT_TRUE(IsOk(read_room(f, "bob")));
+    ASSERT_EQ(f.store->count_queued_pushes(), 1) << "no badge-clearing push was queued";
+    ASSERT_EQ(f.push->drain_once().delivered, 1);
+    const auto clear = f.gateway.last_payload()["notification"];
+    EXPECT_EQ(clear["counts"]["unread"], 0);
+    EXPECT_FALSE(clear.contains("event_id")) << "a badge clear names no event";
+    EXPECT_FALSE(clear.contains("content"));
+    EXPECT_FALSE(clear.contains("sender"));
+    EXPECT_EQ(clear["devices"][0]["pushkey"], "bob-device");
+
+    // Throttled: reading again with nothing new pushed sends nothing.
+    ASSERT_TRUE(IsOk(read_room(f, "bob")));
+    EXPECT_EQ(f.store->count_queued_pushes(), 0);
+}
+
+TEST(PushBadgeClear, ARoomNeverPushedSendsNoClear) {
+    PushFixture f;
+    f.add_user("alice");
+    f.add_user("bob");
+    f.register_pusher("bob", "bob-device");
+    // Default level in a channel is mentions only: this message pushes nothing.
+    ASSERT_TRUE(IsOk(f.send("alice", {{"msgtype", "m.text"}, {"body", "hi"}}, "t1")));
+    ASSERT_EQ(f.store->count_queued_pushes(), 0);
+    ASSERT_TRUE(IsOk(read_room(f, "bob")));
+    EXPECT_EQ(f.store->count_queued_pushes(), 0) << "a clear for a badge that was never lit";
+}
+
+// The Matrix push gateway API has one endpoint; data.url must be it.
+TEST(Pushers, GatewayUrlPathMustBeTheNotifyEndpoint) {
+    PushFixture f;
+    f.add_user("alice");
+    EXPECT_EQ(attempt_register(f, "https://gateway.example/_matrix/push/v1/notify"), 200);
+    EXPECT_EQ(attempt_register(f, "https://gateway.example/admin/reset"), 400);
+    EXPECT_EQ(attempt_register(f, "https://gateway.example/"), 400);
+    EXPECT_EQ(attempt_register(f, "https://gateway.example/_matrix/push/v1/notify/x"), 400);
+    std::string why;
+    EXPECT_FALSE(gateway_url_allowed("https://gateway.example/webhook", f.config.push, why));
+    EXPECT_NE(why.find("/_matrix/push/v1/notify"), std::string::npos) << why;
+}
+
+// Two accounts on one device share its pushkey. `append: false` (the default)
+// keeps spec semantics and moves the pushkey; `append: true` — what a client
+// with several accounts signed in must send — lets both keep it.
+TEST(Pushers, AppendLetsTwoAccountsOnOneDeviceShareAPushkey) {
+    PushFixture f;
+    f.add_user("alice");
+    f.add_user("bob");
+    auto set = [&](const std::string& localpart, bool append) {
+        auto req = make_request("/_matrix/client/v3/pushers/set", "token-" + localpart,
+                                json{{"kind", "http"},
+                                     {"pushkey", "one-phone"},
+                                     {"app_id", "com.bsfchat.app"},
+                                     {"append", append},
+                                     {"data", {{"url", PushFixture::kGatewayUrl}}}}
+                                    .dump());
+        httplib::Response res;
+        f.pushers->handle_set_pusher(req, res);
+        return res;
+    };
+    ASSERT_TRUE(IsOk(set("alice", true)));
+    ASSERT_TRUE(IsOk(set("bob", true)));
+    EXPECT_EQ(f.store->get_pushers("@alice:test").size(), 1u)
+        << "append:true must not evict the other account on the same device";
+    EXPECT_EQ(f.store->get_pushers("@bob:test").size(), 1u);
+
+    ASSERT_TRUE(IsOk(set("bob", false)));
+    EXPECT_TRUE(f.store->get_pushers("@alice:test").empty())
+        << "append:false keeps the spec's 'this pushkey is mine now'";
 }

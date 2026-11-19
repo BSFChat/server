@@ -343,6 +343,9 @@ bool parse_gateway_url(const std::string& url, GatewayUrl& out) {
     return true;
 }
 
+// The one path a push gateway URL may have (Matrix push gateway API).
+constexpr const char* kNotifyPath = "/_matrix/push/v1/notify";
+
 // Whether `url_path` is at or below `prefix_path`, on a path-segment boundary.
 // "/_matrix/push/v1/" must authorise "/_matrix/push/v1/notify" but not
 // "/_matrix/push/v1backdoor".
@@ -447,6 +450,19 @@ bool gateway_url_allowed(const std::string& url, const PushConfig& cfg, std::str
     if (!cfg.allow_internal_gateway && host_is_internal(target.host)) {
         why = "data.url points at an internal address; set push.allow_internal_gateway "
               "if this deployment's gateway really is on the internal network";
+        return false;
+    }
+
+    // The Matrix push gateway API has exactly one endpoint, and the spec says
+    // data.url MUST be it (audit 3, 2026-11-19). An allowlist entry naming a
+    // gateway HOST otherwise let a client point notifications — message data,
+    // under a permissive payload level — at any other path on that host: an
+    // admin route, a webhook, a different service behind the same proxy.
+    // Checked last so every earlier refusal keeps its own reason, and checked
+    // at delivery too (drain_once), like everything else here.
+    if (target.path != kNotifyPath) {
+        why = std::string("data.url path must be ") + kNotifyPath +
+              " (the Matrix push gateway notify endpoint)";
         return false;
     }
     return true;
@@ -633,6 +649,14 @@ void PushHandler::handle_set_pusher(const httplib::Request& req, httplib::Respon
     // victim's notifications. Not fixable without breaking the recycled-token
     // case, which is the worse leak (the previous owner's messages would keep
     // arriving on someone else's phone). Logged so it is at least visible.
+    //
+    // CLIENTS WITH SEVERAL ACCOUNTS SIGNED IN ON ONE DEVICE MUST SEND
+    // `append: true` (audit 3, 2026-11-19). Every account on that device
+    // registers the same (app_id, pushkey), so with the default each account's
+    // registration deletes the others' and only the last one to register gets
+    // push. The rows are keyed (user_id, app_id, pushkey), so with append the
+    // accounts coexist; the server keeps the spec's default rather than
+    // guessing, because guessing wrong is the recycled-token leak above.
     if (!json_bool_or(body, "append", false)) {
         int removed = store_.delete_pushers_by_pushkey_except(pushkey, app_id, *user_id);
         if (removed > 0) {

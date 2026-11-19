@@ -1110,6 +1110,8 @@ void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Resp
     // counts and m.fully_read. Broadcasting it returned every parked poll on
     // the server once per reader per message.
     sync_engine_.notify_ephemeral_for(*user_id);
+    // Clears the phone badge when this read emptied the room (audit 3).
+    if (push_) push_->notify_read(*user_id, room_id);
 
     res.set_content("{}", "application/json");
 }
