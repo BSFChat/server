@@ -43,11 +43,14 @@ struct Config;
 //     streaming; one deadline across all hops of a fetch.
 //   * Type: only text/html (or xhtml) is parsed; image/png|jpeg|gif|webp is
 //     the only thing stored, and only when its magic bytes agree.
-//   * Load: a per-account rate limit on cache misses, a server-wide cap on
-//     fetches in flight (each one holds an HTTP worker) and a per-account
-//     share of it, 429 past any; one deadline covers the page AND its image.
+//   * Load: a per-account rate limit on cache misses (charged only once the
+//     concurrency checks pass), a server-wide cap on fetches in flight (each
+//     one holds an HTTP worker) and a per-account share of it, 429 past any;
+//     one deadline covers the page AND its image.
 //   * Storage: a per-account daily byte budget for stored preview images;
-//     past it a preview is still made, without the image.
+//     past it a preview is still made, without the image — and NOT cached,
+//     since it is that account's answer, not the URL's. The same holds for an
+//     image dropped because the deadline ran out.
 //   * No cookies, no Authorization, no Referer; a fixed User-Agent.
 //
 // The og:image is stored in the media repository with uploader
@@ -107,8 +110,11 @@ private:
 
     // Adds og:image (+ size, dimensions) for an image body to `out`, charging
     // `user_id`'s daily image budget. False (and nothing stored) past it.
+    // `over_budget`, when given, is set when the budget (not the image) was
+    // the reason.
     bool attach_image(nlohmann::json& out, std::string& image_mxc, const std::string& body,
-                      const std::string& content_type, const std::string& user_id);
+                      const std::string& content_type, const std::string& user_id,
+                      bool* over_budget = nullptr);
 
     // Bytes `user_id` may still store today; refreshed per 24 h window.
     int64_t image_budget_left(const std::string& user_id);

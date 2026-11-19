@@ -386,7 +386,7 @@ std::string UrlPreviewHandler::store_image(const std::string& body,
 
 bool UrlPreviewHandler::attach_image(nlohmann::json& out, std::string& image_mxc,
                                      const std::string& body, const std::string& content_type,
-                                     const std::string& user_id) {
+                                     const std::string& user_id, bool* over_budget) {
     // The header is a claim; the magic bytes decide (api/MediaPolicy.h).
     const std::string sniffed = media_policy::normalise_content_type(content_type, body);
     if (!is_preview_image_type(sniffed)) return false;
@@ -396,6 +396,7 @@ bool UrlPreviewHandler::attach_image(nlohmann::json& out, std::string& image_mxc
     if (static_cast<int64_t>(body.size()) > image_budget_left(user_id)) {
         get_logger()->info("URL preview: {} is over the daily preview-image budget; "
                            "previewing without the image", user_id);
+        if (over_budget) *over_budget = true;
         return false;
     }
     const std::string media_id = store_image(body, sniffed);
@@ -451,12 +452,6 @@ void UrlPreviewHandler::handle_preview(const httplib::Request& req, httplib::Res
         return;
     }
 
-    // Charged only on a miss: a cache hit costs one indexed read, a miss is
-    // outbound traffic the server performs on this account's behalf.
-    if (const auto wait = limiter_.acquire(*user_id)) {
-        send_rate_limited(res, wait, "Too many link previews; try again shortly");
-        return;
-    }
     // Each fetch holds an HTTP worker for up to one timeout (page + image).
     // The account's share first, so one account cannot hold every server-wide
     // slot (audit 2-2026-11-18 S2-7).
@@ -490,6 +485,17 @@ void UrlPreviewHandler::handle_preview(const httplib::Request& req, httplib::Res
         ~Slot() { n.fetch_sub(1); }
     } slot{in_flight_};
 
+    // Charged only on a miss: a cache hit costs one indexed read, a miss is
+    // outbound traffic the server performs on this account's behalf. And only
+    // once both concurrency checks have passed (audit 3, 2026-11-19): a
+    // request turned away because the server was busy fetched nothing, and
+    // spending the account's per-minute token on it left the client rate
+    // limited for a preview it never got.
+    if (const auto wait = limiter_.acquire(*user_id)) {
+        send_rate_limited(res, wait, "Too many link previews; try again shortly");
+        return;
+    }
+
     maybe_prune();
 
     // ONE deadline for the whole preview: the page, its redirects, and the
@@ -503,8 +509,22 @@ void UrlPreviewHandler::handle_preview(const httplib::Request& req, httplib::Res
 
     nlohmann::json out = nlohmann::json::object();
     std::string image_mxc;
+    // Set when the image was left out because of THIS request's limits — the
+    // account's daily image budget, or the shared deadline running out — as
+    // opposed to anything about the page. Such an answer is true for this
+    // account at this moment, not for the URL, so it must not go in the
+    // server-wide cache: one account over its budget used to strip the image
+    // from that link for everybody until the row expired (audit 3,
+    // 2026-11-19). A budget of 0 is server policy (no preview images at all),
+    // not an account's limit, so it does not count.
+    bool degraded = false;
+    auto budget_spent = [&] {
+        return image_bytes_per_day_ > 0 && image_budget_left(*user_id) <= 0;
+    };
     if (page.status == FetchStatus::kOk && !page.is_html) {
-        attach_image(out, image_mxc, page.body, page.content_type, *user_id);
+        bool over_budget = false;
+        attach_image(out, image_mxc, page.body, page.content_type, *user_id, &over_budget);
+        degraded = over_budget && image_bytes_per_day_ > 0;
     } else if (page.status == FetchStatus::kOk) {
         const auto tags = url_preview::parse_html(page.body);
         const std::string charset = !page.charset.empty()
@@ -523,29 +543,44 @@ void UrlPreviewHandler::handle_preview(const httplib::Request& req, httplib::Res
         }
         // No image fetch at all once the account's image budget is spent, or
         // once the shared deadline has.
-        if (tags.image && image_budget_left(*user_id) > 0 && steady_ms() < deadline) {
+        if (tags.image && (budget_spent() || steady_ms() >= deadline)) degraded = true;
+        if (tags.image && !degraded && image_budget_left(*user_id) > 0) {
             auto abs = url_preview::resolve_reference(page.final_url, *tags.image);
             if (auto u = abs ? url_preview::parse_url(*abs) : std::nullopt) {
                 Fetched img = fetch(*u, false, deadline);
+                bool over_budget = false;
+                // A failed image fetch that ran out the clock is the deadline's
+                // doing, not the image's.
+                if (img.status == FetchStatus::kFailed && steady_ms() >= deadline) {
+                    degraded = true;
+                }
                 if (img.status == FetchStatus::kOk &&
-                    attach_image(out, image_mxc, img.body, img.content_type, *user_id) &&
+                    attach_image(out, image_mxc, img.body, img.content_type, *user_id,
+                                 &over_budget) &&
                     !out.contains("og:image:width")) {
                     // Header unreadable: fall back to what the page declared.
                     if (auto w = positive_int(tags.image_width)) out["og:image:width"] = *w;
                     if (auto h = positive_int(tags.image_height)) out["og:image:height"] = *h;
                 }
+                if (over_budget && image_bytes_per_day_ > 0) degraded = true;
             }
         }
     }
 
+    // A page that failed because the clock ran out is a transient answer too.
+    if (page.status == FetchStatus::kFailed && steady_ms() >= deadline) degraded = true;
+
     const int64_t now = wall_now();
     if (out.empty()) {
-        store_.put_url_preview(key, std::nullopt, "", now);
+        if (!degraded) store_.put_url_preview(key, std::nullopt, "", now);
         send_error(res, 404, MatrixError::not_found("Nothing to preview at this URL"));
         return;
     }
     const std::string body = out.dump();
-    store_.put_url_preview(key, body, image_mxc, now);
+    // Not cached at all when degraded: the next request (this account's, once
+    // its budget is back, or anybody else's) fetches the full answer and
+    // caches that. The rate limit above bounds what the repeat costs.
+    if (!degraded) store_.put_url_preview(key, body, image_mxc, now);
     res.status = 200;
     res.set_content(body, "application/json");
 }

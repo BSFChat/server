@@ -911,3 +911,61 @@ TEST(UrlPreviewCache, ARefetchParksTheOldImageUntilThePrune) {
     ASSERT_EQ(orphans.size(), 1u);
     EXPECT_EQ(orphans[0].media_id, "aaaa");
 }
+
+// ── Audit 3 (2026-11-19) ─────────────────────────────────────────────────────
+
+// An image left out because ONE account is over its budget is that account's
+// answer, not the URL's: it must not reach the shared cache.
+TEST(UrlPreviewHandlerTest, ABudgetStrippedPreviewDoesNotPoisonTheCache) {
+    PreviewFixture f;
+    f.config.url_preview_rate_per_minute = 600;
+    f.config.url_preview_image_bytes_per_account_per_day =
+        static_cast<int64_t>(png(64, 32).size()) + 10;
+    auto h = f.seamed();
+
+    ASSERT_EQ(f.get(*h, f.url("/page?n=1")).status, 200);  // spends alice's budget
+    auto stripped = f.get(*h, f.url("/page?n=2"));
+    ASSERT_EQ(stripped.status, 200) << stripped.body;
+    EXPECT_FALSE(json::parse(stripped.body).contains("og:image"));
+
+    auto bobs = f.get(*h, f.url("/page?n=2"), "bob");
+    ASSERT_EQ(bobs.status, 200) << bobs.body;
+    EXPECT_TRUE(json::parse(bobs.body).contains("og:image"))
+        << "alice's spent budget stripped the image for bob through the cache";
+}
+
+TEST(UrlPreviewHandlerTest, ADeadlineStrippedPreviewIsNotCached) {
+    PreviewFixture f;
+    f.config.url_preview_rate_per_minute = 600;
+    f.config.url_preview_timeout_seconds = 2;  // page 1.2 s + image 1.2 s > 2 s
+    auto h = f.seamed();
+    auto first = f.get(*h, f.url("/slowpage"));
+    ASSERT_EQ(first.status, 200) << first.body;
+    ASSERT_FALSE(json::parse(first.body).contains("og:image"));
+    const int hits = f.origin.hits.load();
+    f.get(*h, f.url("/slowpage"), "bob");
+    EXPECT_GT(f.origin.hits.load(), hits) << "the deadline-stripped answer was served from cache";
+}
+
+// A request turned away by a concurrency cap fetched nothing, so it must not
+// spend the account's per-minute token.
+TEST(UrlPreviewHandlerTest, ARefusalForConcurrencyDoesNotSpendTheRateToken) {
+    PreviewFixture f;
+    f.config.url_preview_rate_per_minute = 2;
+    f.config.url_preview_max_concurrent_per_account = 1;
+    auto h = f.seamed();
+
+    int held_status = 0;
+    std::thread held([&] { held_status = f.get(*h, f.url("/slow?n=1")).status; });
+    for (int i = 0; i < 400 && f.origin.slow_waiting.load() < 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_EQ(f.origin.slow_waiting.load(), 1);
+    EXPECT_EQ(f.get(*h, f.url("/slow?n=2")).status, 429);  // busy, not rate limited
+    f.origin.release = true;
+    held.join();
+    EXPECT_EQ(held_status, 200);
+
+    EXPECT_EQ(f.get(*h, f.url("/page")).status, 200)
+        << "the busy refusal spent the account's second token";
+}
