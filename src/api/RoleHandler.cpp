@@ -276,6 +276,9 @@ RoleHandler::Commit RoleHandler::commit_roles(const std::string& actor,
     // be computed from two different documents — which is not just a lost edit
     // but a reverted one, because the containment test measures what the
     // proposal ADDS relative to whatever it reads. Permissions audit F8.
+    // The document this proposal replaces; the compare-and-swap below
+    // guarantees it is the one actually replaced.
+    const auto before = store_.get_server_roles();
     const bool applied =
         write_server_scoped_state(store_, config_, std::string(event_type::kServerRoles),
                                   std::string(), j.dump(), mirror_room(), actor, &expected);
@@ -284,9 +287,12 @@ RoleHandler::Commit RoleHandler::commit_roles(const std::string& actor,
     sync_engine_.notify_new_event();
     // A definition edit can take VIEW_CHANNEL away from whoever holds the role;
     // their calls in channels they can no longer see end now rather than at
-    // the reaper (audit 2-2026-11-18 V2-7).
-    retract_calls_after_role_write(store_, sync_engine_, config_,
-                                   std::string(event_type::kServerRoles), std::string());
+    // the reaper (audit 2-2026-11-18 V2-7). Only when it can (audit 3): a
+    // rename or recolour is not worth a walk over every call on the server.
+    if (role_change_can_hide_channels(before, proposed)) {
+        retract_calls_after_role_write(store_, sync_engine_, config_,
+                                       std::string(event_type::kServerRoles), std::string());
+    }
     return Commit::Ok;
 }
 
@@ -557,8 +563,9 @@ void RoleHandler::handle_delete_role(const httplib::Request& req, httplib::Respo
     }
     if (stripped > 0) {
         sync_engine_.notify_new_event();
-        retract_calls_after_role_write(store_, sync_engine_, config_,
-                                       std::string(event_type::kServerRoles), std::string());
+        // No second call sweep: commit_roles above already ran one when the
+        // definition went, and compute() has ignored the dead id since then,
+        // so stripping it changes nobody's access (audit 3).
         get_logger()->info("Role {} deleted by {}; stripped from {} member(s)", role_id, *actor,
                            stripped);
     }
@@ -656,10 +663,11 @@ void RoleHandler::change_self_role(const httplib::Request& req, httplib::Respons
         if (write_server_scoped_state(store_, config_, std::string(event_type::kMemberRoles),
                                       *actor, j.dump(), mirror_room(), *actor, &doc.raw)) {
             sync_engine_.notify_new_event();
-            if (!add) {
-                retract_calls_after_role_write(store_, sync_engine_, config_,
-                                               std::string(event_type::kMemberRoles), *actor);
-            }
+            // Both directions (audit 3): dropping a role can lose an ALLOW,
+            // and TAKING one can bring a DENY VIEW_CHANNEL override with it.
+            // Per-user, so cheap.
+            retract_calls_after_role_write(store_, sync_engine_, config_,
+                                           std::string(event_type::kMemberRoles), *actor);
             send_json(res, json{{"role_ids", ids}});
             return;
         }

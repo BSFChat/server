@@ -548,7 +548,10 @@ enabled = true
 
 # Participant cap for voice channels that set none of their own
 # (max_participants 0 or unset). A peer-to-peer mesh gives out at about 6-8
-# cameras. 0 = unlimited.
+# cameras. 0 = unlimited. It is a mesh limit, so it is not applied when
+# [voice.livekit] is configured. A channel's own m.room.voice
+# max_participants overrides it: N caps that channel at N, -1 makes it
+# unlimited, 0 uses this default.
 default_max_participants = 10
 
 # Public STUN (covers ~70% of NAT setups with no infrastructure from you).

@@ -843,3 +843,86 @@ TEST(AccountData, MDirectReturnsTheDerivedMap) {
     ASSERT_TRUE(j.contains(f.bob)) << res.body;
     EXPECT_EQ(j[f.bob], json::array({room_id}));
 }
+
+// ── Voice ─────────────────────────────────────────────────────────────────
+
+namespace {
+
+httplib::Response voice_join(Fixture& f, const std::string& room_id, const std::string& who) {
+    return f.call_on(*f.voice, &VoiceHandler::handle_voice_join,
+                     kRooms + room_id + "/voice/join", who);
+}
+
+bool in_call(Fixture& f, const std::string& room_id, const std::string& user) {
+    auto ev = f.store->get_state_event(room_id, std::string(event_type::kCallMember), user);
+    return ev && ev->content.data.value("active", false);
+}
+
+} // namespace
+
+TEST(Voice, ClaimingASelfRoleThatHidesTheChannelEndsTheCall) {
+    Fixture f;
+    f.seed_roles({opt_in_role("quiet")});
+    auto vc = f.add_channel(f.admin, "voice");
+    f.join(vc, f.alice);
+    f.override_directly(vc, "role:quiet", 0, permission::kViewChannel);
+    ASSERT_TRUE(IsOk(voice_join(f, vc, "alice")));
+    ASSERT_TRUE(IsOk(claim(f, "alice", "quiet")));
+    EXPECT_FALSE(in_call(f, vc, f.alice));
+}
+
+TEST(Voice, DisablingVoiceEndsTheCallInIt) {
+    Fixture f;
+    auto vc = f.add_channel(f.admin, "voice");
+    f.join(vc, f.alice);
+    ASSERT_TRUE(IsOk(voice_join(f, vc, "alice")));
+    ASSERT_TRUE(IsOk(f.put_state(vc, event_type::kRoomVoice, "", {{"enabled", false}})));
+    EXPECT_FALSE(in_call(f, vc, f.alice));
+}
+
+TEST(Voice, CapsMinusOneIsUnlimitedAndTheMeshDefaultSkipsLiveKit) {
+    Fixture f;
+    f.config.voice.default_max_participants = 3;
+    VoiceChannelContent c = read_voice_channel({{"enabled", true}, {"max_participants", -1}});
+    EXPECT_EQ(c.max_participants, -1);
+    EXPECT_EQ(effective_voice_cap(c, f.config), 0) << "-1 is unlimited";
+    c = read_voice_channel({{"enabled", true}});
+    EXPECT_EQ(effective_voice_cap(c, f.config), 3);
+    f.config.voice.livekit.url = "wss://sfu.example";
+    f.config.voice.livekit.api_key = "k";
+    f.config.voice.livekit.api_secret = "s";
+    EXPECT_EQ(effective_voice_cap(c, f.config), 0) << "the mesh default does not bind an SFU";
+    c = read_voice_channel({{"enabled", true}, {"max_participants", 4}});
+    EXPECT_EQ(effective_voice_cap(c, f.config), 4) << "a channel's own cap still does";
+}
+
+TEST(Voice, TurnWithNoTurnConfiguredHasNoCredentialsOrTtl) {
+    Fixture f;
+    f.config.voice.turn_uris.clear();
+    f.config.voice.turn_secret.clear();
+    f.config.voice.turn_username.clear();
+    auto res = f.call_on(*f.voice, &VoiceHandler::handle_turn_server,
+                         "/_matrix/client/v3/voip/turnServer", "alice");
+    ASSERT_TRUE(IsOk(res));
+    const auto j = json::parse(res.body);
+    EXPECT_FALSE(j.contains("ttl"));
+    EXPECT_FALSE(j.contains("username"));
+    EXPECT_FALSE(j.contains("password"));
+}
+
+TEST(Voice, OnlyARoleEditThatCanHideAChannelNeedsTheSweep) {
+    ServerRole a;
+    a.id = "a";
+    a.permissions = permission::kViewChannel | permission::kSendMessages;
+    ServerRole renamed = a;
+    renamed.name = "renamed";
+    renamed.color = "#ffffff";
+    EXPECT_FALSE(role_change_can_hide_channels({a}, {renamed}));
+    ServerRole blind = a;
+    blind.permissions = permission::kSendMessages;
+    EXPECT_TRUE(role_change_can_hide_channels({a}, {blind}));
+    EXPECT_TRUE(role_change_can_hide_channels({a}, {}));
+    ServerRole b;
+    b.id = "b";
+    EXPECT_FALSE(role_change_can_hide_channels({a}, {a, b})) << "adding a role hides nothing";
+}

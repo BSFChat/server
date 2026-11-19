@@ -71,6 +71,14 @@ size_t retract_calls_after_role_write(SqliteStore& store, SyncEngine& sync_engin
                                       const Config& config, const std::string& event_type,
                                       const std::string& state_key);
 
+// Can replacing the role document `before` with `after` take VIEW_CHANNEL
+// from anybody? True when a role that carried VIEW_CHANNEL or ADMINISTRATOR
+// loses the bit or disappears (its overrides go with it). A role document
+// write that cannot is not worth the server-wide sweep above (audit 3: it
+// ran on every roles write, and twice on a delete).
+bool role_change_can_hide_channels(const std::vector<ServerRole>& before,
+                                   const std::vector<ServerRole>& after);
+
 class VoiceHandler {
 public:
     VoiceHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config);

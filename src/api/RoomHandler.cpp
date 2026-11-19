@@ -700,6 +700,14 @@ std::string RoomHandler::emit_state_event(const std::string& room_id, const std:
         }
     } else if (event_type == ::bsfchat::event_type::kChannelPermissions) {
         retract_call_members_without_view(store_, sync_engine_, config_, room_id);
+    } else if (event_type == ::bsfchat::event_type::kRoomVoice &&
+               !json_bool_or(content, "enabled", true)) {
+        // Switching voice off ends the call that is in it (audit 3); join
+        // already refuses a disabled channel, so nobody can be left in one.
+        for (const auto& caller : active_call_members(store_, room_id)) {
+            retract_call_member(store_, sync_engine_, config_.server_name, room_id, caller,
+                                "voice disabled");
+        }
     }
     return event_id;
 }
@@ -3047,12 +3055,19 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         // mirror so clients still learn about it through /sync. Role definition and
         // role assignment changes are audited inside write_server_scoped_state,
         // which is the choke point they all share.
+        const auto roles_before = evt_type == event_type::kServerRoles
+                                      ? store_.get_server_roles()
+                                      : std::vector<ServerRole>{};
         write_server_scoped_state(store_, config_, evt_type, state_key, content.dump(),
                                   room_id, *user_id);
         sync_engine_.notify_new_event();
         // Whoever this took VIEW_CHANNEL from leaves the calls they can no
-        // longer see (audit 2-2026-11-18 V2-7).
-        retract_calls_after_role_write(store_, sync_engine_, config_, evt_type, state_key);
+        // longer see (audit 2-2026-11-18 V2-7) — for a definitions write,
+        // only when it could have (audit 3).
+        if (evt_type != event_type::kServerRoles ||
+            role_change_can_hide_channels(roles_before, store_.get_server_roles())) {
+            retract_calls_after_role_write(store_, sync_engine_, config_, evt_type, state_key);
+        }
         auto mirrored = store_.get_state_event(room_id, evt_type, state_key);
         res.set_content(
             json{{"event_id", mirrored ? mirrored->event_id : std::string()}}.dump(),
