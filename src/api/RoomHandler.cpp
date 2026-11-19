@@ -3089,6 +3089,38 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         ChannelPermissionOverride proposed;
         from_json(content, proposed);
 
+        // Who the override names, checked as INPUT (400), not as a permission
+        // question (audit 3): a malformed key was a 403, and a key naming a
+        // role or account that does not exist was stored and read by nothing.
+        // Clearing one (allow and deny both 0) stays allowed, so a stale
+        // override left by a deleted role can still be removed.
+        {
+            std::optional<std::string> bad_key;
+            const bool is_user = state_key.rfind("user:", 0) == 0;
+            const bool is_role = state_key.rfind("role:", 0) == 0;
+            const std::string subject =
+                is_user ? state_key.substr(5) : is_role ? state_key.substr(5) : std::string();
+            const bool clearing = proposed.allow == 0 && proposed.deny == 0;
+            if ((!is_user && !is_role) || subject.empty()) {
+                bad_key = "A channel override must name a user (\"user:<id>\") or a role "
+                          "(\"role:<id>\")";
+            } else if (!clearing && is_user && !store_.user_exists(subject)) {
+                bad_key = "There is no account " + subject;
+            } else if (!clearing && is_role) {
+                const auto roles = store_.get_server_roles();
+                if (std::none_of(roles.begin(), roles.end(),
+                                 [&](const ServerRole& r) { return r.id == subject; })) {
+                    bad_key = "There is no role " + subject;
+                }
+            }
+            if (bad_key) {
+                res.status = 400;
+                res.set_content(MatrixError::bad_json(*bad_key).to_json().dump(),
+                                "application/json");
+                return;
+            }
+        }
+
         auto verdict = perms.may_write_channel_override(*user_id, room_id, state_key, before,
                                                         proposed);
         if (!verdict.allowed) {
