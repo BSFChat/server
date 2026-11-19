@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include <cstdint>
@@ -107,15 +108,37 @@ inline constexpr const char* kIgnoredUsersKey = "ignored_users";
 
 } // namespace account_data_type
 
+// Whether writing (or redacting) room STATE of `event_type` can change which
+// rooms an account may be shown, or who is joined to them — i.e. whether it
+// must bump SqliteStore::visibility_generation().
+//
+// A DENYLIST of types known to be inert, not an allowlist of types known to
+// matter: a missed bump is a privacy bug and a spurious one costs a cache
+// refill, so a type nobody thought about bumps. The inert ones are the
+// high-frequency ones (audit 3, 2026-11-19): every push-to-talk press or mute
+// writes m.call.member, and bumping on it threw away the cross-poll view
+// cache and forced a full presence restatement for every account.
+//
+// What DOES decide visibility, for whoever extends this: m.room.member,
+// bsfchat.room.type (category-ness), bsfchat.room.category (sidebar
+// parenting), bsfchat.channel.permissions (overrides), and the role mirror
+// types; plus the non-event writes that bump unconditionally (membership
+// rows, room create/delete, server_state roles, deactivation).
+bool state_type_affects_visibility(std::string_view event_type);
+
 class SqliteStore {
 public:
     explicit SqliteStore(const std::string& db_path);
 
     // Changes whenever anything that decides which rooms an account may be
-    // shown might have changed: a membership row, a room's existence, any
-    // room STATE event (channel overrides and bsfchat.room.type are state),
-    // a redaction (which can strip an override), and any server_state write
-    // (role definitions and assignments). Bumped AFTER the write, so a reader
+    // shown might have changed: a membership row (set_membership), a room's
+    // existence (create_room, delete_room), a room STATE event whose type
+    // state_type_affects_visibility() (insert_event; channel overrides and
+    // bsfchat.room.type are state), a redaction of such a state event
+    // (redact_event; it can strip an override), any server_state write
+    // (set_server_state: role definitions and assignments) and an account
+    // deactivation (deactivate_user, which rewrites membership rows). Nothing
+    // else — a message, a reaction, voice/call state, topic, name, pins. Bumped AFTER the write, so a reader
     // that samples it, then computes, and finds it unchanged afterwards has
     // computed from data no older than that sample.
     //
@@ -1854,9 +1877,14 @@ private:
     std::atomic<uint64_t> visibility_generation_{0};
     // Bumps visibility_generation_ when it goes out of scope, i.e. after the
     // write it guards. Declare it AFTER the lock_guard, so it runs first.
+    // `armed` lets a writer that only learns under the lock whether the
+    // write bears on visibility (redact_event) stand the bump down.
     struct VisibilityBump {
         std::atomic<uint64_t>& generation;
-        ~VisibilityBump() { ++generation; }
+        bool armed = true;
+        ~VisibilityBump() {
+            if (armed) ++generation;
+        }
     };
     // Monotonic; never reused even after delete_room removes the newest rows.
     // Mirrored into server_meta so it survives a restart.

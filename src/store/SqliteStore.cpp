@@ -27,6 +27,16 @@
 
 namespace bsfchat {
 
+bool state_type_affects_visibility(std::string_view type) {
+    // Inert: read by nothing that decides visibility or membership. See the
+    // header before adding to this list.
+    return !(type == event_type::kCallMember || type == event_type::kRoomVoice ||
+             type == event_type::kRoomPinnedEvents || type == event_type::kRoomTopic ||
+             type == event_type::kRoomName || type == event_type::kRoomAvatar ||
+             type == event_type::kRoomCanonicalAlias || type == event_type::kChannelSettings ||
+             type == event_type::kServerScreenShare || type == event_type::kServerInfo);
+}
+
 namespace {
 
 struct StmtDeleter {
@@ -2613,9 +2623,10 @@ int64_t SqliteStore::insert_event(const std::string& event_id, const std::string
         }
 
         exec("COMMIT");
-        // Any room state can bear on visibility (overrides, room type,
-        // membership); a plain message cannot. See visibility_generation().
-        if (state_key) ++visibility_generation_;
+        // Room state can bear on visibility (overrides, room type,
+        // membership); a plain message, voice/call state or a topic cannot.
+        // See visibility_generation() and state_type_affects_visibility().
+        if (state_key && state_type_affects_visibility(event_type)) ++visibility_generation_;
         return stream_pos;
     } catch (...) {
         // Best-effort rollback: some SQLite errors (SQLITE_FULL, SQLITE_IOERR)
@@ -2984,10 +2995,18 @@ bool SqliteStore::redact_event(const std::string& event_id, const std::string& r
     std::string room_id;
     std::optional<std::string> replaced_target;
     {
-        auto sel = prepare(db_, "SELECT room_id, content FROM events WHERE event_id = ?");
+        auto sel = prepare(db_,
+            "SELECT room_id, content, event_type, state_key FROM events WHERE event_id = ?");
         sqlite3_bind_text(sel.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(sel.get()) != SQLITE_ROW) return false;
+        if (sqlite3_step(sel.get()) != SQLITE_ROW) {
+            bump.armed = false;
+            return false;
+        }
         room_id = column_text_or_empty(sel.get(), 0);
+        // Only stripping visibility-bearing STATE (an override, a room type)
+        // can change what anyone may see; deleting a message cannot.
+        bump.armed = sqlite3_column_type(sel.get(), 3) != SQLITE_NULL &&
+                     state_type_affects_visibility(column_text_or_empty(sel.get(), 2));
         auto content = nlohmann::json::parse(column_text_or_empty(sel.get(), 1), nullptr, false);
         if (!content.is_discarded() && content.is_object()) {
             auto rel = content.find("m.relates_to");

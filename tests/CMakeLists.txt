@@ -81,6 +81,8 @@ add_executable(server_tests
     # Audit 2 (2026-11-18): call retraction on removal, deletion departures,
     # and the other server findings fixed with them.
     test_audit2_server.cpp
+    # Audit 3 (2026-11-19): sync access/visibility, presence, gates, ops.
+    test_audit3_server_b.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
