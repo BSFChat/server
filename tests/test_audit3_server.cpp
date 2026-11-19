@@ -178,6 +178,16 @@ struct Fixture {
         raw_state(room_id, event_type::kChannelPermissions, target, j);
     }
 
+    void ignore(const std::string& who, const std::string& whom) {
+        f_ignore(*store, who, whom);
+    }
+
+    static void f_ignore(SqliteStore& st, const std::string& who, const std::string& whom) {
+        st.set_account_data(who, account_data_type::kIgnoredUserList,
+                            json{{"ignored_users", {{whom, json::object()}}}}.dump(),
+                            std::vector<std::string>{whom}, 1);
+    }
+
     template <typename Handler, typename Method>
     httplib::Response call_on(Handler& h, Method method, const std::string& path,
                               const std::string& who, const std::string& body = "",
@@ -415,4 +425,49 @@ TEST(RoleAssignment, ATargetWithChannelAccessTheActorLacksGetsThePreciseReason) 
     EXPECT_TRUE(HasStatus(res, 403));
     EXPECT_EQ(error_text(res).find("ranked at or above"), std::string::npos) << error_text(res);
     EXPECT_NE(error_text(res).find("channel"), std::string::npos) << error_text(res);
+}
+
+// ── DMs and invites to accounts that cannot take part ─────────────────────
+
+namespace {
+
+httplib::Response create_dm(Fixture& f, const std::string& who, const std::string& peer) {
+    return f.call(&RoomHandler::handle_create_room, "/_matrix/client/v3/createRoom", who,
+                  json{{"is_direct", true}, {"invite", json::array({peer})}}.dump());
+}
+
+} // namespace
+
+TEST(DirectMessages, ToAMissingBannedOrDeactivatedPeerAreRefused) {
+    Fixture f;
+    EXPECT_TRUE(HasStatus(create_dm(f, "alice", "@nobody:test"), 404));
+
+    auto carol = f.add_user("carol");
+    f.store->set_server_ban(carol, f.admin, "spam", 1);
+    EXPECT_TRUE(HasStatus(create_dm(f, "alice", carol), 403));
+
+    auto dave = f.add_user("dave");
+    ASSERT_TRUE(f.store->deactivate_user(dave, 1));
+    EXPECT_TRUE(HasStatus(create_dm(f, "alice", dave), 403));
+
+    EXPECT_TRUE(f.store->get_direct_rooms(f.alice).empty()) << "a fake DM was created";
+    EXPECT_TRUE(IsOk(create_dm(f, "alice", f.bob)));
+}
+
+TEST(DirectMessages, SomebodyYouIgnoreCannotForceJoinYouIntoADm) {
+    Fixture f;
+    f.ignore(f.bob, f.alice);
+    EXPECT_TRUE(HasStatus(create_dm(f, "alice", f.bob), 403));
+    EXPECT_TRUE(IsOk(create_dm(f, "bob", f.alice))) << "the ignorer may still open one";
+}
+
+TEST(Invites, ADeactivatedAccountCannotBeInvited) {
+    Fixture f;
+    auto priv = f.add_channel(f.admin, "text", "invite");
+    auto dave = f.add_user("dave");
+    ASSERT_TRUE(f.store->deactivate_user(dave, 1));
+    auto res = f.call(&RoomHandler::handle_invite, kRooms + priv + "/invite", "admin",
+                      json{{"user_id", dave}}.dump());
+    EXPECT_TRUE(HasStatus(res, 403));
+    EXPECT_NE(f.store->get_membership(priv, dave), "invite");
 }

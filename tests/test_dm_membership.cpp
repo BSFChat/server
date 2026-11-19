@@ -817,26 +817,20 @@ TEST(DirectRoomMembership, ADirectRoomCannotBeCreatedAsServerStructure) {
     EXPECT_EQ(with(json{{"parent_id", parent}}), 403);
 }
 
-TEST(DirectRoomMembership, RefusingTheShapeSaysNothingAboutWhoExists) {
-    // The shape rules sit ABOVE the permission check, which everywhere else in
-    // RoomHandler.cpp is only safe once the caller has proven membership. It is
-    // safe here for a different reason, and the reason is worth pinning: every
-    // sentence the rule can return is a statement about the body the caller
-    // just wrote, and none of them reads the store. So a well-formed DM request
-    // naming an account that does not exist must NOT be refused — createRoom
-    // needs no permission, so a refusal there would answer "does @x exist?" for
-    // anyone who asked.
+TEST(DirectRoomMembership, ADmToSomebodyWhoCannotBeMessagedIsRefused) {
+    // This used to pin the opposite: a DM to an id nobody holds answered 200
+    // with a one-member room, so createRoom could not be asked "does @x
+    // exist?". Audit 3 reversed it. The existence answer is already public
+    // (POST /invite says kNoSuchAccount, GET /profile 404s), and a "DM" that
+    // never delivers anything is the worse failure for the person sending it.
     Fixture f("create-dm-oracle");
     f.add_user("alice");
     auto real = f.add_user("bob");
 
     auto ghost = f.create_dm("token-alice", "@nobody:test");
+    EXPECT_EQ(ghost.status, 404) << ghost.body;
     auto present = f.create_dm("token-alice", real);
-    EXPECT_TRUE(IsOk(ghost)) << ghost.body;
     EXPECT_TRUE(IsOk(present)) << present.body;
-    // Same answer either way, which is the property. The cost is a one-member
-    // room; the alternative cost is a user directory nobody published.
-    EXPECT_EQ(ghost.status, present.status);
 }
 
 TEST(DirectRoomMembership, CreatingRoomsIsRateLimited) {

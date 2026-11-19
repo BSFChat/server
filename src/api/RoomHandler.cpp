@@ -1028,6 +1028,34 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
     // Not as belt and braces: this block reads `invite.front()`, and a reader
     // checking whether that is safe should not have to go and find a different
     // function to learn that the list is non-empty.
+    // The peer has to be someone who can be messaged (audit 3). This used to
+    // skip a missing, banned or deactivated peer silently and answer 200 with
+    // a one-person "DM", on the argument that a refusal is an account oracle.
+    // It is not a new one: POST /invite and GET /profile already distinguish
+    // "no such account", and a fake conversation that never delivers is the
+    // worse failure. The ignore check is the other half of the ignore list: a
+    // DM force-joins its peer, so somebody you ignore could otherwise put a
+    // room in your sidebar whenever they liked.
+    if (is_direct && room_req.invite.size() == 1) {
+        const auto& peer = room_req.invite.front();
+        std::optional<std::pair<int, MatrixError>> refusal;
+        if (!store_.user_exists(peer)) {
+            refusal.emplace(404, MatrixError::not_found(kNoSuchAccount));
+        } else if (store_.is_server_banned(peer)) {
+            refusal.emplace(403, MatrixError::forbidden("That user is banned from this server"));
+        } else if (store_.get_user_deactivated_at(peer)) {
+            refusal.emplace(403, MatrixError::forbidden("That account has been deactivated"));
+        } else if (store_.is_ignoring(peer, *user_id)) {
+            refusal.emplace(403, MatrixError::forbidden(
+                                     "That user is not accepting direct messages from you"));
+        }
+        if (refusal) {
+            res.status = refusal->first;
+            res.set_content(refusal->second.to_json().dump(), "application/json");
+            return;
+        }
+    }
+
     if (is_direct && room_req.invite.size() == 1 && room_req.invite.front() != *user_id) {
         if (auto existing = store_.find_direct_room(*user_id, room_req.invite.front())) {
             CreateRoomResponse existing_resp;
@@ -2191,6 +2219,18 @@ void RoomHandler::handle_invite(const httplib::Request& req, httplib::Response& 
         // the single wording exists to refuse.
         res.set_content(MatrixError::forbidden(kNoSuchAccount,
                                                refusal::kInviteNoSuchAccount).to_json().dump(),
+                        "application/json");
+        return;
+    }
+
+    // A deactivated account cannot sign in again, so an invite to it is a
+    // pending row nobody will ever accept (audit 3). The bot branch below has
+    // its own wording for the same refusal.
+    if (!store_.is_bot(target_user) && store_.get_user_deactivated_at(target_user)) {
+        res.status = 403;
+        res.set_content(MatrixError::forbidden("That account has been deactivated",
+                                               refusal::kInviteTargetDeactivated)
+                            .to_json().dump(),
                         "application/json");
         return;
     }
