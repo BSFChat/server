@@ -10,6 +10,7 @@
 
 #include "api/PresenceHandler.h"
 #include "api/SyncHandler.h"
+#include "api/TypingHandler.h"
 #include "http/HttpServer.h"
 #include "cli/AdminCli.h"
 #include "core/DatabaseLock.h"
@@ -602,4 +603,61 @@ TEST(DatabaseLockAudit3, AServerStartingDuringABriefHoldWaitsInsteadOfFailing) {
     EXPECT_TRUE(server);
     server.reset();
     std::filesystem::remove(DatabaseLock::lock_path_for(db));
+}
+
+// ── Typing from an ignored account is not delivered ─────────────────────────
+
+TEST(SyncTypingIgnore, TypingFromAnIgnoredUserIsDropped) {
+    Fixture f("typing-ignored");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+    auto room = f.add_channel(alice, "general");
+    f.join_member(room, bob);
+    f.join_member(room, carol);
+    TypingHandler typing(*f.store, *f.sync, f.config);
+    SyncHandler handler(*f.store, *f.sync, f.config);
+    handler.set_typing_handler(&typing);
+
+    // alice ignores bob.
+    f.store->set_account_data(alice, account_data_type::kIgnoredUserList,
+                              json{{"ignored_users", {{bob, json::object()}}}}.dump(),
+                              std::vector<std::string>{bob}, 5000);
+
+    auto type = [&](const std::string& uid, const std::string& token) {
+        static const std::regex re(R"(/_matrix/client/v3/rooms/([^/]+)/typing/(.+))");
+        httplib::Request req;
+        req.path = "/_matrix/client/v3/rooms/" + room + "/typing/" + uid;
+        req.body = json{{"typing", true}, {"timeout", 30000}}.dump();
+        req.set_header("Authorization", "Bearer " + token);
+        ASSERT_TRUE(std::regex_match(req.path, req.matches, re));
+        httplib::Response res;
+        typing.handle_typing(req, res);
+        ASSERT_TRUE(res.status == -1 || res.status == 200) << res.status << " " << res.body;
+    };
+    auto typers = [&](const json& body) {
+        std::set<std::string> out;
+        auto rooms = body.value("rooms", json::object()).value("join", json::object());
+        if (!rooms.contains(room)) return out;
+        for (const auto& ev : rooms[room].value("ephemeral", json::object())
+                                  .value("events", json::array())) {
+            for (const auto& u : ev["content"].value("user_ids", json::array())) out.insert(u);
+        }
+        return out;
+    };
+    auto poll = [&] {
+        httplib::Request req;
+        req.path = "/_matrix/client/v3/sync";
+        req.params.emplace("since", f.token_now(alice));
+        req.params.emplace("timeout", "0");
+        req.set_header("Authorization", "Bearer token-alice");
+        httplib::Response res;
+        handler.handle_sync(req, res);
+        return json::parse(res.body);
+    };
+
+    type(bob, "token-bob");
+    EXPECT_TRUE(typers(poll()).empty()) << "an ignored user's typing reached the ignoring user";
+    type(carol, "token-carol");
+    EXPECT_EQ(typers(poll()), std::set<std::string>{carol});
 }

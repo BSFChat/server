@@ -190,6 +190,28 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
 
     // Inject typing indicators into joined rooms
     if (typing_handler_) {
+        // Typing from accounts the caller ignores is dropped (audit 3,
+        // 2026-11-19): /sync already drops their messages, and "X is typing"
+        // from somebody you blocked is the same harassment by another route.
+        // The ignore list is read once, and only when somebody is typing.
+        std::optional<std::vector<std::string>> ignored;
+        auto typing_in = [&](const std::string& room_id) {
+            auto users = typing_handler_->get_typing_users(room_id);
+            if (users.empty()) return users;
+            if (!ignored) {
+                ignored = store_.get_ignored_users(*user_id);
+                std::sort(ignored->begin(), ignored->end());
+            }
+            if (!ignored->empty()) {
+                users.erase(std::remove_if(users.begin(), users.end(),
+                                           [&](const std::string& u) {
+                                               return std::binary_search(ignored->begin(),
+                                                                         ignored->end(), u);
+                                           }),
+                            users.end());
+            }
+            return users;
+        };
         // Add typing info to rooms already in the response
         for (auto& [room_id, joined] : response.rooms.join) {
             // Being IN rooms.join is not the same as being allowed to see what
@@ -212,7 +234,7 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
             // Asked only for a room someone is typing in: the typing list is
             // an in-memory read, the permission check is store reads, and
             // this pass runs on every woken poll (S2-4).
-            auto typing_users = typing_handler_->get_typing_users(room_id);
+            auto typing_users = typing_in(room_id);
             if (typing_users.empty()) continue;
             if (!perms->can(*user_id, room_id, permission::kViewChannel)) continue;
             {
@@ -231,7 +253,7 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
             // which keeps denied categories as stubs; without this, a room the
             // first pass refused came straight back here with its typing list.
             // Typing list first, for the reason given in the pass above.
-            auto typing_users = typing_handler_->get_typing_users(room_id);
+            auto typing_users = typing_in(room_id);
             if (typing_users.empty()) continue;
             if (!perms->can(*user_id, room_id, permission::kViewChannel)) continue;
             {
