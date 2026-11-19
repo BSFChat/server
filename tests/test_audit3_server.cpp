@@ -719,3 +719,33 @@ TEST(Categories, DeletingACategoryUnfilesItsChildren) {
     EXPECT_EQ(placement(f, f.room).parent_id, "") << "a dangling parent_id was left behind";
     EXPECT_EQ(placement(f, f.room).order, 3);
 }
+
+// ── Unban puts the user back in the public channels ───────────────────────
+
+TEST(Unban, RejoinsThePublicChannelsButNotAPrivateOne) {
+    Fixture f;
+    auto lounge = f.add_channel(f.admin, "text");
+    auto priv = f.add_channel(f.admin, "text", "invite");
+    for (const auto& r : {lounge, priv}) f.join(r, f.alice);
+
+    ASSERT_TRUE(IsOk(f.call(&RoomHandler::handle_ban, kRooms + f.room + "/ban", "admin",
+                            json{{"user_id", f.alice}}.dump())));
+    ASSERT_TRUE(f.store->is_server_banned(f.alice));
+    // A channel made during the ban has no row for her at all.
+    auto during = f.add_channel(f.admin, "text");
+    ASSERT_TRUE(IsOk(f.call(&RoomHandler::handle_unban, kRooms + f.room + "/unban", "admin",
+                            json{{"user_id", f.alice}}.dump())));
+
+    EXPECT_TRUE(f.store->is_room_member(f.room, f.alice));
+    EXPECT_TRUE(f.store->is_room_member(lounge, f.alice));
+    EXPECT_TRUE(f.store->is_room_member(during, f.alice));
+    EXPECT_FALSE(f.store->is_room_member(priv, f.alice)) << "private channels are by invite";
+
+    // And a kick after the unban is still sticky. (The ban revoked her
+    // session; she signs in again.)
+    f.store->store_access_token("token-alice", f.alice, "dev-alice-2");
+    ASSERT_TRUE(IsOk(f.call(&RoomHandler::handle_kick, kRooms + lounge + "/kick", "admin",
+                            json{{"user_id", f.alice}}.dump())));
+    EXPECT_TRUE(HasStatus(f.call(&RoomHandler::handle_join, kRooms + lounge + "/join", "alice"),
+                          403));
+}

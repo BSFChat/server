@@ -241,6 +241,9 @@ check "carol can log in fresh after the unban" 200 "$(req POST "/login" "" "$LOG
 T_CAROL=$(jfield access_token)
 [[ -n "$T_CAROL" ]] || die "carol got no token after unban"
 
+# The unban puts her back in the public channels without her asking (audit 3).
+req GET "/joined_rooms" "$T_CAROL" > /dev/null
+check_body "carol is back in offtopic after the unban" "$OFFTOPIC"
 check "carol can rejoin offtopic"             200 "$(req POST "/rooms/$OFFTOPIC/join" "$T_CAROL")"
 # secret-plans was never named in either the ban or the unban request.
 check "carol can rejoin secret-plans too"     200 "$(req POST "/rooms/$SECRET/join" "$T_CAROL")"
@@ -294,7 +297,14 @@ check "alice kicks carol from offtopic"        200 "$(req POST "/rooms/$OFFTOPIC
 # A kick is per-channel. Carol keeps her session and the rest of the server.
 check "carol's session still works after a kick" 200 "$(req GET "/joined_rooms" "$T_CAROL")"
 check_body "...and she is still in secret-plans"     "$SECRET"
-check "carol can rejoin the channel she was kicked from" 200 "$(req POST "/rooms/$OFFTOPIC/join" "$T_CAROL")"
+# ...but not the channel itself: a kick is sticky (docs/membership-vs-visibility.md,
+# "kick is now enforced at /join"). The way back is an invite. This used to
+# expect 200, which was stale from before fix/kick-enforceable (audit 3).
+check "carol cannot rejoin the channel she was kicked from" 403 "$(req POST "/rooms/$OFFTOPIC/join" "$T_CAROL")"
+check_body "...because she was removed"              "removed from this channel"
+INV_C='{"user_id":"'"$C"'"}'
+check "alice invites carol back"                 200 "$(req POST "/rooms/$OFFTOPIC/invite" "$T_ALICE" "$INV_C")"
+check "the invite lets carol rejoin"             200 "$(req POST "/rooms/$OFFTOPIC/join" "$T_CAROL")"
 
 echo
 echo "── T7: the audit trail survived the rewrite ─────────────────────────"

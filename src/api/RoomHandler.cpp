@@ -2018,6 +2018,27 @@ void RoomHandler::handle_unban(const httplib::Request& req, httplib::Response& r
         return;
     }
 
+    // Back into the channels everyone is in (audit 3). The ban projection
+    // wrote `ban` into every row the user had, the unban turned those into a
+    // moderator's `leave`, and auto-join never touches a room with a row — so
+    // an unbanned account used to come back to zero rooms. Lifting the ban
+    // now restores the public channels they would be auto-joined to on
+    // registration. Private channels are not touched; they are reached by
+    // invite, as before the ban.
+    //
+    // A kick or voluntary leave from before the ban is NOT remembered: the
+    // ban overwrote those rows, so an unban is a reset to the default set.
+    // A kick placed after the unban is sticky as usual
+    // (docs/membership-vs-visibility.md).
+    if (!store_.is_server_banned(target_user)) {
+        std::vector<std::string> rejoin;
+        for (const auto& public_room : store_.list_public_rooms()) {
+            const auto m = store_.find_membership(public_room, target_user);
+            if (!m || *m == membership::kLeave) rejoin.push_back(public_room);
+        }
+        restore_auto_join(store_, sync_engine_, config_, target_user, rejoin);
+    }
+
     res.set_content("{}", "application/json");
     get_logger()->info("User {} unbanned {} (requested via room {})", *user_id, target_user,
                        room_id);

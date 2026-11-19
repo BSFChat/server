@@ -13,6 +13,7 @@
 
 #include <nlohmann/json.hpp>
 #include <chrono>
+#include <set>
 
 namespace bsfchat {
 
@@ -26,9 +27,14 @@ int64_t now_ms() {
 // Add a user to a single room: update membership + emit m.room.member state event.
 // Also marks all pre-existing content as read (so auto-joined users don't see a
 // wall of "unread" history they were never around for).
+void write_auto_join(SqliteStore& store, const Config& config, const std::string& room_id,
+                     const std::string& user_id);
+bool auto_join_excluded(SqliteStore& store, const std::string& user_id);
+
 void join_user_to_room(SqliteStore& store, SyncEngine& sync_engine,
                         const Config& config, const std::string& room_id,
                         const std::string& user_id) {
+    (void)sync_engine;
     // Any membership row at all means a decision about this user and this
     // room has already been taken: `join` means they are in, `leave` means
     // they were kicked or chose to go, `ban` and `invite` are equally
@@ -42,6 +48,12 @@ void join_user_to_room(SqliteStore& store, SyncEngine& sync_engine,
     // deliberately left a channel was put back into it the same way. The
     // moderator got no indication either time.
     if (store.find_membership(room_id, user_id).has_value()) return;
+    if (auto_join_excluded(store, user_id)) return;
+    write_auto_join(store, config, room_id, user_id);
+}
+
+// Who no sweep may ever force-join, whatever the room.
+bool auto_join_excluded(SqliteStore& store, const std::string& user_id) {
 
     // A server-wide ban wins over every force-join in the server.
     //
@@ -52,7 +64,7 @@ void join_user_to_room(SqliteStore& store, SyncEngine& sync_engine,
     // creating any public channel force-joined EVERY user on the server into it,
     // banned ones included, so a banned account was silently re-admitted by the
     // next channel anybody made — and the moderator had no way to know.
-    if (store.is_server_banned(user_id)) return;
+    if (store.is_server_banned(user_id)) return true;
 
     // A deactivated account is force-joined to nothing, for the same reason and
     // in the same place (schema v29). deactivate_user sets every membership row
@@ -64,7 +76,7 @@ void join_user_to_room(SqliteStore& store, SyncEngine& sync_engine,
     // account and waiting for somebody to make a channel would put you back in
     // it, with a fresh m.room.member event announcing a departed account's
     // arrival to everyone in the room.
-    if (store.get_user_deactivated_at(user_id)) return;
+    if (store.get_user_deactivated_at(user_id)) return true;
 
     // Bots are never auto-joined to anything.
     //
@@ -90,8 +102,12 @@ void join_user_to_room(SqliteStore& store, SyncEngine& sync_engine,
     // This is deliberately NOT a filter inside list_all_users(): bots must stay
     // in that list so RoleBootstrap gives them a role assignment like anyone
     // else, and a filter there would silently change every unrelated caller.
-    if (store.is_bot(user_id)) return;
+    return store.is_bot(user_id);
+}
 
+// The join itself: membership row, member event, read marker.
+void write_auto_join(SqliteStore& store, const Config& config, const std::string& room_id,
+                     const std::string& user_id) {
     // Snapshot current max position BEFORE writing the join event — this is the
     // point up to which we consider everything "already read" for this user.
     int64_t mark_pos = store.get_room_max_stream_position(room_id);
@@ -126,6 +142,24 @@ void auto_join_public_rooms(SqliteStore& store, SyncEngine& sync_engine,
     }
     // Single notify after all events inserted — wakes all syncs
     sync_engine.notify_new_event();
+}
+
+std::size_t restore_auto_join(SqliteStore& store, SyncEngine& sync_engine,
+                              const Config& config, const std::string& user_id,
+                              const std::vector<std::string>& room_ids) {
+    if (auto_join_excluded(store, user_id)) return 0;
+    const auto public_list = store.list_public_rooms();
+    const std::set<std::string> public_rooms(public_list.begin(), public_list.end());
+    std::size_t joined = 0;
+    for (const auto& room_id : room_ids) {
+        if (!public_rooms.count(room_id)) continue;
+        const auto m = store.find_membership(room_id, user_id);
+        if (m && *m != membership::kLeave) continue;
+        write_auto_join(store, config, room_id, user_id);
+        ++joined;
+    }
+    if (joined) sync_engine.notify_new_event();
+    return joined;
 }
 
 void auto_join_all_users(SqliteStore& store, SyncEngine& sync_engine,
