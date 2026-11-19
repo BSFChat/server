@@ -394,3 +394,30 @@ TEST(SyncAccessGained, AccessRestoredAfterNoAccessRestatesTheRoom) {
     EXPECT_TRUE(state_has(back.response, room, event_type::kRoomName));
     EXPECT_TRUE(state_has(back.response, room, event_type::kRoomCreate));
 }
+
+// ── The forced full presence restatement is owed per device ─────────────────
+
+TEST(SyncPresencePerDevice, EveryDeviceGetsTheFullRestatementAfterAPeerChange) {
+    Fixture f("presence-devices");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    f.store->store_access_token("token-alice2", alice, "dev2");
+    auto bob = f.add_user("bob");
+    auto carol = f.add_user("carol");
+    auto room = f.add_channel(alice, "general");
+    f.join_member(room, bob);
+    PresenceRig rig(f);
+
+    rig.presence.touch(bob);
+    rig.presence.touch(carol);  // online, but not alice's peer yet
+    f.say(room, bob, "x");
+    auto since1 = rig.poll("alice", "")["next_batch"].get<std::string>();
+    auto since2 = rig.poll("alice2", "")["next_batch"].get<std::string>();
+
+    f.join_member(room, carol);  // a new peer: new visibility generation
+    f.say(room, bob, "y");
+    auto first = rig.poll("alice", since1);
+    EXPECT_TRUE(presence_senders(first).count(carol));
+    auto second = rig.poll("alice2", since2);
+    EXPECT_TRUE(presence_senders(second).count(carol))
+        << "the first device's poll used up the restatement the second one was owed";
+}

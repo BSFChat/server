@@ -34,6 +34,7 @@ namespace {
 // and number of distinct visibility profiles; past them the cache is simply
 // cleared and refilled, so a flood of accounts costs recomputation, not RAM.
 constexpr size_t kMaxCachedUsers = 8192;
+constexpr size_t kMaxCachedDevices = 16384;
 constexpr size_t kMaxCachedRoomSets = 256;
 
 // Which device is polling: a digest of its access token, never the token
@@ -292,21 +293,27 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
         // a busy server a client may never sit out an idle timeout. Both are
         // per account and rare next to messages, so neither puts O(N) back on
         // the per-message path.
+        //
+        // Per DEVICE (audit 3, 2026-11-19), not per account: the restatement
+        // is owed to each client, and keyed on the account the first device
+        // to poll after a peer-list change consumed it, so the account's
+        // other devices never learned about the new peer.
         int64_t presence_since = result.presence_since;
         {
             const auto now = std::chrono::steady_clock::now();
+            const std::string full_key = *user_id + '\x1f' + device_key;
             std::lock_guard lock(restate_mutex_);
-            auto it = last_full_presence_.find(*user_id);
+            auto it = last_full_presence_.find(full_key);
             if (it == last_full_presence_.end() || it->second.generation != peers_generation ||
                 now - it->second.at >= kFullPresenceInterval) {
                 presence_since = -1;
             }
             if (presence_since < 0) {
                 if (it == last_full_presence_.end() &&
-                    last_full_presence_.size() >= kMaxCachedUsers) {
+                    last_full_presence_.size() >= kMaxCachedDevices) {
                     last_full_presence_.clear();
                 }
-                last_full_presence_[*user_id] = FullPresence{now, peers_generation};
+                last_full_presence_[full_key] = FullPresence{now, peers_generation};
             }
         }
         auto shown = presence_handler_->live_for_sync(*peers, *user_id, presence_since);

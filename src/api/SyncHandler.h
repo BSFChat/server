@@ -75,7 +75,8 @@ private:
     uint64_t restate_generation_ = UINT64_MAX;
     std::unordered_map<std::string, RoomList> visible_rooms_cache_;
     std::map<std::vector<std::string>, RoomList> peers_cache_;
-    // When each account last had every peer's presence restated, and the
+    // Keyed "<user>\x1f<device>" (see device_key_of in the .cpp).
+    // When each device last had every peer's presence restated, and the
     // visibility generation its peer list was computed under. Guarded by
     // restate_mutex_; cleared wholesale past kMaxCachedUsers like the rest.
     struct FullPresence {
