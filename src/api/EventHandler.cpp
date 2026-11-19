@@ -5,6 +5,7 @@
 #include "auth/MediaAccess.h"
 #include "auth/Permissions.h"
 #include "core/Config.h"
+#include "core/InstanceSecret.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
 #include "http/JsonIo.h"
@@ -13,6 +14,7 @@
 #include "push/PushService.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
+#include "sync/SyncToken.h"
 
 #include <bsfchat/Constants.h>
 #include <bsfchat/ErrorCodes.h>
@@ -980,9 +982,13 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
         return send_error(res, 403, no_channel_access(store_, *user_id));
     }
 
-    // Parse query params
+    // Parse query params. `dir` is b or f and nothing else: anything else
+    // used to read as forward (audit 3).
     std::string dir = "b";
     if (req.has_param("dir")) dir = req.get_param_value("dir");
+    if (dir != "b" && dir != "f") {
+        return send_error(res, 400, MatrixError::invalid_param("dir must be 'b' or 'f'"));
+    }
 
     int limit = limits::kDefaultMessagesLimit;
     if (req.has_param("limit")) {
@@ -995,8 +1001,20 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
         limit = std::clamp(limit, 1, limits::kMaxMessagesLimit);
     }
 
+    // `from` is either a /messages token ("s<position>") or a /sync
+    // next_batch, which spec clients pass to back-paginate from where their
+    // sync left off. sync_token::parse reads both. A token that is neither
+    // is 400 M_INVALID_PARAM; it used to read as "no token" and answer 200
+    // with whatever page that happened to be (audit 3).
     std::optional<std::string> from;
-    if (req.has_param("from")) from = req.get_param_value("from");
+    if (req.has_param("from")) {
+        const auto raw = req.get_param_value("from");
+        const auto pos = sync_token::parse(sync_token_key(), *user_id, raw);
+        if (!pos || *pos < 0) {
+            return send_error(res, 400, MatrixError::invalid_param("Unrecognised 'from' token"));
+        }
+        from = "s" + std::to_string(*pos);
+    }
 
     // No `viewer`, deliberately — this is the HISTORY path, and addressed call
     // signalling is not pageable months later (store/CallSignalling.h).
@@ -1012,7 +1030,16 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
 
     MessagesResponse msg_resp;
     msg_resp.chunk = std::move(events);
-    if (from) msg_resp.start = *from;
+    // `start` is required by the spec. With no `from` it is the token that
+    // names where this page began: just past the room's newest event going
+    // backwards, the beginning going forwards.
+    if (from) {
+        msg_resp.start = *from;
+    } else if (dir == "b") {
+        msg_resp.start = "s" + std::to_string(store_.get_room_max_stream_position(room_id) + 1);
+    } else {
+        msg_resp.start = "s0";
+    }
     if (next_pos) {
         // Token format is "s<stream_position>" — same as what /sync emits
         // for `next_batch` and what the /messages handler expects back as
@@ -1023,6 +1050,14 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
     json resp;
     to_json(resp, msg_resp);
     res.set_content(dump_response_json(resp), "application/json");
+}
+
+const std::vector<unsigned char>& EventHandler::sync_token_key() {
+    std::call_once(sync_key_once_, [this] {
+        sync_key_ = sync_token::derive_key(get_or_create_instance_secret(store_),
+                                           config_.server_name);
+    });
+    return sync_key_;
 }
 
 void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Response& res) {

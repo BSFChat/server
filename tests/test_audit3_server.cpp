@@ -587,3 +587,60 @@ TEST(ReadMarker, ANonStringMarkerIsRefused) {
     EXPECT_EQ(errcode(res), "M_BAD_JSON");
     EXPECT_TRUE(HasStatus(read_marker(f, "alice", {{"last_read_pos", "9"}}), 400));
 }
+
+// ── /messages tokens ──────────────────────────────────────────────────────
+
+namespace {
+
+httplib::Response messages(Fixture& f, const std::string& who, httplib::Params params) {
+    return f.call_on(*f.events, &EventHandler::handle_room_messages,
+                     kRooms + f.room + "/messages", who, "", std::move(params));
+}
+
+} // namespace
+
+TEST(Messages, ASyncNextBatchIsAcceptedAsFrom) {
+    Fixture f;
+    f.send_text(f.room, "bob", "older");
+    const auto token = f.sync->handle_sync(f.alice, "", 0).next_batch;
+    f.send_text(f.room, "bob", "newer");
+
+    auto res = messages(f, "alice", {{"from", token}, {"dir", "b"}, {"limit", "50"}});
+    ASSERT_TRUE(IsOk(res));
+    const auto j = json::parse(res.body);
+    EXPECT_TRUE(j.contains("start"));
+    bool saw_older = false, saw_newer = false;
+    for (const auto& ev : j["chunk"]) {
+        const auto body = ev["content"].value("body", "");
+        saw_older |= body == "older";
+        saw_newer |= body == "newer";
+    }
+    EXPECT_TRUE(saw_older);
+    EXPECT_FALSE(saw_newer) << "back-pagination from a sync token went past it";
+
+    res = messages(f, "alice", {{"from", token}, {"dir", "f"}});
+    ASSERT_TRUE(IsOk(res));
+    const auto fwd = json::parse(res.body)["chunk"];
+    ASSERT_FALSE(fwd.empty());
+    EXPECT_EQ(fwd.back()["content"].value("body", ""), "newer");
+}
+
+TEST(Messages, GarbageTokensAndDirectionsAreRefused) {
+    Fixture f;
+    EXPECT_TRUE(HasStatus(messages(f, "alice", {{"from", "garbage"}}), 400));
+    EXPECT_TRUE(HasStatus(messages(f, "alice", {{"from", "sabc"}}), 400));
+    EXPECT_TRUE(HasStatus(messages(f, "alice", {{"dir", "x"}}), 400));
+    // A token minted for somebody else does not parse for this caller.
+    const auto bobs = f.sync->handle_sync(f.bob, "", 0).next_batch;
+    EXPECT_TRUE(HasStatus(messages(f, "alice", {{"from", bobs}}), 400));
+}
+
+TEST(Messages, StartIsAlwaysPresent) {
+    Fixture f;
+    f.send_text(f.room, "bob", "hi");
+    for (const char* dir : {"b", "f"}) {
+        auto res = messages(f, "alice", {{"dir", dir}});
+        ASSERT_TRUE(IsOk(res));
+        EXPECT_TRUE(json::parse(res.body).contains("start")) << dir;
+    }
+}
