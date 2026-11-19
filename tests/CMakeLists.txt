@@ -141,6 +141,7 @@ target_sources(server_tests PRIVATE
     # of these handlers were compiled into the test binary at all.
     ${CMAKE_SOURCE_DIR}/src/api/RoomHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/StateContentRules.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/MassMention.cpp
     ${CMAKE_SOURCE_DIR}/src/api/EventHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/SyncHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/PresenceHandler.cpp

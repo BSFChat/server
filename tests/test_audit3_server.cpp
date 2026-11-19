@@ -7,6 +7,7 @@
 #include "api/AccountDataHandler.h"
 #include "api/AuthHandler.h"
 #include "api/EventHandler.h"
+#include "api/MassMention.h"
 #include "api/ProfileHandler.h"
 #include "api/RoleHandler.h"
 #include "api/RoomHandler.h"
@@ -470,4 +471,35 @@ TEST(Invites, ADeactivatedAccountCannotBeInvited) {
                       json{{"user_id", dave}}.dump());
     EXPECT_TRUE(HasStatus(res, 403));
     EXPECT_NE(f.store->get_membership(priv, dave), "invite");
+}
+
+// ── Mass mentions are tokens, not substrings ─────────────────────────────
+
+TEST(MassMention, MatchesTheTokenTheClientRenders) {
+    EXPECT_TRUE(text_mentions_everyone("@everyone look", false));
+    EXPECT_TRUE(text_mentions_everyone("hey @here!", false));
+    EXPECT_TRUE(text_mentions_everyone("(@Room)", false));
+    EXPECT_TRUE(text_mentions_everyone("<b>@everyone</b> look here", true));
+
+    EXPECT_FALSE(text_mentions_everyone("mail ops@hereford.example", false));
+    EXPECT_FALSE(text_mentions_everyone("@heretic and @everyones", false));
+    EXPECT_FALSE(text_mentions_everyone("use `@everyone` to ping", false));
+    EXPECT_FALSE(text_mentions_everyone("```\n@here\n```", false));
+    EXPECT_FALSE(text_mentions_everyone("see https://x.example/@everyone", false));
+    EXPECT_FALSE(text_mentions_everyone("<code>@everyone</code>", true));
+    EXPECT_FALSE(text_mentions_everyone("<pre><code>@here</code></pre>", true));
+    EXPECT_FALSE(text_mentions_everyone("<a href=\"x\">@room</a>", true));
+    EXPECT_TRUE(text_mentions_everyone("`code` then @here", false));
+    EXPECT_TRUE(text_mentions_everyone("an `unclosed @here", false));
+}
+
+TEST(MassMention, AnEmailAddressIsNotRefusedAsAMassMention) {
+    Fixture f;
+    auto res = f.send(f.room, "alice",
+                      {{"msgtype", "m.text"}, {"body", "write to ops@hereford.example"}});
+    EXPECT_TRUE(IsOk(res));
+    res = f.send(f.room, "alice", {{"msgtype", "m.text"}, {"body", "`@everyone` is how"}});
+    EXPECT_TRUE(IsOk(res));
+    res = f.send(f.room, "alice", {{"msgtype", "m.text"}, {"body", "@everyone wake up"}});
+    EXPECT_TRUE(HasStatus(res, 403));
 }

@@ -1,4 +1,5 @@
 #include "api/EventHandler.h"
+#include "api/MassMention.h"
 #include "api/InputLimits.h"
 #include "api/ChannelAccessRefusal.h"
 #include "auth/MediaAccess.h"
@@ -45,10 +46,6 @@ int64_t now_ms() {
 bool body_contains_url(const std::string& body) {
     static const std::regex re(R"(https?://[^\s<>"']+)", std::regex::icase);
     return std::regex_search(body, re);
-}
-
-bool body_mentions_everyone(const std::string& body) {
-    return body.find("@everyone") != std::string::npos || body.find("@here") != std::string::npos;
 }
 
 // Every field of an m.room.message whose text a client will put in front of a
@@ -746,8 +743,13 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
             !permission::has(user_perms, permission::kEmbedLinks)) {
             return send_error(res, 403, MatrixError::forbidden("You don't have permission to post links here"));
         }
-        if (any_text(text_fields, body_mentions_everyone) &&
-            !permission::has(user_perms, permission::kMentionEveryone)) {
+        // Token-based, per field, the way the client renders it (see
+        // api/MassMention.h).
+        const bool mass_mention =
+            std::any_of(text_fields.begin(), text_fields.end(), [](const RenderableField& f) {
+                return text_mentions_everyone(f.text, f.formatted);
+            });
+        if (mass_mention && !permission::has(user_perms, permission::kMentionEveryone)) {
             return send_error(res, 403, MatrixError::forbidden("You don't have permission to mention everyone"));
         }
 

@@ -55,6 +55,7 @@ add_executable(bsfchat-server
     src/api/RoleHandler.cpp
     src/api/RoomHandler.cpp
     src/api/StateContentRules.cpp
+    src/api/MassMention.cpp
     src/api/EventHandler.cpp
     src/api/SyncHandler.cpp
     src/api/TypingHandler.cpp
