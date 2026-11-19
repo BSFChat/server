@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <optional>
 #include <set>
 
@@ -34,6 +35,16 @@ namespace {
 // cleared and refilled, so a flood of accounts costs recomputation, not RAM.
 constexpr size_t kMaxCachedUsers = 8192;
 constexpr size_t kMaxCachedRoomSets = 256;
+
+// Which device is polling: a digest of its access token, never the token
+// itself (it is kept in long-lived maps). Every signed-in device has its own
+// token, so this tells two devices of one account apart without a store
+// lookup. Empty when there is no bearer token, which cannot get this far.
+std::string device_key_of(const httplib::Request& req) {
+    auto token = extract_access_token(req.get_header_value("Authorization"));
+    if (!token) return {};
+    return std::to_string(std::hash<std::string>{}(*token));
+}
 } // namespace
 
 SyncHandler::RoomList SyncHandler::visible_rooms_for(const std::string& user_id,
@@ -122,7 +133,8 @@ void SyncHandler::handle_sync(const httplib::Request& req, httplib::Response& re
         if (!parked_slot) timeout = 0;
     }
 
-    auto result = sync_engine_.handle_sync_full(*user_id, since, timeout);
+    const std::string device_key = device_key_of(req);
+    auto result = sync_engine_.handle_sync_full(*user_id, since, timeout, device_key);
     auto& response = result.response;
 
     // Joined-room list is fetched once and shared by the typing and presence

@@ -367,23 +367,33 @@ TEST(SyncLeave, LosingViewChannelIsReportedForARoomTheReaderHadRead) {
     auto bob = f.add_user("bob");
     auto seen = f.add_channel(alice, "seen");
     auto unseen = f.add_channel(alice, "unseen");
+    auto never = f.add_channel(alice, "never");
     f.join_member(seen, bob);
     f.join_member(unseen, bob);
+    f.join_member(never, bob);
+    f.set_override(never, "user:" + bob, 0, permission::kViewChannel);
     ASSERT_TRUE(f.store->set_read_marker(bob, seen, f.store->get_current_stream_position()));
 
     auto since = f.token_now(bob);
     f.set_override(seen, "user:" + bob, 0, permission::kViewChannel);
     f.set_override(unseen, "user:" + bob, 0, permission::kViewChannel);
+    f.set_override(never, "user:" + bob, 0, permission::kViewChannel | permission::kSendMessages);
 
     auto result = f.sync->handle_sync_full(bob, since, 0);
     ASSERT_EQ(result.leave.count(seen), 1u);
     EXPECT_EQ(result.leave.at(seen).reason, "no_access");
     EXPECT_TRUE(result.leave.at(seen).timeline.empty());
     EXPECT_EQ(result.response.rooms.join.count(seen), 0u);
-    // Never shown a read position there, so naming the room now would be the
-    // only thing that ever told bob it exists.
-    EXPECT_EQ(result.leave.count(unseen), 0u);
+    // Unread, but listed in the response that minted bob's token (audit 3:
+    // the engine records what each token's response showed), so dropping it
+    // tells bob nothing he was not already told.
+    ASSERT_EQ(result.leave.count(unseen), 1u);
+    EXPECT_EQ(result.leave.at(unseen).reason, "no_access");
     EXPECT_EQ(result.response.rooms.join.count(unseen), 0u);
+    // Never shown at all, so naming the room now would be the only thing that
+    // ever told bob it exists.
+    EXPECT_EQ(result.leave.count(never), 0u);
+    EXPECT_EQ(result.response.rooms.join.count(never), 0u);
 }
 
 // ── 6. the wire format ──────────────────────────────────────────────────────

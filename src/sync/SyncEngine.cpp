@@ -380,13 +380,84 @@ void attach_leave_section(nlohmann::json& response_json, const LeftRooms& leave)
 
 SyncResponse SyncEngine::handle_sync(const std::string& user_id,
                                       const std::string& since_token,
-                                      int timeout_ms) {
-    return handle_sync_full(user_id, since_token, timeout_ms).response;
+                                      int timeout_ms,
+                                      const std::string& device_key) {
+    return handle_sync_full(user_id, since_token, timeout_ms, device_key).response;
+}
+
+namespace {
+// Bounds on the shown-rooms record. Past them it is cleared and refilled: a
+// device whose record went costs at most one missed restatement (the pre-fix
+// behaviour), never a wrong one.
+constexpr std::size_t kMaxShownAccounts = 8192;
+constexpr std::size_t kMaxShownDevices = 16384;
+constexpr std::size_t kShownPositionsPerDevice = 4;
+} // namespace
+
+SyncEngine::ShownViews SyncEngine::current_views(const std::string& user_id,
+                                                 PermissionsEngine& perms) {
+    // Sampled before computing, kept only if unchanged after — the same rule
+    // as every other cache keyed on the generation.
+    const uint64_t generation = store_.visibility_generation();
+    {
+        std::lock_guard lock(shown_mutex_);
+        auto it = user_views_.find(user_id);
+        if (it != user_views_.end() && it->second.generation == generation) {
+            return it->second.views;
+        }
+    }
+    auto views = std::make_shared<std::unordered_map<std::string, int>>();
+    for (const auto& room_id : store_.get_joined_rooms(user_id)) {
+        const RoomView view = cached_room_view(view_cache_, store_, perms, user_id, room_id);
+        if (view != RoomView::kNone) views->emplace(room_id, static_cast<int>(view));
+    }
+    ShownViews shared = std::move(views);
+    std::lock_guard lock(shown_mutex_);
+    if (store_.visibility_generation() == generation) {
+        if (user_views_.size() >= kMaxShownAccounts && !user_views_.count(user_id)) {
+            user_views_.clear();
+        }
+        user_views_[user_id] = UserViews{generation, shared};
+    }
+    return shared;
+}
+
+SyncEngine::ShownViews SyncEngine::shown_at(const std::string& shown_key, int64_t pos) {
+    std::lock_guard lock(shown_mutex_);
+    auto it = shown_log_.find(shown_key);
+    if (it == shown_log_.end()) return nullptr;
+    for (auto e = it->second.rbegin(); e != it->second.rend(); ++e) {
+        if (e->first == pos) return e->second;
+    }
+    return nullptr;
+}
+
+void SyncEngine::record_shown(const std::string& shown_key, int64_t pos, ShownViews views) {
+    std::lock_guard lock(shown_mutex_);
+    auto it = shown_log_.find(shown_key);
+    if (it == shown_log_.end()) {
+        if (shown_log_.size() >= kMaxShownDevices) shown_log_.clear();
+        it = shown_log_.emplace(shown_key, std::deque<std::pair<int64_t, ShownViews>>{}).first;
+    }
+    auto& log = it->second;
+    // Same position again (an idle poll, a re-scan inside the wait): what the
+    // device now holds under that token is the newer answer.
+    for (auto& entry : log) {
+        if (entry.first == pos) {
+            entry.second = std::move(views);
+            return;
+        }
+    }
+    log.emplace_back(pos, std::move(views));
+    while (log.size() > kShownPositionsPerDevice) log.pop_front();
 }
 
 SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
                                         const std::string& since_token,
-                                        int timeout_ms) {
+                                        int timeout_ms,
+                                        const std::string& device_key) {
+    const std::string shown_key =
+        device_key.empty() ? user_id : user_id + '\x1f' + device_key;
     // A banned user sees nothing, whatever their membership rows say.
     //
     // The ban projection already sets every room_members row to "ban", so this is
@@ -406,7 +477,7 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
         // An initial sync lists only the rooms the reader is in now, so it has
         // nothing to say in rooms.leave: a client that starts from scratch
         // simply never hears of a room it has left.
-        return SyncResult{build_initial_sync(user_id), {}};
+        return SyncResult{build_initial_sync(user_id, shown_key), {}};
     }
 
     // Every response this function DELIVERS restates m.direct; the ones it
@@ -523,7 +594,8 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
     // wait below still treats it as unseen and wakes on it at once.
     int64_t covered_pos = since_pos;
     bool truncated = false;
-    auto response = build_incremental_sync(user_id, since_pos, &covered_pos, &truncated);
+    auto response =
+        build_incremental_sync(user_id, since_pos, shown_key, &covered_pos, &truncated);
     if (has_payload(response)) {
         return deliver_woken(std::move(response), since_pos);
     }
@@ -593,7 +665,8 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
             // existed when the scan started.
             const int64_t head_before_rescan = current_position_.load();
 
-            response = build_incremental_sync(user_id, since_pos, &covered_pos, &truncated);
+            response = build_incremental_sync(user_id, since_pos, shown_key, &covered_pos,
+                                              &truncated);
             // Real events, or an ephemeral change the caller injects typing and
             // presence from — either is worth returning immediately. A
             // truncated re-scan is returned too, for the reason given above
@@ -626,7 +699,7 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
             checked_pos = std::max(checked_pos, head_before_rescan);
         }
 
-        response = build_incremental_sync(user_id, since_pos, &covered_pos);
+        response = build_incremental_sync(user_id, since_pos, shown_key, &covered_pos);
     }
 
     // The idle-timeout reply, and the timeout_ms == 0 poll. Both are delivered
@@ -636,7 +709,8 @@ SyncResult SyncEngine::handle_sync_full(const std::string& user_id,
     return deliver(std::move(response));
 }
 
-SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
+SyncResponse SyncEngine::build_initial_sync(const std::string& user_id,
+                                            const std::string& shown_key) {
     SyncResponse response;
     PermissionsEngine perms(store_, config_);
 
@@ -649,7 +723,11 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
     // event_id — instead of never.
     const int64_t head_before_scan = store_.get_current_stream_position();
 
-    auto rooms = store_.get_joined_rooms(user_id);
+    // The visible joined rooms, through the same per-account record the
+    // incremental path diffs against — and recorded under this response's
+    // token, so the first poll after it can tell what it gained.
+    const ShownViews views = current_views(user_id, perms);
+    record_shown(shown_key, head_before_scan, views);
 
     // Stands in for an event committing while the walk below is in progress.
     if (post_scan_hook_for_test_) post_scan_hook_for_test_();
@@ -659,9 +737,8 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
     // channel its viewer is not allowed to read.
     std::set<std::string> stubbed;
 
-    for (const auto& room_id : rooms) {
-        const RoomView view = cached_room_view(view_cache_, store_, perms, user_id, room_id);
-        if (view == RoomView::kNone) continue;
+    for (const auto& [room_id, view_int] : *views) {
+        const RoomView view = static_cast<RoomView>(view_int);
         if (view == RoomView::kCategoryStub) {
             response.rooms.join[room_id] = category_stub(store_, room_id);
             stubbed.insert(room_id);
@@ -749,6 +826,7 @@ SyncResponse SyncEngine::build_initial_sync(const std::string& user_id) {
 }
 
 SyncResult SyncEngine::build_incremental_sync(const std::string& user_id, int64_t since_pos,
+                                              const std::string& shown_key,
                                               int64_t* out_covered_pos, bool* out_truncated) {
     SyncResult result;
     SyncResponse& response = result.response;
@@ -964,6 +1042,54 @@ SyncResult SyncEngine::build_incremental_sync(const std::string& user_id, int64_
         if (store_.get_read_marker(user_id, room_id) <= 0) continue;
         response.rooms.join.erase(room_id);
         result.leave[room_id] = LeftRoom{"no_access", {}};
+    }
+
+    // ── Rooms gained or lost without a membership change (audit 3) ──────
+    //
+    // See SyncEngine::shown_at(). Diffed against what the response that
+    // minted `since` left this device able to see. A gained room is restated
+    // like a newly joined one — full state for kFull, the sidebar stub for a
+    // category — so the client can name it; a lost one the reader is still
+    // joined to is dropped as "no_access", which also covers what the
+    // override pass below cannot see: role changes, and rooms the reader
+    // could see but never opened. (A lost room the reader LEFT is the
+    // departures pass's, above.)
+    //
+    // Recorded under delivered_max, the position next_batch is built from.
+    // It cannot spin: the next poll's `since` is that position, and its
+    // record is the set this response has just restated.
+    std::map<std::string, RoomView> gained_rooms;
+    {
+        const ShownViews now_views = current_views(user_id, perms);
+        const ShownViews before = shown_at(shown_key, since_pos);
+        if (before && before != now_views) {
+            for (const auto& [room_id, view_int] : *now_views) {
+                const auto view = static_cast<RoomView>(view_int);
+                auto it = before->find(room_id);
+                const auto was =
+                    it == before->end() ? RoomView::kNone : static_cast<RoomView>(it->second);
+                // Gains only: none -> stub/full, stub -> full.
+                if (view == was || was == RoomView::kFull) continue;
+                if (result.leave.count(room_id)) continue;
+                gained_rooms.emplace(room_id, view);
+            }
+            for (const auto& [room_id, was] : *before) {
+                (void)was;
+                if (now_views->count(room_id) || result.leave.count(room_id)) continue;
+                if (membership_of(room_id) != membership::kJoin) continue;
+                response.rooms.join.erase(room_id);
+                result.leave[room_id] = LeftRoom{"no_access", {}};
+            }
+        }
+        record_shown(shown_key, delivered_max, now_views);
+    }
+    for (const auto& [room_id, view] : gained_rooms) {
+        auto& joined = response.rooms.join[room_id];
+        if (view == RoomView::kFull) {
+            joined.state.events = store_.get_state_events(room_id);
+        } else {
+            joined.state.events = category_stub(store_, room_id).state.events;
+        }
     }
 
     bool joined_direct_room = false;

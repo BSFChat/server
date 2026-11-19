@@ -295,3 +295,102 @@ TEST(VisibilityGeneration, AVoiceStateChangeDoesNotForceAFullPresenceRestatement
     EXPECT_EQ(presence_senders(woken), std::set<std::string>{alice})
         << "voice state forced a full presence restatement (visibility generation bumped)";
 }
+
+// ── Access gained without a join carries the room's state ───────────────────
+
+namespace {
+
+bool state_has(const SyncResponse& r, const std::string& room_id, std::string_view type) {
+    auto it = r.rooms.join.find(room_id);
+    if (it == r.rooms.join.end()) return false;
+    for (const auto& ev : it->second.state.events) {
+        if (ev.type == type) return true;
+    }
+    return false;
+}
+
+void grant_admin(Fixture& f, const std::string& uid) {
+    MemberRolesContent c;
+    c.role_ids = {std::string(permission::role_id::kEveryone),
+                  std::string(permission::role_id::kAdmin)};
+    json j;
+    to_json(j, c);
+    f.store->set_server_state(std::string(event_type::kMemberRoles), uid, "@server:test",
+                              j.dump());
+}
+
+} // namespace
+
+TEST(SyncAccessGained, AnOverrideGrantRestatesTheRoomsState) {
+    Fixture f("gain-override");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto room = f.add_channel(alice, "staff");
+    f.join_member(room, bob);
+    f.set_override(room, "user:" + bob, 0, permission::kViewChannel);
+    auto since = f.token_now(bob);
+
+    f.set_override(room, "user:" + bob, 0, 0);
+    auto r = f.sync->handle_sync(bob, since, 0);
+    ASSERT_TRUE(r.rooms.join.count(room)) << "the newly visible room is not in the response";
+    EXPECT_TRUE(state_has(r, room, event_type::kRoomName)) << "no name: the client shows the id";
+    EXPECT_TRUE(state_has(r, room, event_type::kRoomCreate));
+    EXPECT_TRUE(state_has(r, room, event_type::kRoomType));
+
+    // Restated once, not on every poll.
+    auto again = f.sync->handle_sync(bob, r.next_batch, 0);
+    EXPECT_FALSE(state_has(again, room, event_type::kRoomName));
+}
+
+TEST(SyncAccessGained, ARoleGrantWithNoRoomEventRestatesTheRoomsState) {
+    Fixture f("gain-role");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto room = f.add_channel(alice, "staff");
+    f.join_member(room, bob);
+    f.set_override(room, "user:" + bob, 0, permission::kViewChannel);
+    auto since = f.token_now(bob);
+
+    grant_admin(f, bob);  // server_state only: nothing lands on the event stream
+    auto r = f.sync->handle_sync(bob, since, 0);
+    EXPECT_TRUE(state_has(r, room, event_type::kRoomName));
+    EXPECT_TRUE(state_has(r, room, event_type::kRoomCreate));
+}
+
+TEST(SyncAccessGained, EveryDeviceIsToldNotOnlyTheFirstToPoll) {
+    Fixture f("gain-devices");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto room = f.add_channel(alice, "staff");
+    f.join_member(room, bob);
+    f.set_override(room, "user:" + bob, 0, permission::kViewChannel);
+    auto phone = f.sync->handle_sync(bob, "", 0, "phone").next_batch;
+    auto desk = f.sync->handle_sync(bob, "", 0, "desk").next_batch;
+
+    grant_admin(f, bob);
+    EXPECT_TRUE(state_has(f.sync->handle_sync(bob, phone, 0, "phone"), room,
+                          event_type::kRoomName));
+    EXPECT_TRUE(state_has(f.sync->handle_sync(bob, desk, 0, "desk"), room,
+                          event_type::kRoomName))
+        << "the second device lost the room to the first one's poll";
+}
+
+TEST(SyncAccessGained, AccessRestoredAfterNoAccessRestatesTheRoom) {
+    Fixture f("gain-restore");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    auto bob = f.add_user("bob");
+    auto room = f.add_channel(alice, "staff");
+    f.join_member(room, bob);
+    auto since = f.token_now(bob);
+
+    f.set_override(room, "user:" + bob, 0, permission::kViewChannel);
+    auto lost = f.sync->handle_sync_full(bob, since, 0);
+    ASSERT_EQ(lost.leave.count(room), 1u);
+    EXPECT_EQ(lost.leave.at(room).reason, "no_access");
+
+    f.set_override(room, "user:" + bob, 0, 0);
+    auto back = f.sync->handle_sync_full(bob, lost.response.next_batch, 0);
+    EXPECT_EQ(back.leave.count(room), 0u);
+    EXPECT_TRUE(state_has(back.response, room, event_type::kRoomName));
+    EXPECT_TRUE(state_has(back.response, room, event_type::kRoomCreate));
+}

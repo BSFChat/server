@@ -5,8 +5,10 @@
 #include <atomic>
 #include <cstdint>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -17,6 +19,7 @@
 namespace bsfchat {
 
 class SqliteStore;
+class PermissionsEngine;
 struct Config;
 
 // One entry of /sync's rooms.leave section (audit 2026-11-15, R-1): "drop this
@@ -97,15 +100,23 @@ public:
     // accepted on read so an upgrade does not force every client on the
     // deployment into a full initial sync at once. Empty means initial sync,
     // and so does anything unrecognised.
+    //
+    // `device_key` names the polling device (SyncHandler passes a digest of
+    // the access token). It keys what each device has been shown, so a room
+    // that becomes visible is restated to EVERY device rather than only the
+    // first one to poll; empty means "the account", which is what tests and
+    // single-device callers get.
     SyncResponse handle_sync(const std::string& user_id,
                               const std::string& since_token,
-                              int timeout_ms);
+                              int timeout_ms,
+                              const std::string& device_key = {});
     // The same, plus rooms.leave. What SyncHandler serves; handle_sync() is
     // this with the leave section dropped, kept so the many callers that only
     // read the protocol response do not have to change.
     SyncResult handle_sync_full(const std::string& user_id,
                                 const std::string& since_token,
-                                int timeout_ms);
+                                int timeout_ms,
+                                const std::string& device_key = {});
 
     // Test seam. Runs inside build_incremental_sync, in the instant after the
     // scan (and the stream head that goes with it) has been taken and before
@@ -131,8 +142,13 @@ public:
         std::unordered_map<std::string, int> views;  // "<user>\x1f<room>" -> RoomView
     };
 
+    // The rooms an account may currently be shown, with how much of each
+    // (the .cpp's RoomView as an int; kNone rooms are absent). Shared and
+    // immutable, so a pointer compare says "nothing changed".
+    using ShownViews = std::shared_ptr<const std::unordered_map<std::string, int>>;
+
 private:
-    SyncResponse build_initial_sync(const std::string& user_id);
+    SyncResponse build_initial_sync(const std::string& user_id, const std::string& shown_key);
     // `out_covered_pos`, when given, receives the stream position this scan is
     // known to have covered: every event at or below it has been offered to
     // this user. It is what next_batch is built from, and what a wait must
@@ -144,8 +160,40 @@ private:
     // limit, i.e. there are certainly more rows past `out_covered_pos` this
     // user has not been offered yet.
     SyncResult build_incremental_sync(const std::string& user_id, int64_t since_pos,
+                                      const std::string& shown_key,
                                       int64_t* out_covered_pos = nullptr,
                                       bool* out_truncated = nullptr);
+
+    // ── What each device has been shown (audit 3, 2026-11-19) ────────────
+    //
+    // Gaining VIEW_CHANNEL without joining — an override, a role grant, or
+    // access restored after a "no_access" leave — puts no member event in the
+    // reader's range, so the newly-joined path never fired and the room
+    // arrived with nothing but the event that granted it: no name, no type,
+    // no create event, and the client showed a raw room id. Role grants write
+    // no room event at all. So the engine remembers, per device and per
+    // next_batch position it handed out, which rooms that response left the
+    // device able to see; the next poll diffs the current set against the one
+    // recorded for its `since` and restates every room it gained (and drops,
+    // as "no_access", every joined room it lost).
+    //
+    // Keyed by POSITION as well as device so a client that retries an old
+    // token (a lost response) is diffed against what that token's response
+    // said, not against a later one it never received. A position with no
+    // record (a restart, an evicted entry, a legacy token) diffs against
+    // nothing: the pre-fix behaviour, never a spurious dump.
+    ShownViews current_views(const std::string& user_id, PermissionsEngine& perms);
+    ShownViews shown_at(const std::string& shown_key, int64_t pos);
+    void record_shown(const std::string& shown_key, int64_t pos, ShownViews views);
+    struct UserViews {
+        uint64_t generation = UINT64_MAX;
+        ShownViews views;
+    };
+    std::mutex shown_mutex_;
+    // Per account, recomputed only when visibility_generation() moves.
+    std::unordered_map<std::string, UserViews> user_views_;
+    // Per "<user>\x1f<device>": the last few positions handed out.
+    std::unordered_map<std::string, std::deque<std::pair<int64_t, ShownViews>>> shown_log_;
 
     // The key next_batch is built with, derived from this deployment's instance
     // secret on first use and cached for the process. Lazy rather than
