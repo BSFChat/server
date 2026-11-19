@@ -644,3 +644,78 @@ TEST(Messages, StartIsAlwaysPresent) {
         EXPECT_TRUE(json::parse(res.body).contains("start")) << dir;
     }
 }
+
+// ── Categories ────────────────────────────────────────────────────────────
+
+namespace {
+
+httplib::Response move(Fixture& f, const std::string& room_id, const json& parent) {
+    return f.call(&RoomHandler::handle_move_channel, kRooms + room_id + "/category", "admin",
+                  json{{"parent_id", parent}}.dump());
+}
+
+CategoryContent placement(Fixture& f, const std::string& room_id) {
+    CategoryContent c;
+    auto ev = f.store->get_state_event(room_id, std::string(event_type::kRoomCategory), "");
+    if (ev) from_json(ev->content.data, c);
+    return c;
+}
+
+} // namespace
+
+TEST(Categories, NoSelfParentingAndNoCategoryUnderACategoryOnAnyPath) {
+    Fixture f;
+    auto cat1 = f.add_channel(f.admin, "category");
+    auto cat2 = f.add_channel(f.admin, "category");
+
+    EXPECT_TRUE(HasStatus(move(f, cat1, cat1), 400));
+    EXPECT_TRUE(HasStatus(move(f, cat1, cat2), 400));
+    EXPECT_TRUE(HasStatus(
+        f.put_state(cat1, event_type::kRoomCategory, "", {{"parent_id", cat1}}), 400));
+    EXPECT_TRUE(HasStatus(
+        f.put_state(cat1, event_type::kRoomCategory, "", {{"parent_id", cat2}}), 400));
+    auto res = f.call(&RoomHandler::handle_create_room, "/_matrix/client/v3/createRoom",
+                      "admin",
+                      json{{"name", "sub"}, {"is_category", true}, {"parent_id", cat1}}.dump());
+    EXPECT_TRUE(HasStatus(res, 400));
+
+    // A filed channel cannot become a category in place either.
+    ASSERT_TRUE(IsOk(move(f, f.room, cat1)));
+    EXPECT_TRUE(HasStatus(f.put_state(f.room, event_type::kRoomType, "", {{"type", "category"}}),
+                          400));
+}
+
+TEST(Categories, AMissingParentIsNotFoundOnEveryPath) {
+    Fixture f;
+    const std::string nowhere = "!nowhere:test";
+    auto res = move(f, f.room, nowhere);
+    EXPECT_TRUE(HasStatus(res, 404));
+    EXPECT_EQ(errcode(res), "M_NOT_FOUND");
+    res = f.put_state(f.room, event_type::kRoomCategory, "", {{"parent_id", nowhere}});
+    EXPECT_TRUE(HasStatus(res, 404));
+    EXPECT_EQ(errcode(res), "M_NOT_FOUND");
+    res = f.call(&RoomHandler::handle_create_room, "/_matrix/client/v3/createRoom", "admin",
+                 json{{"name", "x"}, {"parent_id", nowhere}}.dump());
+    EXPECT_TRUE(HasStatus(res, 404));
+    EXPECT_EQ(errcode(res), "M_NOT_FOUND");
+}
+
+TEST(Categories, UnfilingKeepsTheOrder) {
+    Fixture f;
+    auto cat = f.add_channel(f.admin, "category");
+    ASSERT_TRUE(IsOk(f.put_state(f.room, event_type::kRoomCategory, "",
+                                 {{"parent_id", cat}, {"order", 7}})));
+    ASSERT_TRUE(IsOk(move(f, f.room, nullptr)));
+    EXPECT_EQ(placement(f, f.room).parent_id, "");
+    EXPECT_EQ(placement(f, f.room).order, 7);
+}
+
+TEST(Categories, DeletingACategoryUnfilesItsChildren) {
+    Fixture f;
+    auto cat = f.add_channel(f.admin, "category");
+    ASSERT_TRUE(IsOk(f.put_state(f.room, event_type::kRoomCategory, "",
+                                 {{"parent_id", cat}, {"order", 3}})));
+    ASSERT_TRUE(IsOk(f.call(&RoomHandler::handle_delete_room, kRooms + cat, "admin")));
+    EXPECT_EQ(placement(f, f.room).parent_id, "") << "a dangling parent_id was left behind";
+    EXPECT_EQ(placement(f, f.room).order, 3);
+}

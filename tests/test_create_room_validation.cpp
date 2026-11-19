@@ -231,7 +231,9 @@ TEST(CreateRoomValidation, AMissingParentIsRefusedBeforeTheRoomExists) {
 
     auto res = create(f, "token-alice",
                       json{{"name", "orphan"}, {"parent_id", "!nowhere:test"}}.dump());
-    EXPECT_EQ(res.status, 400);
+    // 404 M_NOT_FOUND, the same answer the other two filing routes give
+    // (audit 3); it was 400 here.
+    EXPECT_EQ(res.status, 404);
     EXPECT_EQ(f.store->list_room_directory_rows().size(), rooms_before)
         << "the half-built channel is back";
 }
