@@ -12,6 +12,7 @@
 #include "api/RoleHandler.h"
 #include "api/RoomHandler.h"
 #include "api/SearchHandler.h"
+#include "api/TypingHandler.h"
 #include "api/StateContentRules.h"
 #include "api/VoiceHandler.h"
 #include "audit/AuditLog.h"
@@ -31,6 +32,7 @@
 #include <nlohmann/json.hpp>
 
 #include <memory>
+#include <regex>
 #include <string>
 
 using namespace bsfchat;
@@ -502,4 +504,42 @@ TEST(MassMention, AnEmailAddressIsNotRefusedAsAMassMention) {
     EXPECT_TRUE(IsOk(res));
     res = f.send(f.room, "alice", {{"msgtype", "m.text"}, {"body", "@everyone wake up"}});
     EXPECT_TRUE(HasStatus(res, 403));
+}
+
+// ── Ignore covers search and typing ───────────────────────────────────────
+
+TEST(Ignore, SearchLeavesOutWhatIgnoredUsersSent) {
+    Fixture f;
+    if (!f.store->search_index_available()) GTEST_SKIP() << "SQLite without FTS5";
+    f.send_text(f.room, "bob", "pineapple from bob");
+    f.send_text(f.room, "mod", "pineapple from mod");
+    f.ignore(f.alice, f.bob);
+
+    json body;
+    body["search_categories"]["room_events"] = {{"search_term", "pineapple"}};
+    auto res = f.call_on(*f.search, &SearchHandler::handle_search,
+                         "/_matrix/client/v3/search", "alice", body.dump());
+    ASSERT_TRUE(IsOk(res));
+    const auto cat = json::parse(res.body)["search_categories"]["room_events"];
+    EXPECT_EQ(cat["count"], 1);
+    ASSERT_EQ(cat["results"].size(), 1u);
+    EXPECT_EQ(cat["results"][0]["result"]["sender"], f.mod);
+}
+
+TEST(Ignore, TypingFromAnIgnoredUserIsLeftOutForTheIgnorer) {
+    Fixture f;
+    TypingHandler typing(*f.store, *f.sync, f.config);
+    static const std::regex re(R"(/_matrix/client/v3/rooms/([^/]+)/typing/(.+))");
+    httplib::Request req;
+    req.path = kRooms + f.room + "/typing/" + f.bob;
+    req.body = json{{"typing", true}, {"timeout", 30000}}.dump();
+    req.set_header("Authorization", "Bearer token-bob");
+    ASSERT_TRUE(std::regex_match(req.path, req.matches, re));
+    httplib::Response res;
+    typing.handle_typing(req, res);
+    ASSERT_TRUE(IsOk(res));
+
+    f.ignore(f.alice, f.bob);
+    EXPECT_TRUE(typing.get_typing_users_for(f.room, f.alice).empty());
+    EXPECT_EQ(typing.get_typing_users_for(f.room, f.mod).size(), 1u);
 }

@@ -1377,10 +1377,14 @@ public:
     // `terms` are bare words. They are quoted as literal phrases here, so no
     // caller can hand FTS5 an expression: MATCH syntax is a prepare-time error
     // surface and `*` matches the whole index.
+    //
+    // `ignoring_user` drops hits sent by anyone that account ignores, in the
+    // query itself so `count` and paging agree with what is returned (audit 3).
     SearchResult search_messages(const std::vector<std::string>& room_ids,
                                  const std::vector<std::string>& terms,
                                  const std::vector<std::string>& senders,
-                                 int limit, int offset, bool order_recent);
+                                 int limit, int offset, bool order_recent,
+                                 const std::optional<std::string>& ignoring_user = std::nullopt);
 
     // Rows currently in the search index. For tests asserting the index is
     // maintained rather than merely appended to.
