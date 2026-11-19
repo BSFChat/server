@@ -305,8 +305,19 @@ PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_assign_roles(
     // You cannot rewrite the roles of someone who ranks at or above you.
     // Editing your OWN assignment is allowed, but only downward — the role
     // checks below are what stop it being a promotion.
-    if (actor_id != target_id && !outranks(actor_id, target_id)) {
-        return {false, "You cannot change the roles of a user ranked at or above you"};
+    //
+    // outranks() is two tests, and the refusal names the one that failed
+    // (audit 3): a target below you in rank who can open a channel you cannot
+    // was told they were "ranked at or above you", which sent people looking
+    // at the role list for a problem that was in a channel override.
+    if (actor_id != target_id) {
+        if (highest_role_position(actor_id) <= highest_role_position(target_id)) {
+            return {false, "You cannot change the roles of a user ranked at or above you"};
+        }
+        if (const auto excess = channel_access_excess(target_id, actor_id); excess != 0) {
+            return {false, "You cannot change the roles of a user who has access in a channel "
+                           "that you do not (" + permission::flags_to_hex(excess) + ")"};
+        }
     }
 
     const auto& all = server_roles();
@@ -318,6 +329,13 @@ PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_assign_roles(
     // Nothing at or above your own rank may be granted...
     for (const auto& id : new_role_ids) {
         if (id == permission::role_id::kEveryone) continue;
+        // A role the target already holds is not being granted, so none of
+        // the grant rules below apply to it — the rank rule included. That
+        // rule used to run first, so a non-admin role manager could not PUT
+        // their own assignment at all: echoing back their own top role is,
+        // by definition, a role at their own rank (audit 3 #10). Removal is
+        // the loop after this one and is still rank-checked.
+        if (std::find(current.begin(), current.end(), id) != current.end()) continue;
         const ServerRole* role = find_role(all, id);
         if (!role) return {false, "Unknown role: " + id};
         if (role->position >= actor_pos) {
@@ -330,9 +348,7 @@ PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_assign_roles(
         // administrator had given BAN_MEMBERS or ADMINISTRATOR — to anyone,
         // themselves included. may_edit_role_definitions already stops them
         // PUTTING such a bit on a role; this stops them HANDING OUT a role an
-        // administrator put it on. Scoped to roles the target does not already
-        // hold, so echoing an assignment back stays legal.
-        if (std::find(current.begin(), current.end(), id) != current.end()) continue;
+        // administrator put it on.
         if (permission::has(role->permissions, permission::kAdministrator)) {
             return {false, "Only an administrator may assign a role with the Administrator "
                            "permission"};
@@ -481,6 +497,20 @@ PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_self_assign_role(
                 "That role grants permissions beyond @everyone and cannot be self-assigned"};
     }
 
+    // The role's CHANNEL overrides are part of what it grants, and the bits
+    // test above never sees them (audit 3 #10): a `role:<id>` ALLOW
+    // VIEW_CHANNEL on a private channel made an opt-in role a "join the staff
+    // room" button. Refused when the role would let the claimant do anything
+    // in any channel that they cannot already do there; an administrator, who
+    // already can, is exempt inside role_override_excess.
+    if (adding) {
+        if (const auto excess = role_override_excess(role_id, actor_id); excess != 0) {
+            return {false, "That role's channel permissions grant access you do not otherwise "
+                           "have (" + permission::flags_to_hex(excess) +
+                               "), so it cannot be self-assigned"};
+        }
+    }
+
     return {};
 }
 
@@ -619,6 +649,18 @@ PermissionsEngine::RoleChangeVerdict PermissionsEngine::may_write_channel_overri
 
     if (is_server_actor(actor_id, config_)) return {};
     if (can(actor_id, std::string(), permission::kAdministrator)) return {};
+
+    // An ALLOW on a self-assignable role is a grant to every member who
+    // clicks it, so only an administrator may attach one (audit 3 #10). The
+    // claim path refuses such a role too (may_self_assign_role); this stops
+    // a channel's manager building it in the first place.
+    if (state_key.rfind("role:", 0) == 0 && (proposed.allow & ~before.allow) != 0) {
+        const ServerRole* r = find_role(server_roles(), state_key.substr(std::strlen("role:")));
+        if (r && r->self_assignable) {
+            return {false, "Only an administrator may grant channel permissions to a "
+                           "self-assignable role"};
+        }
+    }
 
     // The gate the caller has already applied, applied again. Deliberate
     // duplication: this function is THE authority for a channel override (see

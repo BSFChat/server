@@ -272,6 +272,12 @@ holds.
 Refused by account kind rather than by making opt-in roles bot-proof, because
 the roles are not the problem — there is no human behind the token to click one.
 
+The containment rule also covers the role's **channel overrides** (audit 3
+#10). A `role:<id>` ALLOW on a self-assignable role is a grant to everyone who
+clicks it, so the claim is refused when those overrides would let the claimant
+do anything in a channel they cannot already do there, and only an
+administrator may attach an ALLOW override to a self-assignable role at all.
+
 ### 6.2 The un-bootstrapped fallback — closed
 
 `compute()` returns `kEveryoneDefault` when the server has no roles and the

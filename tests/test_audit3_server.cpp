@@ -344,3 +344,75 @@ TEST(TypeErrorBackstop, OnlyABodyThisThreadParsedIsTheCallersFault) {
     clear_request_body_mark();
     EXPECT_FALSE(type_error_is_bad_request_body(302, body));
 }
+
+// ── #10: self-assignable roles and role-manager refusals ──────────────────
+
+namespace {
+
+ServerRole opt_in_role(const std::string& id) {
+    ServerRole r;
+    r.id = id;
+    r.name = id;
+    r.position = 1;
+    r.permissions = 0;
+    r.self_assignable = true;
+    return r;
+}
+
+httplib::Response claim(Fixture& f, const std::string& who, const std::string& role_id) {
+    return f.call_on(*f.roles, &RoleHandler::handle_add_self_role,
+                     std::string(api_path::kSelfRoles) + "/" + role_id, who);
+}
+
+} // namespace
+
+TEST(SelfAssignableRoles, ARoleWhoseOverrideOpensAPrivateChannelCannotBeClaimed) {
+    Fixture f;
+    f.seed_roles({opt_in_role("pingme"), opt_in_role("staffdoor")});
+    auto priv = f.add_channel(f.admin, "text");
+    f.join(priv, f.alice);
+    f.override_directly(priv, "role:everyone", 0, permission::kViewChannel);
+    f.override_directly(priv, "role:staffdoor", permission::kViewChannel, 0);
+
+    EXPECT_TRUE(HasStatus(claim(f, "alice", "staffdoor"), 403));
+    EXPECT_NE(f.store->get_member_role_ids(f.alice).size(), 2u);
+    EXPECT_TRUE(IsOk(claim(f, "alice", "pingme"))) << "a role with no overrides is still opt-in";
+}
+
+TEST(SelfAssignableRoles, OnlyAnAdministratorMayGiveOneAChannelAllow) {
+    Fixture f;
+    f.seed_roles({opt_in_role("pingme")});
+    ChannelPermissionOverride ov;
+    ov.allow = permission::kViewChannel;
+    json body;
+    to_json(body, ov);
+    auto res = f.put_state(f.room, event_type::kChannelPermissions, "role:pingme", body, "mod");
+    EXPECT_TRUE(HasStatus(res, 403));
+    EXPECT_NE(error_text(res).find("self-assignable"), std::string::npos) << error_text(res);
+    EXPECT_TRUE(IsOk(f.put_state(f.room, event_type::kChannelPermissions, "role:pingme", body)));
+}
+
+TEST(RoleAssignment, ANonAdminRoleManagerMayEchoTheirOwnAssignment) {
+    Fixture f;
+    auto res = f.put_state(f.room, event_type::kMemberRoles, f.mod,
+                           {{"role_ids", {"everyone", "moderator"}}}, "mod");
+    EXPECT_TRUE(IsOk(res));
+    // ...and still cannot promote themselves.
+    res = f.put_state(f.room, event_type::kMemberRoles, f.mod,
+                      {{"role_ids", {"everyone", "moderator", "admin"}}}, "mod");
+    EXPECT_TRUE(HasStatus(res, 403));
+}
+
+TEST(RoleAssignment, ATargetWithChannelAccessTheActorLacksGetsThePreciseReason) {
+    Fixture f;
+    auto priv = f.add_channel(f.admin, "text");
+    f.join(priv, f.alice);
+    f.override_directly(priv, "role:everyone", 0, permission::kViewChannel);
+    f.override_directly(priv, "user:" + f.alice, permission::kViewChannel, 0);
+
+    auto res = f.put_state(f.room, event_type::kMemberRoles, f.alice,
+                           {{"role_ids", {"everyone"}}}, "mod");
+    EXPECT_TRUE(HasStatus(res, 403));
+    EXPECT_EQ(error_text(res).find("ranked at or above"), std::string::npos) << error_text(res);
+    EXPECT_NE(error_text(res).find("channel"), std::string::npos) << error_text(res);
+}
