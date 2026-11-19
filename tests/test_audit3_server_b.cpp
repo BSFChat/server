@@ -10,6 +10,7 @@
 
 #include "api/PresenceHandler.h"
 #include "api/SyncHandler.h"
+#include "http/HttpServer.h"
 #include "auth/LocalAuth.h"
 #include "core/Config.h"
 #include "store/SqliteStore.h"
@@ -528,4 +529,20 @@ TEST(SyncSinceValidation, AGarbageSinceIs400NotAFullInitialSync) {
     EXPECT_TRUE(ok.status == -1 || ok.status == 200) << ok.status << " " << ok.body;
     auto legacy = poll("token-alice", "s" + std::to_string(f.store->get_current_stream_position()));
     EXPECT_TRUE(legacy.status == -1 || legacy.status == 200) << legacy.status;
+}
+
+// ── A second server on a taken port fails instead of sharing it ─────────────
+
+TEST(HttpServerBind, ASecondServerOnTheSamePortFailsLoudly) {
+    Config cfg = Config::defaults();
+    cfg.bind_address = "127.0.0.1";
+    cfg.port = 0;
+    HttpServer first(cfg);
+    ASSERT_NO_THROW(first.bind());
+    ASSERT_GT(first.port(), 0);
+
+    cfg.port = first.port();
+    HttpServer second(cfg);
+    EXPECT_THROW(second.bind(), std::runtime_error)
+        << "SO_REUSEPORT let a second server silently share the first one's port";
 }

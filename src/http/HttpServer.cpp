@@ -2,7 +2,10 @@
 #include "core/Config.h"
 #include "core/Logger.h"
 
+#include <cerrno>
+#include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace bsfchat {
 
@@ -46,6 +49,17 @@ HttpServer::HttpServer(const Config& config)
     constexpr size_t kNonMediaSlackBytes = 1024 * 1024;
     server_.set_payload_max_length(config.max_upload_size_mb * 1024 * 1024 + kNonMediaSlackBytes);
 
+    // SO_REUSEADDR only (audit 3, 2026-11-19). httplib's default socket
+    // options set SO_REUSEPORT where the platform has it, so a second server
+    // started on a port already in use bound it SILENTLY and the kernel split
+    // the traffic between the two — which is how two reviewers' servers, on
+    // two different databases, ended up answering for each other. Without it
+    // the second bind fails and start() says so. SO_REUSEADDR is still wanted:
+    // it is what lets a restart rebind while the old socket sits in TIME_WAIT.
+    server_.set_socket_options([](socket_t sock) {
+        httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
+    });
+
     if (config.tls_enabled) {
         // [tls] is parsed but there is no SSLServer path here, so honouring
         // `enabled = true` by carrying on would serve plaintext on a port the
@@ -60,11 +74,34 @@ HttpServer::~HttpServer() {
     stop();
 }
 
+void HttpServer::bind() {
+    if (bound_) return;
+    bool ok = false;
+    if (port_ == 0) {
+        const int port = server_.bind_to_any_port(bind_address_);
+        ok = port > 0;
+        if (ok) port_ = port;
+    } else {
+        ok = server_.bind_to_port(bind_address_, port_);
+    }
+    if (!ok) {
+        const int err = errno;
+        throw std::runtime_error(
+            "Cannot listen on " + bind_address_ + ":" + std::to_string(port_) + " (" +
+            (err ? std::strerror(err) : "bind failed") +
+            "). Is another server (or identity service) already running on this port?");
+    }
+    bound_ = true;
+}
+
 void HttpServer::start() {
     auto log = get_logger();
+    // Bind first, separately, so a taken port is a startup ERROR with a reason
+    // rather than listen() returning false and the process exiting quietly.
+    bind();
     log->info("Starting HTTP server on {}:{} ({} worker threads, growing to {} on demand)",
               bind_address_, port_, workers_, max_workers_);
-    server_.listen(bind_address_, port_);
+    server_.listen_after_bind();
 }
 
 void HttpServer::stop() {
