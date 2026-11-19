@@ -1725,5 +1725,13 @@ TEST_F(UploadAdmissionTest, InFlightUploadsAreCappedServerWide) {
     httplib::Response again;
     EXPECT_TRUE(handler_->admit_upload(upload_request(true, "10"), again)) << again.body;
 
-    EXPECT_EQ(Config::defaults().max_uploads_in_flight, 16);
+    // Audit 3: the default derives from max_workers (512 / 8 = 64), not a
+    // fixed 16 that four accounts' per-account caps could fill.
+    EXPECT_EQ(Config::defaults().max_uploads_in_flight, 0);
+    EXPECT_EQ(Config::defaults().effective_max_uploads_in_flight(), 64);
+    Config small = Config::defaults();
+    small.max_workers = 40;
+    EXPECT_EQ(small.effective_max_uploads_in_flight(), 16);
+    small.max_uploads_in_flight = 5;
+    EXPECT_EQ(small.effective_max_uploads_in_flight(), 5);
 }

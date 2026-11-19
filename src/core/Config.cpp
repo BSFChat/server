@@ -80,7 +80,7 @@ Config Config::load(const std::string& path) {
                     v->value_or(static_cast<int64_t>(cfg.max_upload_size_mb)));
             if (auto v = media->get("max_uploads_in_flight"))
                 cfg.max_uploads_in_flight = static_cast<int>(std::clamp<int64_t>(
-                    v->value_or(static_cast<int64_t>(cfg.max_uploads_in_flight)), 1, 1024));
+                    v->value_or(static_cast<int64_t>(cfg.max_uploads_in_flight)), 0, 1024));
             if (auto v = media->get("require_auth"))
                 cfg.require_media_auth = v->value_or(cfg.require_media_auth);
             if (auto v = media->get("reaper_enabled"))
@@ -929,6 +929,11 @@ void Config::validate(Config& cfg) {
                   "once the ceiling is reached.",
                   cfg.max_workers, cfg.workers, limits::kMaxSyncTimeoutMs / 1000);
     }
+}
+
+int Config::effective_max_uploads_in_flight() const {
+    if (max_uploads_in_flight > 0) return max_uploads_in_flight;
+    return std::clamp(max_workers / 8, 16, 64);
 }
 
 Config Config::defaults() {

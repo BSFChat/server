@@ -92,7 +92,10 @@ path = "./data/media/"
 max_upload_size_mb = 500
 # Uploads received at once across all accounts (each may buffer up to
 # max_upload_size_mb in memory); 429 past it. Per account the cap is 4.
-max_uploads_in_flight = 16
+# 0 = derive from [server] max_workers: max_workers / 8, clamped to 16..64
+# (64 with the default 512). Worst-case upload memory is this times
+# max_upload_size_mb, so on a small host with large uploads set it lower.
+max_uploads_in_flight = 0
 # Require an access token on media downloads (Authorization header or
 # ?access_token=). On by default: media ids are 128-bit random, so with this
 # off a download URL is an unguessable capability URL with no revocation and

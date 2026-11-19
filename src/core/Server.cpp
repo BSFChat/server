@@ -576,7 +576,8 @@ void Server::start() {
     log->info("Server name: {}", config_.server_name);
     log->info("Database: {}", config_.database_path);
     log->info("Registration: {}", config_.registration_enabled ? "enabled" : "disabled");
-    log->info("Storage: {} (max upload: {} MB)", config_.storage.type, config_.max_upload_size_mb);
+    log->info("Storage: {} (max upload: {} MB, {} uploads in flight)", config_.storage.type,
+              config_.max_upload_size_mb, config_.effective_max_uploads_in_flight());
     if (config_.identity) {
         log->info("Identity provider: {}", config_.identity->provider_url);
     }

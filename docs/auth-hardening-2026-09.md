@@ -199,9 +199,14 @@ version:
   Previously the token was checked only after httplib had buffered the whole body, so
   unauthenticated POSTs could hold `max_upload_size_mb` each in memory.
 * Since audit 2-2026-11-18 S2-9 there is also a server-wide in-flight cap,
-  `[media] max_uploads_in_flight` (default 16), checked first in the same place; past it the
+  `[media] max_uploads_in_flight`, checked first in the same place; past it the
   upload gets 429 with `Retry-After: 2`. Upload memory is bounded by roughly that times
   `max_upload_size_mb` instead of by the number of accounts.
+* Since audit 3 (2026-11-19) its default is 0, meaning "derive from the worker pool":
+  `[server] max_workers / 8`, clamped to 16..64, i.e. 64 with the shipped `max_workers = 512`.
+  The old fixed 16 was four accounts times the per-account cap of 4, so four slow uploaders
+  blocked every other account. Set it explicitly on a small host with a large
+  `max_upload_size_mb`.
 
 `SendLimiter` takes the identity as a string and selects a bucket by enum, so the tighter
 per-bot bucket that `feat/bots` will want is one enum entry and one configured size, with no

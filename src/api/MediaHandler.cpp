@@ -241,7 +241,7 @@ bool MediaHandler::admit_upload(const httplib::Request& req, httplib::Response& 
         // Server-wide first (audit 2-2026-11-18 S2-9): the per-account cap
         // alone let N accounts hold N x 4 bodies of up to max_upload_size_mb
         // each in memory at once.
-        const int server_cap = std::max(1, config_.max_uploads_in_flight);
+        const int server_cap = std::max(1, config_.effective_max_uploads_in_flight());
         if (uploads_in_flight_->total >= server_cap) {
             res.set_header("Retry-After", "2");
             res.status = 429;

@@ -577,7 +577,15 @@ struct Config {
     // Uploads being received at once, across every account (audit
     // 2-2026-11-18 S2-9). Each holds up to max_upload_size_mb in memory, so
     // this bounds upload memory at roughly this times that. 429 past it.
-    int max_uploads_in_flight = 16;
+    //
+    // 0 (the default) derives it from the worker pool: max_workers / 8,
+    // clamped to [16, 64] — 64 with the shipped max_workers of 512. The old
+    // fixed 16 was exactly four accounts' worth of the per-account cap of 4,
+    // so four slow uploaders blocked everyone (audit 3, 2026-11-19). Set it
+    // explicitly on a small host with a large max_upload_size_mb: the worst
+    // case is this many times that in memory. Read it through
+    // effective_max_uploads_in_flight().
+    int max_uploads_in_flight = 0;
     // Require an access token (header or ?access_token=) on media downloads.
     // On by default. The desktop client appends ?access_token= (see
     // util/MediaUrl.h) because QML Image.source cannot set headers.
@@ -724,6 +732,9 @@ struct Config {
 
     static Config load(const std::string& path);
     static Config defaults();
+
+    // max_uploads_in_flight with the 0 = derive-from-max_workers rule applied.
+    int effective_max_uploads_in_flight() const;
 
     // Clamps unsafe values and warns about combinations that cannot work
     // (voice enabled with relay-only and no relay, unset identity audience,
