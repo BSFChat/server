@@ -189,9 +189,15 @@ void ProfileHandler::handle_put_displayname(const httplib::Request& req, httplib
         return;
     }
 
-    if (!body.contains("displayname") || !body["displayname"].is_string()) {
+    if (!body.is_object() || !body.contains("displayname")) {
         res.status = 400;
         res.set_content(MatrixError::bad_json("Missing displayname field").to_json().dump(), "application/json");
+        return;
+    }
+    if (!body["displayname"].is_string()) {
+        res.status = 400;
+        res.set_content(MatrixError::bad_json("displayname must be a string").to_json().dump(),
+                        "application/json");
         return;
     }
 

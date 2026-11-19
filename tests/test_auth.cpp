@@ -175,6 +175,14 @@ TEST_F(AuthHandlerTest, RegisterAllowedWhenIdentityPermitsLocalAccounts) {
     EXPECT_TRUE(store->user_exists("@newcomer:test"));
 }
 
+// The spec's errcode for a refused password (audit 3: it was M_INVALID_PARAM).
+TEST_F(AuthHandlerTest, AWeakPasswordIsMWeakPassword) {
+    auto res = do_register("newcomer", "password1");
+    EXPECT_EQ(res.status, 400);
+    EXPECT_EQ(nlohmann::json::parse(res.body)["errcode"], "M_WEAK_PASSWORD");
+    EXPECT_FALSE(store->user_exists("@newcomer:test"));
+}
+
 TEST_F(AuthHandlerTest, RegisterRejectsAtSignInUsername) {
     auto res = do_register("@josh", "password1");
     EXPECT_EQ(res.status, 400);

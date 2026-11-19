@@ -820,3 +820,26 @@ TEST(Accepted, AnEmptyChannelNameIsRefused) {
                       json{{"name", ""}}.dump());
     EXPECT_TRUE(HasStatus(res, 400));
 }
+
+TEST(Accepted, ANonStringDisplaynameSaysSo) {
+    Fixture f;
+    auto res = f.call_on(*f.profile, &ProfileHandler::handle_put_displayname,
+                         "/_matrix/client/v3/profile/" + f.alice + "/displayname", "alice",
+                         json{{"displayname", 5}}.dump());
+    EXPECT_TRUE(HasStatus(res, 400));
+    EXPECT_EQ(error_text(res), "displayname must be a string");
+}
+
+TEST(AccountData, MDirectReturnsTheDerivedMap) {
+    Fixture f;
+    auto dm = create_dm(f, "alice", f.bob);
+    ASSERT_TRUE(IsOk(dm));
+    const auto room_id = json::parse(dm.body).value("room_id", "");
+    auto res = f.call_on(*f.account, &AccountDataHandler::handle_get_account_data,
+                         "/_matrix/client/v3/user/" + f.alice + "/account_data/m.direct",
+                         "alice");
+    ASSERT_TRUE(IsOk(res));
+    const auto j = json::parse(res.body);
+    ASSERT_TRUE(j.contains(f.bob)) << res.body;
+    EXPECT_EQ(j[f.bob], json::array({room_id}));
+}

@@ -138,6 +138,12 @@ std::string redact_ip_key(const std::string& key) {
     return (prefixed ? std::string(kPrefix) : std::string{}) + redact_ip_for_log(address);
 }
 
+// The spec's errcode for a password the server's policy refuses (audit 3: it
+// was M_INVALID_PARAM). Not a protocol factory yet, so spelled here.
+MatrixError weak_password(const std::string& msg) {
+    return {.errcode = "M_WEAK_PASSWORD", .error = msg};
+}
+
 // Rejects a client-supplied device_id, answering 400 if it is unusable.
 // Returns true when the response has been sent and the caller must stop.
 //
@@ -794,7 +800,7 @@ void AuthHandler::handle_register(const httplib::Request& req, httplib::Response
     // on one account to trip a counter. See password_policy_error().
     if (auto err = password_policy_error(reg_req.password, username)) {
         res.status = 400;
-        res.set_content(MatrixError::invalid_param(*err).to_json().dump(), "application/json");
+        res.set_content(weak_password(*err).to_json().dump(), "application/json");
         return;
     }
 
@@ -1021,7 +1027,7 @@ void AuthHandler::handle_password_change(const httplib::Request& req, httplib::R
             (user_id->size() > 1 && colon != std::string::npos)
                 ? user_id->substr(1, colon - 1) : std::string{};
         if (auto err = password_policy_error(new_password, localpart)) {
-            return send_error(res, 400, MatrixError::invalid_param(*err));
+            return send_error(res, 400, weak_password(*err));
         }
     }
 
