@@ -436,3 +436,22 @@ TEST(AuthFastPath, APooledReadErrorFallsBackInsteadOfAnswering401) {
     EXPECT_EQ(f.store->get_user_by_token("token-bob"), std::optional<std::string>(bob));
     EXPECT_EQ(f.store->get_user_by_token("token-nobody"), std::nullopt);
 }
+
+// ── Variable IN lists do not flood the pooled statement cache ───────────────
+
+TEST(StoreStatementCache, InListsOfEveryLengthTakeOnlyAFewSlots) {
+    Fixture f("stmt-cache");
+    auto alice = f.add_user("alice", {std::string(permission::role_id::kAdmin)});
+    std::vector<std::string> rooms;
+    for (int i = 0; i < 40; ++i) rooms.push_back(f.add_channel(alice, "c" + std::to_string(i)));
+
+    const auto before = f.store->cached_reader_statements_for_test();
+    for (size_t n = 1; n <= rooms.size(); ++n) {
+        std::vector<std::string> some(rooms.begin(), rooms.begin() + static_cast<long>(n));
+        auto members = f.store->get_joined_members_of_rooms(some);
+        ASSERT_EQ(members, std::vector<std::string>{alice}) << "padding changed the answer";
+    }
+    // Lengths 1..40 pad to 4, 8, 16, 32, 64.
+    EXPECT_LE(f.store->cached_reader_statements_for_test(), before + 5)
+        << "one cache slot per IN-list length evicts the hot fixed statements";
+}

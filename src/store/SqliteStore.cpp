@@ -82,6 +82,25 @@ constexpr const char* kEventColumns =
 constexpr const char* kEditJoin =
     " LEFT JOIN events rep ON rep.event_id = e.edited_by AND rep.redacted_by IS NULL ";
 
+// The length an IN list of `n` values is padded to on a POOLED reader: the
+// next power of two, at least 4. Each pooled connection caches statements by
+// their exact SQL, and an IN list whose length tracks the caller's data made
+// one cache entry per length — filling the cache with one-off shapes and
+// pushing the hot fixed statements out (audit 3, 2026-11-19). Padding (bound
+// to a repeat of a real value, so the answer is unchanged) leaves a handful
+// of shapes.
+std::size_t in_list_bucket(std::size_t n) {
+    std::size_t bucket = 4;
+    while (bucket < n) bucket <<= 1;
+    return bucket;
+}
+
+std::string in_list_placeholders(std::size_t n) {
+    std::string out;
+    for (std::size_t i = 0; i < n; ++i) out += (i == 0) ? "?" : ",?";
+    return out;
+}
+
 const char* column_text_or_empty(sqlite3_stmt* stmt, int col) {
     auto* p = sqlite3_column_text(stmt, col);
     return p ? reinterpret_cast<const char*>(p) : "";
@@ -261,10 +280,12 @@ struct SqliteStore::ReaderPool {
     // Enough to keep the cores busy when every parked poll wakes for one
     // message; each connection costs its own page cache (~2 MB by default).
     static constexpr std::size_t kConnections = 8;
-    // Per connection. Statements are keyed by their exact SQL, and a few are
-    // built with a variable-length IN list, so this bounds the cache rather
-    // than the set of statements: past it, a statement is prepared and
-    // finalised per use as everywhere else.
+    // Per connection. Statements are keyed by their exact SQL, so this bounds
+    // the cache rather than the set of statements: past it, a statement is
+    // prepared and finalised per use as everywhere else. The pooled readers
+    // that build an IN list pad it to a bucket (in_list_bucket) so they add a
+    // few shapes, not one per list length; SQL that varies any other way must
+    // pass prepare(sql, /*cache=*/false).
     static constexpr std::size_t kMaxCachedStatements = 64;
 
     std::mutex mutex;
@@ -323,8 +344,10 @@ public:
 
     sqlite3* db() const { return db_; }
 
-    LeasedStatement prepare(const std::string& sql) {
-        if (conn_) {
+    // `cache` false for SQL whose text varies with the data (an unbucketed
+    // IN list): prepared and finalised per use, never taking a cache slot.
+    LeasedStatement prepare(const std::string& sql, bool cache = true) {
+        if (conn_ && cache) {
             auto it = conn_->statements.find(sql);
             // Busy means another statement of this lease with the same SQL is
             // still stepping; never hand the same handle out twice.
@@ -338,7 +361,7 @@ public:
             throw std::runtime_error(std::string("SQL prepare error: ") + sqlite3_errmsg(db_) +
                                      " [" + sql + "]");
         }
-        if (conn_ && !conn_->statements.count(sql) &&
+        if (conn_ && cache && !conn_->statements.count(sql) &&
             conn_->statements.size() < ReaderPool::kMaxCachedStatements) {
             conn_->statements.emplace(sql, stmt);
             return LeasedStatement(stmt, true);
@@ -486,6 +509,14 @@ SqliteStore::ReadLease SqliteStore::reader() {
 std::size_t SqliteStore::reader_connections_for_test() {
     std::call_once(readers_once_, [this] { open_readers(); });
     return readers_->all.size();
+}
+
+std::size_t SqliteStore::cached_reader_statements_for_test() {
+    std::call_once(readers_once_, [this] { open_readers(); });
+    std::lock_guard lock(readers_->mutex);
+    std::size_t most = 0;
+    for (const auto& conn : readers_->all) most = std::max(most, conn->statements.size());
+    return most;
 }
 
 // The database is the most sensitive file this process owns: every message
@@ -2248,13 +2279,15 @@ std::vector<std::string> SqliteStore::get_joined_members_of_rooms(
     std::set<std::string> seen;
     for (size_t at = 0; at < room_ids.size(); at += kChunk) {
         const size_t n = std::min(kChunk, room_ids.size() - at);
+        // Padded to a bucket by repeating the last id; see in_list_bucket().
+        const size_t padded = in_list_bucket(n);
         std::string sql = "SELECT DISTINCT user_id FROM room_members "
-                          "WHERE membership = 'join' AND room_id IN (";
-        for (size_t i = 0; i < n; ++i) sql += i ? ",?" : "?";
-        sql += ")";
-        auto stmt = rd.prepare( sql);
-        for (size_t i = 0; i < n; ++i) {
-            sqlite3_bind_text(stmt.get(), static_cast<int>(i + 1), room_ids[at + i].c_str(), -1,
+                          "WHERE membership = 'join' AND room_id IN (" +
+                          in_list_placeholders(padded) + ")";
+        auto stmt = rd.prepare(sql);
+        for (size_t i = 0; i < padded; ++i) {
+            const auto& id = room_ids[at + std::min(i, n - 1)];
+            sqlite3_bind_text(stmt.get(), static_cast<int>(i + 1), id.c_str(), -1,
                               SQLITE_TRANSIENT);
         }
         while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
@@ -3997,9 +4030,12 @@ std::map<std::string, int> SqliteStore::get_unread_mention_counts(const std::str
     // send path drops a target without VIEW_CHANNEL) whereas a sentinel row
     // cannot be — it names no one in particular. See the PushService for the
     // other delivery path, which does its own per-candidate check.
+    // Padded to a bucket by repeating the last key; see in_list_bucket().
+    // keys is never empty: it always holds the reader's own id.
+    const size_t padded = in_list_bucket(keys.size());
     auto stmt = rd.prepare(
         "SELECT m.room_id, COUNT(*) FROM event_mentions m "
-        "WHERE m.user_id IN (" + placeholders(keys.size()) + ") AND m.sender != ? "
+        "WHERE m.user_id IN (" + in_list_placeholders(padded) + ") AND m.sender != ? "
         "AND m.stream_position > COALESCE("
         "  (SELECT last_read_pos FROM read_markers r "
         "   WHERE r.user_id = ? AND r.room_id = m.room_id), 0) "
@@ -4012,7 +4048,8 @@ std::map<std::string, int> SqliteStore::get_unread_mention_counts(const std::str
         "                 WHERE iu.user_id = ? AND iu.ignored_user_id = m.sender) "
         "GROUP BY m.room_id");
     int p = 1;
-    for (const auto& key : keys) {
+    for (size_t i = 0; i < padded; ++i) {
+        const auto& key = keys[std::min(i, keys.size() - 1)];
         sqlite3_bind_text(stmt.get(), p++, key.c_str(), -1, SQLITE_TRANSIENT);
     }
     sqlite3_bind_text(stmt.get(), p++, user_id.c_str(), -1, SQLITE_TRANSIENT);

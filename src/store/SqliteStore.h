@@ -155,6 +155,8 @@ public:
     // the main connection under mutex_ as before. Opens the pool if it has not
     // been opened yet. For tests.
     std::size_t reader_connections_for_test();
+    // The most statements any one pooled connection has cached. For tests.
+    std::size_t cached_reader_statements_for_test();
 
     // Makes the pooled auth fast path behave as if its read failed with
     // SQLITE_BUSY, so a test can see it fall back. Tests only.
