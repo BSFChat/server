@@ -426,6 +426,21 @@ MentionParse parse_mentions(const json& content, const std::string& sender,
     // somebody who just left is ordinary, and failing the whole send over it
     // would lose the message. The content itself is left exactly as the client
     // sent it — the server decides who gets badged, not what the message says.
+    // The SHAPE is the client's to get right, and is refused (audit 3): an
+    // entry that is not a string, or not a user id at all, is a bug in the
+    // sender rather than a stale member list. The two sentinels below are
+    // still dropped quietly — they are well-formed attempts, not garbage.
+    for (const auto& entry : *users_it) {
+        if (entry.is_string()) {
+            const auto& t = entry.get_ref<const std::string&>();
+            if (t == kRoomMentionSentinel || t.rfind(kRoleMentionPrefix, 0) == 0) continue;
+            if (UserId::is_valid(t)) continue;
+        }
+        out.error = {400, MatrixError::invalid_param(
+                              "m.mentions.user_ids must be a list of user ids")};
+        return out;
+    }
+
     std::vector<std::string> seen;
     for (const auto& entry : *users_it) {
         if (!entry.is_string()) continue;
@@ -680,6 +695,28 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
     }
 
     if (evt_type == std::string(event_type::kRoomMessage)) {
+        // Every message has a body (the spec requires it, and it is the text
+        // every client falls back to). A message without one rendered as an
+        // empty bubble (audit 3). message_content_error has already checked
+        // that a present body is a string.
+        if (!content.contains("body")) {
+            return send_error(res, 400, MatrixError::bad_json("Missing body"));
+        }
+        // A reply names its parent. One that names no event in this room is
+        // a client bug (or a probe), and rendering "in reply to" nothing is
+        // worse than refusing; same 404-shaped answer as an edit target
+        // would be wrong here because the caller supplied the id, so 400.
+        if (auto rel = content.find("m.relates_to"); rel != content.end() && rel->is_object()) {
+            if (auto reply = rel->find("m.in_reply_to");
+                reply != rel->end() && reply->is_object()) {
+                const auto parent = json_string_or(*reply, "event_id");
+                auto target = parent.empty() ? std::nullopt : store_.get_event_by_id(parent);
+                if (!target || target->room_id != room_id) {
+                    return send_error(res, 400, MatrixError::invalid_param(
+                                                    "m.in_reply_to names no event in this room"));
+                }
+            }
+        }
         const auto is_attachment_type = [](const std::string& t) {
             return t != msg_type::kText && t != msg_type::kEmote && t != msg_type::kNotice;
         };

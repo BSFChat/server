@@ -570,12 +570,14 @@ TEST(Search, IndexDoesNotGrowOnRepeatedEdits) {
 TEST(Search, EmptyBodiesAreNotIndexed) {
     SearchFixture f;
     f.add_user("alice");
-    // A message with no body (e.g. an attachment-only event some clients send)
-    // contributes nothing to search and should not occupy an index row.
+    // A message with an empty body (an attachment-only event some clients
+    // send; a missing body is refused outright since audit 3) contributes
+    // nothing to search and should not occupy an index row.
     auto req = make_request(
         std::string("/_matrix/client/v3/rooms/") + SearchFixture::kGeneral +
             "/send/m.room.message/tx",
-        "token-alice", json{{"msgtype", "m.image"}, {"url", "mxc://x/y"}}.dump());
+        "token-alice",
+        json{{"msgtype", "m.image"}, {"body", ""}, {"url", "mxc://x/y"}}.dump());
     httplib::Response res;
     f.events->handle_send_event(req, res);
     ASSERT_TRUE(IsOk(res));

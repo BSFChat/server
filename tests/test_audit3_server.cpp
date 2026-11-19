@@ -771,3 +771,52 @@ TEST(Overrides, KeysNamingNobodyOrMalformedAreBadRequests) {
     EXPECT_TRUE(IsOk(f.put_state(f.room, event_type::kChannelPermissions, "role:no-such-role",
                                  {{"allow", "0"}, {"deny", "0"}})));
 }
+
+// ── Smaller things that were accepted and should not have been ────────────
+
+TEST(Accepted, AMessageWithNoBodyIsRefused) {
+    Fixture f;
+    EXPECT_TRUE(HasStatus(f.send(f.room, "alice", {{"msgtype", "m.text"}}), 400));
+}
+
+TEST(Accepted, AReplyToNothingIsRefused) {
+    Fixture f;
+    auto res = f.send(f.room, "alice",
+                      {{"msgtype", "m.text"},
+                       {"body", "re"},
+                       {"m.relates_to", {{"m.in_reply_to", {{"event_id", "$nope:test"}}}}}});
+    EXPECT_TRUE(HasStatus(res, 400));
+    const auto parent = f.send_text(f.room, "bob", "parent");
+    res = f.send(f.room, "alice",
+                 {{"msgtype", "m.text"},
+                  {"body", "re"},
+                  {"m.relates_to", {{"m.in_reply_to", {{"event_id", parent}}}}}});
+    EXPECT_TRUE(IsOk(res));
+}
+
+TEST(Accepted, BogusMentionUserIdsAreRefused) {
+    Fixture f;
+    auto res = f.send(f.room, "alice",
+                      {{"msgtype", "m.text"},
+                       {"body", "hi"},
+                       {"m.mentions", {{"user_ids", json::array({"not an id"})}}}});
+    EXPECT_TRUE(HasStatus(res, 400));
+}
+
+TEST(Accepted, PinningANonexistentEventIsNotFound) {
+    Fixture f;
+    auto res = f.put_state(f.room, event_type::kRoomPinnedEvents, "",
+                           {{"pinned", json::array({"$nope:test"})}});
+    EXPECT_TRUE(HasStatus(res, 404));
+    const auto real = f.send_text(f.room, "bob", "pin me");
+    EXPECT_TRUE(IsOk(f.put_state(f.room, event_type::kRoomPinnedEvents, "",
+                                 {{"pinned", json::array({real})}})));
+}
+
+TEST(Accepted, AnEmptyChannelNameIsRefused) {
+    Fixture f;
+    EXPECT_TRUE(HasStatus(f.put_state(f.room, event_type::kRoomName, "", {{"name", "  "}}), 400));
+    auto res = f.call(&RoomHandler::handle_create_room, "/_matrix/client/v3/createRoom", "admin",
+                      json{{"name", ""}}.dump());
+    EXPECT_TRUE(HasStatus(res, 400));
+}

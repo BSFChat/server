@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <chrono>
 #include <optional>
+#include <set>
 
 namespace bsfchat {
 
@@ -968,6 +969,14 @@ void RoomHandler::handle_create_room(const httplib::Request& req, httplib::Respo
         }
         if (!err && room_req.topic) {
             err = oversize_field("topic", *room_req.topic, input_limits::kMaxRoomTopicBytes);
+        }
+        // A name that is given must say something; same rule as PUT
+        // m.room.name (api/StateContentRules.h).
+        if (!err && room_req.name) {
+            if (auto shape = state_content_error(event_type::kRoomName,
+                                                 json{{"name", *room_req.name}})) {
+                err = MatrixError::invalid_param(*shape);
+            }
         }
         if (err) {
             res.status = 400;
@@ -2858,6 +2867,33 @@ void RoomHandler::handle_set_state(const httplib::Request& req, httplib::Respons
         res.status = 400;
         res.set_content(MatrixError::bad_json(*shape).to_json().dump(), "application/json");
         return;
+    }
+
+    // A pin names a message in this room. Only ids being ADDED are checked,
+    // so a pin list that still carries a since-deleted event can be edited
+    // (audit 3: pinning a nonexistent event was accepted).
+    if (evt_type == event_type::kRoomPinnedEvents) {
+        std::set<std::string> already;
+        if (auto prev = store_.get_state_event(room_id, evt_type, state_key);
+            prev && prev->content.data.is_object()) {
+            if (auto it = prev->content.data.find("pinned"); it != prev->content.data.end() &&
+                                                             it->is_array()) {
+                for (const auto& id : *it) {
+                    if (id.is_string()) already.insert(id.get<std::string>());
+                }
+            }
+        }
+        for (const auto& id : content["pinned"]) {
+            const auto& event_id = id.get_ref<const std::string&>();
+            if (already.count(event_id)) continue;
+            if (!store_.get_event_stream_position(room_id, event_id) ||
+                store_.is_event_redacted(event_id)) {
+                res.status = 404;
+                res.set_content(MatrixError::not_found("No such message to pin: " + event_id)
+                                    .to_json().dump(), "application/json");
+                return;
+            }
+        }
     }
 
     // ── bsfchat.room.category: the move_channel parent rules ─────────────
