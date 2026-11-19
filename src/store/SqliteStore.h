@@ -156,6 +156,10 @@ public:
     // been opened yet. For tests.
     std::size_t reader_connections_for_test();
 
+    // Makes the pooled auth fast path behave as if its read failed with
+    // SQLITE_BUSY, so a test can see it fall back. Tests only.
+    void fail_pooled_auth_reads_for_test(bool fail) { fail_pooled_auth_for_test_ = fail; }
+
     SqliteStore(const SqliteStore&) = delete;
     SqliteStore& operator=(const SqliteStore&) = delete;
 
@@ -1875,6 +1879,7 @@ private:
     std::string db_path_;
     std::mutex mutex_;
     std::atomic<uint64_t> visibility_generation_{0};
+    std::atomic<bool> fail_pooled_auth_for_test_{false};
     // Bumps visibility_generation_ when it goes out of scope, i.e. after the
     // write it guards. Declare it AFTER the lock_guard, so it runs first.
     // `armed` lets a writer that only learns under the lock whether the

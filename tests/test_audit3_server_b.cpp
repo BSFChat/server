@@ -421,3 +421,18 @@ TEST(SyncPresencePerDevice, EveryDeviceGetsTheFullRestatementAfterAPeerChange) {
     EXPECT_TRUE(presence_senders(second).count(carol))
         << "the first device's poll used up the restatement the second one was owed";
 }
+
+// ── A failed pooled read is not "invalid token" ─────────────────────────────
+
+TEST(AuthFastPath, APooledReadErrorFallsBackInsteadOfAnswering401) {
+    Fixture f("auth-fallback");
+    auto bob = f.add_user("bob");
+    ASSERT_GT(f.store->reader_connections_for_test(), 0u);
+    f.store->fail_pooled_auth_reads_for_test(true);
+    EXPECT_EQ(f.store->get_user_by_token("token-bob"), std::optional<std::string>(bob))
+        << "a database blip on the pooled reader was reported as an invalid token";
+    EXPECT_EQ(f.store->get_user_by_token("token-nobody"), std::nullopt);
+    f.store->fail_pooled_auth_reads_for_test(false);
+    EXPECT_EQ(f.store->get_user_by_token("token-bob"), std::optional<std::string>(bob));
+    EXPECT_EQ(f.store->get_user_by_token("token-nobody"), std::nullopt);
+}
