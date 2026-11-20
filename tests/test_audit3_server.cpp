@@ -926,3 +926,28 @@ TEST(Voice, OnlyARoleEditThatCanHideAChannelNeedsTheSweep) {
     b.id = "b";
     EXPECT_FALSE(role_change_can_hide_channels({a}, {a, b})) << "adding a role hides nothing";
 }
+
+// ── An edit of an edit is stored against the original ─────────────────────
+
+TEST(Edits, AnEditOfAnEditPointsAtTheOriginal) {
+    Fixture f;
+    const auto original = f.send_text(f.room, "alice", "v1");
+    auto edit = [&](const std::string& target, const std::string& text) {
+        auto res = f.send(f.room, "alice",
+                          {{"msgtype", "m.text"},
+                           {"body", "* " + text},
+                           {"m.new_content", {{"msgtype", "m.text"}, {"body", text}}},
+                           {"m.relates_to", {{"rel_type", "m.replace"}, {"event_id", target}}}});
+        EXPECT_TRUE(IsOk(res));
+        return json::parse(res.body).value("event_id", "");
+    };
+    const auto first = edit(original, "v2");
+    const auto second = edit(first, "v3");
+    auto stored = f.store->get_event_by_id(second);
+    ASSERT_TRUE(stored);
+    const auto& rel = stored->unsigned_data && stored->unsigned_data->data.contains(
+                                                   "bsfchat.original_content")
+                          ? stored->unsigned_data->data["bsfchat.original_content"]["m.relates_to"]
+                          : stored->content.data["m.relates_to"];
+    EXPECT_EQ(rel.value("event_id", ""), original);
+}

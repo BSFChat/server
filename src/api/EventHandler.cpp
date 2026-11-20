@@ -890,6 +890,11 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
                 // must also not be distinguishable from one that was never
                 // there, which is why it now shares the not_here() answer.)
                 edit_target = target_id;
+                // Stored pointing at the ORIGINAL (audit 3). A client that
+                // chained its edits used to have the second one stored
+                // against the first edit, which spec clients drop because
+                // they only aggregate replacements of the original.
+                content["m.relates_to"]["event_id"] = target_id;
             }
         }
 
