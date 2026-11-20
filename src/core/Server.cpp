@@ -1,6 +1,8 @@
 #include "core/Server.h"
+#include "core/Version.h"
 #include "core/FirstRun.h"
 #include "core/Logger.h"
+#include "http/JsonIo.h"
 #include "auth/AutoJoin.h"
 #include "auth/RoleBootstrap.h"
 #include "api/AccountDataHandler.h"
@@ -573,7 +575,8 @@ void Server::register_routes() {
 
 void Server::start() {
     auto log = get_logger();
-    log->info("BSFChat server v{} starting", "0.1.0");
+    // The real build, not the "0.1.0" this line hard-coded (audit 3).
+    log->info("BSFChat server {} starting", build::describe());
     log->info("Server name: {}", config_.server_name);
     log->info("Database: {}", config_.database_path);
     log->info("Registration: {}", config_.registration_enabled ? "enabled" : "disabled");
