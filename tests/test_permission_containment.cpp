@@ -773,11 +773,25 @@ TEST(PermissionContainment, AnOverrideMustNameAUserOrARole) {
     auto admin = f.add_user("admin", {std::string(permission::role_id::kAdmin)});
     auto room = f.add_channel(admin, "general");
 
+    // The route answers a malformed key as bad input (400 M_BAD_JSON) before
+    // it asks the engine anything (audit 3, "overrides: refuse keys naming
+    // nobody"); it used to come back as the engine's 403.
     RoomHandler rooms(*f.store, *f.sync, f.config);
-    EXPECT_TRUE(IsForbidden(call(rooms, &RoomHandler::handle_set_state,
-                                 state_path(room, std::string(event_type::kChannelPermissions),
-                                            "everyone"),
-                                 "token-admin", override_body(permission::kViewChannel))));
+    auto res = call(rooms, &RoomHandler::handle_set_state,
+                    state_path(room, std::string(event_type::kChannelPermissions), "everyone"),
+                    "token-admin", override_body(permission::kViewChannel));
+    EXPECT_EQ(res.status, 400) << res.body;
+    EXPECT_NE(res.body.find("M_BAD_JSON"), std::string::npos) << res.body;
+
+    // The engine still refuses it on its own, for any caller that reaches it
+    // without the route's input check.
+    ChannelPermissionOverride proposed;
+    proposed.allow = permission::kViewChannel;
+    PermissionsEngine perms(*f.store, f.config);
+    EXPECT_FALSE(
+        perms.may_write_channel_override(admin, room, "everyone", ChannelPermissionOverride{},
+                                         proposed)
+            .allowed);
 }
 
 // F6, for the bot configuration that is actually the common one. Every bot on
