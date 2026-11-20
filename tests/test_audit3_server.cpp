@@ -408,11 +408,11 @@ TEST(SelfAssignableRoles, OnlyAnAdministratorMayGiveOneAChannelAllow) {
 TEST(RoleAssignment, ANonAdminRoleManagerMayEchoTheirOwnAssignment) {
     Fixture f;
     auto res = f.put_state(f.room, event_type::kMemberRoles, f.mod,
-                           {{"role_ids", {"everyone", "moderator"}}}, "mod");
+                           {{"role_ids", {"everyone", permission::role_id::kModerator}}}, "mod");
     EXPECT_TRUE(IsOk(res));
     // ...and still cannot promote themselves.
     res = f.put_state(f.room, event_type::kMemberRoles, f.mod,
-                      {{"role_ids", {"everyone", "moderator", "admin"}}}, "mod");
+                      {{"role_ids", {"everyone", permission::role_id::kModerator, "admin"}}}, "mod");
     EXPECT_TRUE(HasStatus(res, 403));
 }
 
@@ -763,8 +763,8 @@ TEST(Overrides, KeysNamingNobodyOrMalformedAreBadRequests) {
         EXPECT_TRUE(HasStatus(res, 400)) << key;
         EXPECT_EQ(errcode(res), "M_BAD_JSON") << key;
     }
-    EXPECT_TRUE(IsOk(f.put_state(f.room, event_type::kChannelPermissions, "role:moderator",
-                                 body)));
+    EXPECT_TRUE(IsOk(f.put_state(f.room, event_type::kChannelPermissions,
+                                 "role:" + std::string(permission::role_id::kModerator), body)));
     EXPECT_TRUE(IsOk(f.put_state(f.room, event_type::kChannelPermissions, "user:" + f.bob,
                                  body)));
     // Clearing a stale override for a role that no longer exists still works.
