@@ -1055,7 +1055,13 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
         if (!pos || *pos < 0) {
             return send_error(res, 400, MatrixError::invalid_param("Unrecognised 'from' token"));
         }
-        from = "s" + std::to_string(*pos);
+        // The two tokens name a position differently. "s<N>" is a /messages
+        // boundary, exclusive both ways (b: before N, f: after N). A sync
+        // next_batch at N says "everything up to and including N has been
+        // delivered", i.e. the point just after N — so paging backwards from
+        // it has to include N itself, and forwards it is already "after N".
+        const bool sync_token = raw.rfind("t_", 0) == 0;
+        from = "s" + std::to_string(sync_token && dir == "b" ? *pos + 1 : *pos);
     }
 
     // No `viewer`, deliberately — this is the HISTORY path, and addressed call
