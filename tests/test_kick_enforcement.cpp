@@ -308,34 +308,48 @@ TEST(KickEnforcement, ABanStillRefusesTheJoinOnItsOwnTerms) {
 // THE REGRESSION A SENDER-ONLY RULE WOULD HAVE CAUSED.
 //
 // Unbanning writes `{"membership":"leave"}` with the MODERATOR as sender into
-// every room the target was banned in, deliberately, so that lifting a ban
-// restores the ability to come back without deciding they have. That event is
-// indistinguishable from a kick by sender alone, so a sender-only rule would
-// have left every unbanned account locked out of every channel on the server
-// with no way back except an invite per channel.
+// every room the target was banned in. That event is indistinguishable from a
+// kick by sender alone, so a sender-only rule would have left every unbanned
+// account locked out of every channel on the server with no way back except an
+// invite per channel.
+//
+// Since audit 3 the unban goes on to re-join the user to the public channels
+// (docs/membership-vs-visibility.md, "an unban restores the public channels"),
+// so in those the leave is immediately superseded by a join. It still stands in
+// a channel the restore skips — one that was invite-only at the time — and it
+// must still not read as a kick if that channel is opened up later.
 TEST(KickEnforcement, AnUnbannedUserCanRejoinEveryChannel) {
     Fixture f;
     auto mod = f.add_user("mod", true);
     auto mallory = f.add_user("mallory");
     auto room_a = f.add_channel(mod);
     auto room_b = f.add_channel(mod);
-    f.join_directly(room_a, mallory);
-    f.join_directly(room_b, mallory);
+    auto room_c = f.add_channel(mod);
+    f.store->insert_event(generate_event_id("test"), room_c, mod,
+                          std::string(event_type::kRoomJoinRules), std::string(""),
+                          json{{"join_rule", "invite"}}.dump(), 1002);
+    for (const auto& room : {room_a, room_b, room_c}) f.join_directly(room, mallory);
 
     ASSERT_TRUE(IsOk(f.ban(room_a, "mod", mallory)));
     ASSERT_TRUE(IsOk(f.unban(room_a, "mod", mallory)));
 
-    // The projection wrote a moderator-sent `leave` into both rooms.
-    for (const auto& room : {room_a, room_b}) {
-        auto ev = f.store->get_state_event(room, std::string(event_type::kRoomMember), mallory);
-        ASSERT_TRUE(ev.has_value());
-        ASSERT_EQ(ev->content.data.value("membership", ""), membership::kLeave);
-        ASSERT_NE(ev->sender, mallory) << "fixture no longer reproduces the ambiguity";
-    }
+    // The public channels are restored outright.
+    EXPECT_EQ(f.membership_of(room_a, mallory), membership::kJoin);
+    EXPECT_EQ(f.membership_of(room_b, mallory), membership::kJoin);
 
+    // The invite-only one keeps the projection's moderator-sent `leave`.
+    auto ev = f.store->get_state_event(room_c, std::string(event_type::kRoomMember), mallory);
+    ASSERT_TRUE(ev.has_value());
+    ASSERT_EQ(ev->content.data.value("membership", ""), membership::kLeave);
+    ASSERT_NE(ev->sender, mallory) << "fixture no longer reproduces the ambiguity";
+
+    // Opened up afterwards, it lets her back in with a bare join.
+    f.store->insert_event(generate_event_id("test"), room_c, mod,
+                          std::string(event_type::kRoomJoinRules), std::string(""),
+                          json{{"join_rule", "public"}}.dump(), 1003);
     f.store->store_access_token("token-mallory", mallory, "dev");
+    EXPECT_TRUE(IsOk(f.join_as(room_c, "mallory")));
     EXPECT_TRUE(IsOk(f.join_as(room_a, "mallory")));
-    EXPECT_TRUE(IsOk(f.join_as(room_b, "mallory")));
 }
 
 // ── Last-writer semantics, checked rather than assumed ────────────────────

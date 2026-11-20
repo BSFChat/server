@@ -438,10 +438,12 @@ TEST(ServerBan, UnbanRestoresAccessEverywhere) {
                           target_body(victim))));
 
     EXPECT_FALSE(f.store->is_server_banned(victim));
-    // "leave", not "join": lifting a ban restores the ability to come back, it
-    // does not decide for them that they have.
-    EXPECT_EQ(f.store->get_membership(general, victim), membership::kLeave);
-    EXPECT_EQ(f.store->get_membership(other, victim), membership::kLeave);
+    // Back in both: lifting a ban re-joins the user to the public channels
+    // they would be auto-joined to on registration (audit 3; it used to leave
+    // a moderator's "leave" everywhere, i.e. an account in zero rooms). See
+    // docs/membership-vs-visibility.md, "an unban restores the public channels".
+    EXPECT_EQ(f.store->get_membership(general, victim), membership::kJoin);
+    EXPECT_EQ(f.store->get_membership(other, victim), membership::kJoin);
 
     // Unban does NOT resurrect the sessions the ban revoked — those rows are
     // gone, and nothing recreates them. The user comes back by logging in again.
