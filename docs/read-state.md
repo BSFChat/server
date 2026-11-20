@@ -35,6 +35,24 @@ one endpoint a client polls continuously, to recover a number the server had in
 its hand when it wrote the row. A client that only knows the spec reads
 `event_id` and ignores the rest.
 
+## Writing the marker
+
+`POST /rooms/{roomId}/read_marker` moves the marker forward, never back:
+
+* `{"m.fully_read": "$event"}` and/or `{"m.read": "$event"}` — up to that
+  event (the later of the two when both are given). This server keeps one
+  marker, so the spec's receipt and fully-read marker both move it. An id that
+  is not an event in the room moves nothing; a non-string value is
+  `400 M_BAD_JSON`.
+* `{"last_read_pos": N}` — the desktop client's older explicit form, used only
+  when no event is named.
+* `{}` — everything currently in the room. This is what the desktop client
+  sends when the room is open and scrolled to the bottom.
+
+Until audit 3 a named event was ignored and the marker always went to the
+newest event, so a spec client (or a second device racing the first) marked
+messages read that the reader had not seen.
+
 ## Why there is no second stream position
 
 The obvious objection to putting account data in `/sync` is that account data

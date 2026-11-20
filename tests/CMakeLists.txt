@@ -83,6 +83,9 @@ add_executable(server_tests
     test_audit2_server.cpp
     # Audit 3 (2026-11-19): sync access/visibility, presence, gates, ops.
     test_audit3_server_b.cpp
+    # Audit 3 (2026-11-19): stored-state shapes, self-assignable roles and the
+    # functional-pass server findings.
+    test_audit3_server.cpp
 )
 
 target_include_directories(server_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
@@ -139,6 +142,8 @@ target_sources(server_tests PRIVATE
     # The permission-gated request surface was structurally untestable: none
     # of these handlers were compiled into the test binary at all.
     ${CMAKE_SOURCE_DIR}/src/api/RoomHandler.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/StateContentRules.cpp
+    ${CMAKE_SOURCE_DIR}/src/api/MassMention.cpp
     ${CMAKE_SOURCE_DIR}/src/api/EventHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/SyncHandler.cpp
     ${CMAKE_SOURCE_DIR}/src/api/PresenceHandler.cpp

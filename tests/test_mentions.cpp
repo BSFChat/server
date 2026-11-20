@@ -345,23 +345,24 @@ TEST(Mentions, MentioningSomeoneWithoutViewChannelIsDropped) {
     EXPECT_EQ(f.store->count_unread_mentions(bob, MentionFixture::kRoom), 0);
 }
 
-TEST(Mentions, GarbageUserIdsAreDroppedNotStored) {
+// These used to be dropped and the send accepted; audit 3 made a malformed
+// entry the sender's 400. A well-formed id for somebody who is not here is
+// still dropped (see the stale-member tests above).
+TEST(Mentions, GarbageUserIdsAreRefused) {
     MentionFixture f;
     f.add_user("alice");
     auto bob = f.add_user("bob");
 
-    auto res = f.send("alice",
-                      {{"msgtype", "m.text"},
-                       {"body", "junk"},
-                       {"m.mentions",
-                        {{"user_ids", json::array({"not-a-user-id", "", "@nocolon", 42,
-                                                   json::object(), bob})}}}},
-                      "t1");
-    ASSERT_TRUE(IsOk(res));
-    // Only the one well-formed, resolvable member survives.
-    auto rows = f.store->get_event_mentions(MentionFixture::event_id_of(res));
-    ASSERT_EQ(rows.size(), 1u);
-    EXPECT_EQ(rows[0], bob);
+    int n = 0;
+    for (const json& junk : {json("not-a-user-id"), json(""), json("@nocolon"), json(42),
+                             json::object()}) {
+        auto res = f.send("alice",
+                          {{"msgtype", "m.text"},
+                           {"body", "junk"},
+                           {"m.mentions", {{"user_ids", json::array({junk, bob})}}}},
+                          "t" + std::to_string(++n));
+        EXPECT_EQ(res.status, 400) << junk.dump();
+    }
 }
 
 TEST(Mentions, DuplicateMentionsCollapseToASingleBadge) {

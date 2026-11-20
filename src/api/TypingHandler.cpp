@@ -174,6 +174,17 @@ std::vector<std::string> TypingHandler::get_typing_users(const std::string& room
     return result;
 }
 
+std::vector<std::string> TypingHandler::get_typing_users_for(const std::string& room_id,
+                                                            const std::string& viewer) {
+    auto users = get_typing_users(room_id);  // copied out; the store is read unlocked
+    users.erase(std::remove_if(users.begin(), users.end(),
+                               [&](const std::string& u) {
+                                   return u != viewer && store_.is_ignoring(viewer, u);
+                               }),
+                users.end());
+    return users;
+}
+
 void TypingHandler::cleanup_expired(const std::string& room_id) {
     auto it = typing_.find(room_id);
     if (it == typing_.end()) return;

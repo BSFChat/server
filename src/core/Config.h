@@ -152,7 +152,9 @@ struct VoiceConfig {
     int64_t turn_ttl = 86400;
     // Participant cap voice/join applies to a channel whose m.room.voice sets
     // no max_participants (or 0). 0 here means unlimited. A full mesh gives
-    // out at about 6-8 cameras (audit 2-2026-11-18 V2-7).
+    // out at about 6-8 cameras (audit 2-2026-11-18 V2-7), so this is a mesh
+    // limit: it is not applied when [voice.livekit] is configured. A channel
+    // opts out with max_participants -1 (audit 3).
     int default_max_participants = 10;
     std::string stun_uri; // No default — admin should configure their own STUN/TURN
     // Was `false` ("TURN-only for IP privacy") while turn_uris/stun_uri

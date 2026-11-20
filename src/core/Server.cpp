@@ -1,6 +1,8 @@
 #include "core/Server.h"
+#include "core/Version.h"
 #include "core/FirstRun.h"
 #include "core/Logger.h"
+#include "http/JsonIo.h"
 #include "auth/AutoJoin.h"
 #include "auth/RoleBootstrap.h"
 #include "api/AccountDataHandler.h"
@@ -107,6 +109,7 @@ void Server::register_routes() {
     // behalf. See apply_cors_headers in http/RequestGuard.h (audit S8).
     svr.set_pre_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         apply_cors_headers(req, res, config_.cors_allowed_origins);
+        clear_request_body_mark();
         return httplib::Server::HandlerResponse::Unhandled;
     });
 
@@ -138,15 +141,17 @@ void Server::register_routes() {
         } catch (const nlohmann::json::type_error& e) {
             what = e.what();
             // Backstop for audit 2-2026-11-18 S2-3: a request-body field of the
-            // wrong type reaching value()/get<>() unchecked (302 "type must
-            // be", 304/305/306 "cannot use ... with"). That is the client's
-            // malformed JSON, not a server fault. 316 (invalid UTF-8 on dump)
-            // and the rest stay 500.
-            bad_input = e.id == 302 || e.id == 304 || e.id == 305 || e.id == 306;
+            // wrong type reaching value()/get<>() unchecked is the client's
+            // malformed JSON. Only when there IS a body and this handler
+            // parsed it, though (audit 3 #3): the same type_error out of
+            // stored state on a bodyless GET is a server fault, and a 400
+            // there told every co-member their own request was bad.
+            bad_input = type_error_is_bad_request_body(e.id, req.body);
         } catch (const std::exception& e) {
             what = e.what();
         } catch (...) {
         }
+        clear_request_body_mark();
         const auto route = log_safe(req.matched_route.empty() ? req.path : req.matched_route, 200);
         if (bad_input) {
             get_logger()->warn("Ill-typed request body in {} {}: {}", req.method, route,
@@ -572,7 +577,8 @@ void Server::register_routes() {
 
 void Server::start() {
     auto log = get_logger();
-    log->info("BSFChat server v{} starting", "0.1.0");
+    // The real build, not the "0.1.0" this line hard-coded (audit 3).
+    log->info("BSFChat server {} starting", build::describe());
     log->info("Server name: {}", config_.server_name);
     log->info("Database: {}", config_.database_path);
     log->info("Registration: {}", config_.registration_enabled ? "enabled" : "disabled");

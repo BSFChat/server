@@ -674,6 +674,31 @@ storage, or express it as an `m.room.message` your bot can recognise.
 State events are not on this endpoint at all. They go to
 `PUT /rooms/{id}/state/{type}/{key}`, which has its own per-type authorisation.
 
+That route also checks the **shape** of the content before storing it, and a
+field of the wrong type is `400 M_BAD_JSON` with the field named in `error`
+(for example *"type must be one of text, voice, category"*). The rules, all
+fields optional unless marked:
+
+| Type | Content |
+| --- | --- |
+| `m.room.name` | `name` (required): non-blank string |
+| `m.room.topic` | `topic`: string |
+| `m.room.avatar` | `url`: string; `info`: object |
+| `m.room.join_rules` | `join_rule` (required): `public`, `invite`, `knock`, `private`, `restricted` or `knock_restricted` |
+| `m.room.history_visibility` | `history_visibility` (required): `invited`, `joined`, `shared` or `world_readable` |
+| `m.room.canonical_alias` | `alias`: string; `alt_aliases`: array of strings |
+| `m.room.power_levels` | integer levels; `users`, `events`, `notifications`: objects of integers |
+| `m.room.pinned_events` | `pinned` (required): array of event ids, each an event in this room |
+| `m.room.voice` | `enabled`: boolean; `max_participants`: integer, `-1` = unlimited, `0` = server default |
+| `bsfchat.room.type` | `type` (required): `text`, `voice` or `category` |
+| `bsfchat.room.category` | `parent_id`: string (a category, not this room, `""` = top level); `order`: integer |
+| `bsfchat.channel.settings` | `slowmode_seconds`: non-negative integer |
+| `bsfchat.channel.permissions` | `allow`, `deny`: hex string or non-negative integer |
+| `bsfchat.server.roles` | `roles`: array of role objects (`id`, `name`, `color` strings; `position` integer; `permissions` hex; booleans) |
+| `bsfchat.member.roles` | `role_ids` (required): array of strings |
+| `bsfchat.server.info` | `name`, `avatar`: strings |
+| `bsfchat.server.screenshare` | `max_quality`, `max_fps`, `max_width`, `max_jpeg_quality`, `max_bitrate_kbps`: integers; `allow_lossless`: boolean |
+
 ### Transaction ids and idempotency
 
 The server keys the transaction record on

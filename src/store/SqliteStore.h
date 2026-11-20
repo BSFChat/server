@@ -1032,6 +1032,10 @@ public:
 
     int64_t get_current_stream_position();
     int64_t get_room_max_stream_position(const std::string& room_id);
+    // The stream position of `event_id`, when it is an event in `room_id`;
+    // nullopt otherwise (no such event, or another room's).
+    std::optional<int64_t> get_event_stream_position(const std::string& room_id,
+                                                     const std::string& event_id);
 
     // Server-wide state (bsfchat.server.roles / bsfchat.member.roles).
     // Deliberately NOT stored as room events: they used to live in an
@@ -1406,10 +1410,14 @@ public:
     // `terms` are bare words. They are quoted as literal phrases here, so no
     // caller can hand FTS5 an expression: MATCH syntax is a prepare-time error
     // surface and `*` matches the whole index.
+    //
+    // `ignoring_user` drops hits sent by anyone that account ignores, in the
+    // query itself so `count` and paging agree with what is returned (audit 3).
     SearchResult search_messages(const std::vector<std::string>& room_ids,
                                  const std::vector<std::string>& terms,
                                  const std::vector<std::string>& senders,
-                                 int limit, int offset, bool order_recent);
+                                 int limit, int offset, bool order_recent,
+                                 const std::optional<std::string>& ignoring_user = std::nullopt);
 
     // Rows currently in the search index. For tests asserting the index is
     // maintained rather than merely appended to.

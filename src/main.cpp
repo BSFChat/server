@@ -45,6 +45,7 @@ int main(int argc, char* argv[]) {
         log->info("       bsfchat-server <admin-subcommand> --config <path> [...]");
         log->info("  --config <path>   TOML configuration file");
         log->info("  --help, -h        this message");
+        log->info("  --version         print the version and exit");
         log->info("");
         log->info("With no --config the server uses built-in defaults, whose");
         log->info("database path is RELATIVE to the working directory. That is");
@@ -82,6 +83,11 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") return usage(0);
+        // To stdout, alone, so a script can read it (audit 3).
+        if (arg == "--version") {
+            std::cout << "bsfchat-server " << bsfchat::build::describe() << std::endl;
+            return 0;
+        }
         if (arg == "--config") {
             if (i + 1 >= argc) {
                 log->error("--config requires a path");

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstddef>
 #include <string>
+#include <vector>
 
 namespace bsfchat {
 
@@ -15,6 +17,16 @@ void auto_join_public_rooms(SqliteStore& store, SyncEngine& sync_engine,
 
 // Add all existing server users (except skip_user_id, who is usually already a member)
 // to a newly-created room. Emits m.room.member events for each.
+// Joins `user_id` to each of `room_ids` that is a public channel (the set
+// auto_join_public_rooms would use) and where their membership is absent or
+// `leave` — the way back in after a server ban is lifted (audit 3). The
+// caller decides which `leave` rows qualify; a kick is sticky, so it must
+// not pass those. Banned, deactivated and bot accounts are never joined.
+// Returns how many rooms it joined.
+std::size_t restore_auto_join(SqliteStore& store, SyncEngine& sync_engine,
+                              const Config& config, const std::string& user_id,
+                              const std::vector<std::string>& room_ids);
+
 void auto_join_all_users(SqliteStore& store, SyncEngine& sync_engine,
                           const Config& config, const std::string& room_id,
                           const std::string& skip_user_id);

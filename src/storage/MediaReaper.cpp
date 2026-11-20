@@ -116,8 +116,8 @@ void MediaReaper::start() {
     // know from the log whether anything is actually being deleted tonight.
     if (config_.media_reaper_dry_run) {
         log->info("Media reaper: DRY RUN — every {} min it will log what it would delete "
-                  "(orphan grace {} h) and delete nothing. Set media_reaper_dry_run = false "
-                  "to arm it.",
+                  "(orphan grace {} h) and delete nothing. Set reaper_dry_run = false under "
+                  "[media] to arm it.",
                   config_.media_reaper_interval_minutes, config_.media_orphan_grace_hours);
     } else {
         log->info("Media reaper: ARMED — every {} min, objects unreferenced for {} h are "

@@ -9,6 +9,7 @@
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
 
+#include <bsfchat/Constants.h>
 #include <bsfchat/ErrorCodes.h>
 #include <bsfchat/Identifiers.h>
 
@@ -146,6 +147,18 @@ void AccountDataHandler::handle_get_account_data(const httplib::Request& req,
     const auto& type = match.params["type"];
     if (type.empty()) {
         return send_error(res, 400, MatrixError::invalid_param("type must not be empty"));
+    }
+
+    // m.direct is not stored: /sync derives it from the rooms themselves
+    // (rooms.is_direct and membership), so GET answers the same derived map
+    // rather than a 404 for a document no client ever had to write (audit 3).
+    if (type == event_type::kDirect) {
+        json direct = json::object();
+        for (auto& [room_id, peer] : store_.get_direct_rooms(*user_id)) {
+            direct[peer].push_back(std::move(room_id));
+        }
+        res.set_content(dump_response_json(direct), "application/json");
+        return;
     }
 
     auto stored = store_.get_account_data(*user_id, type);

@@ -1,6 +1,7 @@
 #include "store/SqliteStore.h"
 #include "store/CallSignalling.h"
 #include "store/MediaReferences.h"
+#include "store/StoredContent.h"
 #include "auth/LocalAuth.h"
 #include "core/Logger.h"
 #include "identity/Localpart.h"
@@ -3716,6 +3717,17 @@ int64_t SqliteStore::get_room_max_stream_position(const std::string& room_id) {
     return sqlite3_column_int64(stmt.get(), 0);
 }
 
+std::optional<int64_t> SqliteStore::get_event_stream_position(const std::string& room_id,
+                                                              const std::string& event_id) {
+    std::lock_guard lock(mutex_);
+    auto stmt = prepare(db_,
+        "SELECT stream_position FROM events WHERE event_id = ? AND room_id = ?");
+    sqlite3_bind_text(stmt.get(), 1, event_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, room_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW) return std::nullopt;
+    return sqlite3_column_int64(stmt.get(), 0);
+}
+
 // Read markers
 
 bool SqliteStore::set_read_marker(const std::string& user_id, const std::string& room_id, int64_t stream_pos) {
@@ -4076,9 +4088,7 @@ std::vector<ServerRole> SqliteStore::get_server_roles() {
     if (!content_json) return {};
     auto json = nlohmann::json::parse(*content_json, nullptr, false);
     if (json.is_discarded()) return {};
-    ServerRolesContent content;
-    from_json(json, content);
-    return content.roles;
+    return parse_server_roles_lenient(json);
 }
 
 std::vector<std::string> SqliteStore::get_member_role_ids(const std::string& user_id) {
@@ -4337,7 +4347,8 @@ SqliteStore::SearchResult
 SqliteStore::search_messages(const std::vector<std::string>& room_ids,
                              const std::vector<std::string>& terms,
                              const std::vector<std::string>& senders,
-                             int limit, int offset, bool order_recent) {
+                             int limit, int offset, bool order_recent,
+                             const std::optional<std::string>& ignoring_user) {
     SearchResult result;
     // Fail closed. An empty permitted-room set must return nothing, never
     // degenerate into an unrestricted search.
@@ -4377,6 +4388,10 @@ SqliteStore::search_messages(const std::vector<std::string>& room_ids,
     if (!senders.empty()) {
         where += " AND s.sender IN (" + placeholders(senders.size()) + ")";
     }
+    if (ignoring_user) {
+        where += " AND NOT EXISTS (SELECT 1 FROM ignored_users iu "
+                 "WHERE iu.user_id = ? AND iu.ignored_user_id = s.sender)";
+    }
 
     auto bind_common = [&](sqlite3_stmt* stmt) {
         int i = 1;
@@ -4386,6 +4401,9 @@ SqliteStore::search_messages(const std::vector<std::string>& room_ids,
         }
         for (const auto& s : senders) {
             sqlite3_bind_text(stmt, i++, s.c_str(), -1, SQLITE_TRANSIENT);
+        }
+        if (ignoring_user) {
+            sqlite3_bind_text(stmt, i++, ignoring_user->c_str(), -1, SQLITE_TRANSIENT);
         }
         return i;
     };

@@ -4,6 +4,9 @@
 
 #include <httplib.h>
 
+#include <mutex>
+#include <vector>
+
 namespace bsfchat {
 
 class SqliteStore;
@@ -37,6 +40,12 @@ private:
     // EventHandler and shares it across every worker thread, which is what
     // makes one account's budget one budget.
     SendLimiter limits_;
+    // The /sync token key, so /messages can accept a next_batch as `from`.
+    // Derived the way SyncEngine derives its own (same secret, same server
+    // name, so the same key), lazily for the same reason.
+    const std::vector<unsigned char>& sync_token_key();
+    std::once_flag sync_key_once_;
+    std::vector<unsigned char> sync_key_;
 };
 
 } // namespace bsfchat

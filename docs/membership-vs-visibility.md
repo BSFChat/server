@@ -360,6 +360,22 @@ there would be nothing for `/join` to refuse and no marker to write.
 Note for operators until the client catches up: reversing a kick means inviting
 the user back by mxid, since a removed user is no longer in the member list.
 
+## Update: an unban restores the public channels
+
+A server ban rewrites every membership row the user has to `ban`, and the unban
+turns those into a moderator's `leave`. Auto-join never touches a room with a
+row, so an unbanned account used to come back to zero rooms (audit 3). Lifting
+the ban now re-joins the user to every public channel they would be
+auto-joined to on registration — the same set, through the same exclusions
+(bots, deactivated accounts). Private channels are left alone; they are reached
+by invite as before.
+
+Because the ban overwrote them, kicks and voluntary leaves from before the ban
+are not remembered: an unban is a reset to the default set. A kick placed after
+the unban is sticky as described above, and `tests/e2e/e2e_server_ban.sh` T6b
+now expects exactly that (it still expected a kicked user to rejoin, which
+predated `fix/kick-enforceable`).
+
 ## Recommendation: stop modelling private channels as public-rooms-plus-override
 
 **Do not start this in the RC.** It is a data-model change, and the fix above is

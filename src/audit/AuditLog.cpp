@@ -1,6 +1,8 @@
 #include "audit/AuditLog.h"
 
 #include "store/SqliteStore.h"
+#include "store/StoredContent.h"
+#include "http/JsonIo.h"
 
 #include <bsfchat/Constants.h>
 #include <bsfchat/MatrixTypes.h>
@@ -59,9 +61,7 @@ RoleSnapshot parse_roles(const std::optional<std::string>& content_json) {
     }
     auto parsed = json::parse(*content_json, nullptr, false);
     if (parsed.is_discarded() || !parsed.is_object()) return snap;
-    ServerRolesContent content;
-    from_json(parsed, content);
-    for (const auto& role : content.roles) {
+    for (const auto& role : parse_server_roles_lenient(parsed)) {
         if (role.id.empty()) continue;
         snap.by_id[role.id] = role;
     }
@@ -369,17 +369,20 @@ void audit_room_deletion(SqliteStore& store, const std::string& actor,
                          const std::string& room_id) {
     std::string type{room_type::kText};
     if (auto type_content = room_state_content(store, room_id, event_type::kRoomType)) {
-        type = type_content->value("type", type);
+        // Typed reads throughout: this is stored state, possibly written
+        // before PUT state checked shapes, and a throw here made the room
+        // undeletable (audit 3 #3).
+        type = json_string_or(*type_content, "type", type);
     }
 
     std::string name;
     if (auto name_content = room_state_content(store, room_id, event_type::kRoomName)) {
-        name = name_content->value("name", "");
+        name = json_string_or(*name_content, "name");
     }
 
     std::string parent_id;
     if (auto cat_content = room_state_content(store, room_id, event_type::kRoomCategory)) {
-        parent_id = cat_content->value("parent_id", "");
+        parent_id = json_string_or(*cat_content, "parent_id");
     }
 
     SqliteStore::AuditRecord record;
@@ -409,7 +412,7 @@ void audit_room_type_change(SqliteStore& store, const std::string& actor,
 
     std::string name;
     if (auto name_content = room_state_content(store, room_id, event_type::kRoomName)) {
-        name = name_content->value("name", "");
+        name = json_string_or(*name_content, "name");
     }
 
     SqliteStore::AuditRecord record;

@@ -187,8 +187,10 @@ void SearchHandler::handle_search(const httplib::Request& req, httplib::Response
     if (!searchable.empty()) {
         SqliteStore::SearchResult found;
         try {
+            // The caller's ignore list applies here as on /sync and
+            // /messages (audit 3): searching must not be a way round it.
             found = store_.search_messages(searchable, terms, senders, limit, offset,
-                                           order_recent);
+                                           order_recent, *user_id);
         } catch (const std::exception& e) {
             // The store quotes every term as a literal phrase, so a well-formed
             // request cannot reach here. Answer 400 rather than 500 anyway: if

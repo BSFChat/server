@@ -1,9 +1,11 @@
 #include "api/EventHandler.h"
+#include "api/MassMention.h"
 #include "api/InputLimits.h"
 #include "api/ChannelAccessRefusal.h"
 #include "auth/MediaAccess.h"
 #include "auth/Permissions.h"
 #include "core/Config.h"
+#include "core/InstanceSecret.h"
 #include "core/Logger.h"
 #include "http/Middleware.h"
 #include "http/JsonIo.h"
@@ -12,6 +14,7 @@
 #include "push/PushService.h"
 #include "store/SqliteStore.h"
 #include "sync/SyncEngine.h"
+#include "sync/SyncToken.h"
 
 #include <bsfchat/Constants.h>
 #include <bsfchat/ErrorCodes.h>
@@ -45,10 +48,6 @@ int64_t now_ms() {
 bool body_contains_url(const std::string& body) {
     static const std::regex re(R"(https?://[^\s<>"']+)", std::regex::icase);
     return std::regex_search(body, re);
-}
-
-bool body_mentions_everyone(const std::string& body) {
-    return body.find("@everyone") != std::string::npos || body.find("@here") != std::string::npos;
 }
 
 // Every field of an m.room.message whose text a client will put in front of a
@@ -427,6 +426,21 @@ MentionParse parse_mentions(const json& content, const std::string& sender,
     // somebody who just left is ordinary, and failing the whole send over it
     // would lose the message. The content itself is left exactly as the client
     // sent it — the server decides who gets badged, not what the message says.
+    // The SHAPE is the client's to get right, and is refused (audit 3): an
+    // entry that is not a string, or not a user id at all, is a bug in the
+    // sender rather than a stale member list. The two sentinels below are
+    // still dropped quietly — they are well-formed attempts, not garbage.
+    for (const auto& entry : *users_it) {
+        if (entry.is_string()) {
+            const auto& t = entry.get_ref<const std::string&>();
+            if (t == kRoomMentionSentinel || t.rfind(kRoleMentionPrefix, 0) == 0) continue;
+            if (UserId::is_valid(t)) continue;
+        }
+        out.error = {400, MatrixError::invalid_param(
+                              "m.mentions.user_ids must be a list of user ids")};
+        return out;
+    }
+
     std::vector<std::string> seen;
     for (const auto& entry : *users_it) {
         if (!entry.is_string()) continue;
@@ -681,6 +695,28 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
     }
 
     if (evt_type == std::string(event_type::kRoomMessage)) {
+        // Every message has a body (the spec requires it, and it is the text
+        // every client falls back to). A message without one rendered as an
+        // empty bubble (audit 3). message_content_error has already checked
+        // that a present body is a string.
+        if (!content.contains("body")) {
+            return send_error(res, 400, MatrixError::bad_json("Missing body"));
+        }
+        // A reply names its parent. One that names no event in this room is
+        // a client bug (or a probe), and rendering "in reply to" nothing is
+        // worse than refusing; same 404-shaped answer as an edit target
+        // would be wrong here because the caller supplied the id, so 400.
+        if (auto rel = content.find("m.relates_to"); rel != content.end() && rel->is_object()) {
+            if (auto reply = rel->find("m.in_reply_to");
+                reply != rel->end() && reply->is_object()) {
+                const auto parent = json_string_or(*reply, "event_id");
+                auto target = parent.empty() ? std::nullopt : store_.get_event_by_id(parent);
+                if (!target || target->room_id != room_id) {
+                    return send_error(res, 400, MatrixError::invalid_param(
+                                                    "m.in_reply_to names no event in this room"));
+                }
+            }
+        }
         const auto is_attachment_type = [](const std::string& t) {
             return t != msg_type::kText && t != msg_type::kEmote && t != msg_type::kNotice;
         };
@@ -746,8 +782,13 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
             !permission::has(user_perms, permission::kEmbedLinks)) {
             return send_error(res, 403, MatrixError::forbidden("You don't have permission to post links here"));
         }
-        if (any_text(text_fields, body_mentions_everyone) &&
-            !permission::has(user_perms, permission::kMentionEveryone)) {
+        // Token-based, per field, the way the client renders it (see
+        // api/MassMention.h).
+        const bool mass_mention =
+            std::any_of(text_fields.begin(), text_fields.end(), [](const RenderableField& f) {
+                return text_mentions_everyone(f.text, f.formatted);
+            });
+        if (mass_mention && !permission::has(user_perms, permission::kMentionEveryone)) {
             return send_error(res, 403, MatrixError::forbidden("You don't have permission to mention everyone"));
         }
 
@@ -821,8 +862,8 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
                     if (!target->content.data.is_object()) break;
                     auto it = target->content.data.find("m.relates_to");
                     if (it == target->content.data.end() || !it->is_object()) break;
-                    if (it->value("rel_type", "") != "m.replace") break;
-                    auto parent_id = it->value("event_id", "");
+                    if (json_string_or(*it, "rel_type") != "m.replace") break;
+                    auto parent_id = json_string_or(*it, "event_id");
                     if (parent_id.empty() || parent_id == target->event_id) break;
                     auto parent = store_.get_event_by_id(parent_id);
                     if (!parent || parent->room_id != room_id) break;
@@ -849,6 +890,11 @@ void EventHandler::handle_send_event(const httplib::Request& req, httplib::Respo
                 // must also not be distinguishable from one that was never
                 // there, which is why it now shares the not_here() answer.)
                 edit_target = target_id;
+                // Stored pointing at the ORIGINAL (audit 3). A client that
+                // chained its edits used to have the second one stored
+                // against the first edit, which spec clients drop because
+                // they only aggregate replacements of the original.
+                content["m.relates_to"]["event_id"] = target_id;
             }
         }
 
@@ -978,9 +1024,13 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
         return send_error(res, 403, no_channel_access(store_, *user_id));
     }
 
-    // Parse query params
+    // Parse query params. `dir` is b or f and nothing else: anything else
+    // used to read as forward (audit 3).
     std::string dir = "b";
     if (req.has_param("dir")) dir = req.get_param_value("dir");
+    if (dir != "b" && dir != "f") {
+        return send_error(res, 400, MatrixError::invalid_param("dir must be 'b' or 'f'"));
+    }
 
     int limit = limits::kDefaultMessagesLimit;
     if (req.has_param("limit")) {
@@ -993,8 +1043,20 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
         limit = std::clamp(limit, 1, limits::kMaxMessagesLimit);
     }
 
+    // `from` is either a /messages token ("s<position>") or a /sync
+    // next_batch, which spec clients pass to back-paginate from where their
+    // sync left off. sync_token::parse reads both. A token that is neither
+    // is 400 M_INVALID_PARAM; it used to read as "no token" and answer 200
+    // with whatever page that happened to be (audit 3).
     std::optional<std::string> from;
-    if (req.has_param("from")) from = req.get_param_value("from");
+    if (req.has_param("from")) {
+        const auto raw = req.get_param_value("from");
+        const auto pos = sync_token::parse(sync_token_key(), *user_id, raw);
+        if (!pos || *pos < 0) {
+            return send_error(res, 400, MatrixError::invalid_param("Unrecognised 'from' token"));
+        }
+        from = "s" + std::to_string(*pos);
+    }
 
     // No `viewer`, deliberately — this is the HISTORY path, and addressed call
     // signalling is not pageable months later (store/CallSignalling.h).
@@ -1010,7 +1072,16 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
 
     MessagesResponse msg_resp;
     msg_resp.chunk = std::move(events);
-    if (from) msg_resp.start = *from;
+    // `start` is required by the spec. With no `from` it is the token that
+    // names where this page began: just past the room's newest event going
+    // backwards, the beginning going forwards.
+    if (from) {
+        msg_resp.start = *from;
+    } else if (dir == "b") {
+        msg_resp.start = "s" + std::to_string(store_.get_room_max_stream_position(room_id) + 1);
+    } else {
+        msg_resp.start = "s0";
+    }
     if (next_pos) {
         // Token format is "s<stream_position>" — same as what /sync emits
         // for `next_batch` and what the /messages handler expects back as
@@ -1021,6 +1092,14 @@ void EventHandler::handle_room_messages(const httplib::Request& req, httplib::Re
     json resp;
     to_json(resp, msg_resp);
     res.set_content(dump_response_json(resp), "application/json");
+}
+
+const std::vector<unsigned char>& EventHandler::sync_token_key() {
+    std::call_once(sync_key_once_, [this] {
+        sync_key_ = sync_token::derive_key(get_or_create_instance_secret(store_),
+                                           config_.server_name);
+    });
+    return sync_key_;
 }
 
 void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Response& res) {
@@ -1067,13 +1146,44 @@ void EventHandler::handle_read_marker(const httplib::Request& req, httplib::Resp
         return send_error(res, 400, MatrixError::bad_json());
     }
 
+    if (!body.is_object()) {
+        return send_error(res, 400, MatrixError::bad_json("Request body must be a JSON object"));
+    }
+
+    // Where the marker goes (audit 3). A named event means THAT event: the
+    // marker used to go to the room's newest event whatever the client named,
+    // so a spec client — or a second device racing the first — marked unread
+    // messages as read. `m.read` is the spec's receipt and this server's one
+    // marker serves both, so the later of the two named events wins. `{}` (or
+    // neither key) still means "everything", which is what the desktop client
+    // sends; `last_read_pos` is its older explicit form.
     int64_t pos = 0;
-    if (body.contains("last_read_pos") && body["last_read_pos"].is_number_integer()) {
-        pos = body["last_read_pos"].get<int64_t>();
-    } else if (body.contains("m.fully_read") && body["m.fully_read"].is_string()) {
-        pos = store_.get_room_max_stream_position(room_id);
-    } else {
-        pos = store_.get_room_max_stream_position(room_id);
+    bool named = false;
+    for (const char* key : {"m.fully_read", "m.read"}) {
+        const auto it = body.find(key);
+        if (it == body.end() || it->is_null()) continue;
+        if (!it->is_string()) {
+            return send_error(res, 400,
+                              MatrixError::bad_json(std::string(key) + " must be an event id"));
+        }
+        // An id that is not an event in this room moves nothing (and is not
+        // an error a client could act on — a marker is idempotent).
+        if (const auto at = store_.get_event_stream_position(room_id, it->get<std::string>())) {
+            pos = std::max(pos, *at);
+        }
+        named = true;
+    }
+    if (auto it = body.find("last_read_pos"); it != body.end() && !it->is_null()) {
+        if (!it->is_number_integer()) {
+            return send_error(res, 400, MatrixError::bad_json("last_read_pos must be an integer"));
+        }
+        if (!named) pos = it->get<int64_t>();
+        named = true;
+    }
+    if (!named) pos = store_.get_room_max_stream_position(room_id);
+    if (pos <= 0) {
+        res.set_content("{}", "application/json");
+        return;
     }
 
     // Nothing moved: the marker is already at or past `pos`. The client posts

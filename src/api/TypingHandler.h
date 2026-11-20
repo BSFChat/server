@@ -25,6 +25,12 @@ public:
     // Get currently typing users for a room (called by sync)
     std::vector<std::string> get_typing_users(const std::string& room_id);
 
+    // The same, as `viewer` should see it: anyone `viewer` ignores is left out
+    // (audit 3). This is the call /sync should make when it builds a room's
+    // m.typing for a particular reader.
+    std::vector<std::string> get_typing_users_for(const std::string& room_id,
+                                                  const std::string& viewer);
+
 private:
     struct TypingEntry {
         std::string user_id;

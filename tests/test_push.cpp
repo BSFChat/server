@@ -1766,9 +1766,10 @@ TEST(Pushers, DotSegmentsCannotEscapeTheAllowlistedPath) {
     EXPECT_EQ(attempt(base + "/./x").status, 400);
     EXPECT_EQ(attempt(base + "/..%2f..%2fadmin").status, 400);
     EXPECT_EQ(attempt(base + "/%2E%2E/admin").status, 400);
-    // Control: the allowlisted endpoint and a path under it still register.
+    // Control: the allowlisted endpoint registers. A path under it no longer
+    // does: data.url must be exactly .../_matrix/push/v1/notify (audit 3).
     EXPECT_TRUE(IsOk(attempt(base)));
-    EXPECT_TRUE(IsOk(attempt(base + "/v2.beta")));
+    EXPECT_EQ(attempt(base + "/v2.beta").status, 400);
 }
 
 TEST(Pushers, ReRegisteringKeepsYourOwnQueuedPushes) {

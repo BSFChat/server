@@ -141,6 +141,12 @@ VoiceChannelContent read_voice_channel(const json& content) {
     if (content.is_object()) {
         try {
             from_json(content, voice);
+            // -1 is "explicitly unlimited" (audit 3), which the protocol's
+            // clamp folds into 0, "use the server default"; keep it apart.
+            if (auto it = content.find("max_participants");
+                it != content.end() && it->is_number_integer() && it->get<int64_t>() == -1) {
+                voice.max_participants = -1;
+            }
             return voice;
         } catch (const json::exception&) {
         }
@@ -151,7 +157,13 @@ VoiceChannelContent read_voice_channel(const json& content) {
 }
 
 int effective_voice_cap(const VoiceChannelContent& channel, const Config& config) {
+    // max_participants: N > 0 is the channel's cap; -1 is unlimited by the
+    // channel's choice; 0 (or unset) is the server default. The default
+    // exists because a full MESH gives out at 6-8 cameras, so it does not
+    // apply when calls go through a LiveKit SFU (audit 3).
     if (channel.max_participants > 0) return channel.max_participants;
+    if (channel.max_participants < 0) return 0;
+    if (config.voice.livekit.configured()) return 0;
     return std::max(0, config.voice.default_max_participants);
 }
 
@@ -240,6 +252,27 @@ size_t retract_calls_after_role_write(SqliteStore& store, SyncEngine& sync_engin
         return retracted;
     }
     return 0;
+}
+
+bool role_change_can_hide_channels(const std::vector<ServerRole>& before,
+                                   const std::vector<ServerRole>& after) {
+    constexpr permission::Flags kSight = permission::kViewChannel | permission::kAdministrator;
+    for (const auto& old_role : before) {
+        const permission::Flags had = old_role.permissions & kSight;
+        if (had == 0) continue;
+        auto it = std::find_if(after.begin(), after.end(),
+                               [&](const ServerRole& r) { return r.id == old_role.id; });
+        if (it != after.end() && (it->permissions & had) != had) return true;
+    }
+    // Any role that is gone, whatever its own bits: its `role:<id>` ALLOW
+    // overrides stop applying with it.
+    for (const auto& old_role : before) {
+        if (std::none_of(after.begin(), after.end(),
+                         [&](const ServerRole& r) { return r.id == old_role.id; })) {
+            return true;
+        }
+    }
+    return false;
 }
 
 VoiceHandler::VoiceHandler(SqliteStore& store, SyncEngine& sync_engine, const Config& config)
@@ -989,6 +1022,24 @@ void VoiceHandler::handle_turn_server(const httplib::Request& req, httplib::Resp
     if (!config_.voice.stun_uri.empty()) {
         uris.push_back(config_.voice.stun_uri);
     }
+
+    // No TURN relay means no credentials to hand out, and so no ttl either
+    // (audit 3: it answered ttl 86400 with an empty username and password,
+    // which a client reads as "credentials that expire in a day"). Still 200,
+    // with whatever STUN there is and the p2p policy, because the client
+    // reads both from this response and treats an error as a voice failure.
+    const bool have_turn_uri =
+        std::any_of(config_.voice.turn_uris.begin(), config_.voice.turn_uris.end(),
+                    [](const std::string& u) { return !u.empty(); });
+    const bool have_credentials =
+        !config_.voice.turn_secret.empty() || !config_.voice.turn_username.empty();
+    if (!have_turn_uri || !have_credentials) {
+        res.set_content(json{{"uris", uris}, {"allow_p2p", config_.voice.allow_peer_to_peer}}
+                            .dump(),
+                        "application/json");
+        return;
+    }
+
     for (const auto& turn_uri : config_.voice.turn_uris) {
         if (!turn_uri.empty()) {
             uris.push_back(turn_uri);
