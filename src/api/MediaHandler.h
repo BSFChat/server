@@ -76,6 +76,11 @@ public:
     // a ticket does and does not commit to.
     void handle_ticket(const httplib::Request& req, httplib::Response& res);
 
+    // GET /_matrix/media/v3/config: the largest upload this server accepts, as
+    // m.upload.size (bytes). Unauthenticated, as the spec has it, so a client
+    // can size a file before it signs in or starts an upload.
+    void handle_config(const httplib::Request& req, httplib::Response& res);
+
 private:
     std::string generate_media_id() const;
     // Resolves the caller from the Authorization header, a signed `?mt=` ticket,

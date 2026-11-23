@@ -348,6 +348,8 @@ void Server::register_routes() {
     // this change into the protocol repo, which has to merge first; fold it in
     // the next time protocol changes for another reason. The client's mirror of
     // this string is in client/src/util/MediaUrl.h.
+    svr.Get("/_matrix/media/v3/config",
+            [h = media_handler](const httplib::Request& req, httplib::Response& res) { h->handle_config(req, res); });
     svr.Post("/_matrix/media/v3/ticket",
              [h = media_handler](const httplib::Request& req, httplib::Response& res) { h->handle_ticket(req, res); });
     svr.Get(R"(/_matrix/media/v3/download/([^/]+)/([^/]+)/([^/]+))",

@@ -768,6 +768,13 @@ a `4xx`: do not retry it, split the message. An oversize **edit** is refused
 whole — the message already in the timeline is left exactly as it was, so there
 is no half-applied state to reconcile.
 
+The official client sends a text body longer than `max_message_bytes` as a
+`message.txt` file: an `m.file` event with `bsfchat.long_message: true`, carrying the
+message's `m.relates_to` and `m.mentions`. Bots get the plain `413`, so split or upload
+the text yourself.
+
+The server publishes the ceilings it enforces in `GET /_matrix/client/versions` under `bsfchat.limits` (`max_message_bytes`, `max_formatted_body_bytes`, `max_event_bytes`), unauthenticated. Read them there rather than assuming the defaults.
+
 An operator may lower `max_message_bytes`, so do not hard-code 16384. If you
 post long output, either check `len(body.encode("utf-8"))` against a
 conservative figure of your own and chunk above it, or upload it as a file
@@ -903,8 +910,9 @@ your `Authorization` header. The desktop client instead appends
 same, but prefer the header; query strings leak into logs. Range requests are
 supported (at most 4 ranges, else `416`).
 
-Limits: `max_upload_size_mb` defaults to **50**; exceeding it is `413
-M_TOO_LARGE`. An empty body is `400 M_INVALID_PARAM`. Media from another
+Limits: `max_upload_size_mb` defaults to **50**; the current value is in
+`GET /_matrix/media/v3/config` as `m.upload.size`. Exceeding it is `413
+M_TOO_LARGE`, and the message names the limit. An empty body is `400 M_INVALID_PARAM`. Media from another
 server's `mxc://` is `404` — there is no federation and nothing is proxied.
 
 ---

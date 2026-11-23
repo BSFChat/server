@@ -193,11 +193,13 @@ std::string trim_ows(const std::string& s) {
     return s.substr(b, e - b + 1);
 }
 
-void send_upload_too_large(httplib::Response& res) {
+void send_upload_too_large(httplib::Response& res, std::size_t max_upload_mb) {
     res.status = 413;
     nlohmann::json err;
     err["errcode"] = "M_TOO_LARGE";
-    err["error"] = "Upload exceeds maximum allowed size";
+    // Name the limit: a bare "too large" leaves the sender guessing how much to
+    // cut, and the client can only say something useful if the server does.
+    err["error"] = "Upload exceeds this server's limit of " + std::to_string(max_upload_mb) + " MB";
     res.set_content(err.dump(), "application/json");
 }
 
@@ -228,7 +230,7 @@ bool MediaHandler::admit_upload(const httplib::Request& req, httplib::Response& 
         std::size_t len = 0;
         const auto [ptr, ec] = std::from_chars(raw.data(), raw.data() + raw.size(), len);
         if (ec == std::errc::result_out_of_range || (ec == std::errc{} && len > max_bytes)) {
-            send_upload_too_large(res);
+            send_upload_too_large(res, config_.max_upload_size_mb);
             return false;
         }
     }
@@ -318,7 +320,7 @@ void MediaHandler::handle_upload(const httplib::Request& req, httplib::Response&
     const std::string& body = req.body;
     size_t max_bytes = config_.max_upload_size_mb * 1024 * 1024;
     if (body.size() > max_bytes) {
-        send_upload_too_large(res);
+        send_upload_too_large(res, config_.max_upload_size_mb);
         return;
     }
 
@@ -481,6 +483,11 @@ std::optional<std::string> MediaHandler::authenticate_media(const httplib::Reque
         return store_.get_user_by_token(req.get_param_value("access_token"));
     }
     return std::nullopt;
+}
+
+void MediaHandler::handle_config(const httplib::Request&, httplib::Response& res) {
+    const std::size_t max_bytes = config_.max_upload_size_mb * 1024 * 1024;
+    res.set_content(nlohmann::json{{"m.upload.size", max_bytes}}.dump(), "application/json");
 }
 
 void MediaHandler::handle_ticket(const httplib::Request& req, httplib::Response& res) {

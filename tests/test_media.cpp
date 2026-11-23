@@ -1650,6 +1650,28 @@ TEST_F(UploadAdmissionTest, AnAdmittedUploadStillStores) {
     EXPECT_NE(res->body.find("mxc://test/"), std::string::npos) << res->body;
 }
 
+// The client sizes a file before it uploads it, from this number. It has to be
+// the operator's configured limit: a client that guesses the default is wrong
+// on any deployment that has changed max_upload_size_mb.
+TEST_F(UploadAdmissionTest, ConfigPublishesTheConfiguredUploadLimit) {
+    httplib::Response res;
+    httplib::Request req;
+    req.path = "/_matrix/media/v3/config";
+    handler_->handle_config(req, res);
+
+    const auto body = nlohmann::json::parse(res.body);
+    EXPECT_EQ(body["m.upload.size"].get<std::size_t>(), 10u * 1024 * 1024);
+}
+
+// A refused upload names the limit, so the sender knows how much to cut.
+TEST_F(UploadAdmissionTest, TooLargeUploadNamesTheLimit) {
+    httplib::Response res;
+    EXPECT_FALSE(handler_->admit_upload(
+        upload_request(true, std::to_string(11 * 1024 * 1024)), res));
+    EXPECT_EQ(res.status, 413);
+    EXPECT_NE(res.body.find("10 MB"), std::string::npos) << res.body;
+}
+
 TEST_F(UploadAdmissionTest, AdmissionChecksAuthAndLengthWithoutABody) {
     {
         httplib::Response res;
