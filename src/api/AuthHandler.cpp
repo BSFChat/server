@@ -292,6 +292,22 @@ void AuthHandler::handle_versions(const httplib::Request& req, httplib::Response
     // flag there and put the string beside it.
     resp["unstable_features"] = {{"bsfchat.server", true}};
 
+    // The size ceilings this server ENFORCES on a send, in bytes, so a client
+    // can refuse an oversize message before it is sent instead of having it
+    // bounce. Operator-configured values are published here, not the protocol
+    // default, because a client that assumes the default would be wrong on any
+    // deployment that has changed `[limits]`. None of these are secret: they
+    // are the same numbers a refused send names in its 413 body.
+    //
+    // Unauthenticated, like `versions`: a client reads them during discovery,
+    // before it has a token. Nothing here identifies the deployment.
+    const size_t body_cap = config_.send_limits.max_message_bytes;
+    resp["bsfchat.limits"] = {
+        {"max_message_bytes", body_cap},
+        {"max_formatted_body_bytes", body_cap * limits::kFormattedBodyMultiplier},
+        {"max_event_bytes", config_.send_limits.max_event_bytes},
+    };
+
     // The BUILD IDENTITY is for whoever is running the server, so it is served
     // only to a caller holding a valid token.
     //

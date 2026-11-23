@@ -486,6 +486,30 @@ TEST(VersionsEndpoint, BuildIdentityIsNotServedUnauthenticated) {
     EXPECT_FALSE(body.contains("bsfchat.channel"));
 }
 
+// A client refuses an oversize message before sending it only if it knows the
+// limit, so /versions publishes the one this server enforces — the operator's
+// configured value, not the protocol default — and the formatted_body ceiling
+// derived from it.
+TEST(VersionsEndpoint, PublishesTheConfiguredSendLimits) {
+    Fixture f;
+    f.config.send_limits.max_message_bytes = 4096;
+    AuthHandler handler(*f.store, *f.sync, f.config);
+
+    httplib::Response res;
+    httplib::Request req;
+    req.path = "/_matrix/client/versions";
+    handler.handle_versions(req, res);
+
+    ASSERT_TRUE(IsOk(res));
+    auto body = json::parse(res.body);
+    ASSERT_TRUE(body.contains("bsfchat.limits"));
+    const auto& lim = body["bsfchat.limits"];
+    EXPECT_EQ(lim["max_message_bytes"].get<size_t>(), 4096u);
+    EXPECT_EQ(lim["max_formatted_body_bytes"].get<size_t>(),
+              4096u * bsfchat::limits::kFormattedBodyMultiplier);
+    EXPECT_EQ(lim["max_event_bytes"].get<size_t>(), f.config.send_limits.max_event_bytes);
+}
+
 TEST(VersionsEndpoint, BuildIdentityIsServedToATokenHolder) {
     Fixture f;
     f.add_user("alice");
